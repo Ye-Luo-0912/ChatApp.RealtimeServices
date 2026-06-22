@@ -8,7 +8,7 @@ public static class RealtimeRedisRegistration
 {
     public static IServiceCollection AddRealtimeInfrastructureRedis(
         this IServiceCollection services,
-        string garnetConnectionString)
+        string? garnetConnectionString)
     {
         if (string.IsNullOrWhiteSpace(garnetConnectionString))
         {

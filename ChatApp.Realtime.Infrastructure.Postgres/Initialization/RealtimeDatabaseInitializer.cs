@@ -1,13 +1,12 @@
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Configuration;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
-using ChatApp.RealtimeServices.Options;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Npgsql;
 
-namespace ChatApp.RealtimeServices.Diagnostics;
+namespace ChatApp.Realtime.Infrastructure.Postgres.Initialization;
 
 public sealed class RealtimeDatabaseInitializer : IHostedService
 {

@@ -25,6 +25,20 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
             .CreateDbContextAsync(ct)
             .ConfigureAwait(false);
 
+        var exists = await dbContext.Messages
+            .AnyAsync(m => m.SenderUserId == message.SenderUserId
+                        && m.ClientMessageId == message.ClientMessageId, ct)
+            .ConfigureAwait(false);
+
+        if (exists)
+        {
+            _logger.LogInformation(
+                "实时消息已存在，跳过重复写入。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}",
+                message.ClientMessageId,
+                message.SenderUserId);
+            return false;
+        }
+
         dbContext.Messages.Add(new RealtimeMessageEntity
         {
             MessageId = message.MessageId,

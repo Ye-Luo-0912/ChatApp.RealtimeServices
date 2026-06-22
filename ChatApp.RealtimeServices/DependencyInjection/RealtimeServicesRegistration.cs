@@ -40,14 +40,11 @@ public static class RealtimeServicesRegistration
             databaseOptions.MessageStoreProvider);
         services.AddRealtimeInfrastructureNats(
             CreateRealtimeQueueOptions(natsOptions));
+        services.AddRealtimeDatabaseInitializer(
+            databaseOptions.InitializeSchemaOnStart,
+            connectionOptions.RealtimeDatabase);
 
         services.AddHostedService<RealtimeStartupReporter>();
-
-        if (databaseOptions.InitializeSchemaOnStart
-            && !string.IsNullOrWhiteSpace(connectionOptions.RealtimeDatabase))
-        {
-            services.AddHostedService<RealtimeDatabaseInitializer>();
-        }
 
         services.AddHostedService<RealtimeEventWorker>();
         services.AddHostedService<IncomingMessageWorker>();
@@ -107,7 +104,7 @@ public static class RealtimeServicesRegistration
             ?? throw new InvalidOperationException("ConnectionStrings 配置节缺失。");
 
         if (string.IsNullOrWhiteSpace(raw.Garnet))
-            throw new InvalidOperationException("ConnectionStrings:Garnet 为必填配置。");
+            throw new InvalidOperationException("ConnectionStrings 配置节缺失。");
 
         return new RealtimeConnectionOptions
         {
@@ -140,6 +137,11 @@ public static class RealtimeServicesRegistration
         RealtimeConnectionOptions connectionOptions)
     {
         var warnings = new List<string>();
+
+        if (string.IsNullOrWhiteSpace(connectionOptions.Garnet))
+        {
+            warnings.Add("ConnectionStrings:Garnet 未配置，Garnet/Redis 客户端不会注册。");
+        }
 
         if (string.IsNullOrWhiteSpace(natsOptions.Url))
         {

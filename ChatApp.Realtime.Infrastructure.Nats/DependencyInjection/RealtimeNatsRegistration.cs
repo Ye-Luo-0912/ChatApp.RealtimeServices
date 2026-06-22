@@ -3,6 +3,7 @@ using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Infrastructure.Nats.Queueing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace ChatApp.Realtime.Infrastructure.Nats.DependencyInjection;
 
@@ -19,8 +20,14 @@ public static class RealtimeNatsRegistration
 
         services.AddSingleton(queueOptions);
         services.AddSingleton<NatsConnectionClient>();
+
+        services.RemoveAll<IRealtimeEventPublisher>();
         services.AddSingleton<IRealtimeEventPublisher, NatsRealtimeEventPublisher>();
+
+        services.RemoveAll<IRealtimeEventConsumer>();
         services.AddSingleton<IRealtimeEventConsumer, NatsRealtimeEventConsumer>();
+
+        services.RemoveAll<IIncomingMessageConsumer>();
         services.AddSingleton<IIncomingMessageConsumer, NatsIncomingMessageConsumer>();
 
         return services;

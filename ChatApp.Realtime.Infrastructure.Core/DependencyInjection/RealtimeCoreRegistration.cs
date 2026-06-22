@@ -10,6 +10,7 @@ using ChatApp.Realtime.Infrastructure.Core.Messaging;
 using ChatApp.Realtime.Infrastructure.Core.State;
 using ChatApp.Realtime.Infrastructure.Core.Stores;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace ChatApp.Realtime.Infrastructure.Core.DependencyInjection;
 
@@ -17,15 +18,15 @@ public static class RealtimeCoreRegistration
 {
     public static IServiceCollection AddRealtimeInfrastructureCore(this IServiceCollection services)
     {
-        services.AddSingleton<RealtimeReadinessState>();
-        services.AddSingleton<IRealtimeAuthReader, NoopRealtimeAuthReader>();
-        services.AddSingleton<IRealtimeStateStore, InMemoryRealtimeStateStore>();
-        services.AddSingleton<IIncomingMessageProcessor, DefaultIncomingMessageProcessor>();
+        services.TryAddSingleton<RealtimeReadinessState>();
+        services.TryAddSingleton<IRealtimeAuthReader, NoopRealtimeAuthReader>();
+        services.TryAddSingleton<IRealtimeStateStore, InMemoryRealtimeStateStore>();
+        services.TryAddSingleton<IIncomingMessageProcessor, DefaultIncomingMessageProcessor>();
 
-        services.AddSingleton<IRealtimeEventPublisher, NoopRealtimeEventPublisher>();
-        services.AddSingleton<IRealtimeEventConsumer, NoopRealtimeEventConsumer>();
-        services.AddSingleton<IIncomingMessageConsumer, NoopIncomingMessageConsumer>();
-        services.AddSingleton<IRealtimeMessageStore, NoopRealtimeMessageStore>();
+        services.TryAddSingleton<IRealtimeEventPublisher, NoopRealtimeEventPublisher>();
+        services.TryAddSingleton<IRealtimeEventConsumer, NoopRealtimeEventConsumer>();
+        services.TryAddSingleton<IIncomingMessageConsumer, NoopIncomingMessageConsumer>();
+        services.TryAddSingleton<IRealtimeMessageStore, NoopRealtimeMessageStore>();
 
         return services;
     }
