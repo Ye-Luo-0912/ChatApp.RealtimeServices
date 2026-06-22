@@ -1,5 +1,6 @@
 using ChatApp.RealtimeServices.DependencyInjection;
 using ChatApp.RealtimeServices.Options;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -8,6 +9,11 @@ using Microsoft.Extensions.Options;
 try
 {
     var builder = Host.CreateApplicationBuilder(args);
+
+    builder.Configuration.AddJsonFile(
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".chatapp", "realtime.user.json"),
+        optional: true,
+        reloadOnChange: false);
 
     builder.Logging.ClearProviders();
     builder.Logging.AddSimpleConsole(options =>
