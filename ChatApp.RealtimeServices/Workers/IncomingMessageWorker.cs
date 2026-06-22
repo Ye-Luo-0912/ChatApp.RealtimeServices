@@ -54,7 +54,7 @@ public sealed class IncomingMessageWorker : BackgroundService
                         envelope.Command.CommandId,
                         envelope.DeliveryCount,
                         PoisonDeliveryThreshold);
-                    await envelope.AckAsync(stoppingToken).ConfigureAwait(false);
+                    await AckAsync(envelope, stoppingToken).ConfigureAwait(false);
                     continue;
                 }
 
