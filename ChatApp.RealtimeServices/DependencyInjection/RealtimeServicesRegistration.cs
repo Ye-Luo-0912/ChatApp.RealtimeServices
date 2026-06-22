@@ -10,7 +10,6 @@ using ChatApp.RealtimeServices.Options;
 using ChatApp.RealtimeServices.Workers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Options;
 
 namespace ChatApp.RealtimeServices.DependencyInjection;
 
@@ -26,10 +25,10 @@ public static class RealtimeServicesRegistration
         var connectionOptions = BindConnectionOptions(configuration);
         var warnings = BuildWarnings(configuration, natsOptions, databaseOptions, connectionOptions);
 
-        services.AddSingleton<IOptions<RealtimeOptions>>(Microsoft.Extensions.Options.Options.Create(realtimeOptions));
-        services.AddSingleton<IOptions<NatsOptions>>(Microsoft.Extensions.Options.Options.Create(natsOptions));
-        services.AddSingleton<IOptions<RealtimeDatabaseOptions>>(Microsoft.Extensions.Options.Options.Create(databaseOptions));
-        services.AddSingleton<IOptions<RealtimeConnectionOptions>>(Microsoft.Extensions.Options.Options.Create(connectionOptions));
+        services.AddSingleton(Microsoft.Extensions.Options.Options.Create(realtimeOptions));
+        services.AddSingleton(Microsoft.Extensions.Options.Options.Create(natsOptions));
+        services.AddSingleton(Microsoft.Extensions.Options.Options.Create(databaseOptions));
+        services.AddSingleton(Microsoft.Extensions.Options.Options.Create(connectionOptions));
         services.AddSingleton(new RealtimeConfigurationWarnings(warnings));
 
         services.AddRealtimeInfrastructureCore();
@@ -61,10 +60,7 @@ public static class RealtimeServicesRegistration
 
         if (string.IsNullOrWhiteSpace(options.ServiceName))
             throw new InvalidOperationException("Realtime:ServiceName 为必填配置。");
-        if (string.IsNullOrWhiteSpace(options.InstanceId))
-            throw new InvalidOperationException("Realtime:InstanceId 为必填配置。");
-
-        return options;
+        return string.IsNullOrWhiteSpace(options.InstanceId) ? throw new InvalidOperationException("Realtime:InstanceId 为必填配置。") : options;
     }
 
     private static NatsOptions BindNatsOptions(IConfiguration configuration)

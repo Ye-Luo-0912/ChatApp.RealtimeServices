@@ -12,7 +12,6 @@ public sealed class JetStreamContextManager
 {
     private readonly NatsConnectionClient _connectionClient;
     private readonly RealtimeQueueOptions _queueOptions;
-    private readonly JetStreamStreamOptions _streams;
     private readonly ILogger<JetStreamContextManager> _logger;
 
     private readonly Lazy<INatsJSContext> _context;
@@ -27,14 +26,13 @@ public sealed class JetStreamContextManager
     {
         _connectionClient = connectionClient;
         _queueOptions = queueOptions;
-        _streams = streams;
         _logger = logger;
 
         _context = new Lazy<INatsJSContext>(CreateContext);
         _incomingMessagesStream = new Lazy<INatsJSStream>(() => EnsureStreamAsync(
-            _streams.IncomingMessages, _queueOptions.Topics.IncomingMessages).GetAwaiter().GetResult());
+            streams.IncomingMessages, _queueOptions.Topics.IncomingMessages).GetAwaiter().GetResult());
         _realtimeEventsStream = new Lazy<INatsJSStream>(() => EnsureStreamAsync(
-            _streams.RealtimeEvents, _queueOptions.Topics.RealtimeEvents).GetAwaiter().GetResult());
+            streams.RealtimeEvents, _queueOptions.Topics.RealtimeEvents).GetAwaiter().GetResult());
     }
 
     public INatsJSContext Context => _context.Value;
@@ -80,7 +78,7 @@ public sealed class JetStreamContextManager
         {
             _logger.LogInformation("正在创建 JetStream 流。流名={Stream}；Subject={Subject}", streamName, subject);
 
-            var config = new StreamConfig(streamName, new[] { subject })
+            var config = new StreamConfig(streamName, [subject])
             {
                 Storage = StreamConfigStorage.File,
                 Retention = StreamConfigRetention.Limits,
