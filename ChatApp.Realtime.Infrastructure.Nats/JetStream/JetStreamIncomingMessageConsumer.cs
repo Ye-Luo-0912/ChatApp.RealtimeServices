@@ -63,10 +63,12 @@ public sealed class JetStreamIncomingMessageConsumer : IIncomingMessageConsumer
             if (command is not null)
             {
                 var jsMsg = msg;
+                var deliveryCount = jsMsg.Metadata?.NumDelivered;
                 yield return new IncomingMessageEnvelope(
                     command,
                     ack: async ackCt => await jsMsg.AckAsync(cancellationToken: ackCt).ConfigureAwait(false),
-                    nak: async nakCt => await jsMsg.NakAsync(cancellationToken: nakCt).ConfigureAwait(false));
+                    nak: async nakCt => await jsMsg.NakAsync(cancellationToken: nakCt).ConfigureAwait(false),
+                    deliveryCount: deliveryCount);
             }
             else
             {

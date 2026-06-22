@@ -10,6 +10,7 @@ namespace ChatApp.RealtimeServices.Workers;
 public sealed class IncomingMessageWorker : BackgroundService
 {
     private const string WorkerName = nameof(IncomingMessageWorker);
+    private const ulong PoisonDeliveryThreshold = 8;
 
     private readonly IIncomingMessageConsumer _consumer;
     private readonly IIncomingMessageProcessor _processor;
@@ -46,13 +47,24 @@ public sealed class IncomingMessageWorker : BackgroundService
             {
                 _readinessState.MarkHeartbeat(WorkerName);
 
+                if (IsPoison(envelope))
+                {
+                    _logger.LogCritical(
+                        "检测到毒丸消息，直接丢弃。命令编号={CommandId}；投递次数={DeliveryCount}；阈值={Threshold}",
+                        envelope.Command.CommandId,
+                        envelope.DeliveryCount,
+                        PoisonDeliveryThreshold);
+                    await envelope.AckAsync(stoppingToken).ConfigureAwait(false);
+                    continue;
+                }
+
                 var result = await _processor
                     .ProcessAsync(envelope.Command, stoppingToken)
                     .ConfigureAwait(false);
 
                 if (result.Succeeded)
                 {
-                    await envelope.TryAckAsync(stoppingToken).ConfigureAwait(false);
+                    await AckAsync(envelope, stoppingToken).ConfigureAwait(false);
 
                     _logger.LogInformation(
                         "入站消息处理成功。命令编号={CommandId}；消息编号={MessageId}",
@@ -61,7 +73,7 @@ public sealed class IncomingMessageWorker : BackgroundService
                 }
                 else
                 {
-                    await envelope.TryNakAsync(stoppingToken).ConfigureAwait(false);
+                    await NakAsync(envelope, stoppingToken).ConfigureAwait(false);
 
                     _logger.LogWarning(
                         "入站消息处理失败。命令编号={CommandId}；错误码={ErrorCode}；错误信息={ErrorMessage}",
@@ -93,5 +105,39 @@ public sealed class IncomingMessageWorker : BackgroundService
             _readinessState.MarkStopped(WorkerName);
             _logger.LogInformation("入站消息工作器已停止。");
         }
+    }
+
+    private async ValueTask AckAsync(IncomingMessageEnvelope envelope, CancellationToken ct)
+    {
+        try
+        {
+            await envelope.AckAsync(ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "ACK 失败。命令编号={CommandId}",
+                envelope.Command.CommandId);
+        }
+    }
+
+    private async ValueTask NakAsync(IncomingMessageEnvelope envelope, CancellationToken ct)
+    {
+        try
+        {
+            await envelope.NakAsync(ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "NAK 失败。命令编号={CommandId}",
+                envelope.Command.CommandId);
+        }
+    }
+
+    private static bool IsPoison(IncomingMessageEnvelope envelope)
+    {
+        return envelope.DeliveryCount.HasValue
+               && envelope.DeliveryCount.Value >= PoisonDeliveryThreshold;
     }
 }
