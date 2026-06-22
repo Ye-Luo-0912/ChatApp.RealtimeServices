@@ -1,0 +1,41 @@
+# Build output
+bin/
+obj/
+
+# Rider / IntelliJ
+.idea/
+*.sln.iml
+
+# Visual Studio cache
+.vs/
+
+# User-specific files
+*.user
+*.rsuser
+*.suo
+
+# Logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# .NET / NuGet
+*.nupkg
+*.snupkg
+.nuget/
+
+# Test / coverage
+TestResults/
+coverage/
+*.coverage
+*.coveragexml
+
+# Env / secrets
+.env
+.env.*
+appsettings.*.local.json
+
+

@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="ChatApp.RealtimeServices/ChatApp.RealtimeServices.csproj" />
+  <Project Path="ChatApp.Realtime.Abstractions/ChatApp.Realtime.Abstractions.csproj" />
+  <Project Path="ChatApp.Realtime.Infrastructure/ChatApp.Realtime.Infrastructure.csproj" />
+</Solution>

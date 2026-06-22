@@ -1,0 +1,50 @@
+services:
+  # 引擎三：NATS 消息队列
+  # 本地开发阶段使用 Core NATS 负责实时消息和事件分发，开启 JetStream 方便后续升级持久化流。
+  nats:
+    image: nats:latest
+    container_name: chatapp_nats
+    restart: always
+    command:
+      - "-js"
+      - "-m"
+      - "8222"
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats_data:/data
+
+  # 实时服务进程
+  # 默认不随基础设施启动；后续准备容器部署时再通过 --profile container-service 启用。
+  realtime_services:
+    profiles:
+      - container-service
+    build:
+      context: ../ChatApp.RealtimeServices
+      dockerfile: ChatApp.RealtimeServices/Dockerfile
+      args:
+        FINAL_BASE_IMAGE: mcr.microsoft.com/dotnet/runtime:10.0
+    container_name: chatapp_realtime_services
+    restart: unless-stopped
+    depends_on:
+      - nats
+      - postgres_db
+      - garnet_cache
+    environment:
+      DOTNET_ENVIRONMENT: Container
+      Realtime__ServiceName: ChatApp.RealtimeServices
+      Realtime__InstanceId: realtime-container-1
+      Nats__Url: nats://nats:4222
+      Nats__QueueGroup: chatapp-realtime-services
+      Nats__Subjects__IncomingMessages: chat.incoming-messages
+      Nats__Subjects__RealtimeEvents: chat.realtime-events
+      Nats__Subjects__MessagePersistence: chat.message-persistence
+      ConnectionStrings__Garnet: garnet_cache:6379,abortConnect=false
+      ConnectionStrings__RealtimeDatabase: Host=postgres_db;Port=5432;Database=ChatAppDatabase;Username=postgres;Password=520666;Include Error Detail=true;Pooling=true;Minimum Pool Size=0;Maximum Pool Size=100;Connection Idle Lifetime=300;
+      RealtimeDatabase__Schema: realtime
+      RealtimeDatabase__MessageStoreProvider: Npgsql
+      RealtimeDatabase__InitializeSchemaOnStart: "true"
+
+volumes:
+  nats_data:
