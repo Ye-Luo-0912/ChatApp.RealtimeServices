@@ -39,7 +39,8 @@ public static class RealtimeServicesRegistration
             databaseOptions.Schema,
             databaseOptions.MessageStoreProvider);
         services.AddRealtimeInfrastructureNats(
-            CreateRealtimeQueueOptions(natsOptions));
+            CreateRealtimeQueueOptions(natsOptions),
+            natsOptions.JetStream?.Streams);
         services.AddRealtimeDatabaseInitializer(
             databaseOptions.InitializeSchemaOnStart,
             connectionOptions.RealtimeDatabase);
@@ -100,15 +101,11 @@ public static class RealtimeServicesRegistration
     private static RealtimeConnectionOptions BindConnectionOptions(IConfiguration configuration)
     {
         var section = configuration.GetSection("ConnectionStrings");
-        var raw = section.Get<RealtimeConnectionOptions>()
-            ?? throw new InvalidOperationException("ConnectionStrings 配置节缺失。");
-
-        if (string.IsNullOrWhiteSpace(raw.Garnet))
-            throw new InvalidOperationException("ConnectionStrings 配置节缺失。");
+        var raw = section.Get<RealtimeConnectionOptions>() ?? new RealtimeConnectionOptions();
 
         return new RealtimeConnectionOptions
         {
-            Garnet = raw.Garnet,
+            Garnet = Normalize(raw.Garnet),
             RealtimeDatabase = Normalize(configuration["ConnectionStrings:RealtimeDatabase"])
                 ?? Normalize(configuration["ConnectionStrings:DefaultConnection"])
         };
@@ -118,7 +115,11 @@ public static class RealtimeServicesRegistration
     {
         return new RealtimeQueueOptions
         {
-            Provider = "Nats",
+            Provider = string.IsNullOrWhiteSpace(options.Url)
+                ? "Noop"
+                : options.Mode.Equals("JetStream", StringComparison.OrdinalIgnoreCase)
+                    ? "JetStream"
+                    : "Nats",
             Endpoint = options.Url,
             ConsumerGroup = options.QueueGroup,
             Topics = new RealtimeQueueTopics

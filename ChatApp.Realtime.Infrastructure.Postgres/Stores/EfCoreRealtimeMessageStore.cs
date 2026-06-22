@@ -3,6 +3,7 @@ using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using ChatApp.Realtime.Infrastructure.Postgres.Data.Entities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using Npgsql;
 
 namespace ChatApp.Realtime.Infrastructure.Postgres.Stores;
 
@@ -50,7 +51,20 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
             ReceivedAtMs = message.ReceivedAtMs
         });
 
-        await dbContext.SaveChangesAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await dbContext.SaveChangesAsync(ct).ConfigureAwait(false);
+        }
+        catch (DbUpdateException ex)
+            when (ex.InnerException is PostgresException pgEx
+                  && pgEx.SqlState == PostgresErrorCodes.UniqueViolation)
+        {
+            _logger.LogInformation(
+                "实时消息存在（并发写入检测），跳过重复。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}",
+                message.ClientMessageId,
+                message.SenderUserId);
+            return false;
+        }
 
         _logger.LogInformation(
             "实时消息已写入数据库。消息编号={MessageId}；发送用户={SenderUserId}；接收用户={ReceiverUserId}",

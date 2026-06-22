@@ -8,6 +8,7 @@
 
   <ItemGroup>
     <PackageReference Include="NATS.Net" Version="2.8.0" />
+    <PackageReference Include="NATS.Client.JetStream" Version="2.8.0" />
   </ItemGroup>
 
   <ItemGroup>
