@@ -13,7 +13,7 @@ public sealed class NoopIncomingMessageConsumer : IIncomingMessageConsumer
         _logger = logger;
     }
 
-    public async IAsyncEnumerable<IncomingMessageCommand> ConsumeAsync(
+    public async IAsyncEnumerable<IncomingMessageEnvelope> ConsumeAsync(
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();

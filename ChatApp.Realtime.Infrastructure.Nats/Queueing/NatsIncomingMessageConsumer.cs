@@ -23,7 +23,7 @@ public sealed class NatsIncomingMessageConsumer : IIncomingMessageConsumer
         _logger = logger;
     }
 
-    public async IAsyncEnumerable<IncomingMessageCommand> ConsumeAsync(
+    public async IAsyncEnumerable<IncomingMessageEnvelope> ConsumeAsync(
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         _logger.LogInformation(
@@ -63,7 +63,7 @@ public sealed class NatsIncomingMessageConsumer : IIncomingMessageConsumer
 
             if (command is not null)
             {
-                yield return command;
+                yield return new IncomingMessageEnvelope(command);
             }
         }
     }

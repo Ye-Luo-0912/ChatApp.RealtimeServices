@@ -24,7 +24,7 @@ public sealed class JetStreamIncomingMessageConsumer : IIncomingMessageConsumer
         _logger = logger;
     }
 
-    public async IAsyncEnumerable<IncomingMessageCommand> ConsumeAsync(
+    public async IAsyncEnumerable<IncomingMessageEnvelope> ConsumeAsync(
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         var consumer = await _contextManager
@@ -36,16 +36,8 @@ public sealed class JetStreamIncomingMessageConsumer : IIncomingMessageConsumer
             _options.ConsumerGroup,
             _options.Topics.IncomingMessages);
 
-        INatsJSMsg<string>? previousMsg = null;
-
         await foreach (var msg in consumer.ConsumeAsync<string>(cancellationToken: ct))
         {
-            if (previousMsg is not null)
-            {
-                await previousMsg.AckAsync(cancellationToken: ct).ConfigureAwait(false);
-                previousMsg = null;
-            }
-
             IncomingMessageCommand? command = null;
 
             try
@@ -70,8 +62,11 @@ public sealed class JetStreamIncomingMessageConsumer : IIncomingMessageConsumer
 
             if (command is not null)
             {
-                previousMsg = msg;
-                yield return command;
+                var jsMsg = msg;
+                yield return new IncomingMessageEnvelope(
+                    command,
+                    ack: async ackCt => await jsMsg.AckAsync(cancellationToken: ackCt).ConfigureAwait(false),
+                    nak: async nakCt => await jsMsg.NakAsync(cancellationToken: nakCt).ConfigureAwait(false));
             }
             else
             {

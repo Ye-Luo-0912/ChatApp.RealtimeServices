@@ -24,28 +24,22 @@ public static class RealtimeNatsRegistration
         services.AddSingleton(queueOptions);
         services.AddSingleton<NatsConnectionClient>();
 
+        services.RemoveAll<IRealtimeEventPublisher>();
+        services.AddSingleton<IRealtimeEventPublisher, NatsRealtimeEventPublisher>();
+
+        services.RemoveAll<IRealtimeEventConsumer>();
+        services.AddSingleton<IRealtimeEventConsumer, NatsRealtimeEventConsumer>();
+
         if (IsJetStream(queueOptions))
         {
             services.AddSingleton(jetStreamStreams ?? new JetStreamStreamOptions());
             services.AddSingleton<JetStreamContextManager>();
-
-            services.RemoveAll<IRealtimeEventPublisher>();
-            services.AddSingleton<IRealtimeEventPublisher, JetStreamRealtimeEventPublisher>();
-
-            services.RemoveAll<IRealtimeEventConsumer>();
-            services.AddSingleton<IRealtimeEventConsumer, JetStreamRealtimeEventConsumer>();
 
             services.RemoveAll<IIncomingMessageConsumer>();
             services.AddSingleton<IIncomingMessageConsumer, JetStreamIncomingMessageConsumer>();
         }
         else
         {
-            services.RemoveAll<IRealtimeEventPublisher>();
-            services.AddSingleton<IRealtimeEventPublisher, NatsRealtimeEventPublisher>();
-
-            services.RemoveAll<IRealtimeEventConsumer>();
-            services.AddSingleton<IRealtimeEventConsumer, NatsRealtimeEventConsumer>();
-
             services.RemoveAll<IIncomingMessageConsumer>();
             services.AddSingleton<IIncomingMessageConsumer, NatsIncomingMessageConsumer>();
         }

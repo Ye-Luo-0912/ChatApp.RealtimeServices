@@ -13,5 +13,5 @@ public interface IIncomingMessageConsumer
     /// <remarks>
     /// 该方法会根据实现的不同，从不同的消息源（如NATS）订阅并消费消息。在没有配置真实的消息消费者时，可能仅用于调试或占位用途，并不会实际返回任何值。
     /// </remarks>
-    IAsyncEnumerable<IncomingMessageCommand> ConsumeAsync(CancellationToken ct = default);
+    IAsyncEnumerable<IncomingMessageEnvelope> ConsumeAsync(CancellationToken ct = default);
 }

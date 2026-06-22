@@ -12,49 +12,38 @@ public sealed class JetStreamContextManager
 {
     private readonly NatsConnectionClient _connectionClient;
     private readonly RealtimeQueueOptions _queueOptions;
+    private readonly JetStreamStreamOptions _streamOptions;
     private readonly ILogger<JetStreamContextManager> _logger;
 
     private readonly Lazy<INatsJSContext> _context;
-    private readonly Lazy<INatsJSStream> _incomingMessagesStream;
-    private readonly Lazy<INatsJSStream> _realtimeEventsStream;
 
     public JetStreamContextManager(
         NatsConnectionClient connectionClient,
         RealtimeQueueOptions queueOptions,
-        JetStreamStreamOptions streams,
+        JetStreamStreamOptions streamOptions,
         ILogger<JetStreamContextManager> logger)
     {
         _connectionClient = connectionClient;
         _queueOptions = queueOptions;
+        _streamOptions = streamOptions;
         _logger = logger;
 
         _context = new Lazy<INatsJSContext>(CreateContext);
-        _incomingMessagesStream = new Lazy<INatsJSStream>(() => EnsureStreamAsync(
-            streams.IncomingMessages, _queueOptions.Topics.IncomingMessages).GetAwaiter().GetResult());
-        _realtimeEventsStream = new Lazy<INatsJSStream>(() => EnsureStreamAsync(
-            streams.RealtimeEvents, _queueOptions.Topics.RealtimeEvents).GetAwaiter().GetResult());
     }
 
-    public INatsJSContext Context => _context.Value;
-
-    public INatsJSStream IncomingMessagesStream => _incomingMessagesStream.Value;
-    public INatsJSStream RealtimeEventsStream => _realtimeEventsStream.Value;
+    private INatsJSContext Context => _context.Value;
 
     public async Task<INatsJSConsumer> GetOrCreateIncomingMessagesConsumerAsync(CancellationToken ct = default)
     {
-        return await GetOrCreateConsumerAsync(
-            IncomingMessagesStream,
-            _queueOptions.ConsumerGroup,
+        var stream = await EnsureStreamAsync(
+            _streamOptions.IncomingMessages,
             _queueOptions.Topics.IncomingMessages,
             ct).ConfigureAwait(false);
-    }
 
-    public async Task<INatsJSConsumer> GetOrCreateRealtimeEventsConsumerAsync(CancellationToken ct = default)
-    {
         return await GetOrCreateConsumerAsync(
-            RealtimeEventsStream,
+            stream,
             _queueOptions.ConsumerGroup,
-            _queueOptions.Topics.RealtimeEvents,
+            _queueOptions.Topics.IncomingMessages,
             ct).ConfigureAwait(false);
     }
 
@@ -64,7 +53,7 @@ public sealed class JetStreamContextManager
         return _connectionClient.Client.CreateJetStreamContext();
     }
 
-    private async Task<INatsJSStream> EnsureStreamAsync(string streamName, string subject, CancellationToken ct = default)
+    private async Task<INatsJSStream> EnsureStreamAsync(string streamName, string subject, CancellationToken ct)
     {
         var js = Context;
 
