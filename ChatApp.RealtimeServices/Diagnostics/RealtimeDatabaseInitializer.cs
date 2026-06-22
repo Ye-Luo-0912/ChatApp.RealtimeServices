@@ -1,5 +1,6 @@
-using ChatApp.Realtime.Infrastructure.Clients;
-using ChatApp.Realtime.Infrastructure.Data;
+using ChatApp.Realtime.Infrastructure.Postgres.Clients;
+using ChatApp.Realtime.Infrastructure.Postgres.Configuration;
+using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using ChatApp.RealtimeServices.Options;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;

@@ -11,6 +11,6 @@ public interface IRealtimeMessageStore
     /// </summary>
     /// <param name="message">要保存的实时消息记录。</param>
     /// <param name="ct">用于取消操作的取消令牌。</param>
-    /// <returns>表示异步操作的任务。</returns>
-    Task SaveAsync(RealtimeMessageRecord message, CancellationToken ct = default);
+    /// <returns>如果消息是新写入的返回 true；如果是重复消息跳过写入则返回 false。</returns>
+    Task<bool> SaveAsync(RealtimeMessageRecord message, CancellationToken ct = default);
 }

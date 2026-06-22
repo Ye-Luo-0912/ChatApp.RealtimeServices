@@ -1,5 +1,5 @@
 using ChatApp.Realtime.Abstractions.Events;
-using ChatApp.Realtime.Infrastructure.Health;
+using ChatApp.Realtime.Infrastructure.Core.Health;
 using ChatApp.RealtimeServices.Options;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;

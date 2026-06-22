@@ -1,4 +1,6 @@
-using ChatApp.Realtime.Infrastructure.Health;
+using ChatApp.Realtime.Infrastructure.Core.Health;
+using ChatApp.Realtime.Infrastructure.Nats.Configuration;
+using ChatApp.Realtime.Infrastructure.Postgres.Configuration;
 using ChatApp.RealtimeServices.Options;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;

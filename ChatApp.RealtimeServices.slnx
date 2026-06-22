@@ -1,5 +1,8 @@
 <Solution>
   <Project Path="ChatApp.RealtimeServices/ChatApp.RealtimeServices.csproj" />
   <Project Path="ChatApp.Realtime.Abstractions/ChatApp.Realtime.Abstractions.csproj" />
-  <Project Path="ChatApp.Realtime.Infrastructure/ChatApp.Realtime.Infrastructure.csproj" />
+  <Project Path="ChatApp.Realtime.Infrastructure.Core/ChatApp.Realtime.Infrastructure.Core.csproj" />
+  <Project Path="ChatApp.Realtime.Infrastructure.Nats/ChatApp.Realtime.Infrastructure.Nats.csproj" />
+  <Project Path="ChatApp.Realtime.Infrastructure.Postgres/ChatApp.Realtime.Infrastructure.Postgres.csproj" />
+  <Project Path="ChatApp.Realtime.Infrastructure.Redis/ChatApp.Realtime.Infrastructure.Redis.csproj" />
 </Solution>

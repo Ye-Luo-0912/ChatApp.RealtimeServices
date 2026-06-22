@@ -1,5 +1,10 @@
 using ChatApp.Realtime.Abstractions.Queueing;
-using ChatApp.Realtime.Infrastructure.DependencyInjection;
+using ChatApp.Realtime.Infrastructure.Core.DependencyInjection;
+using ChatApp.Realtime.Infrastructure.Nats.Configuration;
+using ChatApp.Realtime.Infrastructure.Nats.DependencyInjection;
+using ChatApp.Realtime.Infrastructure.Postgres.Configuration;
+using ChatApp.Realtime.Infrastructure.Postgres.DependencyInjection;
+using ChatApp.Realtime.Infrastructure.Redis.DependencyInjection;
 using ChatApp.RealtimeServices.Diagnostics;
 using ChatApp.RealtimeServices.Options;
 using ChatApp.RealtimeServices.Workers;
@@ -15,11 +20,11 @@ public static class RealtimeServicesRegistration
         this IServiceCollection services,
         IConfiguration configuration)
     {
-        var realtimeOptions = ReadRealtimeOptions(configuration);
-        var natsOptions = ReadNatsOptions(configuration);
-        var databaseOptions = ReadRealtimeDatabaseOptions(configuration);
-        var connectionOptions = ReadConnectionOptions(configuration);
-        var warnings = ReadConfigurationWarnings(configuration, natsOptions, databaseOptions, connectionOptions);
+        var realtimeOptions = BindRealtimeOptions(configuration);
+        var natsOptions = BindNatsOptions(configuration);
+        var databaseOptions = BindDatabaseOptions(configuration);
+        var connectionOptions = BindConnectionOptions(configuration);
+        var warnings = BuildWarnings(configuration, natsOptions, databaseOptions, connectionOptions);
 
         services.AddSingleton<IOptions<RealtimeOptions>>(Microsoft.Extensions.Options.Options.Create(realtimeOptions));
         services.AddSingleton<IOptions<NatsOptions>>(Microsoft.Extensions.Options.Options.Create(natsOptions));
@@ -27,11 +32,13 @@ public static class RealtimeServicesRegistration
         services.AddSingleton<IOptions<RealtimeConnectionOptions>>(Microsoft.Extensions.Options.Options.Create(connectionOptions));
         services.AddSingleton(new RealtimeConfigurationWarnings(warnings));
 
-        services.AddRealtimeInfrastructure(
-            connectionOptions.Garnet,
+        services.AddRealtimeInfrastructureCore();
+        services.AddRealtimeInfrastructureRedis(connectionOptions.Garnet);
+        services.AddRealtimeInfrastructurePostgres(
             connectionOptions.RealtimeDatabase,
             databaseOptions.Schema,
-            databaseOptions.MessageStoreProvider,
+            databaseOptions.MessageStoreProvider);
+        services.AddRealtimeInfrastructureNats(
             CreateRealtimeQueueOptions(natsOptions));
 
         services.AddHostedService<RealtimeStartupReporter>();
@@ -48,39 +55,65 @@ public static class RealtimeServicesRegistration
         return services;
     }
 
-    private static RealtimeOptions ReadRealtimeOptions(IConfiguration configuration)
+    private static RealtimeOptions BindRealtimeOptions(IConfiguration configuration)
     {
-        return new RealtimeOptions
-        {
-            ServiceName = GetRequiredValue(configuration, "Realtime:ServiceName"),
-            InstanceId = GetRequiredValue(configuration, "Realtime:InstanceId"),
-            WorkerIntervalMs = GetPositiveInt(configuration, "Realtime:WorkerIntervalMs", 1000),
-            EnableDetailedErrors = GetBool(configuration, "Realtime:EnableDetailedErrors", false)
-        };
+        var section = configuration.GetSection("Realtime");
+        var options = section.Get<RealtimeOptions>()
+            ?? throw new InvalidOperationException("Realtime 配置节缺失。");
+
+        if (string.IsNullOrWhiteSpace(options.ServiceName))
+            throw new InvalidOperationException("Realtime:ServiceName 为必填配置。");
+        if (string.IsNullOrWhiteSpace(options.InstanceId))
+            throw new InvalidOperationException("Realtime:InstanceId 为必填配置。");
+
+        return options;
     }
 
-    private static NatsOptions ReadNatsOptions(IConfiguration configuration)
+    private static NatsOptions BindNatsOptions(IConfiguration configuration)
     {
-        return new NatsOptions
-        {
-            Url = Normalize(configuration["Nats:Url"]),
-            QueueGroup = GetRequiredValue(configuration, "Nats:QueueGroup"),
-            Subjects = new NatsSubjectOptions
-            {
-                IncomingMessages = GetRequiredValue(configuration, "Nats:Subjects:IncomingMessages"),
-                RealtimeEvents = GetRequiredValue(configuration, "Nats:Subjects:RealtimeEvents"),
-                MessagePersistence = Normalize(configuration["Nats:Subjects:MessagePersistence"])
-            }
-        };
+        var section = configuration.GetSection("Nats");
+        var options = section.Get<NatsOptions>()
+            ?? throw new InvalidOperationException("Nats 配置节缺失。");
+
+        if (string.IsNullOrWhiteSpace(options.QueueGroup))
+            throw new InvalidOperationException("Nats:QueueGroup 为必填配置。");
+        if (options.Subjects is null)
+            throw new InvalidOperationException("Nats:Subjects 配置节缺失。");
+        if (string.IsNullOrWhiteSpace(options.Subjects.IncomingMessages))
+            throw new InvalidOperationException("Nats:Subjects:IncomingMessages 为必填配置。");
+        if (string.IsNullOrWhiteSpace(options.Subjects.RealtimeEvents))
+            throw new InvalidOperationException("Nats:Subjects:RealtimeEvents 为必填配置。");
+
+        return options;
     }
 
-    private static RealtimeDatabaseOptions ReadRealtimeDatabaseOptions(IConfiguration configuration)
+    private static RealtimeDatabaseOptions BindDatabaseOptions(IConfiguration configuration)
     {
+        var section = configuration.GetSection("RealtimeDatabase");
+        var raw = section.Get<RealtimeDatabaseOptions>();
+
         return new RealtimeDatabaseOptions
         {
-            Schema = Normalize(configuration["RealtimeDatabase:Schema"]) ?? "realtime",
-            MessageStoreProvider = Normalize(configuration["RealtimeDatabase:MessageStoreProvider"]) ?? "Noop",
-            InitializeSchemaOnStart = GetBool(configuration, "RealtimeDatabase:InitializeSchemaOnStart", false)
+            Schema = Normalize(raw?.Schema) ?? "realtime",
+            MessageStoreProvider = Normalize(raw?.MessageStoreProvider) ?? "Noop",
+            InitializeSchemaOnStart = raw?.InitializeSchemaOnStart ?? false
+        };
+    }
+
+    private static RealtimeConnectionOptions BindConnectionOptions(IConfiguration configuration)
+    {
+        var section = configuration.GetSection("ConnectionStrings");
+        var raw = section.Get<RealtimeConnectionOptions>()
+            ?? throw new InvalidOperationException("ConnectionStrings 配置节缺失。");
+
+        if (string.IsNullOrWhiteSpace(raw.Garnet))
+            throw new InvalidOperationException("ConnectionStrings:Garnet 为必填配置。");
+
+        return new RealtimeConnectionOptions
+        {
+            Garnet = raw.Garnet,
+            RealtimeDatabase = Normalize(configuration["ConnectionStrings:RealtimeDatabase"])
+                ?? Normalize(configuration["ConnectionStrings:DefaultConnection"])
         };
     }
 
@@ -100,18 +133,7 @@ public static class RealtimeServicesRegistration
         };
     }
 
-    private static RealtimeConnectionOptions ReadConnectionOptions(IConfiguration configuration)
-    {
-        return new RealtimeConnectionOptions
-        {
-            Garnet = GetRequiredValue(configuration, "ConnectionStrings:Garnet"),
-            RealtimeDatabase =
-                Normalize(configuration["ConnectionStrings:RealtimeDatabase"])
-                ?? Normalize(configuration["ConnectionStrings:DefaultConnection"])
-        };
-    }
-
-    private static IReadOnlyList<string> ReadConfigurationWarnings(
+    private static IReadOnlyList<string> BuildWarnings(
         IConfiguration configuration,
         NatsOptions natsOptions,
         RealtimeDatabaseOptions databaseOptions,
@@ -157,52 +179,6 @@ public static class RealtimeServicesRegistration
         }
 
         return warnings;
-    }
-
-    private static string GetRequiredValue(IConfiguration configuration, string key)
-    {
-        var value = Normalize(configuration[key]);
-
-        if (value is null)
-        {
-            throw new InvalidOperationException($"{key} 为必填配置。");
-        }
-
-        return value;
-    }
-
-    private static int GetPositiveInt(IConfiguration configuration, string key, int defaultValue)
-    {
-        var value = Normalize(configuration[key]);
-
-        if (value is null)
-        {
-            return defaultValue;
-        }
-
-        if (!int.TryParse(value, out var parsed) || parsed <= 0)
-        {
-            throw new InvalidOperationException($"{key} 必须大于 0。");
-        }
-
-        return parsed;
-    }
-
-    private static bool GetBool(IConfiguration configuration, string key, bool defaultValue)
-    {
-        var value = Normalize(configuration[key]);
-
-        if (value is null)
-        {
-            return defaultValue;
-        }
-
-        if (!bool.TryParse(value, out var parsed))
-        {
-            throw new InvalidOperationException($"{key} 必须是 true 或 false。");
-        }
-
-        return parsed;
     }
 
     private static string? Normalize(string? value)
