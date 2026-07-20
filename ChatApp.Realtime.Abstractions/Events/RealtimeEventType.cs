@@ -33,5 +33,15 @@ public enum RealtimeEventType : byte
     /// <summary>
     /// 表示会话被撤销的实时事件类型。当用户的某个会话（如登录会话）被系统撤销时，会触发此事件。这通常发生在用户从多个设备登录并选择退出其中一个设备的情况，或者因安全原因系统自动撤销了会话。
     /// </summary>
-    SessionRevoked = 6
+    SessionRevoked = 6,
+
+    /// <summary>
+    /// 表示接收者已经送达或读取消息，事件目标是原消息发送者。
+    /// </summary>
+    MessageReceiptUpdated = 7,
+
+    /// <summary>
+    /// 用户账号已删除：Realtime 侧应异步清理该用户的消息、会话与相关状态（Saga）。
+    /// </summary>
+    UserAccountDeleted = 8
 }
