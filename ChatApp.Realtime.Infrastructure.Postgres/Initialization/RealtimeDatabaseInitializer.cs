@@ -1,10 +1,10 @@
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Configuration;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
+using ChatApp.Realtime.Infrastructure.Postgres.Migrations;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using Npgsql;
 
 namespace ChatApp.Realtime.Infrastructure.Postgres.Initialization;
 
@@ -68,45 +68,21 @@ public sealed class RealtimeDatabaseInitializer : IHostedService
 
     private async Task InitializeAsync(CancellationToken cancellationToken)
     {
-        var schema = _databaseSchema.QuotedSchema;
-        var table = _databaseSchema.MessagesTableSql;
-
         await using var connection = await _databaseClient
             .GetDataSource()
             .OpenConnectionAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        _logger.LogInformation("正在初始化实时数据库最小表结构。数据库架构={Schema}", _databaseOptions.Value.Schema);
+        _logger.LogInformation(
+            "正在通过版本化迁移初始化实时数据库。数据库架构={Schema}",
+            _databaseOptions.Value.Schema);
 
-        var commands = new[]
-        {
-            $"CREATE SCHEMA IF NOT EXISTS {schema};",
-            $"""
-             CREATE TABLE IF NOT EXISTS {table} (
-                 "message_id" character varying(64) NOT NULL PRIMARY KEY,
-                 "client_message_id" character varying(128) NOT NULL,
-                 "sender_user_id" bigint NOT NULL,
-                 "sender_session_id" character varying(128) NOT NULL,
-                 "receiver_user_id" bigint NOT NULL,
-                 "content" text NOT NULL,
-                 "received_at_ms" bigint NOT NULL,
-                 "created_at_ms" bigint NOT NULL
-             );
-             """,
-            $"CREATE INDEX IF NOT EXISTS \"ix_messages_client_message_id\" ON {table} (\"client_message_id\");",
-            $"CREATE INDEX IF NOT EXISTS \"ix_messages_sender_user_id\" ON {table} (\"sender_user_id\");",
-            $"CREATE INDEX IF NOT EXISTS \"ix_messages_receiver_user_id\" ON {table} (\"receiver_user_id\");",
-            $"CREATE INDEX IF NOT EXISTS \"ix_messages_received_at_ms\" ON {table} (\"received_at_ms\");",
-            $"CREATE UNIQUE INDEX IF NOT EXISTS \"ux_messages_sender_client_message\" ON {table} (\"sender_user_id\", \"client_message_id\");"
-        };
+        var runner = new RealtimeSchemaMigrationRunner(_databaseSchema, _logger);
+        await runner.MigrateAsync(connection, cancellationToken).ConfigureAwait(false);
 
-        foreach (var command in commands)
-        {
-            await using var dbCommand = new NpgsqlCommand(command, connection);
-            await dbCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        }
-
-        _logger.LogInformation("实时数据库最小表结构初始化完成。数据库架构={Schema}", _databaseOptions.Value.Schema);
+        _logger.LogInformation(
+            "实时数据库版本化迁移完成。数据库架构={Schema}",
+            _databaseOptions.Value.Schema);
     }
 
     public Task StopAsync(CancellationToken cancellationToken)

@@ -20,5 +20,13 @@ public interface IRealtimeMessageBus
 
     Task PublishEventAsync(RealtimeEvent evt, CancellationToken ct = default);
     IAsyncEnumerable<RealtimeEventDelivery> ConsumeEventsAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// 订阅账号清理 subject（AccountCleanupCompleted / UserAccountDeleted）。
+    /// 使用共享 durable（AccountCleanupConsumerName），供 Server Saga 等对账消费方使用。
+    /// </summary>
+    IAsyncEnumerable<RealtimeEventDelivery> ConsumeAccountCleanupEventsAsync(
+        CancellationToken ct = default);
+
     Task<TimeSpan> PingAsync(CancellationToken ct = default);
 }

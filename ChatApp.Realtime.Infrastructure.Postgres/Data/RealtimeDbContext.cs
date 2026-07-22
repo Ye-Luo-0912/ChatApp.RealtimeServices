@@ -13,6 +13,7 @@ public sealed class RealtimeDbContext : DbContext
     }
 
     public DbSet<RealtimeMessageEntity> Messages => Set<RealtimeMessageEntity>();
+    public DbSet<RealtimeOutboxEntity> Outbox => Set<RealtimeOutboxEntity>();
 
     public static void ConfigureSchema(string schema)
     {
@@ -55,15 +56,49 @@ public sealed class RealtimeDbContext : DbContext
             entity.Property(message => message.ReceivedAtMs)
                 .HasColumnName("received_at_ms");
 
+            entity.Property(message => message.DeliveredAtMs)
+                .HasColumnName("delivered_at_ms");
+
+            entity.Property(message => message.ReadAtMs)
+                .HasColumnName("read_at_ms");
+
             entity.Property(message => message.CreatedAtMs)
                 .HasColumnName("created_at_ms");
 
-            entity.HasIndex(message => message.ClientMessageId);
-            entity.HasIndex(message => message.SenderUserId);
-            entity.HasIndex(message => message.ReceiverUserId);
-            entity.HasIndex(message => message.ReceivedAtMs);
             entity.HasIndex(message => new { message.SenderUserId, message.ClientMessageId })
                 .IsUnique();
+            entity.HasIndex(message => new
+                {
+                    message.ReceiverUserId,
+                    message.ReceivedAtMs,
+                    message.MessageId
+                });
+            entity.HasIndex(message => new
+                {
+                    message.SenderUserId,
+                    message.ReceivedAtMs,
+                    message.MessageId
+                });
+        });
+
+        modelBuilder.Entity<RealtimeOutboxEntity>(entity =>
+        {
+            entity.ToTable("outbox");
+            entity.HasKey(item => item.EventId);
+            entity.Property(item => item.EventId).HasColumnName("event_id").HasMaxLength(64);
+            entity.Property(item => item.PayloadJson).HasColumnName("payload_json").IsRequired();
+            entity.Property(item => item.TargetUserId).HasColumnName("target_user_id");
+            entity.Property(item => item.EventType).HasColumnName("event_type");
+            entity.Property(item => item.CreatedAtMs).HasColumnName("created_at_ms");
+            entity.Property(item => item.NextAttemptAtMs).HasColumnName("next_attempt_at_ms");
+            entity.Property(item => item.PublishedAtMs).HasColumnName("published_at_ms");
+            entity.Property(item => item.AttemptCount).HasColumnName("attempt_count");
+            entity.Property(item => item.LockedBy).HasColumnName("locked_by").HasMaxLength(128);
+            entity.Property(item => item.LockedUntilMs).HasColumnName("locked_until_ms");
+            entity.Property(item => item.LastError).HasColumnName("last_error").HasMaxLength(2048);
+            entity.HasIndex(item => new { item.PublishedAtMs, item.NextAttemptAtMs });
+            entity.HasIndex(item => item.TargetUserId);
+            entity.HasIndex(item => new { item.TargetUserId, item.EventType });
         });
     }
 }

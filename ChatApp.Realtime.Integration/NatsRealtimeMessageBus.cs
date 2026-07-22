@@ -73,12 +73,12 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
                 _options.IncomingMessagesSubject,
                 _options.MaxAgeHours,
                 ct).ConfigureAwait(false);
-            await _context.Value.PublishAsync(
+            await PublishJetStreamWithReconnectRetryAsync(
                 _options.IncomingMessagesSubject,
                 RealtimeWireSerializer.Serialize(command),
-                opts: CreatePublishOptions(CreateMessageId(command.SenderUserId, command.ClientMessageId)),
-                headers: RealtimeIntegrationTelemetry.CreatePropagationHeaders(),
-                cancellationToken: ct).ConfigureAwait(false);
+                CreateMessageId(command.SenderUserId, command.ClientMessageId),
+                RealtimeIntegrationTelemetry.CreatePropagationHeaders(),
+                ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -101,12 +101,12 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
                 _options.MessageReceiptsSubject,
                 _options.MaxAgeHours,
                 ct).ConfigureAwait(false);
-            await _context.Value.PublishAsync(
+            await PublishJetStreamWithReconnectRetryAsync(
                 _options.MessageReceiptsSubject,
                 RealtimeWireSerializer.Serialize(command),
-                opts: CreatePublishOptions(CreateMessageId(command.ReceiverUserId, command.CommandId)),
-                headers: RealtimeIntegrationTelemetry.CreatePropagationHeaders(),
-                cancellationToken: ct).ConfigureAwait(false);
+                CreateMessageId(command.ReceiverUserId, command.CommandId),
+                RealtimeIntegrationTelemetry.CreatePropagationHeaders(),
+                ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -172,22 +172,25 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
 
     public async Task PublishEventAsync(RealtimeEvent evt, CancellationToken ct = default)
     {
+        var subject = evt.Type is RealtimeEventType.UserAccountDeleted or RealtimeEventType.AccountCleanupCompleted
+            ? _options.AccountCleanupSubject
+            : _options.RealtimeEventsSubject;
         using var activity = RealtimeIntegrationTelemetry.StartProducer(
             "realtime_event.publish",
-            _options.RealtimeEventsSubject);
+            subject);
         try
         {
             await EnsureStreamAsync(
                 _options.RealtimeEventsStream,
-                _options.RealtimeEventsSubject,
+                subject,
                 _options.MaxAgeHours,
                 ct).ConfigureAwait(false);
-            await _context.Value.PublishAsync(
-                _options.RealtimeEventsSubject,
+            await PublishJetStreamWithReconnectRetryAsync(
+                subject,
                 RealtimeWireSerializer.Serialize(evt),
-                opts: CreatePublishOptions(evt.EventId),
-                headers: RealtimeIntegrationTelemetry.CreatePropagationHeaders(),
-                cancellationToken: ct).ConfigureAwait(false);
+                evt.EventId,
+                RealtimeIntegrationTelemetry.CreatePropagationHeaders(),
+                ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -195,26 +198,43 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
             throw;
         }
     }
+    public IAsyncEnumerable<RealtimeEventDelivery> ConsumeEventsAsync(
+        CancellationToken ct = default) => ConsumeEventSubjectAsync(
+            _options.RealtimeEventsSubject,
+            CreateConsumerName(_options.GatewayConsumerPrefix, _options.InstanceId),
+            ct);
 
-    public async IAsyncEnumerable<RealtimeEventDelivery> ConsumeEventsAsync(
-        [EnumeratorCancellation] CancellationToken ct = default)
+    public IAsyncEnumerable<RealtimeEventDelivery> ConsumeAccountCleanupEventsAsync(
+        CancellationToken ct = default)
+    {
+        var consumerName = string.IsNullOrWhiteSpace(_options.AccountCleanupConsumerName)
+            ? CreateConsumerName(_options.GatewayConsumerPrefix, _options.InstanceId)
+            : NormalizeConsumerName(_options.AccountCleanupConsumerName);
+        return ConsumeEventSubjectAsync(_options.AccountCleanupSubject, consumerName, ct);
+    }
+
+    private async IAsyncEnumerable<RealtimeEventDelivery> ConsumeEventSubjectAsync(
+        string subject,
+        string consumerName,
+        [EnumeratorCancellation] CancellationToken ct)
     {
         var stream = await EnsureStreamAsync(
             _options.RealtimeEventsStream,
-            _options.RealtimeEventsSubject,
+            subject,
             _options.MaxAgeHours,
             ct).ConfigureAwait(false);
-        var consumerName = CreateConsumerName(_options.GatewayConsumerPrefix, _options.InstanceId);
         var consumer = await stream.CreateOrUpdateConsumerAsync(
             new ConsumerConfig(consumerName)
             {
-                FilterSubject = _options.RealtimeEventsSubject,
+                FilterSubject = subject,
                 AckPolicy = ConsumerConfigAckPolicy.Explicit,
                 AckWait = TimeSpan.FromSeconds(_options.AckWaitSeconds),
                 MaxDeliver = _options.MaxDeliver,
                 MaxAckPending = _options.MaxAckPending,
                 Backoff = _options.BackoffSeconds.Select(seconds => TimeSpan.FromSeconds(seconds)).ToArray(),
-                DeliverPolicy = ConsumerConfigDeliverPolicy.New
+                DeliverPolicy = _options.ReplayRetainedEventsOnConsumerCreation
+                    ? ConsumerConfigDeliverPolicy.All
+                    : ConsumerConfigDeliverPolicy.New
             },
             ct).ConfigureAwait(false);
         var consumeOptions = new NatsJSConsumeOpts
@@ -286,6 +306,43 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
     public async Task<TimeSpan> PingAsync(CancellationToken ct = default) =>
         await _client.Value.PingAsync(ct).ConfigureAwait(false);
 
+    private async Task PublishJetStreamWithReconnectRetryAsync(
+        string subject,
+        string payload,
+        string messageId,
+        NatsHeaders? headers,
+        CancellationToken ct)
+    {
+        var attempt = 0;
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                await _context.Value.PublishAsync(
+                    subject,
+                    payload,
+                    opts: CreatePublishOptions(messageId),
+                    headers: headers,
+                    cancellationToken: ct).ConfigureAwait(false);
+                return;
+            }
+            catch (NatsJSPublishNoResponseException ex) when (!ct.IsCancellationRequested)
+            {
+                attempt++;
+                var delay = TimeSpan.FromMilliseconds(
+                    Math.Min(2_000, 250 * Math.Pow(2, Math.Min(attempt - 1, 3))) +
+                    Random.Shared.Next(0, 250));
+                _logger.LogWarning(
+                    ex,
+                    "JetStream 发布未收到响应，将使用相同 MsgId 重试。Subject={Subject}；尝试={Attempt}；延迟={Delay}",
+                    subject,
+                    attempt,
+                    delay);
+                await Task.Delay(delay, ct).ConfigureAwait(false);
+            }
+        }
+    }
     private async Task PublishDeadLetterAsync(DeadLetterMessage message, CancellationToken ct)
     {
         await EnsureStreamAsync(
@@ -337,7 +394,10 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
                 CancellationToken.None).ConfigureAwait(false);
         }
 
-        var config = new StreamConfig(streamName, [subject])
+        var subjects = streamName.Equals(_options.RealtimeEventsStream, StringComparison.Ordinal)
+            ? new[] { _options.RealtimeEventsSubject, _options.AccountCleanupSubject }
+            : new[] { subject };
+        var config = new StreamConfig(streamName, subjects)
         {
             Storage = StreamConfigStorage.File,
             Retention = StreamConfigRetention.Limits,
@@ -367,7 +427,7 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
             ReconnectWaitMin = TimeSpan.FromMilliseconds(500),
             ReconnectWaitMax = TimeSpan.FromSeconds(5),
             ReconnectJitter = TimeSpan.FromMilliseconds(500),
-            PublishTimeoutOnDisconnected = true
+            PublishTimeoutOnDisconnected = false
         });
         Subscribe(connection);
         return connection;
@@ -455,8 +515,10 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
     }
 
     private static string CreateConsumerName(string prefix, string instanceId)
+        => NormalizeConsumerName($"{prefix}-{instanceId}");
+
+    private static string NormalizeConsumerName(string raw)
     {
-        var raw = $"{prefix}-{instanceId}";
         var normalized = new string(raw.Select(character =>
             char.IsLetterOrDigit(character) || character is '-' or '_' ? character : '-').ToArray());
         return normalized.Length <= 128 ? normalized : normalized[..128];
