@@ -10,6 +10,7 @@ using ChatApp.RealtimeServices.Options;
 using ChatApp.RealtimeServices.Workers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
 namespace ChatApp.RealtimeServices.DependencyInjection;
 
@@ -17,19 +18,24 @@ public static class RealtimeServicesRegistration
 {
     public static IServiceCollection AddRealtimeServices(
         this IServiceCollection services,
-        IConfiguration configuration)
+        IConfiguration configuration,
+        IHostEnvironment environment)
     {
         var realtimeOptions = BindRealtimeOptions(configuration);
         var natsOptions = BindNatsOptions(configuration);
         var databaseOptions = BindDatabaseOptions(configuration);
         var connectionOptions = BindConnectionOptions(configuration);
+        var outboxOptions = BindOutboxOptions(configuration);
+        ValidateProductionConfiguration(environment, natsOptions, databaseOptions, connectionOptions);
         var warnings = BuildWarnings(configuration, natsOptions, databaseOptions, connectionOptions);
 
         services.AddSingleton(Microsoft.Extensions.Options.Options.Create(realtimeOptions));
         services.AddSingleton(Microsoft.Extensions.Options.Options.Create(natsOptions));
         services.AddSingleton(Microsoft.Extensions.Options.Options.Create(databaseOptions));
         services.AddSingleton(Microsoft.Extensions.Options.Options.Create(connectionOptions));
+        services.AddSingleton(Microsoft.Extensions.Options.Options.Create(outboxOptions));
         services.AddSingleton(new RealtimeConfigurationWarnings(warnings));
+        services.AddSingleton<RealtimeHealthService>();
 
         services.AddRealtimeInfrastructureCore();
         services.AddRealtimeInfrastructureRedis(connectionOptions.Garnet);
@@ -39,15 +45,18 @@ public static class RealtimeServicesRegistration
             databaseOptions.MessageStoreProvider);
         services.AddRealtimeInfrastructureNats(
             CreateRealtimeQueueOptions(natsOptions),
-            natsOptions.JetStream?.Streams);
+            natsOptions.JetStream);
         services.AddRealtimeDatabaseInitializer(
             databaseOptions.InitializeSchemaOnStart,
             connectionOptions.RealtimeDatabase);
 
         services.AddHostedService<RealtimeStartupReporter>();
 
-        services.AddHostedService<RealtimeEventWorker>();
         services.AddHostedService<IncomingMessageWorker>();
+        services.AddHostedService<AccountCleanupWorker>();
+        services.AddHostedService<MessageReceiptWorker>();
+        services.AddHostedService<MessageHistoryQueryWorker>();
+        services.AddHostedService<OutboxPublisherWorker>();
 
         return services;
     }
@@ -60,7 +69,30 @@ public static class RealtimeServicesRegistration
 
         if (string.IsNullOrWhiteSpace(options.ServiceName))
             throw new InvalidOperationException("Realtime:ServiceName 为必填配置。");
-        return string.IsNullOrWhiteSpace(options.InstanceId) ? throw new InvalidOperationException("Realtime:InstanceId 为必填配置。") : options;
+        if (string.IsNullOrWhiteSpace(options.InstanceId))
+            throw new InvalidOperationException("Realtime:InstanceId 为必填配置。");
+        if (options.ProcessingConcurrency <= 0 || options.ProcessingQueueCapacity < options.ProcessingConcurrency)
+            throw new InvalidOperationException("Realtime 消费并发度必须大于 0，队列容量不能小于并发度。");
+        if (options.HistoryQueryConcurrency <= 0
+            || options.HistoryQueryQueueCapacity < options.HistoryQueryConcurrency)
+            throw new InvalidOperationException("历史查询并发度必须大于 0，队列容量不能小于并发度。");
+
+        return options.InstanceId.Equals("auto", StringComparison.OrdinalIgnoreCase)
+            ? new RealtimeOptions
+            {
+                ServiceName = options.ServiceName,
+                InstanceId = Environment.MachineName,
+                WorkerIntervalMs = options.WorkerIntervalMs,
+                EnableDetailedErrors = options.EnableDetailedErrors,
+                ProcessingConcurrency = options.ProcessingConcurrency,
+                ProcessingQueueCapacity = options.ProcessingQueueCapacity,
+                HistoryQueryConcurrency = options.HistoryQueryConcurrency,
+                HistoryQueryQueueCapacity = options.HistoryQueryQueueCapacity,
+                TransientRetryDelayMs = options.TransientRetryDelayMs,
+                PoisonDeliveryThreshold = options.PoisonDeliveryThreshold,
+                ReadinessHeartbeatTimeoutMs = options.ReadinessHeartbeatTimeoutMs
+            }
+            : options;
     }
 
     private static NatsOptions BindNatsOptions(IConfiguration configuration)
@@ -75,9 +107,27 @@ public static class RealtimeServicesRegistration
             throw new InvalidOperationException("Nats:Subjects 配置节缺失。");
         if (string.IsNullOrWhiteSpace(options.Subjects.IncomingMessages))
             throw new InvalidOperationException("Nats:Subjects:IncomingMessages 为必填配置。");
+        if (string.IsNullOrWhiteSpace(options.Subjects.MessageReceipts))
+            throw new InvalidOperationException("Nats:Subjects:MessageReceipts 为必填配置。");
         if (string.IsNullOrWhiteSpace(options.Subjects.RealtimeEvents))
             throw new InvalidOperationException("Nats:Subjects:RealtimeEvents 为必填配置。");
+        if (string.IsNullOrWhiteSpace(options.Subjects.MessageHistoryQueries))
+            throw new InvalidOperationException("Nats:Subjects:MessageHistoryQueries 为必填配置。");
+        if (!options.Mode.Equals("Core", StringComparison.OrdinalIgnoreCase)
+            && !options.Mode.Equals("JetStream", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Nats:Mode 只允许 Core 或 JetStream。");
+        if (string.IsNullOrWhiteSpace(options.Subjects.DeadLetters))
+            throw new InvalidOperationException("Nats:Subjects:DeadLetters 为必填配置。");
 
+        return options;
+    }
+
+    private static OutboxOptions BindOutboxOptions(IConfiguration configuration)
+    {
+        var options = configuration.GetSection("Outbox").Get<OutboxOptions>() ?? new OutboxOptions();
+        if (options.BatchSize <= 0 || options.PublishConcurrency <= 0 || options.PollIntervalMs <= 0
+            || options.LeaseSeconds <= 0 || options.MaxRetryDelaySeconds <= 0)
+            throw new InvalidOperationException("Outbox 配置值必须大于 0。");
         return options;
     }
 
@@ -86,10 +136,16 @@ public static class RealtimeServicesRegistration
         var section = configuration.GetSection("RealtimeDatabase");
         var raw = section.Get<RealtimeDatabaseOptions>();
 
+        var provider = Normalize(raw?.MessageStoreProvider) ?? "Noop";
+        if (!provider.Equals("Noop", StringComparison.OrdinalIgnoreCase)
+            && !provider.Equals("Npgsql", StringComparison.OrdinalIgnoreCase)
+            && !provider.Equals("EfCore", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("RealtimeDatabase:MessageStoreProvider 只允许 Noop、Npgsql 或 EfCore。");
+
         return new RealtimeDatabaseOptions
         {
             Schema = Normalize(raw?.Schema) ?? "realtime",
-            MessageStoreProvider = Normalize(raw?.MessageStoreProvider) ?? "Noop",
+            MessageStoreProvider = provider,
             InitializeSchemaOnStart = raw?.InitializeSchemaOnStart ?? false
         };
     }
@@ -121,10 +177,36 @@ public static class RealtimeServicesRegistration
             Topics = new RealtimeQueueTopics
             {
                 IncomingMessages = options.Subjects.IncomingMessages,
+                MessageReceipts = options.Subjects.MessageReceipts,
                 RealtimeEvents = options.Subjects.RealtimeEvents,
-                MessagePersistence = options.Subjects.MessagePersistence
+                AccountCleanup = options.Subjects.AccountCleanup,
+                MessageHistoryQueries = options.Subjects.MessageHistoryQueries,
+                MessagePersistence = options.Subjects.MessagePersistence,
+                DeadLetters = options.Subjects.DeadLetters
             }
         };
+    }
+
+    private static void ValidateProductionConfiguration(
+        IHostEnvironment environment,
+        NatsOptions natsOptions,
+        RealtimeDatabaseOptions databaseOptions,
+        RealtimeConnectionOptions connectionOptions)
+    {
+        if (environment.IsDevelopment())
+            return;
+
+        if (string.IsNullOrWhiteSpace(natsOptions.Url)
+            || !natsOptions.Mode.Equals("JetStream", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("非开发环境必须配置 NATS JetStream，禁止回退到 Core/Noop。");
+        if (natsOptions.JetStream is null || natsOptions.JetStream.Replicas < 3)
+            throw new InvalidOperationException("非开发环境 JetStream 副本数必须至少为 3。");
+        if (string.IsNullOrWhiteSpace(connectionOptions.RealtimeDatabase)
+            || (!databaseOptions.MessageStoreProvider.Equals("Npgsql", StringComparison.OrdinalIgnoreCase)
+                && !databaseOptions.MessageStoreProvider.Equals("EfCore", StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidOperationException("非开发环境必须配置真实 PostgreSQL 消息存储。");
+        if (string.IsNullOrWhiteSpace(connectionOptions.Garnet))
+            throw new InvalidOperationException("非开发环境必须配置 Garnet/Redis 共享状态存储。");
     }
 
     private static IReadOnlyList<string> BuildWarnings(

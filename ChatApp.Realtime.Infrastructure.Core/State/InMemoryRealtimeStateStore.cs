@@ -5,20 +5,31 @@ namespace ChatApp.Realtime.Infrastructure.Core.State;
 
 public sealed class InMemoryRealtimeStateStore : IRealtimeStateStore
 {
-    private readonly ConcurrentDictionary<string, string> _values = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, StateEntry> _values = new(StringComparer.Ordinal);
 
-    public Task SetAsync(string key, string value, CancellationToken ct = default)
+    public Task SetAsync(string key, string value, TimeSpan? ttl = null, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        _values[key] = value;
+        _values[key] = new StateEntry(
+            value,
+            ttl.HasValue ? DateTimeOffset.UtcNow.Add(ttl.Value).ToUnixTimeMilliseconds() : null);
         return Task.CompletedTask;
     }
 
     public Task<string?> GetAsync(string key, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        _values.TryGetValue(key, out var value);
-        return Task.FromResult(value);
+        if (!_values.TryGetValue(key, out var entry))
+            return Task.FromResult<string?>(null);
+
+        if (entry.ExpiresAtMs is not null
+            && entry.ExpiresAtMs <= DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
+        {
+            _values.TryRemove(key, out _);
+            return Task.FromResult<string?>(null);
+        }
+
+        return Task.FromResult<string?>(entry.Value);
     }
 
     public Task RemoveAsync(string key, CancellationToken ct = default)
@@ -27,4 +38,6 @@ public sealed class InMemoryRealtimeStateStore : IRealtimeStateStore
         _values.TryRemove(key, out _);
         return Task.CompletedTask;
     }
+
+    private sealed record StateEntry(string Value, long? ExpiresAtMs);
 }

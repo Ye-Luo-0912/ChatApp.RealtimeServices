@@ -5,4 +5,6 @@
   <Project Path="ChatApp.Realtime.Infrastructure.Nats/ChatApp.Realtime.Infrastructure.Nats.csproj" />
   <Project Path="ChatApp.Realtime.Infrastructure.Postgres/ChatApp.Realtime.Infrastructure.Postgres.csproj" />
   <Project Path="ChatApp.Realtime.Infrastructure.Redis/ChatApp.Realtime.Infrastructure.Redis.csproj" />
+  <Project Path="ChatApp.Realtime.Integration/ChatApp.Realtime.Integration.csproj" />
+  <Project Path="ChatApp.Realtime.Tests/ChatApp.Realtime.Tests.csproj" />
 </Solution>

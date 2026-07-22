@@ -14,6 +14,7 @@ public sealed class MessageProcessResult
     public string? MessageId { get; init; }
     public string? ErrorCode { get; init; }
     public string? ErrorMessage { get; init; }
+    public MessageFailureKind FailureKind { get; init; }
 
     public static MessageProcessResult Success(string? messageId = null)
     {
@@ -24,13 +25,24 @@ public sealed class MessageProcessResult
         };
     }
 
-    public static MessageProcessResult Failed(string errorCode, string errorMessage)
+    public static MessageProcessResult Failed(
+        string errorCode,
+        string errorMessage,
+        MessageFailureKind failureKind = MessageFailureKind.Permanent)
     {
         return new MessageProcessResult
         {
             Succeeded = false,
             ErrorCode = errorCode,
-            ErrorMessage = errorMessage
+            ErrorMessage = errorMessage,
+            FailureKind = failureKind
         };
     }
+}
+
+public enum MessageFailureKind : byte
+{
+    None = 0,
+    Permanent = 1,
+    Transient = 2
 }

@@ -1,143 +1,157 @@
-# RealtimeServices 本地开发运行
+# ChatApp RealtimeServices
 
-当前阶段先不把 `RealtimeServices` 放进容器，也暂时不启用 NativeAOT。NATS、PostgreSQL、Garnet 交给 Docker Compose 管理，实时服务直接在本机用 `dotnet run` 启动。
+实时消息链路默认使用 JetStream + PostgreSQL Transactional Outbox：入站消息和待发布事件在同一数据库事务提交，Outbox Worker 获得 JetStream 服务端确认后才标记事件完成。
 
-## 启动基础设施
+## 可靠性语义
+
+- 入站消息与回执：独立 Subject、JetStream 显式 ACK、延迟重试和有界 MaxAckPending。
+- 幂等键：`(sender_user_id, client_message_id)`；事件 ID 由该逻辑键确定性生成。
+- 消息、回执状态和对应事件：均与 realtime.outbox 在同一 PostgreSQL 事务提交。
+- Outbox：本实例事务提交后以容量 1 的合并信号立即唤醒发布器；多副本仍使用 `FOR UPDATE SKIP LOCKED` 和租约抢占，200 ms 轮询负责跨实例、竞态与恢复兜底；发布失败指数退避。
+- 永久错误和坏 JSON：写入 `DEAD_LETTERS` 流后终止原消息，不直接丢弃。
+- 实例内吞吐：有界 Channel 分区并发；同一对用户固定到同一分区以维持点对点顺序。
+- 历史读取：Core NATS request/reply + 8 路有界工作器；不进入 JetStream 写入流。
+- 历史分页：收件人/发件人复合索引 + (ReceivedAtMs, MessageId) keyset cursor，
+  默认 50、最多 100 条并限制响应字节。
+- 状态：配置 Garnet/Redis 后，IRealtimeStateStore 自动替换为共享状态存储并支持 TTL。
+
+数据库访问保留两种 Provider：普通模型和事务可使用 EF Core；默认高频消息写入与 Outbox 抢占使用 Npgsql 原生 SQL。
+
+本服务负责把已持久化消息可靠发布到 `chat.realtime-events`。仓库目前没有真实认证适配器和 WebSocket/SignalR 网关，因此不会默认启动那个只记录日志的事件消费者，也不会提前 ACK 并丢弃待投递事件；终端推送服务应使用自己的 durable consumer，在实际推送成功后 ACK。
+
+## 与业务 API、TCP 网关的边界
+
+跨项目通信集中在独立的 [.NET 10 集成模块](./ChatApp.Realtime.Integration/README.md)：
+
+1. `ChatApp.Server` 的好友请求、好友列表和屏蔽列表变更，由 EF Core SaveChanges 拦截器在业务事务内写入 `realtime.outbox`。
+2. 本服务抢占 Outbox，获得 JetStream 服务端确认后标记发布完成。
+3. TCP 网关发布聊天命令与送达/已读回执；本服务持久化后统一发布 REALTIME_EVENTS。
+4. 每个网关实例使用独立 durable consumer，避免普通队列组把用户事件分配给没有该用户连接的网关。
+5. TCP 网关通过 chat.message-history.query 请求历史；服务只信任网关注入的已认证 UserId。
+
+集成模块以 .NET 10 提供，当前 .NET 11 TCP 网关可直接引用；网关不复制消息存储或 NATS 实现。
+
+## 本地启动
+
+设置数据库密码并启动 PostgreSQL、Garnet 和**单节点** NATS（本地默认；容器名 `chatapp_nats`）：
+
+```powershell
+$env:POSTGRES_PASSWORD = "your-local-password"
+docker compose `
+  -f ..\ChatApp.Server\docker-compose.yaml `
+  -f .\docker-compose.nats.yaml `
+  up -d postgres_db garnet_cache nats
+```
+
+可选三节点 JetStream 集群（HA / `Replicas=3`）：
 
 ```powershell
 docker compose `
   -f ..\ChatApp.Server\docker-compose.yaml `
-  -f docker-compose.nats.yaml `
-  up -d postgres_db garnet_cache nats
+  -f .\docker-compose.nats.yaml `
+  -f .\docker-compose.nats.cluster.yaml `
+  --profile nats-cluster `
+  up -d nats nats2 nats3
 ```
 
-这样会启动：
+切换单节点 ↔ 集群时请先清掉对应 NATS 数据卷，避免 JetStream 元数据冲突。
 
-- `postgres_db`：现有 PostgreSQL
-- `garnet_cache`：现有 Garnet
-- `nats`：NATS 消息队列，已开启 JetStream 以便后续升级
-
-宿主机连接配置：
-
-- NATS：`nats://localhost:4222`
-- NATS 监控：`http://localhost:8222`
-- Garnet：`127.0.0.1:6379`
-- PostgreSQL：`localhost:5432`
-
-## 启动实时服务
+本机运行时使用 Development 环境，JetStream 副本数默认是 1，方便同时兼容单节点开发（需 .NET SDK 11 preview，见 `global.json`）：
 
 ```powershell
-dotnet run --project .\ChatApp.RealtimeServices\ChatApp.RealtimeServices.csproj --no-launch-profile
+$env:DOTNET_ENVIRONMENT = "Development"
+$env:ASPNETCORE_URLS = "http://127.0.0.1:8080"
+dotnet run --project .\ChatApp.RealtimeServices\ChatApp.RealtimeServices.csproj -c Release --no-launch-profile
 ```
 
-当前 `appsettings.json` 默认启用：
-
-- Core NATS 真实消费者/生产者
-- Npgsql 直连消息存储
-- 启动时初始化 `realtime.messages` 最小表结构
-
-说明：当前使用 Core NATS 做轻量实时链路验证，不提供持久化确认和消息重放。后续需要可靠投递、失败重试、死信和回放时，再在现有 subject 边界上切换到 JetStream。
-
-## 发送测试消息（Core NATS）
-
-```powershell
-$ts = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-$json = "{`"CommandId`":`"cmd-local-$ts`",`"ClientMessageId`":`"client-local-$ts`",`"SenderUserId`":1001,`"SenderSessionId`":`"session-local-1001`",`"ReceiverUserId`":1002,`"Content`":`"本地开发链路测试消息`",`"ReceivedAtMs`":$ts}"
-
-$client = [System.Net.Sockets.TcpClient]::new("127.0.0.1", 4222)
-$stream = $client.GetStream()
-$bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-$command = [System.Text.Encoding]::ASCII.GetBytes("PUB chat.incoming-messages $($bytes.Length)`r`n")
-$end = [System.Text.Encoding]::ASCII.GetBytes("`r`n")
-$stream.Write($command, 0, $command.Length)
-$stream.Write($bytes, 0, $bytes.Length)
-$stream.Write($end, 0, $end.Length)
-$stream.Flush()
-$client.Dispose()
-```
-
-验证落库：
-
-```powershell
-docker exec chatapp_postgres psql -U postgres -d ChatAppDatabase -c "select message_id, client_message_id, sender_user_id, receiver_user_id, content from realtime.messages order by created_at_ms desc limit 5;"
-```
-
-## JetStream 模式
-
-### 切换配置
-
-将 `appsettings.json` 中 `Nats:Mode` 改为 `"JetStream"`：
-
-```json
-"Nats": {
-    "Url": "nats://localhost:4222",
-    "Mode": "JetStream",
-    ...
-}
-```
-
-或用户级配置覆盖（`~/.chatapp/realtime.user.json`）：
+连接字符串继续放在 `~/.chatapp/realtime.user.json`，不要提交到仓库：
 
 ```json
 {
-  "ConnectionStrings": { ... },
-  "Nats": { "Mode": "JetStream" }
+  "ConnectionStrings": {
+    "RealtimeDatabase": "Host=localhost;Port=5432;Database=ChatAppDatabase;Username=postgres;Password=...;Pooling=true;Maximum Pool Size=100;Timeout=5;Command Timeout=5",
+    "Garnet": "127.0.0.1:6379,abortConnect=false"
+  },
+  "Nats": {
+    "Url": "nats://localhost:4222",
+    "Mode": "JetStream"
+  }
 }
 ```
 
-### JetStream 行为
+开发模式允许 `InitializeSchemaOnStart=true`（走版本化 `schema_migrations` + `RealtimeSchemaMigrationRunner`）。容器/生产环境关闭运行时迁移，改由 `scripts/realtime-schema.sql`（与 runner 同内容）在迁移 Job 中执行。
 
-- 启动时自动创建 `INCOMING_MESSAGES` 流和持久消费者
-- 流配置：File 存储、Limits 保留、2 分钟去重窗口
-- 消费者：Explicit Ack、30s Ack Wait、最多重投 10 次
-- **Ack/Nak 由 Worker 控制**：处理成功 Ack，失败 Nak
-- **毒丸策略**：投递次数 ≥ 8 时直接 Ack 丢弃，避免无限重试
-- RealtimeEvents 仍走 Core NATS（发布/订阅），不受 JetStream 影响
+## 健康与指标
 
-### 发送 JetStream 测试消息
+- `GET http://localhost:8080/live`：进程存活。
+- `GET http://localhost:8080/ready`：Worker 心跳、NATS、PostgreSQL、Garnet 均健康才返回 200。
+- `GET http://localhost:8080/metrics`：Prometheus 文本端点，包含处理计数、历史查询、
+  DLQ、Outbox、.NET 运行时、ASP.NET/Kestrel 和 Npgsql Meter。
+- `GET http://localhost:8080/diagnostics/runtime`：供开发排查使用的 JSON 运行快照；
+  不再与 Prometheus `/metrics` 混用。
+- `realtime.outbox.pending`、`realtime.outbox.oldest.age` 和
+  `realtime.outbox.max_attempts`：由独立低频采集器更新，不进入消息处理热路径。
+- `realtime.history.queue.depth` 和 `realtime.history.in_flight`：历史查询的排队与
+  执行中数量，可用于识别工作器已饱和还是数据库查询本身变慢。
 
-JetStream 接收的消息格式与 Core NATS 相同，使用 `nats` CLI 发布：
+`Observability` 配置控制 Prometheus 缓存、Outbox 采样间隔、OTLP 地址和 Trace 采样率。
+生产环境建议启用 OTLP，由 Collector 统一转发指标与 Trace；跨 NATS/Outbox 使用 W3C
+Trace Context 保持 Gateway 到本服务的关联。
 
-```powershell
-nats pub chat.incoming-messages '{
-  "CommandId": "cmd-js-1",
-  "ClientMessageId": "client-js-1",
-  "SenderUserId": 1001,
-  "SenderSessionId": "session-js-1",
-  "ReceiverUserId": 1002,
-  "Content": "JetStream 测试消息",
-  "ReceivedAtMs": 1719000000000
-}'
-```
+生产编排应分别把 liveness 和 readiness 指向 `/live`、`/ready`。Dockerfile 已包含同等健康检查和 30 秒优雅停机窗口。持久消息、回执、Outbox 和历史查询的可重复负载工具位于同级 TCP 网关仓库的 `tools/ChatApp.Realtime.PipelineLoadGenerator`；正式基准方法见该仓库的 `docs/performance-baseline.md`。
 
-### 验证 JetStream 状态
+## 验证消息、Outbox 与死信
 
 ```powershell
-# 查看流
-nats str list
+nats pub --header "Nats-Msg-Id:cmd-1" chat.incoming-messages '{"CommandId":"cmd-1","ClientMessageId":"client-1","SenderUserId":1001,"SenderSessionId":"s-1","ReceiverUserId":1002,"Content":"hello","ReceivedAtMs":1719000000000}'
 
-# 查看 INCOMING_MESSAGES 流详情
-nats str info INCOMING_MESSAGES
+docker exec chatapp_postgres psql -U postgres -d ChatAppDatabase -c "select message_id, client_message_id from realtime.messages order by created_at_ms desc limit 5;"
+docker exec chatapp_postgres psql -U postgres -d ChatAppDatabase -c "select event_id, attempt_count, published_at_ms, last_error from realtime.outbox order by created_at_ms desc limit 5;"
 
-# 查看消费者
-nats con ls INCOMING_MESSAGES
-
-# 消费者状态（确认/未确认数）
-nats con info INCOMING_MESSAGES chatapp-realtime-services
+nats stream info INCOMING_MESSAGES
+nats stream info REALTIME_EVENTS
+nats stream view DEAD_LETTERS
 ```
 
-### 验证毒丸处理
+`scripts/test-jetstream-incoming.ps1` 可验证正常消息、重复消息与永久失败消息。永久失败现在应在第一次处理时进入死信流，不再等待第八次后直接 ACK 丢弃。
 
-发送一条必然失败的消息（例如 `ReceiverUserId` 为 0 触发 Npgsql 约束）：
+## 容器化高可用运行
+
+单节点本地 Compose 默认可跑 `--profile container-service`（Development + `Replicas=1`）。
+三节点 HA 需叠加集群文件（Container + `Replicas=3`）、持久卷、数据库迁移任务和两个实时服务副本：
 
 ```powershell
-for ($i = 1; $i -le 12; $i++) {
-  Write-Host "发送第 $i 条毒丸..."
-  nats pub chat.incoming-messages "{\"CommandId\":\"poison-$i\",\"ClientMessageId\":\"poison-$i\",\"SenderUserId\":1001,\"SenderSessionId\":\"s\",\"ReceiverUserId\":0,\"Content\":\"x\",\"ReceivedAtMs\":1}"
-  Start-Sleep -Seconds 2
-}
+$env:POSTGRES_PASSWORD = "replace-me"
+docker compose `
+  -f ..\ChatApp.Server\docker-compose.yaml `
+  -f .\docker-compose.nats.yaml `
+  -f .\docker-compose.nats.cluster.yaml `
+  --profile nats-cluster `
+  --profile container-service `
+  up -d --build
 ```
 
-观察日志输出 — 前 8 次投递会 Nak，第 9 次起 Worker 会输出 `检测到毒丸消息，直接丢弃` 并 Ack 终止。
+生产环境仍应使用跨故障域的 NATS/PostgreSQL/Redis 集群、Secret 管理、TLS、PodDisruptionBudget 和反亲和，而不是把单机 Compose 当作最终生产拓扑。
 
-`realtime_services` 容器服务已经放入 `container-service` profile，不会随默认 compose 命令启动。后续准备做容器部署时再启用该 profile，并重新评估 NativeAOT、基础镜像和 NATS JetStream 客户端兼容性。
+## 构建与测试
+
+```powershell
+dotnet restore .\ChatApp.RealtimeServices.slnx
+dotnet build .\ChatApp.RealtimeServices.slnx --no-restore --configuration Release
+dotnet test .\ChatApp.RealtimeServices.slnx --no-build --configuration Release
+docker compose -f ..\ChatApp.Server\docker-compose.yaml -f .\docker-compose.nats.yaml config --quiet
+```
+
+CI 同时执行 Release 构建、自动化测试和容器镜像构建。
+
+## 短管道冒烟（可选）
+
+Realtime `/ready` 后，在同级 TCP 网关仓库用 `PipelineLoadGenerator` 跑 ≤1 分钟冒烟（正式 30m 基线见该仓库 `docs/performance-baseline.md`）：
+
+```powershell
+cd ..\ChatAppTCP_Server
+dotnet run --project .\tools\ChatApp.Realtime.PipelineLoadGenerator -c Release -- `
+  --nats-url nats://127.0.0.1:4222 `
+  --warmup-seconds 5 --duration-seconds 30 `
+  --concurrency 4 --operations-per-second 4 --payload-bytes 512
+```

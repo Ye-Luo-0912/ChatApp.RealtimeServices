@@ -41,6 +41,16 @@ public static class RealtimePostgresRegistration
             services.AddSingleton<IRealtimeMessageStore, NpgsqlRealtimeMessageStore>();
         }
 
+        if (!string.IsNullOrWhiteSpace(connectionString)
+            && (messageStoreProvider.Equals("Npgsql", StringComparison.OrdinalIgnoreCase)
+                || messageStoreProvider.Equals("EfCore", StringComparison.OrdinalIgnoreCase)))
+        {
+            services.RemoveAll<IRealtimeMessageHistoryStore>();
+            services.AddSingleton<IRealtimeMessageHistoryStore, NpgsqlRealtimeMessageHistoryStore>();
+            services.RemoveAll<IRealtimeOutboxStore>();
+            services.AddSingleton<IRealtimeOutboxStore, NpgsqlRealtimeOutboxStore>();
+        }
+
         return services;
     }
 

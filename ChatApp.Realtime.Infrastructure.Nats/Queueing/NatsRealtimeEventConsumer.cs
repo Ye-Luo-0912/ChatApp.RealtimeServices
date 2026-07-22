@@ -23,25 +23,25 @@ public sealed class NatsRealtimeEventConsumer : IRealtimeEventConsumer
         _logger = logger;
     }
 
-    public async IAsyncEnumerable<RealtimeEvent> ConsumeAsync(
+    public async IAsyncEnumerable<RealtimeEventEnvelope> ConsumeAsync(
         [EnumeratorCancellation] CancellationToken ct = default)
     {
+        // Core NATS 队列组：专用 cleanup 队列名，避免与网关推送抢同一订阅组。
+        var queueGroup = $"{_options.ConsumerGroup}-account-cleanup";
         _logger.LogInformation(
-            "NATS 实时事件消费者已订阅。Subject={Subject}；队列组={QueueGroup}",
+            "NATS 账号清理事件消费者已订阅。Subject={Subject}；队列组={QueueGroup}",
             _options.Topics.RealtimeEvents,
-            _options.ConsumerGroup);
+            queueGroup);
 
         await foreach (var msg in _connectionClient.Client.SubscribeAsync<string>(
                            _options.Topics.RealtimeEvents,
-                           _options.ConsumerGroup,
+                           queueGroup,
                            cancellationToken: ct))
         {
             RealtimeEvent? evt = null;
-
             try
             {
                 msg.EnsureSuccess();
-
                 if (string.IsNullOrWhiteSpace(msg.Data))
                 {
                     _logger.LogWarning("NATS 实时事件为空，已跳过。Subject={Subject}", msg.Subject);
@@ -62,9 +62,7 @@ public sealed class NatsRealtimeEventConsumer : IRealtimeEventConsumer
             }
 
             if (evt is not null)
-            {
-                yield return evt;
-            }
+                yield return new RealtimeEventEnvelope(evt);
         }
     }
 }

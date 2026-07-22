@@ -43,5 +43,10 @@ public enum RealtimeEventType : byte
     /// <summary>
     /// 用户账号已删除：Realtime 侧应异步清理该用户的消息、会话与相关状态（Saga）。
     /// </summary>
-    UserAccountDeleted = 8
+    UserAccountDeleted = 8,
+
+    /// <summary>
+    /// Realtime 侧账号清理已完成（供 Server Saga / 运维对账）。
+    /// </summary>
+    AccountCleanupCompleted = 9
 }

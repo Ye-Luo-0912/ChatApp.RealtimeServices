@@ -1,6 +1,6 @@
 namespace ChatApp.Realtime.Abstractions.Messaging;
 
-public sealed class IncomingMessageCommand
+public sealed record IncomingMessageCommand
 {
     public required string CommandId { get; init; }
     public required string ClientMessageId { get; init; }

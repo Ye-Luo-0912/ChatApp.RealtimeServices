@@ -33,10 +33,18 @@ public sealed class RealtimeGarnetClient : IDisposable
         return GetConnection().GetDatabase();
     }
 
+    public async Task<TimeSpan> PingAsync(CancellationToken ct = default) =>
+        await GetDatabase().PingAsync().WaitAsync(ct).ConfigureAwait(false);
+
     private ConnectionMultiplexer Connect()
     {
         _logger.LogInformation("正在建立 Garnet 连接。");
-        return ConnectionMultiplexer.Connect(_connectionString);
+        var options = ConfigurationOptions.Parse(_connectionString);
+        options.AbortOnConnectFail = false;
+        options.ConnectRetry = Math.Max(options.ConnectRetry, 3);
+        options.KeepAlive = options.KeepAlive <= 0 ? 30 : options.KeepAlive;
+        options.ReconnectRetryPolicy ??= new ExponentialRetry(1000);
+        return ConnectionMultiplexer.Connect(options);
     }
 
     public void Dispose()

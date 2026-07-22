@@ -2,6 +2,7 @@ using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
+using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
 using Microsoft.Extensions.Logging;
 
 namespace ChatApp.Realtime.Infrastructure.Nats.Queueing;
@@ -28,8 +29,12 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
             evt,
             RealtimeJsonSerializerContext.Default.RealtimeEvent);
 
+        var subject = evt.Type is RealtimeEventType.UserAccountDeleted or RealtimeEventType.AccountCleanupCompleted
+            ? _options.Topics.AccountCleanup
+            : _options.Topics.RealtimeEvents;
+
         await _connectionClient.Client
-            .PublishAsync(_options.Topics.RealtimeEvents, json, cancellationToken: ct)
+            .PublishAsync(subject, json, headers: NatsTraceContext.CreatePropagationHeaders(), cancellationToken: ct)
             .ConfigureAwait(false);
 
         _logger.LogInformation(
@@ -37,6 +42,6 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
             evt.EventId,
             evt.Type,
             evt.TargetUserId,
-            _options.Topics.RealtimeEvents);
+            subject);
     }
 }

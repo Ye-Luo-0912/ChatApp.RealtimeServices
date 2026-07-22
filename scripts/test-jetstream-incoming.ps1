@@ -15,6 +15,7 @@ $appsettingsPath = "$repoRoot\ChatApp.RealtimeServices\appsettings.json"
 $natsSubject = "chat.incoming-messages"
 $consumerGroup = "chatapp-realtime-services"
 $jsStream = "INCOMING_MESSAGES"
+$dlqStream = "DEAD_LETTERS"
 
 $ts = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $normalMsgId = "test-normal-$ts"
@@ -41,7 +42,7 @@ $natsConnected = $false
 try {
     $conn = nats server check connection --server nats://localhost:4222 2>&1
     $natsConnected = $LASTEXITCODE -eq 0
-} catch { }
+} catch { $natsConnected = $false }
 if (-not $natsConnected) {
     Write-Error "无法连接 NATS (nats://localhost:4222)。请先启动 NATS。"
     exit 1
@@ -52,7 +53,7 @@ $dbOk = $false
 try {
     $dbCheck = docker exec chatapp_postgres psql -U postgres -d ChatAppDatabase -c "SELECT 1;" 2>&1
     $dbOk = $LASTEXITCODE -eq 0
-} catch { }
+} catch { $dbOk = $false }
 if (-not $dbOk) {
     Write-Error "无法连接 PostgreSQL (chatapp_postgres)。请先启动 Docker。"
     exit 1
@@ -93,6 +94,7 @@ if (-not $SkipRestart) {
     $svcJob = Start-Job -ScriptBlock {
         param($proj)
         Set-Location $using:repoRoot
+        $env:DOTNET_ENVIRONMENT = "Development"
         dotnet run --project $proj --no-launch-profile 2>&1
     } -ArgumentList $ProjectPath
 
@@ -120,14 +122,14 @@ try {
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "  $jsStream 流信息获取失败: $streamInfo"
     } else {
-        Write-Host "  流 $jsStream: OK"
+        Write-Host ("  流 ${jsStream}: OK")
     }
 
     $conInfo = nats con info $jsStream $consumerGroup 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "  消费者信息获取失败 (可能是队列组名编码问题): $conInfo"
     } else {
-        Write-Host "  消费者 $consumerGroup: OK"
+        Write-Host ("  消费者 ${consumerGroup}: OK")
         Write-Host "  $conInfo" | Select-String "Pending|AckPending|NumDelivered"
     }
     Write-Host ""
@@ -212,7 +214,15 @@ try {
 
     Start-Sleep -Seconds 5
 
-    # 检查消费者状态
+    # 检查死信流和消费者状态
+    $dlqInfo = nats str info $dlqStream 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "  死信流 ${dlqStream}: OK" -ForegroundColor Green
+        Write-Host "  $dlqInfo" | Select-String "Messages|Bytes|Last Message"
+    } else {
+        Write-Warning "  死信流信息获取失败: $dlqInfo"
+    }
+
     $conInfo2 = nats con info $jsStream $consumerGroup 2>&1
     if ($LASTEXITCODE -eq 0) {
         Write-Host "  消费者状态:"
@@ -220,11 +230,10 @@ try {
     }
 
     Write-Host ""
-    Write-Host "  毒丸策略说明:" -ForegroundColor DarkGray
-    Write-Host "    - Content 为空 → ProcessAsync 返回 Failed → Worker 调 NakAsync"
-    Write-Host "    - JetStream 会按 AckWait(30s) 重新投递，MaxDeliver=10"
-    Write-Host "    - 投递计数 >= 8 时 Worker 输出 '检测到毒丸消息，直接丢弃' 并 Ack"
-    Write-Host "    - 前 7 次投递在服务日志中可见 Nak 和 '入站消息处理失败' 日志"
+    Write-Host "  永久失败策略说明:" -ForegroundColor DarkGray
+    Write-Host "    - Content 为空 → ProcessAsync 返回 Permanent Failure"
+    Write-Host "    - Worker 先把原始负载写入 DEAD_LETTERS，再 ACK 原消息"
+    Write-Host "    - DLQ 发布失败时不会 ACK，原消息会延迟重投"
     Write-Host ""
 
 } finally {
@@ -250,5 +259,5 @@ Write-Host ""
 Write-Host "  # 检查重复消息数量 (应只有 1 条)"
 Write-Host "  docker exec chatapp_postgres psql -U postgres -d ChatAppDatabase -c ""SELECT count(*) FROM realtime.messages WHERE client_message_id = '$dupMsgId';"""
 Write-Host ""
-Write-Host "  # 检查毒丸消费者状态"
-Write-Host "  nats con info $jsStream $consumerGroup"
+Write-Host "  # 检查死信流"
+Write-Host "  nats stream view $dlqStream"

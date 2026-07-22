@@ -25,6 +25,13 @@ public sealed class RealtimeDatabaseClient : IAsyncDisposable
         return !IsConfigured ? throw new InvalidOperationException("实时数据库连接字符串未配置。") : _dataSource.Value!;
     }
 
+    public async Task PingAsync(CancellationToken ct = default)
+    {
+        await using var connection = await GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
+        await using var command = new NpgsqlCommand("SELECT 1", connection);
+        await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
+    }
+
     private NpgsqlDataSource? CreateDataSource()
     {
         if (_connectionString is null)
@@ -34,7 +41,14 @@ public sealed class RealtimeDatabaseClient : IAsyncDisposable
         }
 
         _logger.LogInformation("正在创建实时数据库数据源。");
-        return new NpgsqlDataSourceBuilder(_connectionString).Build();
+        var connectionOptions = new NpgsqlConnectionStringBuilder(_connectionString);
+        if (connectionOptions.MaxAutoPrepare == 0)
+        {
+            connectionOptions.MaxAutoPrepare = 50;
+            connectionOptions.AutoPrepareMinUsages = 2;
+        }
+
+        return new NpgsqlDataSourceBuilder(connectionOptions.ConnectionString).Build();
     }
 
     public async ValueTask DisposeAsync()

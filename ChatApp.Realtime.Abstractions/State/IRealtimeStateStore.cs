@@ -6,7 +6,7 @@ namespace ChatApp.Realtime.Abstractions.State;
 /// </summary>
 public interface IRealtimeStateStore
 {
-    Task SetAsync(string key, string value, CancellationToken ct = default);
+    Task SetAsync(string key, string value, TimeSpan? ttl = null, CancellationToken ct = default);
     Task<string?> GetAsync(string key, CancellationToken ct = default);
     Task RemoveAsync(string key, CancellationToken ct = default);
 }

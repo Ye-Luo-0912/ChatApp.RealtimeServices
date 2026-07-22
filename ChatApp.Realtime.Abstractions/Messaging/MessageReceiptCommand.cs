@@ -1,0 +1,11 @@
+namespace ChatApp.Realtime.Abstractions.Messaging;
+
+public sealed record MessageReceiptCommand
+{
+    public required string CommandId { get; init; }
+    public required string MessageId { get; init; }
+    public required long ReceiverUserId { get; init; }
+    public required string ReceiverSessionId { get; init; }
+    public required MessageReceiptType ReceiptType { get; init; }
+    public long OccurredAtMs { get; init; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+}

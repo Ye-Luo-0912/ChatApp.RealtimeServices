@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Infrastructure.Nats.Configuration;
+using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Nats.Queueing;
 using Microsoft.Extensions.Logging;
 using NATS.Client.JetStream;
@@ -12,39 +14,169 @@ public sealed class JetStreamContextManager
 {
     private readonly NatsConnectionClient _connectionClient;
     private readonly RealtimeQueueOptions _queueOptions;
-    private readonly JetStreamStreamOptions _streamOptions;
+    private readonly JetStreamOptions _options;
     private readonly ILogger<JetStreamContextManager> _logger;
-
     private readonly Lazy<INatsJSContext> _context;
+    private readonly ConcurrentDictionary<string, Task<INatsJSStream>> _streams =
+        new(StringComparer.Ordinal);
 
     public JetStreamContextManager(
         NatsConnectionClient connectionClient,
         RealtimeQueueOptions queueOptions,
-        JetStreamStreamOptions streamOptions,
+        JetStreamOptions options,
         ILogger<JetStreamContextManager> logger)
     {
         _connectionClient = connectionClient;
         _queueOptions = queueOptions;
-        _streamOptions = streamOptions;
+        _options = options;
         _logger = logger;
-
         _context = new Lazy<INatsJSContext>(CreateContext);
     }
 
     private INatsJSContext Context => _context.Value;
 
-    public async Task<INatsJSConsumer> GetOrCreateIncomingMessagesConsumerAsync(CancellationToken ct = default)
+    public async Task<INatsJSConsumer> GetOrCreateIncomingMessagesConsumerAsync(
+        CancellationToken ct = default)
     {
-        var stream = await EnsureStreamAsync(
-            _streamOptions.IncomingMessages,
-            _queueOptions.Topics.IncomingMessages,
+        var stream = await GetOrCreateStreamAsync(
+            _options.Streams.IncomingMessages,
+            [_queueOptions.Topics.IncomingMessages],
+            _options.MaxAgeHours,
             ct).ConfigureAwait(false);
-
-        return await GetOrCreateConsumerAsync(
+        return await CreateOrUpdateConsumerAsync(
             stream,
             _queueOptions.ConsumerGroup,
             _queueOptions.Topics.IncomingMessages,
             ct).ConfigureAwait(false);
+    }
+
+    public async Task<INatsJSConsumer> GetOrCreateMessageReceiptsConsumerAsync(
+        CancellationToken ct = default)
+    {
+        var stream = await GetOrCreateStreamAsync(
+            _options.Streams.MessageReceipts,
+            [_queueOptions.Topics.MessageReceipts],
+            _options.MaxAgeHours,
+            ct).ConfigureAwait(false);
+        return await CreateOrUpdateConsumerAsync(
+            stream,
+            $"{_queueOptions.ConsumerGroup}-receipts",
+            _queueOptions.Topics.MessageReceipts,
+            ct).ConfigureAwait(false);
+    }
+
+    public async Task EnsureStreamsAsync(CancellationToken ct = default)
+    {
+        await Task.WhenAll(
+            GetOrCreateStreamAsync(
+                _options.Streams.IncomingMessages,
+                [_queueOptions.Topics.IncomingMessages],
+                _options.MaxAgeHours,
+                ct),
+            GetOrCreateStreamAsync(
+                _options.Streams.MessageReceipts,
+                [_queueOptions.Topics.MessageReceipts],
+                _options.MaxAgeHours,
+                ct),
+            GetOrCreateStreamAsync(
+                _options.Streams.RealtimeEvents,
+                [_queueOptions.Topics.RealtimeEvents, _queueOptions.Topics.AccountCleanup],
+                _options.MaxAgeHours,
+                ct),
+            GetOrCreateStreamAsync(
+                _options.Streams.DeadLetters,
+                [_queueOptions.Topics.DeadLetters],
+                _options.DeadLetterMaxAgeHours,
+                ct)).ConfigureAwait(false);
+    }
+
+    public async Task<INatsJSConsumer> GetOrCreateRealtimeEventsConsumerAsync(
+        CancellationToken ct = default)
+    {
+        var stream = await GetOrCreateStreamAsync(
+            _options.Streams.RealtimeEvents,
+            [_queueOptions.Topics.RealtimeEvents, _queueOptions.Topics.AccountCleanup],
+            _options.MaxAgeHours,
+            ct).ConfigureAwait(false);
+        return await CreateOrUpdateConsumerAsync(
+            stream,
+            $"{_queueOptions.ConsumerGroup}-events",
+            _queueOptions.Topics.RealtimeEvents,
+            ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 账号清理专用 durable，仅订阅 AccountCleanup subject。
+    /// </summary>
+    public async Task<INatsJSConsumer> GetOrCreateAccountCleanupConsumerAsync(
+        CancellationToken ct = default)
+    {
+        var stream = await GetOrCreateStreamAsync(
+            _options.Streams.RealtimeEvents,
+            [_queueOptions.Topics.RealtimeEvents, _queueOptions.Topics.AccountCleanup],
+            _options.MaxAgeHours,
+            ct).ConfigureAwait(false);
+        return await CreateOrUpdateConsumerAsync(
+            stream,
+            $"{_queueOptions.ConsumerGroup}-account-cleanup",
+            _queueOptions.Topics.AccountCleanup,
+            ct).ConfigureAwait(false);
+    }
+
+    public async Task PublishRealtimeEventAsync(
+        string eventId,
+        string payload,
+        CancellationToken ct = default)
+        => await PublishToSubjectAsync(
+            _queueOptions.Topics.RealtimeEvents,
+            eventId,
+            payload,
+            ct).ConfigureAwait(false);
+
+    public async Task PublishAccountCleanupEventAsync(
+        string eventId,
+        string payload,
+        CancellationToken ct = default)
+        => await PublishToSubjectAsync(
+            _queueOptions.Topics.AccountCleanup,
+            eventId,
+            payload,
+            ct).ConfigureAwait(false);
+
+    private async Task PublishToSubjectAsync(
+        string subject,
+        string eventId,
+        string payload,
+        CancellationToken ct)
+    {
+        await GetOrCreateStreamAsync(
+            _options.Streams.RealtimeEvents,
+            [_queueOptions.Topics.RealtimeEvents, _queueOptions.Topics.AccountCleanup],
+            _options.MaxAgeHours,
+            ct).ConfigureAwait(false);
+        await Context.PublishAsync(
+            subject,
+            payload,
+            opts: CreatePublishOptions(eventId),
+            headers: NatsTraceContext.CreatePropagationHeaders(),
+            cancellationToken: ct).ConfigureAwait(false);
+    }
+
+    public async Task PublishDeadLetterAsync(
+        string deadLetterId,
+        string payload,
+        CancellationToken ct = default)
+    {
+        await GetOrCreateStreamAsync(
+            _options.Streams.DeadLetters,
+            [_queueOptions.Topics.DeadLetters],
+            _options.DeadLetterMaxAgeHours,
+            ct).ConfigureAwait(false);
+        await Context.PublishAsync(
+            _queueOptions.Topics.DeadLetters,
+            payload,
+            opts: CreatePublishOptions(deadLetterId),
+            cancellationToken: ct).ConfigureAwait(false);
     }
 
     private INatsJSContext CreateContext()
@@ -53,53 +185,93 @@ public sealed class JetStreamContextManager
         return _connectionClient.Client.CreateJetStreamContext();
     }
 
-    private async Task<INatsJSStream> EnsureStreamAsync(string streamName, string subject, CancellationToken ct)
+    private async Task<INatsJSStream> GetOrCreateStreamAsync(
+        string streamName,
+        IReadOnlyCollection<string> subjects,
+        int maxAgeHours,
+        CancellationToken ct)
     {
-        var js = Context;
-
-        try
+        while (true)
         {
-            var stream = await js.GetStreamAsync(streamName, cancellationToken: ct).ConfigureAwait(false);
-            _logger.LogInformation("JetStream 流已存在。流名={Stream}", streamName);
-            return stream;
-        }
-        catch (NatsJSException)
-        {
-            _logger.LogInformation("正在创建 JetStream 流。流名={Stream}；Subject={Subject}", streamName, subject);
-
-            var config = new StreamConfig(streamName, [subject])
+            var task = _streams.GetOrAdd(
+                streamName,
+                _ => CreateOrUpdateStreamAsync(
+                    streamName,
+                    subjects,
+                    maxAgeHours));
+            try
             {
-                Storage = StreamConfigStorage.File,
-                Retention = StreamConfigRetention.Limits,
-                DuplicateWindow = TimeSpan.FromMinutes(2)
-            };
-
-            return await js.CreateStreamAsync(config, ct).ConfigureAwait(false);
+                return await task.WaitAsync(ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                _streams.TryRemove(
+                    new KeyValuePair<string, Task<INatsJSStream>>(
+                        streamName,
+                        task));
+                throw;
+            }
         }
     }
 
-    private static async Task<INatsJSConsumer> GetOrCreateConsumerAsync(
+    private async Task<INatsJSStream> CreateOrUpdateStreamAsync(
+        string streamName,
+        IReadOnlyCollection<string> subjects,
+        int maxAgeHours)
+    {
+        _logger.LogInformation(
+            "正在校准 JetStream 流配置。流名={Stream}；Subjects={Subjects}；副本={Replicas}",
+            streamName,
+            string.Join(",", subjects),
+            _options.Replicas);
+        var config = new StreamConfig(
+            streamName,
+            subjects.ToArray())
+        {
+            Storage = StreamConfigStorage.File,
+            Retention = StreamConfigRetention.Limits,
+            Discard = StreamConfigDiscard.Old,
+            DuplicateWindow = TimeSpan.FromMinutes(
+                _options.DuplicateWindowMinutes),
+            MaxAge = TimeSpan.FromHours(maxAgeHours),
+            MaxBytes = _options.MaxBytes,
+            MaxMsgSize = _options.MaxMessageSize,
+            NumReplicas = _options.Replicas
+        };
+        return await Context.CreateOrUpdateStreamAsync(
+            config,
+            CancellationToken.None).ConfigureAwait(false);
+    }
+
+    private async Task<INatsJSConsumer> CreateOrUpdateConsumerAsync(
         INatsJSStream stream,
         string consumerName,
         string filterSubject,
         CancellationToken ct)
     {
-        try
+        var config = new ConsumerConfig(consumerName)
         {
-            return await stream.GetConsumerAsync(consumerName, ct).ConfigureAwait(false);
-        }
-        catch (NatsJSException)
-        {
-            var config = new ConsumerConfig(consumerName)
-            {
-                FilterSubject = filterSubject,
-                AckPolicy = ConsumerConfigAckPolicy.Explicit,
-                AckWait = TimeSpan.FromSeconds(30),
-                MaxDeliver = 10,
-                DeliverPolicy = ConsumerConfigDeliverPolicy.All
-            };
-
-            return await stream.CreateOrUpdateConsumerAsync(config, ct).ConfigureAwait(false);
-        }
+            FilterSubject = filterSubject,
+            AckPolicy = ConsumerConfigAckPolicy.Explicit,
+            AckWait = TimeSpan.FromSeconds(
+                _options.Consumer.AckWaitSeconds),
+            MaxDeliver = _options.Consumer.MaxDeliver,
+            MaxAckPending = _options.Consumer.MaxAckPending,
+            Backoff = _options.Consumer.BackoffSeconds
+                .Select(seconds => TimeSpan.FromSeconds(seconds))
+                .ToArray(),
+            DeliverPolicy = ConsumerConfigDeliverPolicy.All
+        };
+        return await stream.CreateOrUpdateConsumerAsync(
+            config,
+            ct).ConfigureAwait(false);
     }
+
+    private static NatsJSPubOpts CreatePublishOptions(
+        string messageId) => new()
+        {
+            MsgId = messageId,
+            RetryAttempts = 3,
+            RetryWaitBetweenAttempts = TimeSpan.FromMilliseconds(200)
+        };
 }

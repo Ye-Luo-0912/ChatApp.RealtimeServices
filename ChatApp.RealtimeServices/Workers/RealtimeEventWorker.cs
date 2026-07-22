@@ -44,15 +44,19 @@ public sealed class RealtimeEventWorker : BackgroundService
 
         try
         {
-            await foreach (var evt in _consumer.ConsumeAsync(stoppingToken).ConfigureAwait(false))
+            await foreach (var envelope in _consumer.ConsumeAsync(stoppingToken).ConfigureAwait(false))
             {
                 _readinessState.MarkHeartbeat(WorkerName);
+                var evt = envelope.Event;
 
                 _logger.LogInformation(
                     "收到实时事件。事件编号={EventId}；类型={Type}；目标用户={TargetUserId}",
                     evt.EventId,
                     evt.Type,
                     evt.TargetUserId);
+
+                // Stub：仅记录后 ACK。网关推送路径已停用；生产清理见 AccountCleanupWorker。
+                await envelope.AckAsync(stoppingToken).ConfigureAwait(false);
             }
 
             while (!stoppingToken.IsCancellationRequested)

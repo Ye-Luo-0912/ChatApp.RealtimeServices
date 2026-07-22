@@ -79,16 +79,21 @@ public sealed class RealtimeReadinessState
             (Timestamp: now, Error: ex.Message));
     }
 
-    public RealtimeReadinessSnapshot GetSnapshot()
+    public RealtimeReadinessSnapshot GetSnapshot(TimeSpan? heartbeatTimeout = null)
     {
         var workers = _workers.Values
             .OrderBy(static worker => worker.Name, StringComparer.Ordinal)
             .ToArray();
 
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var timeoutMs = heartbeatTimeout is null ? long.MaxValue : (long)heartbeatTimeout.Value.TotalMilliseconds;
         return new RealtimeReadinessSnapshot(
-            workers.Length > 0 && workers.All(static worker => worker.Status == RealtimeWorkerStatus.Running),
+            workers.Length > 0 && workers.All(worker =>
+                worker.Status == RealtimeWorkerStatus.Running
+                && worker.LastHeartbeatAtMs is not null
+                && now - worker.LastHeartbeatAtMs <= timeoutMs),
             workers,
-            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            now);
     }
 }
 

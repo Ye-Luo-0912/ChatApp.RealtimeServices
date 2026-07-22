@@ -16,8 +16,15 @@ public sealed class RealtimeEvent
     public required long TargetUserId { get; init; }
     public long? ActorUserId { get; init; }
 
+    public string? MessageId { get; init; }
+
     public string? SessionId { get; init; }
     public string? PayloadJson { get; init; }
+
+    // W3C trace context is persisted inside the existing Outbox JSON payload.
+    // Both fields are optional to remain compatible with older events.
+    public string? TraceParent { get; init; }
+    public string? TraceState { get; init; }
 
     public long OccurredAtMs { get; init; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 }

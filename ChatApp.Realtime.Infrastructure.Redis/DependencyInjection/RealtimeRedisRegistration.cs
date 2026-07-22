@@ -1,6 +1,9 @@
+using ChatApp.Realtime.Abstractions.State;
 using ChatApp.Realtime.Infrastructure.Redis.Clients;
+using ChatApp.Realtime.Infrastructure.Redis.State;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace ChatApp.Realtime.Infrastructure.Redis.DependencyInjection;
 
@@ -18,6 +21,8 @@ public static class RealtimeRedisRegistration
         services.AddSingleton(sp => new RealtimeGarnetClient(
             garnetConnectionString,
             sp.GetRequiredService<ILogger<RealtimeGarnetClient>>()));
+        services.RemoveAll<IRealtimeStateStore>();
+        services.AddSingleton<IRealtimeStateStore, RedisRealtimeStateStore>();
 
         return services;
     }

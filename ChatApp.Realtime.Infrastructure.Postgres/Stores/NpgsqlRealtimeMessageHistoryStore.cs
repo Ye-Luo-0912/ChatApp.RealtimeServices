@@ -48,46 +48,54 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  history.delivered_at_ms,
                  history.read_at_ms
              FROM (
-                 SELECT
-                     message_id,
-                     client_message_id,
-                     sender_user_id,
-                     receiver_user_id,
-                     content,
-                     received_at_ms,
-                     delivered_at_ms,
-                     read_at_ms
-                 FROM {_databaseSchema.MessagesTableSql}
-                 WHERE receiver_user_id = @user_id
-                   AND (
-                       @before_received_at_ms IS NULL
-                       OR received_at_ms < @before_received_at_ms
-                       OR (
-                           received_at_ms = @before_received_at_ms
-                           AND message_id < @before_message_id
+                 (
+                     SELECT
+                         message_id,
+                         client_message_id,
+                         sender_user_id,
+                         receiver_user_id,
+                         content,
+                         received_at_ms,
+                         delivered_at_ms,
+                         read_at_ms
+                     FROM {_databaseSchema.MessagesTableSql}
+                     WHERE receiver_user_id = @user_id
+                       AND (
+                           @before_received_at_ms IS NULL
+                           OR received_at_ms < @before_received_at_ms
+                           OR (
+                               received_at_ms = @before_received_at_ms
+                               AND message_id < @before_message_id
+                           )
                        )
-                   )
+                     ORDER BY received_at_ms DESC, message_id DESC
+                     LIMIT @take
+                 )
                  UNION ALL
-                 SELECT
-                     message_id,
-                     client_message_id,
-                     sender_user_id,
-                     receiver_user_id,
-                     content,
-                     received_at_ms,
-                     delivered_at_ms,
-                     read_at_ms
-                 FROM {_databaseSchema.MessagesTableSql}
-                 WHERE sender_user_id = @user_id
-                   AND receiver_user_id <> @user_id
-                   AND (
-                       @before_received_at_ms IS NULL
-                       OR received_at_ms < @before_received_at_ms
-                       OR (
-                           received_at_ms = @before_received_at_ms
-                           AND message_id < @before_message_id
+                 (
+                     SELECT
+                         message_id,
+                         client_message_id,
+                         sender_user_id,
+                         receiver_user_id,
+                         content,
+                         received_at_ms,
+                         delivered_at_ms,
+                         read_at_ms
+                     FROM {_databaseSchema.MessagesTableSql}
+                     WHERE sender_user_id = @user_id
+                       AND receiver_user_id <> @user_id
+                       AND (
+                           @before_received_at_ms IS NULL
+                           OR received_at_ms < @before_received_at_ms
+                           OR (
+                               received_at_ms = @before_received_at_ms
+                               AND message_id < @before_message_id
+                           )
                        )
-                   )
+                     ORDER BY received_at_ms DESC, message_id DESC
+                     LIMIT @take
+                 )
              ) AS history
              ORDER BY history.received_at_ms DESC, history.message_id DESC
              LIMIT @take;

@@ -12,16 +12,64 @@ public sealed class NoopRealtimeMessageStore : IRealtimeMessageStore
         _logger = logger;
     }
 
-    public Task<bool> SaveAsync(RealtimeMessageRecord message, CancellationToken ct = default)
+    public Task<RealtimeMessagePersistResult> SaveAsync(
+        RealtimeMessageRecord message,
+        Abstractions.Events.RealtimeEvent eventToPublish,
+        CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
 
-        _logger.LogInformation(
-            "P0 默认实现跳过实时消息入库。消息编号={MessageId}；发送用户={SenderUserId}；接收用户={ReceiverUserId}",
+        _logger.LogCritical(
+            "未配置真实消息存储，拒绝确认消息。消息编号={MessageId}；发送用户={SenderUserId}；接收用户={ReceiverUserId}",
             message.MessageId,
             message.SenderUserId,
             message.ReceiverUserId);
 
-        return Task.FromResult(true);
+        throw new InvalidOperationException("未配置真实消息存储，消息不能被持久化。");
+    }
+
+    public Task<MessageReceiptPersistResult> ApplyReceiptAsync(
+        MessageReceiptRecord receipt,
+        Abstractions.Events.RealtimeEvent eventToPublish,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        _logger.LogCritical(
+            "未配置真实消息存储，拒绝确认消息回执。消息编号={MessageId}；接收用户={ReceiverUserId}",
+            receipt.MessageId,
+            receipt.ReceiverUserId);
+
+        throw new InvalidOperationException("未配置真实消息存储，消息回执不能被持久化。");
+    }
+
+    public Task<long> DeleteByUserAsync(
+        long userId,
+        int batchSize = 1000,
+        CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(userId);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(batchSize);
+        ct.ThrowIfCancellationRequested();
+
+        _logger.LogInformation(
+            "P0 默认实现跳过用户消息清理。用户={UserId}",
+            userId);
+        return Task.FromResult(0L);
+    }
+
+    public Task EnqueueEventAsync(
+        Abstractions.Events.RealtimeEvent eventToPublish,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(eventToPublish);
+        ArgumentException.ThrowIfNullOrWhiteSpace(eventToPublish.EventId);
+        ct.ThrowIfCancellationRequested();
+
+        _logger.LogInformation(
+            "P0 默认实现跳过 Outbox 入队。事件={EventId}；类型={Type}",
+            eventToPublish.EventId,
+            eventToPublish.Type);
+        return Task.CompletedTask;
     }
 }

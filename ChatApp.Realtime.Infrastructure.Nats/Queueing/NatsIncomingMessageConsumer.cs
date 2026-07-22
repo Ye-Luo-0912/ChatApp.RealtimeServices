@@ -3,6 +3,7 @@ using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
+using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
 using Microsoft.Extensions.Logging;
 
 namespace ChatApp.Realtime.Infrastructure.Nats.Queueing;
@@ -63,7 +64,11 @@ public sealed class NatsIncomingMessageConsumer : IIncomingMessageConsumer
 
             if (command is not null)
             {
-                yield return new IncomingMessageEnvelope(command);
+                yield return new IncomingMessageEnvelope(command)
+                {
+                    RawPayload = msg.Data,
+                    ParentContext = NatsTraceContext.ExtractParentContext(msg.Headers)
+                };
             }
         }
     }

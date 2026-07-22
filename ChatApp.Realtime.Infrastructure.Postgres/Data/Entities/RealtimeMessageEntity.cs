@@ -9,5 +9,7 @@ public sealed class RealtimeMessageEntity
     public required long ReceiverUserId { get; init; }
     public required string Content { get; init; }
     public long ReceivedAtMs { get; init; }
+    public long? DeliveredAtMs { get; set; }
+    public long? ReadAtMs { get; set; }
     public long CreatedAtMs { get; init; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 }

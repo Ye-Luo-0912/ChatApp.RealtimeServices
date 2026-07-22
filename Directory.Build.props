@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup>
+    <DefaultItemExcludes>$(DefaultItemExcludes);bin/**;obj/**;.codex-obj/**;.codex-bin/**</DefaultItemExcludes>
+    <BaseIntermediateOutputPath Condition="'$(IsolatedBuild)' == 'true'">$(MSBuildThisFileDirectory).artifacts/$(MSBuildProjectName)/obj/</BaseIntermediateOutputPath>
+    <BaseOutputPath Condition="'$(IsolatedBuild)' == 'true'">$(MSBuildThisFileDirectory).artifacts/$(MSBuildProjectName)/bin/</BaseOutputPath>
+  </PropertyGroup>
+</Project>
