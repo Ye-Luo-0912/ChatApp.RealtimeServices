@@ -1,6 +1,7 @@
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Messaging.History;
+using Xunit;
 
 namespace ChatApp.Realtime.Tests;
 

@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="Npgsql" Version="10.0.2" />
+    <PackageReference Include="Testcontainers.PostgreSql" Version="4.7.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ChatApp.Realtime.Abstractions\ChatApp.Realtime.Abstractions.csproj" />
+    <ProjectReference Include="..\ChatApp.Realtime.Infrastructure.Core\ChatApp.Realtime.Infrastructure.Core.csproj" />
+    <ProjectReference Include="..\ChatApp.Realtime.Infrastructure.Postgres\ChatApp.Realtime.Infrastructure.Postgres.csproj" />
+    <ProjectReference Include="..\ChatApp.Realtime.Integration\ChatApp.Realtime.Integration.csproj" />
+  </ItemGroup>
+</Project>
