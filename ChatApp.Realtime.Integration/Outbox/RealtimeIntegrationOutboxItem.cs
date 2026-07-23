@@ -9,6 +9,7 @@ public sealed class RealtimeIntegrationOutboxItem
     public required string PayloadJson { get; init; }
     public required long TargetUserId { get; init; }
     public required short EventType { get; init; }
+    public short Status { get; set; }
     public long CreatedAtMs { get; init; }
     public long NextAttemptAtMs { get; init; }
     public long? PublishedAtMs { get; set; }

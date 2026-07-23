@@ -14,6 +14,7 @@ public static class RealtimeOutboxModelBuilderExtensions
             entity.Property(item => item.PayloadJson).HasColumnName("payload_json").IsRequired();
             entity.Property(item => item.TargetUserId).HasColumnName("target_user_id");
             entity.Property(item => item.EventType).HasColumnName("event_type");
+            entity.Property(item => item.Status).HasColumnName("status");
             entity.Property(item => item.CreatedAtMs).HasColumnName("created_at_ms");
             entity.Property(item => item.NextAttemptAtMs).HasColumnName("next_attempt_at_ms");
             entity.Property(item => item.PublishedAtMs).HasColumnName("published_at_ms");

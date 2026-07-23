@@ -1,6 +1,3 @@
-using System.Globalization;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
@@ -127,15 +124,9 @@ public sealed class DefaultMessageReceiptProcessor : IMessageReceiptProcessor
         return null;
     }
 
-    private static string CreateEventId(MessageReceiptCommand command)
-    {
-        var source = string.Concat(
+    private static string CreateEventId(MessageReceiptCommand command) =>
+        RealtimeEventContracts.CreateMessageReceiptUpdatedEventId(
             command.MessageId,
-            ":",
-            command.ReceiverUserId.ToString(CultureInfo.InvariantCulture),
-            ":",
-            ((byte)command.ReceiptType).ToString(CultureInfo.InvariantCulture));
-        return Convert.ToHexStringLower(
-            SHA256.HashData(Encoding.UTF8.GetBytes(source)));
-    }
+            command.ReceiverUserId,
+            command.ReceiptType);
 }

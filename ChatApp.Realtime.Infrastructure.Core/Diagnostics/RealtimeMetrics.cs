@@ -23,8 +23,13 @@ public sealed class RealtimeMetrics : IDisposable
     private readonly ObservableGauge<long> _historyQueriesInFlightGauge;
     private readonly ObservableGauge<long> _outboxPendingGauge;
     private readonly ObservableGauge<double> _outboxOldestAgeGauge;
+    private readonly ObservableGauge<double> _outboxOldestInFlightAgeGauge;
     private readonly ObservableGauge<long> _outboxMaxAttemptsGauge;
+    private readonly ObservableGauge<long> _outboxDeadGauge;
+    private readonly Counter<long> _outboxDeadLetterCounter;
+    private readonly Counter<long> _outboxCleanupCounter;
     private readonly Counter<long> _outboxStatsFailureCounter;
+    private readonly Counter<long> _idempotencyConflictCounter;
     private readonly Histogram<double> _processingDuration;
     private readonly Histogram<double> _historyQueryDuration;
 
@@ -42,7 +47,9 @@ public sealed class RealtimeMetrics : IDisposable
     private long _historyQueriesInFlight;
     private long _outboxPending;
     private long _outboxOldestPendingAtMs = -1;
+    private long _outboxOldestInFlightAtMs = -1;
     private long _outboxMaxAttempts;
+    private long _outboxDead;
 
     public RealtimeMetrics()
     {
@@ -69,11 +76,24 @@ public sealed class RealtimeMetrics : IDisposable
             "realtime.outbox.oldest.age",
             ObserveOutboxOldestAgeSeconds,
             "s");
+        _outboxOldestInFlightAgeGauge = _meter.CreateObservableGauge<double>(
+            "realtime.outbox.oldest_inflight.age",
+            ObserveOutboxOldestInFlightAgeSeconds,
+            "s");
         _outboxMaxAttemptsGauge = _meter.CreateObservableGauge<long>(
             "realtime.outbox.max_attempts",
             () => Interlocked.Read(ref _outboxMaxAttempts));
+        _outboxDeadGauge = _meter.CreateObservableGauge<long>(
+            "realtime.outbox.dead",
+            () => Interlocked.Read(ref _outboxDead));
+        _outboxDeadLetterCounter = _meter.CreateCounter<long>(
+            "realtime.outbox.dead_letters");
+        _outboxCleanupCounter = _meter.CreateCounter<long>(
+            "realtime.outbox.cleanup.deleted");
         _outboxStatsFailureCounter = _meter.CreateCounter<long>(
             "realtime.outbox.stats.failures");
+        _idempotencyConflictCounter = _meter.CreateCounter<long>(
+            "realtime.messages.idempotency_conflicts");
         _processingDuration = _meter.CreateHistogram<double>("realtime.messages.processing.duration", "ms");
         _historyQueryDuration = _meter.CreateHistogram<double>("realtime.history.duration", "ms");
     }
@@ -122,6 +142,7 @@ public sealed class RealtimeMetrics : IDisposable
     {
         Interlocked.Increment(ref _outboxPublished);
         _outboxPublishedCounter.Add(1);
+        AdjustOutboxPending(-1);
     }
 
     public void RecordOutboxFailure()
@@ -130,13 +151,76 @@ public sealed class RealtimeMetrics : IDisposable
         _outboxFailureCounter.Add(1);
     }
 
+    public void RecordOutboxDeadLetter()
+    {
+        _outboxDeadLetterCounter.Add(1);
+        AdjustOutboxPending(-1);
+        Interlocked.Increment(ref _outboxDead);
+    }
+
+    public void RecordOutboxReplay(int count)
+    {
+        if (count <= 0)
+            return;
+
+        AdjustOutboxPending(count);
+        AdjustOutboxDead(-count);
+    }
+
+    public void RecordOutboxEnqueued(int count)
+    {
+        if (count > 0)
+            AdjustOutboxPending(count);
+    }
+
+    public void RecordOutboxCleanup(int deleted) =>
+        _outboxCleanupCounter.Add(deleted);
+
+    public void RecordIdempotencyConflict() =>
+        _idempotencyConflictCounter.Add(1);
+
+    /// <summary>
+    /// 低频对账：用 DB Pending/Dead 聚合覆盖进程内计数（校正 drift / oldest age）。
+    /// </summary>
     public void UpdateOutboxStats(RealtimeOutboxStats stats)
     {
         Interlocked.Exchange(ref _outboxPending, stats.PendingCount);
         Interlocked.Exchange(
             ref _outboxOldestPendingAtMs,
             stats.OldestPendingAtMs ?? -1);
+        Interlocked.Exchange(
+            ref _outboxOldestInFlightAtMs,
+            stats.OldestInFlightAtMs ?? -1);
         Interlocked.Exchange(ref _outboxMaxAttempts, stats.MaxAttemptCount);
+        Interlocked.Exchange(ref _outboxDead, stats.DeadCount);
+    }
+
+    private void AdjustOutboxPending(int delta)
+    {
+        if (delta == 0)
+            return;
+
+        while (true)
+        {
+            var current = Interlocked.Read(ref _outboxPending);
+            var next = Math.Max(0, current + delta);
+            if (Interlocked.CompareExchange(ref _outboxPending, next, current) == current)
+                return;
+        }
+    }
+
+    private void AdjustOutboxDead(int delta)
+    {
+        if (delta == 0)
+            return;
+
+        while (true)
+        {
+            var current = Interlocked.Read(ref _outboxDead);
+            var next = Math.Max(0, current + delta);
+            if (Interlocked.CompareExchange(ref _outboxDead, next, current) == current)
+                return;
+        }
     }
 
     public void RecordOutboxStatsFailure() =>
@@ -195,15 +279,20 @@ public sealed class RealtimeMetrics : IDisposable
 
     public void Dispose() => _meter.Dispose();
 
-    private double ObserveOutboxOldestAgeSeconds()
+    private double ObserveOutboxOldestAgeSeconds() =>
+        ObserveAgeSeconds(Interlocked.Read(ref _outboxOldestPendingAtMs));
+
+    private double ObserveOutboxOldestInFlightAgeSeconds() =>
+        ObserveAgeSeconds(Interlocked.Read(ref _outboxOldestInFlightAtMs));
+
+    private static double ObserveAgeSeconds(long oldestAtMs)
     {
-        var oldestPendingAtMs = Interlocked.Read(ref _outboxOldestPendingAtMs);
-        if (oldestPendingAtMs < 0)
+        if (oldestAtMs < 0)
             return 0;
 
         return Math.Max(
             0,
-            (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - oldestPendingAtMs) / 1000d);
+            (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - oldestAtMs) / 1000d);
     }
 }
 

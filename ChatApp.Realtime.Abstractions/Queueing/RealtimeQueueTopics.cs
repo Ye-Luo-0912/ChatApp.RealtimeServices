@@ -12,6 +12,11 @@ public sealed class RealtimeQueueTopics
     /// <summary>账号删除清理专用 subject，避免清理消费者 ACK 无关网关事件。</summary>
     public string AccountCleanup { get; init; } = "chat.realtime-events.account-deleted";
     public string MessageHistoryQueries { get; init; } = "chat.message-history.query";
+    public string ConversationListQueries { get; init; } = "chat.conversation-list.query";
+    public string ConversationMarkReads { get; init; } = "chat.conversation-mark-read";
+    public string ConversationSetPrefs { get; init; } = "chat.conversation-prefs.set";
+    public string MessageRecalls { get; init; } = "chat.message-recall";
+    public string SyncBootstrapQueries { get; init; } = "chat.sync.bootstrap";
     public string? MessagePersistence { get; init; }
     public string DeadLetters { get; init; } = "chat.dead-letters";
 }

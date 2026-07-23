@@ -43,6 +43,24 @@ public sealed class NoopRealtimeMessageStore : IRealtimeMessageStore
         throw new InvalidOperationException("未配置真实消息存储，消息回执不能被持久化。");
     }
 
+    public Task<MessageRecallPersistResult> ApplyRecallAsync(
+        string messageId,
+        long senderUserId,
+        string senderSessionId,
+        long recalledAtMs,
+        long maxAgeMs,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        _logger.LogCritical(
+            "未配置真实消息存储，拒绝撤回。消息编号={MessageId}；发送用户={SenderUserId}",
+            messageId,
+            senderUserId);
+
+        throw new InvalidOperationException("未配置真实消息存储，消息不能被撤回。");
+    }
+
     public Task<long> DeleteByUserAsync(
         long userId,
         int batchSize = 1000,

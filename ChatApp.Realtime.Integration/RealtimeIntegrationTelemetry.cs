@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using ChatApp.Realtime.Abstractions.Auth;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using NATS.Client.Core;
 
@@ -41,6 +42,21 @@ public static class RealtimeIntegrationTelemetry
         var traceState = RealtimeTraceContext.CaptureTraceState();
         if (!string.IsNullOrWhiteSpace(traceState))
             headers[RealtimeTraceContext.TraceStateHeader] = traceState;
+        return headers;
+    }
+
+    /// <summary>
+    /// 网关在发布入站/回执/历史查询时应注入已认证身份头，RealtimeServices 在 Trust 开启时优先信任这些头。
+    /// </summary>
+    public static NatsHeaders CreateIdentityHeaders(
+        long userId,
+        string? sessionId = null,
+        NatsHeaders? existing = null)
+    {
+        var headers = existing ?? CreatePropagationHeaders() ?? new NatsHeaders();
+        headers[RealtimeIdentityHeaders.UserId] = userId.ToString();
+        if (!string.IsNullOrWhiteSpace(sessionId))
+            headers[RealtimeIdentityHeaders.SessionId] = sessionId;
         return headers;
     }
 

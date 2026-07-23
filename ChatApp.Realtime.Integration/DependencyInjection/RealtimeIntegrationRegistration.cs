@@ -13,6 +13,11 @@ public static class RealtimeIntegrationRegistration
         ArgumentException.ThrowIfNullOrWhiteSpace(options.Url);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.InstanceId);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.MessageHistoryQueriesSubject);
+        ArgumentException.ThrowIfNullOrWhiteSpace(options.ConversationListQueriesSubject);
+        ArgumentException.ThrowIfNullOrWhiteSpace(options.ConversationMarkReadsSubject);
+        ArgumentException.ThrowIfNullOrWhiteSpace(options.ConversationSetPrefsSubject);
+        ArgumentException.ThrowIfNullOrWhiteSpace(options.MessageRecallsSubject);
+        ArgumentException.ThrowIfNullOrWhiteSpace(options.SyncBootstrapQueriesSubject);
         if (options.HistoryRequestTimeoutMs <= 0)
             throw new ArgumentOutOfRangeException(nameof(options.HistoryRequestTimeoutMs));
         if (options.Replicas <= 0)

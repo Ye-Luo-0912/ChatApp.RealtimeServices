@@ -7,6 +7,8 @@ using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Health;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
+using ChatApp.Realtime.Infrastructure.Nats.Configuration;
+using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
 using ChatApp.RealtimeServices.Options;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -23,6 +25,7 @@ public sealed class IncomingMessageWorker : BackgroundService
     private readonly RealtimeReadinessState _readinessState;
     private readonly RealtimeMetrics _metrics;
     private readonly RealtimeOptions _options;
+    private readonly RealtimeNatsTrustSettings _trust;
     private readonly ILogger<IncomingMessageWorker> _logger;
 
     public IncomingMessageWorker(
@@ -32,6 +35,7 @@ public sealed class IncomingMessageWorker : BackgroundService
         RealtimeReadinessState readinessState,
         RealtimeMetrics metrics,
         IOptions<RealtimeOptions> options,
+        RealtimeNatsTrustSettings trust,
         ILogger<IncomingMessageWorker> logger)
     {
         _consumer = consumer;
@@ -40,6 +44,7 @@ public sealed class IncomingMessageWorker : BackgroundService
         _readinessState = readinessState;
         _metrics = metrics;
         _options = options.Value;
+        _trust = trust;
         _logger = logger;
     }
 
@@ -214,6 +219,22 @@ public sealed class IncomingMessageWorker : BackgroundService
                 envelope,
                 "max_deliveries",
                 "消息投递次数达到毒丸阈值。",
+                ct).ConfigureAwait(false);
+            return;
+        }
+
+        var identityError = NatsGatewayIdentity.ValidateIncomingSender(
+            _trust.RequireGatewayIdentity,
+            envelope.TrustedUserId,
+            envelope.TrustedSessionId,
+            envelope.Command.SenderUserId,
+            envelope.Command.SenderSessionId);
+        if (identityError is not null)
+        {
+            await DeadLetterAndAckAsync(
+                envelope,
+                identityError,
+                "网关身份校验失败：payload 发送方与可信身份头不匹配或缺失。",
                 ct).ConfigureAwait(false);
             return;
         }

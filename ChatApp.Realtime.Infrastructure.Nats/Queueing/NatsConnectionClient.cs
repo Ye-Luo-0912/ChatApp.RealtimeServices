@@ -1,6 +1,8 @@
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Queueing;
+using ChatApp.Realtime.Infrastructure.Nats.Configuration;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using NATS.Client.Core;
 using NATS.Net;
 
@@ -9,16 +11,19 @@ namespace ChatApp.Realtime.Infrastructure.Nats.Queueing;
 public sealed class NatsConnectionClient : IAsyncDisposable
 {
     private readonly RealtimeQueueOptions _options;
+    private readonly NatsAuthOptions _auth;
     private readonly NatsTransportMetrics _metrics;
     private readonly ILogger<NatsConnectionClient> _logger;
     private readonly Lazy<NatsClient> _client;
 
     public NatsConnectionClient(
         RealtimeQueueOptions options,
+        IOptions<NatsOptions> natsOptions,
         NatsTransportMetrics metrics,
         ILogger<NatsConnectionClient> logger)
     {
         _options = options;
+        _auth = natsOptions.Value.Auth ?? new NatsAuthOptions();
         _metrics = metrics;
         _logger = logger;
         _client = new Lazy<NatsClient>(CreateClient);
@@ -36,12 +41,15 @@ public sealed class NatsConnectionClient : IAsyncDisposable
             throw new InvalidOperationException("Nats:Url 未配置，无法创建 NATS 客户端。");
         }
 
-        _logger.LogInformation("正在创建 NATS 客户端。地址={Url}", _options.Endpoint);
+        _logger.LogInformation(
+            "正在创建 NATS 客户端。地址={Url}",
+            NatsEndpointRedactor.ForLog(_options.Endpoint));
 
         var client = new NatsClient(new NatsOpts
         {
             Url = _options.Endpoint,
             Name = _options.ConsumerGroup,
+            AuthOpts = CreateAuthOpts(_auth),
             ConnectTimeout = TimeSpan.FromSeconds(5),
             RequestTimeout = TimeSpan.FromSeconds(5),
             CommandTimeout = TimeSpan.FromSeconds(5),
@@ -55,6 +63,44 @@ public sealed class NatsConnectionClient : IAsyncDisposable
         });
         Subscribe(client.Connection);
         return client;
+    }
+
+    private static NatsAuthOpts CreateAuthOpts(NatsAuthOptions auth)
+    {
+        if (!string.IsNullOrWhiteSpace(auth.CredsFile))
+        {
+            return new NatsAuthOpts { CredsFile = auth.CredsFile };
+        }
+
+        if (!string.IsNullOrWhiteSpace(auth.NKeyFile))
+        {
+            return new NatsAuthOpts { NKeyFile = auth.NKeyFile };
+        }
+
+        if (!string.IsNullOrWhiteSpace(auth.Seed) || !string.IsNullOrWhiteSpace(auth.NKey))
+        {
+            return new NatsAuthOpts
+            {
+                Seed = auth.Seed,
+                NKey = auth.NKey
+            };
+        }
+
+        if (!string.IsNullOrWhiteSpace(auth.Token))
+        {
+            return new NatsAuthOpts { Token = auth.Token };
+        }
+
+        if (!string.IsNullOrWhiteSpace(auth.Username))
+        {
+            return new NatsAuthOpts
+            {
+                Username = auth.Username,
+                Password = auth.Password
+            };
+        }
+
+        return NatsAuthOpts.Default;
     }
 
     private void Subscribe(INatsConnection connection)

@@ -12,8 +12,14 @@ public sealed class RealtimeDatabaseSchema
     public string QuotedSchema => QuoteIdentifier(Schema);
 
     public string MessagesTableSql => $"{QuotedSchema}.\"messages\"";
+    public string AttachmentsTableSql => $"{QuotedSchema}.\"attachments\"";
+    public string ConversationsTableSql => $"{QuotedSchema}.\"conversations\"";
+    public string ConversationMembersTableSql => $"{QuotedSchema}.\"conversation_members\"";
+    public string DeviceSyncCursorsTableSql => $"{QuotedSchema}.\"device_sync_cursors\"";
     public string OutboxTableSql => $"{QuotedSchema}.\"outbox\"";
     public string SchemaMigrationsTableSql => $"{QuotedSchema}.\"schema_migrations\"";
+    public string SchemaMigrationCheckpointsTableSql =>
+        $"{QuotedSchema}.\"schema_migration_checkpoints\"";
 
     public static string QuoteIdentifier(string identifier)
     {

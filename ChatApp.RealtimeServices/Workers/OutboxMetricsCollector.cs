@@ -29,6 +29,7 @@ public sealed class OutboxMetricsCollector : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // 启动时立即对账一次；之后仅低频校准（热路径由 publish success/fail/dead 更新）。
         using var timer = new PeriodicTimer(_collectionInterval);
         do
         {
@@ -38,6 +39,11 @@ public sealed class OutboxMetricsCollector : BackgroundService
                     .GetStatsAsync(stoppingToken)
                     .ConfigureAwait(false);
                 _metrics.UpdateOutboxStats(stats);
+                _logger.LogDebug(
+                    "Outbox 指标已对账。Pending={Pending}；Dead={Dead}；MaxAttempts={MaxAttempts}",
+                    stats.PendingCount,
+                    stats.DeadCount,
+                    stats.MaxAttemptCount);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -46,7 +52,7 @@ public sealed class OutboxMetricsCollector : BackgroundService
             catch (Exception ex)
             {
                 _metrics.RecordOutboxStatsFailure();
-                _logger.LogWarning(ex, "采集 Outbox 指标失败，将在下一周期重试。");
+                _logger.LogWarning(ex, "Outbox 指标对账失败，将在下一周期重试。");
             }
         }
         while (await timer.WaitForNextTickAsync(stoppingToken).ConfigureAwait(false));

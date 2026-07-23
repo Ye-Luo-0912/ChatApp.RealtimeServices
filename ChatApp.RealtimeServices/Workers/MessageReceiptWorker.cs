@@ -8,6 +8,8 @@ using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Health;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
+using ChatApp.Realtime.Infrastructure.Nats.Configuration;
+using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
 using ChatApp.RealtimeServices.Options;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -25,6 +27,7 @@ public sealed class MessageReceiptWorker : BackgroundService
     private readonly RealtimeMetrics _metrics;
     private readonly RealtimeOptions _options;
     private readonly RealtimeQueueOptions _queueOptions;
+    private readonly RealtimeNatsTrustSettings _trust;
     private readonly ILogger<MessageReceiptWorker> _logger;
 
     public MessageReceiptWorker(
@@ -35,6 +38,7 @@ public sealed class MessageReceiptWorker : BackgroundService
         RealtimeMetrics metrics,
         IOptions<RealtimeOptions> options,
         RealtimeQueueOptions queueOptions,
+        RealtimeNatsTrustSettings trust,
         ILogger<MessageReceiptWorker> logger)
     {
         _consumer = consumer;
@@ -43,6 +47,7 @@ public sealed class MessageReceiptWorker : BackgroundService
         _readinessState = readinessState;
         _metrics = metrics;
         _options = options.Value;
+        _trust = trust;
         _queueOptions = queueOptions;
         _logger = logger;
     }
@@ -220,6 +225,20 @@ public sealed class MessageReceiptWorker : BackgroundService
                 envelope,
                 "max_receipt_deliveries",
                 "消息回执投递次数达到毒丸阈值。",
+                ct).ConfigureAwait(false);
+            return;
+        }
+
+        var identityError = NatsGatewayIdentity.ValidateReceiptReceiver(
+            _trust.RequireGatewayIdentity,
+            envelope.TrustedUserId,
+            envelope.Command.ReceiverUserId);
+        if (identityError is not null)
+        {
+            await DeadLetterAndAckAsync(
+                envelope,
+                identityError,
+                "网关身份校验失败：payload 接收方与可信身份头不匹配或缺失。",
                 ct).ConfigureAwait(false);
             return;
         }

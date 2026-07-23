@@ -14,6 +14,7 @@ namespace ChatApp.Realtime.Infrastructure.Nats.JetStream;
 public sealed class JetStreamMessageReceiptConsumer : IMessageReceiptConsumer
 {
     private readonly RealtimeQueueOptions _options;
+    private readonly RealtimeNatsTrustSettings _trust;
     private readonly JetStreamContextManager _contextManager;
     private readonly JetStreamOptions _jetStreamOptions;
     private readonly IDeadLetterPublisher _deadLetterPublisher;
@@ -22,6 +23,7 @@ public sealed class JetStreamMessageReceiptConsumer : IMessageReceiptConsumer
 
     public JetStreamMessageReceiptConsumer(
         RealtimeQueueOptions options,
+        RealtimeNatsTrustSettings trust,
         JetStreamContextManager contextManager,
         JetStreamOptions jetStreamOptions,
         IDeadLetterPublisher deadLetterPublisher,
@@ -29,6 +31,7 @@ public sealed class JetStreamMessageReceiptConsumer : IMessageReceiptConsumer
         ILogger<JetStreamMessageReceiptConsumer> logger)
     {
         _options = options;
+        _trust = trust;
         _contextManager = contextManager;
         _jetStreamOptions = jetStreamOptions;
         _deadLetterPublisher = deadLetterPublisher;
@@ -112,6 +115,10 @@ public sealed class JetStreamMessageReceiptConsumer : IMessageReceiptConsumer
                 }
 
                 var jsMsg = msg;
+                var (trustedUserId, _) = NatsGatewayIdentity.Extract(
+                    msg.Headers,
+                    _trust.UserIdHeader,
+                    _trust.SessionIdHeader);
                 yield return new MessageReceiptEnvelope(
                     command,
                     ack: ackCt => JetStreamMetricAck.AckAsync(
@@ -120,7 +127,8 @@ public sealed class JetStreamMessageReceiptConsumer : IMessageReceiptConsumer
                         jsMsg, _metrics, observation, delay, nakCt),
                     deliveryCount: msg.Metadata?.NumDelivered,
                     rawPayload: msg.Data,
-                    parentContext: NatsTraceContext.ExtractParentContext(msg.Headers));
+                    parentContext: NatsTraceContext.ExtractParentContext(msg.Headers),
+                    trustedUserId: trustedUserId);
             }
 
             await Task.Delay(TimeSpan.FromMilliseconds(100), ct)

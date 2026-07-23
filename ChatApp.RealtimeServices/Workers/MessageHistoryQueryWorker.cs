@@ -3,6 +3,9 @@ using System.Threading.Channels;
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Health;
+using ChatApp.Realtime.Infrastructure.Nats.Configuration;
+using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
+using ChatApp.RealtimeServices.Concurrency;
 using ChatApp.RealtimeServices.Options;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -18,6 +21,8 @@ public sealed class MessageHistoryQueryWorker : BackgroundService
     private readonly RealtimeReadinessState _readinessState;
     private readonly RealtimeMetrics _metrics;
     private readonly RealtimeOptions _options;
+    private readonly RealtimeQueryConcurrencyGate _queryGate;
+    private readonly RealtimeNatsTrustSettings _trust;
     private readonly ILogger<MessageHistoryQueryWorker> _logger;
 
     public MessageHistoryQueryWorker(
@@ -26,6 +31,8 @@ public sealed class MessageHistoryQueryWorker : BackgroundService
         RealtimeReadinessState readinessState,
         RealtimeMetrics metrics,
         IOptions<RealtimeOptions> options,
+        RealtimeQueryConcurrencyGate queryGate,
+        RealtimeNatsTrustSettings trust,
         ILogger<MessageHistoryQueryWorker> logger)
     {
         _consumer = consumer;
@@ -33,15 +40,18 @@ public sealed class MessageHistoryQueryWorker : BackgroundService
         _readinessState = readinessState;
         _metrics = metrics;
         _options = options.Value;
+        _queryGate = queryGate;
+        _trust = trust;
         _logger = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation(
-            "历史消息查询工作器已启动。并发={Concurrency}；队列容量={Capacity}",
-            _options.HistoryQueryConcurrency,
-            _options.HistoryQueryQueueCapacity);
+            "历史消息查询工作器已启动。共享并发={Concurrency}；队列容量={Capacity}；工作槽={Slots}",
+            _queryGate.Permits,
+            _options.HistoryQueryQueueCapacity,
+            Math.Max(1, _options.HistoryQueryWorkerSlots));
         _readinessState.MarkStarted(WorkerName);
 
         using var heartbeatCts =
@@ -56,7 +66,7 @@ public sealed class MessageHistoryQueryWorker : BackgroundService
                 AllowSynchronousContinuations = false
             });
         var processors = Enumerable
-            .Range(0, _options.HistoryQueryConcurrency)
+            .Range(0, Math.Max(1, _options.HistoryQueryWorkerSlots))
             .Select(index => ProcessAsync(index, channel.Reader, stoppingToken))
             .ToArray();
 
@@ -152,58 +162,84 @@ public sealed class MessageHistoryQueryWorker : BackgroundService
         {
             _metrics.HistoryQueryStarted();
             using var activity = RealtimeTelemetry.StartConsumer(
-                "message_history.process",
+                "message_history_query.process",
                 envelope.ParentContext);
             var started = Stopwatch.GetTimestamp();
             var succeeded = false;
             string? outcome = "cancelled";
             try
             {
-                MessageHistoryPage page;
+                await _queryGate.WaitAsync(ct).ConfigureAwait(false);
                 try
                 {
-                    page = await _processor
-                        .ProcessAsync(envelope.Query, ct)
-                        .ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    RealtimeTelemetry.RecordException(activity, ex);
-                    _logger.LogError(
-                        ex,
-                        "历史消息查询失败。工作槽={WorkerIndex}；请求编号={RequestId}",
-                        workerIndex,
-                        envelope.Query.RequestId);
-                    page = MessageHistoryPage.Failed(
-                        envelope.Query.RequestId,
-                        "history_unavailable",
-                        _options.EnableDetailedErrors
-                            ? ex.Message
-                            : "历史消息服务暂时不可用，请稍后重试。");
-                }
+                    MessageHistoryPage page;
+                    try
+                    {
+                        var identityError = NatsGatewayIdentity.ValidateHistoryUser(
+                            _trust.RequireGatewayIdentity,
+                            envelope.TrustedUserId,
+                            envelope.Query.UserId);
+                        if (identityError is not null)
+                        {
+                            page = MessageHistoryPage.Failed(
+                                envelope.Query.RequestId,
+                                identityError,
+                                "网关身份校验失败：历史查询用户与可信身份头不匹配或缺失。");
+                        }
+                        else
+                        {
+                            page = await _processor
+                                .ProcessAsync(envelope.Query, ct)
+                                .ConfigureAwait(false);
+                        }
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        RealtimeTelemetry.RecordException(activity, ex);
+                        _logger.LogError(
+                            ex,
+                            "历史消息查询失败。工作槽={WorkerIndex}；请求编号={RequestId}",
+                            workerIndex,
+                            envelope.Query.RequestId);
+                        page = MessageHistoryPage.Failed(
+                            envelope.Query.RequestId,
+                            "history_query_unavailable",
+                            _options.EnableDetailedErrors
+                                ? ex.Message
+                                : "历史查询服务暂时不可用，请稍后重试。");
+                    }
 
-                try
-                {
-                    await envelope.ReplyAsync(page, ct).ConfigureAwait(false);
-                    succeeded = page.Succeeded;
-                    outcome = page.ErrorCode;
+                    try
+                    {
+                        await envelope.ReplyAsync(page, ct).ConfigureAwait(false);
+                        succeeded = page.Succeeded;
+                        outcome = page.ErrorCode;
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        outcome = "reply_failed";
+                        _logger.LogWarning(
+                            ex,
+                            "历史消息查询响应发送失败。请求编号={RequestId}",
+                            envelope.Query.RequestId);
+                    }
                 }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                finally
                 {
-                    throw;
+                    _queryGate.Release();
                 }
-                catch (Exception ex)
-                {
-                    outcome = "reply_failed";
-                    _logger.LogWarning(
-                        ex,
-                        "历史消息查询响应发送失败。请求编号={RequestId}",
-                        envelope.Query.RequestId);
-                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
             }
             finally
             {

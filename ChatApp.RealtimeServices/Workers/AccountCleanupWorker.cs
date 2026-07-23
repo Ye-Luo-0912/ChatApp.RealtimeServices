@@ -54,9 +54,10 @@ public sealed class AccountCleanupWorker : BackgroundService
                 _readinessState.MarkHeartbeat(WorkerName);
                 var evt = envelope.Event;
 
-                if (evt.Type == RealtimeEventType.AccountCleanupCompleted)
+                if (evt.Type is RealtimeEventType.AccountCleanupCompleted
+                    or RealtimeEventType.AttachmentBlobsPurge)
                 {
-                    // 完成事件由其它订阅方（Server Saga）处理；清理 worker 直接 ACK。
+                    // 完成 / blob GC 事件由其它订阅方（Server）处理；清理 worker 直接 ACK。
                     await envelope.AckAsync(stoppingToken).ConfigureAwait(false);
                     continue;
                 }

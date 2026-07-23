@@ -14,6 +14,7 @@ namespace ChatApp.Realtime.Infrastructure.Nats.JetStream;
 public sealed class JetStreamIncomingMessageConsumer : IIncomingMessageConsumer
 {
     private readonly RealtimeQueueOptions _options;
+    private readonly RealtimeNatsTrustSettings _trust;
     private readonly JetStreamContextManager _contextManager;
     private readonly JetStreamOptions _jetStreamOptions;
     private readonly IDeadLetterPublisher _deadLetterPublisher;
@@ -22,6 +23,7 @@ public sealed class JetStreamIncomingMessageConsumer : IIncomingMessageConsumer
 
     public JetStreamIncomingMessageConsumer(
         RealtimeQueueOptions options,
+        RealtimeNatsTrustSettings trust,
         JetStreamContextManager contextManager,
         JetStreamOptions jetStreamOptions,
         IDeadLetterPublisher deadLetterPublisher,
@@ -29,6 +31,7 @@ public sealed class JetStreamIncomingMessageConsumer : IIncomingMessageConsumer
         ILogger<JetStreamIncomingMessageConsumer> logger)
     {
         _options = options;
+        _trust = trust;
         _contextManager = contextManager;
         _jetStreamOptions = jetStreamOptions;
         _deadLetterPublisher = deadLetterPublisher;
@@ -112,6 +115,10 @@ public sealed class JetStreamIncomingMessageConsumer : IIncomingMessageConsumer
                 {
                     var jsMsg = msg;
                     var deliveryCount = jsMsg.Metadata?.NumDelivered;
+                    var (trustedUserId, trustedSessionId) = NatsGatewayIdentity.Extract(
+                        msg.Headers,
+                        _trust.UserIdHeader,
+                        _trust.SessionIdHeader);
                     yield return new IncomingMessageEnvelope(
                         command,
                         ack: ackCt => JetStreamMetricAck.AckAsync(
@@ -120,7 +127,9 @@ public sealed class JetStreamIncomingMessageConsumer : IIncomingMessageConsumer
                             jsMsg, _metrics, observation, delay, nakCt),
                         deliveryCount: deliveryCount,
                         rawPayload: msg.Data,
-                        parentContext: NatsTraceContext.ExtractParentContext(msg.Headers));
+                        parentContext: NatsTraceContext.ExtractParentContext(msg.Headers),
+                        trustedUserId: trustedUserId,
+                        trustedSessionId: trustedSessionId);
                 }
                 else
                 {

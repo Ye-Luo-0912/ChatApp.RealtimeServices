@@ -1,4 +1,5 @@
 using System.Text.Json;
+using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Stores;
@@ -6,6 +7,7 @@ using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using ChatApp.Realtime.Infrastructure.Postgres.Data.Entities;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
 using Npgsql;
 
@@ -14,13 +16,16 @@ namespace ChatApp.Realtime.Infrastructure.Postgres.Stores;
 public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
 {
     private readonly IDbContextFactory<RealtimeDbContext> _dbContextFactory;
+    private readonly RealtimeDatabaseSchema _databaseSchema;
     private readonly ILogger<EfCoreRealtimeMessageStore> _logger;
 
     public EfCoreRealtimeMessageStore(
         IDbContextFactory<RealtimeDbContext> dbContextFactory,
+        RealtimeDatabaseSchema databaseSchema,
         ILogger<EfCoreRealtimeMessageStore> logger)
     {
         _dbContextFactory = dbContextFactory;
+        _databaseSchema = databaseSchema;
         _logger = logger;
     }
 
@@ -29,28 +34,56 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
         RealtimeEvent eventToPublish,
         CancellationToken ct = default)
     {
+        var fingerprint = RealtimeMessageFingerprint.Compute(
+            message.ReceiverUserId,
+            message.Content,
+            message.AttachmentIds);
+
         await using var dbContext = await _dbContextFactory
             .CreateDbContextAsync(ct)
             .ConfigureAwait(false);
 
         await using var transaction = await dbContext.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
 
-        var existingMessageId = await dbContext.Messages
+        var existing = await dbContext.Messages
             .Where(m => m.SenderUserId == message.SenderUserId
                         && m.ClientMessageId == message.ClientMessageId)
-            .Select(m => m.MessageId)
+            .Select(m => new
+            {
+                m.MessageId,
+                m.ReceiverUserId,
+                m.Content,
+                m.ContentFingerprint
+            })
             .SingleOrDefaultAsync(ct)
             .ConfigureAwait(false);
 
-        if (existingMessageId is not null)
+        if (existing is not null)
         {
-            await EnsureOutboxAsync(dbContext, eventToPublish, existingMessageId, ct).ConfigureAwait(false);
+            // EfCore 路径不绑定附件；冲突比较时已有附件视为空集（生产路径为 Npgsql）。
+            if (!RealtimeMessageFingerprint.MatchesExisting(
+                    existing.ContentFingerprint,
+                    existing.ReceiverUserId,
+                    existing.Content,
+                    Array.Empty<string>(),
+                    fingerprint))
+            {
+                await transaction.RollbackAsync(ct).ConfigureAwait(false);
+                _logger.LogWarning(
+                    "入站消息幂等键内容冲突。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}；已有消息={MessageId}",
+                    message.ClientMessageId,
+                    message.SenderUserId,
+                    existing.MessageId);
+                return RealtimeMessagePersistResult.Conflict(existing.MessageId);
+            }
+
             await transaction.CommitAsync(ct).ConfigureAwait(false);
-            _logger.LogInformation(
+            // 消息与首条 Outbox 同 SaveChanges：重复投递不重建已 Published/Dead（或已清理）的 Outbox。
+            _logger.LogDebug(
                 "实时消息已存在，跳过重复写入。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}",
                 message.ClientMessageId,
                 message.SenderUserId);
-            return new RealtimeMessagePersistResult(false, existingMessageId);
+            return RealtimeMessagePersistResult.Duplicate(existing.MessageId);
         }
 
         dbContext.Messages.Add(new RealtimeMessageEntity
@@ -60,14 +93,43 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
             SenderUserId = message.SenderUserId,
             SenderSessionId = message.SenderSessionId,
             ReceiverUserId = message.ReceiverUserId,
+            ConversationId = message.ConversationId,
             Content = message.Content,
-            ReceivedAtMs = message.ReceivedAtMs
+            ContentFingerprint = fingerprint,
+            ReceivedAtMs = message.ReceivedAtMs,
+            ReplyToMessageId = message.ReplyToMessageId,
+            ReplyToSenderUserId = message.ReplyToSenderUserId,
+            ReplyToPreview = message.ReplyToPreview,
+            ForwardedFromMessageId = message.ForwardedFromMessageId,
+            ForwardedFromSenderUserId = message.ForwardedFromSenderUserId,
+            ForwardedFromPreview = message.ForwardedFromPreview
         });
         dbContext.Outbox.Add(CreateOutboxEntity(eventToPublish, message.MessageId));
 
         try
         {
             await dbContext.SaveChangesAsync(ct).ConfigureAwait(false);
+
+            if (message.SenderUserId != message.ReceiverUserId)
+            {
+                dbContext.Outbox.Add(CreateOutboxEntity(
+                    CreateSenderEchoEvent(
+                        CopyWithMessageId(eventToPublish, message.MessageId),
+                        message.SenderUserId)));
+            }
+
+            if (!string.IsNullOrWhiteSpace(message.ConversationId))
+            {
+                await AdvanceConversationAndEnqueueAsync(
+                        dbContext,
+                        message,
+                        eventToPublish.TraceParent,
+                        eventToPublish.TraceState,
+                        ct)
+                    .ConfigureAwait(false);
+                await dbContext.SaveChangesAsync(ct).ConfigureAwait(false);
+            }
+
             await transaction.CommitAsync(ct).ConfigureAwait(false);
         }
         catch (DbUpdateException ex)
@@ -76,29 +138,50 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
         {
             await transaction.RollbackAsync(ct).ConfigureAwait(false);
             dbContext.ChangeTracker.Clear();
-            var concurrentMessageId = await dbContext.Messages
+            var concurrent = await dbContext.Messages
                 .Where(m => m.SenderUserId == message.SenderUserId
                             && m.ClientMessageId == message.ClientMessageId)
-                .Select(m => m.MessageId)
+                .Select(m => new
+                {
+                    m.MessageId,
+                    m.ReceiverUserId,
+                    m.Content,
+                    m.ContentFingerprint
+                })
                 .SingleOrDefaultAsync(ct)
                 .ConfigureAwait(false);
-            if (concurrentMessageId is null)
+            if (concurrent is null)
                 throw;
 
-            _logger.LogInformation(
+            // EfCore 路径不绑定附件；冲突比较时已有附件视为空集（生产路径为 Npgsql）。
+            if (!RealtimeMessageFingerprint.MatchesExisting(
+                    concurrent.ContentFingerprint,
+                    concurrent.ReceiverUserId,
+                    concurrent.Content,
+                    Array.Empty<string>(),
+                    fingerprint))
+            {
+                _logger.LogWarning(
+                    "入站消息幂等键内容冲突（并发写入检测）。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}",
+                    message.ClientMessageId,
+                    message.SenderUserId);
+                return RealtimeMessagePersistResult.Conflict(concurrent.MessageId);
+            }
+
+            _logger.LogDebug(
                 "实时消息存在（并发写入检测），跳过重复。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}",
                 message.ClientMessageId,
                 message.SenderUserId);
-            return new RealtimeMessagePersistResult(false, concurrentMessageId);
+            return RealtimeMessagePersistResult.Duplicate(concurrent.MessageId);
         }
 
-        _logger.LogInformation(
+        _logger.LogDebug(
             "实时消息已写入数据库。消息编号={MessageId}；发送用户={SenderUserId}；接收用户={ReceiverUserId}",
             message.MessageId,
             message.SenderUserId,
             message.ReceiverUserId);
 
-        return new RealtimeMessagePersistResult(true, message.MessageId);
+        return RealtimeMessagePersistResult.Created(message.MessageId);
     }
 
     public async Task<MessageReceiptPersistResult> ApplyReceiptAsync(
@@ -170,17 +253,107 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
             receipt.MessageId,
             message.SenderUserId);
     }
-    private static async Task EnsureOutboxAsync(
+
+    private async Task AdvanceConversationAndEnqueueAsync(
         RealtimeDbContext dbContext,
-        RealtimeEvent evt,
-        string messageId,
+        RealtimeMessageRecord message,
+        string? traceParent,
+        string? traceState,
         CancellationToken ct)
     {
-        if (await dbContext.Outbox.AnyAsync(item => item.EventId == evt.EventId, ct).ConfigureAwait(false))
-            return;
+        var connection = (NpgsqlConnection)dbContext.Database.GetDbConnection();
+        var dbTransaction = dbContext.Database.CurrentTransaction
+            ?? throw new InvalidOperationException("会话投影写入必须在事务内执行。");
+        var transaction = (NpgsqlTransaction)dbTransaction.GetDbTransaction();
 
-        dbContext.Outbox.Add(CreateOutboxEntity(evt, messageId));
-        await dbContext.SaveChangesAsync(ct).ConfigureAwait(false);
+        var conversationId = message.ConversationId!;
+        var preview = ConversationId.CreatePreview(message.Content);
+        var (advanced, unread) = await ConversationWriteCommands.TryAdvanceAndIncrementUnreadAsync(
+                connection,
+                transaction,
+                _databaseSchema,
+                conversationId,
+                message.SenderUserId,
+                message.ReceiverUserId,
+                message.MessageId,
+                preview,
+                message.ReceivedAtMs,
+                ct)
+            .ConfigureAwait(false);
+
+        if (advanced)
+        {
+            dbContext.Outbox.Add(CreateOutboxEntity(
+                ConversationWriteCommands.CreateConversationChangedEvent(
+                    conversationId,
+                    message.SenderUserId,
+                    message.ReceiverUserId,
+                    message.MessageId,
+                    preview,
+                    message.ReceivedAtMs,
+                    message.SenderUserId,
+                    traceParent,
+                    traceState)));
+            dbContext.Outbox.Add(CreateOutboxEntity(
+                ConversationWriteCommands.CreateConversationChangedEvent(
+                    conversationId,
+                    message.ReceiverUserId,
+                    message.SenderUserId,
+                    message.MessageId,
+                    preview,
+                    message.ReceivedAtMs,
+                    message.SenderUserId,
+                    traceParent,
+                    traceState)));
+        }
+
+        if (unread is int unreadCount)
+        {
+            dbContext.Outbox.Add(CreateOutboxEntity(
+                ConversationWriteCommands.CreateUnreadCountChangedEvent(
+                    conversationId,
+                    message.ReceiverUserId,
+                    unreadCount,
+                    lastReadMessageId: null,
+                    lastReadAtMs: null,
+                    causeMessageId: message.MessageId,
+                    message.ReceivedAtMs,
+                    traceParent,
+                    traceState)));
+        }
+    }
+
+    private static RealtimeEvent CopyWithMessageId(RealtimeEvent evt, string messageId) =>
+        new()
+        {
+            EventId = evt.EventId,
+            Type = evt.Type,
+            TargetUserId = evt.TargetUserId,
+            ActorUserId = evt.ActorUserId,
+            MessageId = messageId,
+            SessionId = evt.SessionId,
+            PayloadJson = evt.PayloadJson,
+            OccurredAtMs = evt.OccurredAtMs,
+            TraceParent = evt.TraceParent,
+            TraceState = evt.TraceState
+        };
+
+    private static RealtimeEvent CreateSenderEchoEvent(RealtimeEvent receiverEvent, long senderUserId)
+    {
+        var messageId = receiverEvent.MessageId ?? string.Empty;
+        return new RealtimeEvent
+        {
+            EventId = RealtimeEventContracts.CreateSenderEchoEventId(messageId, senderUserId),
+            Type = RealtimeEventType.MessageReceived,
+            TargetUserId = senderUserId,
+            ActorUserId = receiverEvent.ActorUserId,
+            MessageId = receiverEvent.MessageId,
+            SessionId = receiverEvent.SessionId,
+            PayloadJson = receiverEvent.PayloadJson,
+            OccurredAtMs = receiverEvent.OccurredAtMs,
+            TraceParent = receiverEvent.TraceParent,
+            TraceState = receiverEvent.TraceState
+        };
     }
 
     private static RealtimeOutboxEntity CreateReceiptOutboxEntity(
@@ -231,8 +404,20 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
                 evt,
                 RealtimeJsonSerializerContext.Default.RealtimeEvent),
             TargetUserId = evt.TargetUserId,
-            EventType = (short)evt.Type
+            EventType = (short)evt.Type,
+            Status = (short)RealtimeOutboxStatus.Pending
         };
+
+    public Task<MessageRecallPersistResult> ApplyRecallAsync(
+        string messageId,
+        long senderUserId,
+        string senderSessionId,
+        long recalledAtMs,
+        long maxAgeMs,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "EfCoreRealtimeMessageStore 不支持撤回；请使用 NpgsqlRealtimeMessageStore。");
+
     public async Task<long> DeleteByUserAsync(
         long userId,
         int batchSize = 1000,
@@ -260,10 +445,13 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
             total += batch.Count;
         }
 
-        // Outbox：按 typed target_user_id 精确清理（含已发布与未发布），保留 AccountCleanupCompleted。
-        var keepType = (short)RealtimeEventType.AccountCleanupCompleted;
+        var keepTypes = new HashSet<short>
+        {
+            (short)RealtimeEventType.AccountCleanupCompleted,
+            (short)RealtimeEventType.AttachmentBlobsPurge
+        };
         var outboxDeleted = await dbContext.Outbox
-            .Where(o => o.TargetUserId == userId && o.EventType != keepType)
+            .Where(o => o.TargetUserId == userId && !keepTypes.Contains(o.EventType))
             .ExecuteDeleteAsync(ct)
             .ConfigureAwait(false);
 

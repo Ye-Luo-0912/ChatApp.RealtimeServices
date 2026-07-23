@@ -4,7 +4,7 @@ using Npgsql;
 namespace ChatApp.Realtime.Infrastructure.Postgres.Migrations;
 
 /// <summary>
-/// 基线表结构（messages / outbox）。对已由历史 ad-hoc DDL 创建的库使用 IF NOT EXISTS，可安全重入。
+/// 基线表结构（messages / outbox）。对已由历史 ad-hoc DDL 创建的库使用 IF NOT EXISTS，可安全重入�?
 /// </summary>
 public sealed class Migration001_BaselineSchema : IRealtimeSchemaMigration
 {
@@ -13,7 +13,7 @@ public sealed class Migration001_BaselineSchema : IRealtimeSchemaMigration
 
     public async Task ApplyAsync(
         NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
+        NpgsqlTransaction? transaction,
         RealtimeDatabaseSchema schema,
         CancellationToken cancellationToken)
     {

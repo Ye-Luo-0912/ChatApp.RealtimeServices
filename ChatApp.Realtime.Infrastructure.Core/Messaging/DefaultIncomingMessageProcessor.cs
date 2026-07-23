@@ -1,6 +1,5 @@
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
+using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
@@ -41,6 +40,10 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             return validationError;
         }
 
+        var conversationId = ConversationId.CreateDirect(
+            command.SenderUserId,
+            command.ReceiverUserId);
+
         var record = new RealtimeMessageRecord
         {
             MessageId = command.CommandId,
@@ -48,13 +51,23 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             SenderUserId = command.SenderUserId,
             SenderSessionId = command.SenderSessionId,
             ReceiverUserId = command.ReceiverUserId,
+            ConversationId = conversationId,
             Content = command.Content,
+            AttachmentIds = command.AttachmentIds,
+            ReplyToMessageId = command.ReplyToMessageId,
+            ReplyToSenderUserId = command.ReplyToSenderUserId,
+            ReplyToPreview = command.ReplyToPreview,
+            ForwardedFromMessageId = command.ForwardedFromMessageId,
+            ForwardedFromSenderUserId = command.ForwardedFromSenderUserId,
+            ForwardedFromPreview = command.ForwardedFromPreview,
             ReceivedAtMs = command.ReceivedAtMs
         };
 
         var evt = new RealtimeEvent
         {
-            EventId = CreateEventId(command),
+            EventId = RealtimeEventContracts.CreateMessageReceivedEventId(
+                command.SenderUserId,
+                command.ClientMessageId),
             Type = RealtimeEventType.MessageReceived,
             TargetUserId = command.ReceiverUserId,
             ActorUserId = command.SenderUserId,
@@ -68,8 +81,15 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                     SenderUserId = command.SenderUserId,
                     SenderSessionId = command.SenderSessionId,
                     ReceiverUserId = command.ReceiverUserId,
+                    ConversationId = conversationId,
                     Content = command.Content,
-                    ReceivedAtMs = command.ReceivedAtMs
+                    ReceivedAtMs = command.ReceivedAtMs,
+                    ReplyToMessageId = command.ReplyToMessageId,
+                    ReplyToSenderUserId = command.ReplyToSenderUserId,
+                    ReplyToPreview = command.ReplyToPreview,
+                    ForwardedFromMessageId = command.ForwardedFromMessageId,
+                    ForwardedFromSenderUserId = command.ForwardedFromSenderUserId,
+                    ForwardedFromPreview = command.ForwardedFromPreview
                 },
                 RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload),
             OccurredAtMs = command.ReceivedAtMs,
@@ -78,11 +98,40 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
         };
 
         var persisted = await _messageStore.SaveAsync(record, evt, ct).ConfigureAwait(false);
+        if (persisted.IsConflict)
+        {
+            _metrics.RecordIdempotencyConflict();
+            _metrics.RecordProcessingFailure("idempotency_conflict");
+            _logger.LogWarning(
+                "入站消息幂等键内容冲突。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}；已有消息={MessageId}",
+                record.ClientMessageId,
+                record.SenderUserId,
+                persisted.MessageId);
+            return MessageProcessResult.Failed(
+                "idempotency_conflict",
+                "相同客户端消息编号已存在但内容不一致。",
+                MessageFailureKind.Permanent);
+        }
+
+        if (persisted.IsAttachmentBindFailed)
+        {
+            _metrics.RecordProcessingFailure("attachment_bind_failed");
+            _logger.LogWarning(
+                "入站消息附件绑定失败。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}；消息={MessageId}",
+                record.ClientMessageId,
+                record.SenderUserId,
+                persisted.MessageId);
+            return MessageProcessResult.Failed(
+                "attachment_bind_failed",
+                "附件不存在、未确认或不属于发送方，消息未写入。",
+                MessageFailureKind.Permanent);
+        }
+
         _outboxSignal.Notify();
 
         if (!persisted.IsNew)
         {
-            _logger.LogInformation(
+            _logger.LogDebug(
                 "重复入站消息已完成幂等处理。消息编号={MessageId}；发送用户={SenderUserId}；接收用户={ReceiverUserId}",
                 persisted.MessageId,
                 record.SenderUserId,
@@ -94,7 +143,7 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
 
         _metrics.RecordPersisted();
 
-        _logger.LogInformation(
+        _logger.LogDebug(
             "入站消息已处理。消息编号={MessageId}；发送用户={SenderUserId}；接收用户={ReceiverUserId}",
             record.MessageId,
             record.SenderUserId,
@@ -111,19 +160,84 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             return MessageProcessResult.Failed("invalid_client_message_id", "客户端消息编号不能为空且长度不能超过 128。");
         if (command.SenderUserId <= 0 || command.ReceiverUserId <= 0)
             return MessageProcessResult.Failed("invalid_user_id", "发送方和接收方用户编号必须大于 0。");
+        if (command.SenderUserId == command.ReceiverUserId)
+            return MessageProcessResult.Failed("invalid_self_chat", "单聊发送方与接收方不能为同一用户。");
         if (string.IsNullOrWhiteSpace(command.SenderSessionId) || command.SenderSessionId.Length > 128)
             return MessageProcessResult.Failed("invalid_session_id", "发送会话编号不能为空且长度不能超过 128。");
-        if (string.IsNullOrWhiteSpace(command.Content))
+        if (string.IsNullOrWhiteSpace(command.Content)
+            && command.AttachmentIds is not { Count: > 0 })
             return MessageProcessResult.Failed("empty_content", "入站消息内容不能为空。");
         if (command.Content.Length > 65_536)
             return MessageProcessResult.Failed("content_too_large", "入站消息内容不能超过 65536 个字符。");
+        if (command.AttachmentIds is { Count: > 0 })
+        {
+            if (command.AttachmentIds.Count > 32)
+                return MessageProcessResult.Failed(
+                    "too_many_attachments",
+                    "单条消息附件数不能超过 32。");
+            foreach (var id in command.AttachmentIds)
+            {
+                if (string.IsNullOrWhiteSpace(id) || id.Length > 64)
+                    return MessageProcessResult.Failed(
+                        "invalid_attachment_id",
+                        "附件编号不能为空且长度不能超过 64。");
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(command.ReplyToMessageId))
+        {
+            if (command.ReplyToMessageId.Length > 64)
+                return MessageProcessResult.Failed(
+                    "invalid_reply_to_message_id",
+                    "回复目标消息编号长度不能超过 64。");
+            if (command.ReplyToSenderUserId is null or <= 0)
+                return MessageProcessResult.Failed(
+                    "invalid_reply_to_sender",
+                    "回复目标发送方用户编号必须大于 0。");
+            if (command.ReplyToPreview is { Length: > 256 })
+                return MessageProcessResult.Failed(
+                    "invalid_reply_to_preview",
+                    "回复预览长度不能超过 256。");
+        }
+        else if (command.ReplyToSenderUserId is not null
+                 || !string.IsNullOrWhiteSpace(command.ReplyToPreview))
+        {
+            return MessageProcessResult.Failed(
+                "invalid_reply_to",
+                "缺少回复目标消息编号时不能携带回复元数据。");
+        }
+
+        if (!string.IsNullOrWhiteSpace(command.ForwardedFromMessageId)
+            && !string.IsNullOrWhiteSpace(command.ReplyToMessageId))
+        {
+            return MessageProcessResult.Failed(
+                "invalid_reply_and_forward",
+                "同一条消息不能同时回复与转发。");
+        }
+
+        if (!string.IsNullOrWhiteSpace(command.ForwardedFromMessageId))
+        {
+            if (command.ForwardedFromMessageId.Length > 64)
+                return MessageProcessResult.Failed(
+                    "invalid_forwarded_from_message_id",
+                    "转发原消息编号长度不能超过 64。");
+            if (command.ForwardedFromSenderUserId is null or <= 0)
+                return MessageProcessResult.Failed(
+                    "invalid_forwarded_from_sender",
+                    "转发原发送方用户编号必须大于 0。");
+            if (command.ForwardedFromPreview is { Length: > 256 })
+                return MessageProcessResult.Failed(
+                    "invalid_forwarded_from_preview",
+                    "转发预览长度不能超过 256。");
+        }
+        else if (command.ForwardedFromSenderUserId is not null
+                 || !string.IsNullOrWhiteSpace(command.ForwardedFromPreview))
+        {
+            return MessageProcessResult.Failed(
+                "invalid_forwarded_from",
+                "缺少转发原消息编号时不能携带转发元数据。");
+        }
 
         return null;
-    }
-
-    private static string CreateEventId(IncomingMessageCommand command)
-    {
-        var input = Encoding.UTF8.GetBytes($"{command.SenderUserId}:{command.ClientMessageId}");
-        return Convert.ToHexStringLower(SHA256.HashData(input));
     }
 }

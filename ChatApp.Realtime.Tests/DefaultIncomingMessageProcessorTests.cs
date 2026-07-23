@@ -39,6 +39,8 @@ public sealed class DefaultIncomingMessageProcessorTests
         Assert.NotNull(payload);
         Assert.Equal(command.Content, payload.Content);
         Assert.Equal(command.ClientMessageId, payload.ClientMessageId);
+        Assert.Equal("dm:1001:1002", payload.ConversationId);
+        Assert.Equal("dm:1001:1002", store.Message!.ConversationId);
     }
 
     [Fact]
@@ -125,6 +127,47 @@ public sealed class DefaultIncomingMessageProcessorTests
         Assert.Null(store.Message);
     }
 
+    [Fact]
+    public async Task ProcessAsync_RejectsIdempotencyContentConflict()
+    {
+        var store = new CapturingStore(conflict: true);
+        var signal = new RecordingRealtimeOutboxSignal();
+        using var metrics = new RealtimeMetrics();
+        var processor = new DefaultIncomingMessageProcessor(
+            store,
+            signal,
+            metrics,
+            NullLogger<DefaultIncomingMessageProcessor>.Instance);
+
+        var result = await processor.ProcessAsync(ValidCommand());
+
+        Assert.False(result.Succeeded);
+        Assert.Equal("idempotency_conflict", result.ErrorCode);
+        Assert.Equal(MessageFailureKind.Permanent, result.FailureKind);
+        Assert.Equal(0, signal.Notifications);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_RejectsSelfChat()
+    {
+        var store = new CapturingStore();
+        var signal = new RecordingRealtimeOutboxSignal();
+        using var metrics = new RealtimeMetrics();
+        var processor = new DefaultIncomingMessageProcessor(
+            store,
+            signal,
+            metrics,
+            NullLogger<DefaultIncomingMessageProcessor>.Instance);
+        var command = ValidCommand() with { ReceiverUserId = 1001 };
+
+        var result = await processor.ProcessAsync(command);
+
+        Assert.False(result.Succeeded);
+        Assert.Equal("invalid_self_chat", result.ErrorCode);
+        Assert.Equal(0, signal.Notifications);
+        Assert.Null(store.Message);
+    }
+
     private static IncomingMessageCommand ValidCommand() => new()
     {
         CommandId = "command-1",
@@ -136,7 +179,7 @@ public sealed class DefaultIncomingMessageProcessorTests
         ReceivedAtMs = 1_700_000_000_000
     };
 
-    private sealed class CapturingStore(bool isNew = true) : IRealtimeMessageStore
+    private sealed class CapturingStore(bool isNew = true, bool conflict = false) : IRealtimeMessageStore
     {
         public RealtimeMessageRecord? Message { get; private set; }
         public RealtimeEvent? Event { get; private set; }
@@ -148,7 +191,12 @@ public sealed class DefaultIncomingMessageProcessorTests
         {
             Message = message;
             Event = eventToPublish;
-            return Task.FromResult(new RealtimeMessagePersistResult(isNew, message.MessageId));
+            if (conflict)
+                return Task.FromResult(RealtimeMessagePersistResult.Conflict(message.MessageId));
+            return Task.FromResult(
+                isNew
+                    ? RealtimeMessagePersistResult.Created(message.MessageId)
+                    : RealtimeMessagePersistResult.Duplicate(message.MessageId));
         }
         public Task<MessageReceiptPersistResult> ApplyReceiptAsync(
             MessageReceiptRecord receipt,

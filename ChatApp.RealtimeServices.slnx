@@ -7,4 +7,5 @@
   <Project Path="ChatApp.Realtime.Infrastructure.Redis/ChatApp.Realtime.Infrastructure.Redis.csproj" />
   <Project Path="ChatApp.Realtime.Integration/ChatApp.Realtime.Integration.csproj" />
   <Project Path="ChatApp.Realtime.Tests/ChatApp.Realtime.Tests.csproj" />
+  <Project Path="ChatApp.Realtime.IntegrationTests/ChatApp.Realtime.IntegrationTests.csproj" />
 </Solution>

@@ -1,6 +1,8 @@
+using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
+using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Infrastructure.Nats.Configuration;
@@ -29,6 +31,16 @@ public static class RealtimeNatsRegistration
         services.AddSingleton<NatsConnectionClient>();
         services.RemoveAll<IMessageHistoryQueryConsumer>();
         services.AddSingleton<IMessageHistoryQueryConsumer, NatsMessageHistoryQueryConsumer>();
+        services.RemoveAll<IConversationListQueryConsumer>();
+        services.AddSingleton<IConversationListQueryConsumer, NatsConversationListQueryConsumer>();
+        services.RemoveAll<IConversationMarkReadConsumer>();
+        services.AddSingleton<IConversationMarkReadConsumer, NatsConversationMarkReadConsumer>();
+        services.RemoveAll<IConversationSetPrefsConsumer>();
+        services.AddSingleton<IConversationSetPrefsConsumer, NatsConversationSetPrefsConsumer>();
+        services.RemoveAll<IMessageRecallConsumer>();
+        services.AddSingleton<IMessageRecallConsumer, NatsMessageRecallConsumer>();
+        services.RemoveAll<ISyncBootstrapQueryConsumer>();
+        services.AddSingleton<ISyncBootstrapQueryConsumer, NatsSyncBootstrapQueryConsumer>();
 
         if (IsJetStream(queueOptions))
         {

@@ -1,6 +1,8 @@
+using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
+using ChatApp.Realtime.Abstractions.Sync;
 
 namespace ChatApp.Realtime.Integration;
 
@@ -10,6 +12,21 @@ public interface IRealtimeMessageBus
     Task PublishMessageReceiptAsync(MessageReceiptCommand command, CancellationToken ct = default);
     Task<MessageHistoryPage> QueryMessageHistoryAsync(
         MessageHistoryQuery query,
+        CancellationToken ct = default);
+    Task<ConversationListPage> QueryConversationListAsync(
+        ConversationListQuery query,
+        CancellationToken ct = default);
+    Task<ConversationMarkReadResult> MarkConversationReadAsync(
+        ConversationMarkReadCommand command,
+        CancellationToken ct = default);
+    Task<ConversationSetPrefsResult> SetConversationPrefsAsync(
+        ConversationSetPrefsCommand command,
+        CancellationToken ct = default);
+    Task<MessageRecallResult> RecallMessageAsync(
+        MessageRecallCommand command,
+        CancellationToken ct = default);
+    Task<SyncBootstrapPage> QuerySyncBootstrapAsync(
+        SyncBootstrapQuery query,
         CancellationToken ct = default);
 
     /// <summary>按消息 Id 查询；UserId 须为参与方（发送或接收）。</summary>

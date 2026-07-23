@@ -8,6 +8,10 @@ public sealed class IncomingMessageEnvelope
     public required IncomingMessageCommand Command { get; init; }
     public ulong? DeliveryCount { get; init; }
     public ActivityContext ParentContext { get; init; }
+    /// <summary>网关身份头中的用户编号（可信）；未注入时为 null。</summary>
+    public long? TrustedUserId { get; init; }
+    /// <summary>网关身份头中的会话编号（可信）；未注入时为 null。</summary>
+    public string? TrustedSessionId { get; init; }
 
     private readonly Func<CancellationToken, ValueTask>? _ack;
     private readonly Func<TimeSpan?, CancellationToken, ValueTask>? _nak;
@@ -25,7 +29,9 @@ public sealed class IncomingMessageEnvelope
         Func<TimeSpan?, CancellationToken, ValueTask> nak,
         ulong? deliveryCount = null,
         string? rawPayload = null,
-        ActivityContext parentContext = default)
+        ActivityContext parentContext = default,
+        long? trustedUserId = null,
+        string? trustedSessionId = null)
     {
         Command = command;
         _ack = ack;
@@ -33,6 +39,8 @@ public sealed class IncomingMessageEnvelope
         DeliveryCount = deliveryCount;
         RawPayload = rawPayload;
         ParentContext = parentContext;
+        TrustedUserId = trustedUserId;
+        TrustedSessionId = trustedSessionId;
     }
 
     public ValueTask AckAsync(CancellationToken ct = default)

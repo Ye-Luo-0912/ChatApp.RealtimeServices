@@ -1,0 +1,37 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="NATS.Client.JetStream" Version="2.8.0" />
+    <PackageReference Include="Testcontainers.Nats" Version="4.7.0" />
+    <PackageReference Include="Testcontainers.PostgreSql" Version="4.7.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ChatApp.RealtimeServices\ChatApp.RealtimeServices.csproj" />
+    <ProjectReference Include="..\ChatApp.Realtime.Integration\ChatApp.Realtime.Integration.csproj" />
+    <ProjectReference Include="..\ChatApp.Realtime.Abstractions\ChatApp.Realtime.Abstractions.csproj" />
+  </ItemGroup>
+
+</Project>

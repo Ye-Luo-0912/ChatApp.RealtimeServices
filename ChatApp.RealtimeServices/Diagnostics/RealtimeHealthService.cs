@@ -46,7 +46,9 @@ public sealed class RealtimeHealthService
             ? "not_configured"
             : await CheckAsync(token => redis.PingAsync(token), ct).ConfigureAwait(false);
 
-        var dependenciesHealthy = dependencies.Values.All(status => status == "healthy");
+        // not_configured：可选依赖（如 Development 下未配 Garnet）不阻断就绪。
+        var dependenciesHealthy = dependencies.Values.All(static status =>
+            status is "healthy" or "not_configured");
         return new RealtimeHealthSnapshot(
             workers.IsReady && dependenciesHealthy,
             workers,

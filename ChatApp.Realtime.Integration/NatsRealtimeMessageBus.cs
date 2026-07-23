@@ -3,10 +3,12 @@ using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
+using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.Serialization;
 using Microsoft.Extensions.Logging;
@@ -77,7 +79,9 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
                 _options.IncomingMessagesSubject,
                 RealtimeWireSerializer.Serialize(command),
                 CreateMessageId(command.SenderUserId, command.ClientMessageId),
-                RealtimeIntegrationTelemetry.CreatePropagationHeaders(),
+                RealtimeIntegrationTelemetry.CreateIdentityHeaders(
+                    command.SenderUserId,
+                    command.SenderSessionId),
                 ct).ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -105,7 +109,9 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
                 _options.MessageReceiptsSubject,
                 RealtimeWireSerializer.Serialize(command),
                 CreateMessageId(command.ReceiverUserId, command.CommandId),
-                RealtimeIntegrationTelemetry.CreatePropagationHeaders(),
+                RealtimeIntegrationTelemetry.CreateIdentityHeaders(
+                    command.ReceiverUserId,
+                    command.ReceiverSessionId),
                 ct).ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -131,7 +137,7 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
             var response = await _client.Value.RequestAsync<string, string>(
                     _options.MessageHistoryQueriesSubject,
                     RealtimeWireSerializer.Serialize(query),
-                    headers: RealtimeIntegrationTelemetry.CreatePropagationHeaders(),
+                    headers: RealtimeIntegrationTelemetry.CreateIdentityHeaders(query.UserId),
                     cancellationToken: timeout.Token)
                 .ConfigureAwait(false);
             response.EnsureSuccess();
@@ -141,6 +147,178 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
 
             return RealtimeWireSerializer.DeserializeMessageHistoryPage(response.Data)
                    ?? throw new JsonException("历史消息查询响应无法反序列化。");
+        }
+        catch (Exception ex)
+        {
+            RealtimeIntegrationTelemetry.RecordException(activity, ex);
+            throw;
+        }
+    }
+
+    public async Task<ConversationListPage> QueryConversationListAsync(
+        ConversationListQuery query,
+        CancellationToken ct = default)
+    {
+        using var activity = RealtimeIntegrationTelemetry.StartClient(
+            "conversation_list.request",
+            _options.ConversationListQueriesSubject);
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromMilliseconds(
+                _options.HistoryRequestTimeoutMs));
+
+            var response = await _client.Value.RequestAsync<string, string>(
+                    _options.ConversationListQueriesSubject,
+                    RealtimeWireSerializer.Serialize(query),
+                    headers: RealtimeIntegrationTelemetry.CreateIdentityHeaders(query.UserId),
+                    cancellationToken: timeout.Token)
+                .ConfigureAwait(false);
+            response.EnsureSuccess();
+
+            if (string.IsNullOrWhiteSpace(response.Data))
+                throw new JsonException("会话列表查询返回了空响应。");
+
+            return RealtimeWireSerializer.DeserializeConversationListPage(response.Data)
+                   ?? throw new JsonException("会话列表查询响应无法反序列化。");
+        }
+        catch (Exception ex)
+        {
+            RealtimeIntegrationTelemetry.RecordException(activity, ex);
+            throw;
+        }
+    }
+
+    public async Task<ConversationMarkReadResult> MarkConversationReadAsync(
+        ConversationMarkReadCommand command,
+        CancellationToken ct = default)
+    {
+        using var activity = RealtimeIntegrationTelemetry.StartClient(
+            "conversation_mark_read.request",
+            _options.ConversationMarkReadsSubject);
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromMilliseconds(
+                _options.HistoryRequestTimeoutMs));
+
+            var response = await _client.Value.RequestAsync<string, string>(
+                    _options.ConversationMarkReadsSubject,
+                    RealtimeWireSerializer.Serialize(command),
+                    headers: RealtimeIntegrationTelemetry.CreateIdentityHeaders(command.UserId),
+                    cancellationToken: timeout.Token)
+                .ConfigureAwait(false);
+            response.EnsureSuccess();
+
+            if (string.IsNullOrWhiteSpace(response.Data))
+                throw new JsonException("会话已读标记返回了空响应。");
+
+            return RealtimeWireSerializer.DeserializeConversationMarkReadResult(response.Data)
+                   ?? throw new JsonException("会话已读标记响应无法反序列化。");
+        }
+        catch (Exception ex)
+        {
+            RealtimeIntegrationTelemetry.RecordException(activity, ex);
+            throw;
+        }
+    }
+
+    public async Task<ConversationSetPrefsResult> SetConversationPrefsAsync(
+        ConversationSetPrefsCommand command,
+        CancellationToken ct = default)
+    {
+        using var activity = RealtimeIntegrationTelemetry.StartClient(
+            "conversation_set_prefs.request",
+            _options.ConversationSetPrefsSubject);
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromMilliseconds(
+                _options.HistoryRequestTimeoutMs));
+
+            var response = await _client.Value.RequestAsync<string, string>(
+                    _options.ConversationSetPrefsSubject,
+                    RealtimeWireSerializer.Serialize(command),
+                    headers: RealtimeIntegrationTelemetry.CreateIdentityHeaders(command.UserId),
+                    cancellationToken: timeout.Token)
+                .ConfigureAwait(false);
+            response.EnsureSuccess();
+
+            if (string.IsNullOrWhiteSpace(response.Data))
+                throw new JsonException("会话偏好设置返回了空响应。");
+
+            return RealtimeWireSerializer.DeserializeConversationSetPrefsResult(response.Data)
+                   ?? throw new JsonException("会话偏好设置响应无法反序列化。");
+        }
+        catch (Exception ex)
+        {
+            RealtimeIntegrationTelemetry.RecordException(activity, ex);
+            throw;
+        }
+    }
+
+    public async Task<MessageRecallResult> RecallMessageAsync(
+        MessageRecallCommand command,
+        CancellationToken ct = default)
+    {
+        using var activity = RealtimeIntegrationTelemetry.StartClient(
+            "message_recall.request",
+            _options.MessageRecallsSubject);
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromMilliseconds(
+                _options.HistoryRequestTimeoutMs));
+
+            var response = await _client.Value.RequestAsync<string, string>(
+                    _options.MessageRecallsSubject,
+                    RealtimeWireSerializer.Serialize(command),
+                    headers: RealtimeIntegrationTelemetry.CreateIdentityHeaders(
+                        command.SenderUserId,
+                        command.SenderSessionId),
+                    cancellationToken: timeout.Token)
+                .ConfigureAwait(false);
+            response.EnsureSuccess();
+
+            if (string.IsNullOrWhiteSpace(response.Data))
+                throw new JsonException("消息撤回返回了空响应。");
+
+            return RealtimeWireSerializer.DeserializeMessageRecallResult(response.Data)
+                   ?? throw new JsonException("消息撤回响应无法反序列化。");
+        }
+        catch (Exception ex)
+        {
+            RealtimeIntegrationTelemetry.RecordException(activity, ex);
+            throw;
+        }
+    }
+
+    public async Task<SyncBootstrapPage> QuerySyncBootstrapAsync(
+        SyncBootstrapQuery query,
+        CancellationToken ct = default)
+    {
+        using var activity = RealtimeIntegrationTelemetry.StartClient(
+            "sync_bootstrap.request",
+            _options.SyncBootstrapQueriesSubject);
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromMilliseconds(
+                _options.HistoryRequestTimeoutMs));
+
+            var response = await _client.Value.RequestAsync<string, string>(
+                    _options.SyncBootstrapQueriesSubject,
+                    RealtimeWireSerializer.Serialize(query),
+                    headers: RealtimeIntegrationTelemetry.CreateIdentityHeaders(query.UserId),
+                    cancellationToken: timeout.Token)
+                .ConfigureAwait(false);
+            response.EnsureSuccess();
+
+            if (string.IsNullOrWhiteSpace(response.Data))
+                throw new JsonException("同步引导查询返回了空响应。");
+
+            return RealtimeWireSerializer.DeserializeSyncBootstrapPage(response.Data)
+                   ?? throw new JsonException("同步引导查询响应无法反序列化。");
         }
         catch (Exception ex)
         {
@@ -172,7 +350,9 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
 
     public async Task PublishEventAsync(RealtimeEvent evt, CancellationToken ct = default)
     {
-        var subject = evt.Type is RealtimeEventType.UserAccountDeleted or RealtimeEventType.AccountCleanupCompleted
+        var subject = evt.Type is RealtimeEventType.UserAccountDeleted
+            or RealtimeEventType.AccountCleanupCompleted
+            or RealtimeEventType.AttachmentBlobsPurge
             ? _options.AccountCleanupSubject
             : _options.RealtimeEventsSubject;
         using var activity = RealtimeIntegrationTelemetry.StartProducer(
@@ -413,13 +593,19 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
 
     private NatsConnection CreateClient()
     {
-        _logger.LogInformation("创建实时集成 NATS 客户端。Client={Client}; Url={Url}", _options.ClientName, _options.Url);
+        var requestTimeout = TimeSpan.FromMilliseconds(
+            Math.Max(_options.HistoryRequestTimeoutMs, 1_000));
+        _logger.LogInformation(
+            "创建实时集成 NATS 客户端。Client={Client}; Url={Url}",
+            _options.ClientName,
+            NatsEndpointRedactor.ForLog(_options.Url));
         var connection = new NatsConnection(new NatsOpts
         {
             Url = _options.Url,
             Name = $"{_options.ClientName}-{_options.InstanceId}",
+            AuthOpts = CreateAuthOpts(_options.Auth),
             ConnectTimeout = TimeSpan.FromSeconds(5),
-            RequestTimeout = TimeSpan.FromSeconds(5),
+            RequestTimeout = requestTimeout,
             CommandTimeout = TimeSpan.FromSeconds(5),
             PingInterval = TimeSpan.FromSeconds(20),
             MaxPingOut = 2,
@@ -431,6 +617,41 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
         });
         Subscribe(connection);
         return connection;
+    }
+
+    private static NatsAuthOpts CreateAuthOpts(RealtimeIntegrationAuthOptions? auth)
+    {
+        if (auth is null)
+            return NatsAuthOpts.Default;
+
+        if (!string.IsNullOrWhiteSpace(auth.CredsFile))
+            return new NatsAuthOpts { CredsFile = auth.CredsFile };
+
+        if (!string.IsNullOrWhiteSpace(auth.NKeyFile))
+            return new NatsAuthOpts { NKeyFile = auth.NKeyFile };
+
+        if (!string.IsNullOrWhiteSpace(auth.Seed) || !string.IsNullOrWhiteSpace(auth.NKey))
+        {
+            return new NatsAuthOpts
+            {
+                Seed = auth.Seed,
+                NKey = auth.NKey
+            };
+        }
+
+        if (!string.IsNullOrWhiteSpace(auth.Token))
+            return new NatsAuthOpts { Token = auth.Token };
+
+        if (!string.IsNullOrWhiteSpace(auth.Username))
+        {
+            return new NatsAuthOpts
+            {
+                Username = auth.Username,
+                Password = auth.Password
+            };
+        }
+
+        return NatsAuthOpts.Default;
     }
 
     private void Subscribe(INatsConnection connection)

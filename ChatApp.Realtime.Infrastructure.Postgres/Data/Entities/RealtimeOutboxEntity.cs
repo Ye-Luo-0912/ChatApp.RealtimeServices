@@ -6,6 +6,7 @@ public sealed class RealtimeOutboxEntity
     public required string PayloadJson { get; init; }
     public required long TargetUserId { get; init; }
     public required short EventType { get; init; }
+    public short Status { get; set; }
     public long CreatedAtMs { get; init; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
     public long NextAttemptAtMs { get; set; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
     public long? PublishedAtMs { get; set; }

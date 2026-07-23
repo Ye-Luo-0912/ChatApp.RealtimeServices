@@ -3,6 +3,7 @@ using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
+using ChatApp.Realtime.Infrastructure.Nats.Configuration;
 using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
 using Microsoft.Extensions.Logging;
 
@@ -11,15 +12,18 @@ namespace ChatApp.Realtime.Infrastructure.Nats.Queueing;
 public sealed class NatsMessageHistoryQueryConsumer : IMessageHistoryQueryConsumer
 {
     private readonly RealtimeQueueOptions _options;
+    private readonly RealtimeNatsTrustSettings _trust;
     private readonly NatsConnectionClient _connectionClient;
     private readonly ILogger<NatsMessageHistoryQueryConsumer> _logger;
 
     public NatsMessageHistoryQueryConsumer(
         RealtimeQueueOptions options,
+        RealtimeNatsTrustSettings trust,
         NatsConnectionClient connectionClient,
         ILogger<NatsMessageHistoryQueryConsumer> logger)
     {
         _options = options;
+        _trust = trust;
         _connectionClient = connectionClient;
         _logger = logger;
     }
@@ -72,6 +76,10 @@ public sealed class NatsMessageHistoryQueryConsumer : IMessageHistoryQueryConsum
                 continue;
             }
 
+            var (trustedUserId, _) = NatsGatewayIdentity.Extract(
+                msg.Headers,
+                _trust.UserIdHeader,
+                _trust.SessionIdHeader);
             yield return new MessageHistoryQueryEnvelope(
                 query,
                 async (page, replyCt) =>
@@ -84,7 +92,8 @@ public sealed class NatsMessageHistoryQueryConsumer : IMessageHistoryQueryConsum
                             cancellationToken: replyCt)
                         .ConfigureAwait(false);
                 },
-                parentContext: NatsTraceContext.ExtractParentContext(msg.Headers));
+                parentContext: NatsTraceContext.ExtractParentContext(msg.Headers),
+                trustedUserId: trustedUserId);
         }
     }
 }

@@ -21,7 +21,8 @@ public sealed class MessageReceiptEnvelope
         Func<TimeSpan?, CancellationToken, ValueTask> nak,
         ulong? deliveryCount = null,
         string? rawPayload = null,
-        ActivityContext parentContext = default)
+        ActivityContext parentContext = default,
+        long? trustedUserId = null)
     {
         Command = command;
         _ack = ack;
@@ -29,12 +30,14 @@ public sealed class MessageReceiptEnvelope
         DeliveryCount = deliveryCount;
         RawPayload = rawPayload;
         ParentContext = parentContext;
+        TrustedUserId = trustedUserId;
     }
 
     public required MessageReceiptCommand Command { get; init; }
     public ulong? DeliveryCount { get; init; }
     public string? RawPayload { get; init; }
     public ActivityContext ParentContext { get; init; }
+    public long? TrustedUserId { get; init; }
 
     public ValueTask AckAsync(CancellationToken ct = default) =>
         _ack is not null ? _ack(ct) : ValueTask.CompletedTask;

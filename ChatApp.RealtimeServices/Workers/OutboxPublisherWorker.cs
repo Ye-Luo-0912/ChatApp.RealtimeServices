@@ -115,6 +115,7 @@ public sealed class OutboxPublisherWorker : BackgroundService
             500 * Math.Pow(2, Math.Min(attemptCount - 1, 6)));
         return TimeSpan.FromMilliseconds(milliseconds + Random.Shared.Next(0, 500));
     }
+
     private async ValueTask PublishOneAsync(RealtimeOutboxRecord record, CancellationToken ct)
     {
         var parentContext = RealtimeTraceContext.Parse(
@@ -136,6 +137,20 @@ public sealed class OutboxPublisherWorker : BackgroundService
         {
             RealtimeTelemetry.RecordException(activity, ex);
             _metrics.RecordOutboxFailure();
+            if (record.AttemptCount >= _options.MaxAttempts)
+            {
+                await _outboxStore
+                    .MarkDeadAsync(record, ex.Message, ct)
+                    .ConfigureAwait(false);
+                _metrics.RecordOutboxDeadLetter();
+                _logger.LogError(
+                    ex,
+                    "Outbox 事件已进入死信。事件编号={EventId}；尝试次数={AttemptCount}",
+                    record.EventId,
+                    record.AttemptCount);
+                return;
+            }
+
             var delay = CalculateRetryDelay(record.AttemptCount);
             await _outboxStore.MarkFailedAsync(record, ex.Message, delay, ct).ConfigureAwait(false);
             _logger.LogWarning(

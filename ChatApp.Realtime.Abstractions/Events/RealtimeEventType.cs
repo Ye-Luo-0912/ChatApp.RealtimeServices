@@ -1,52 +1,56 @@
 namespace ChatApp.Realtime.Abstractions.Events;
 
 /// <summary>
-/// 枚举类型，表示实时事件的种类。每个枚举值对应一种特定类型的实时事件，用于在应用程序中区分不同的实时消息或状态变化。
+/// 枚举类型，表示实时事件的种类。每个枚举值对应一种特定类型的实时事件。
+/// 业务别名与 EventId 规则见 <see cref="RealtimeEventContracts"/>。
 /// </summary>
 public enum RealtimeEventType : byte
 {
-    /// <summary>
-    /// 表示好友请求列表发生变化的实时事件类型。当用户的好友请求状态（如收到新的好友请求、接受或拒绝好友请求）发生变化时，会触发此事件。
-    /// </summary>
     FriendRequestListChanged = 1,
-
-    /// <summary>
-    /// 表示好友列表发生变化的实时事件类型。当用户的好友状态（如添加好友、删除好友）发生变化时，会触发此事件。
-    /// </summary>
     FriendListChanged = 2,
-
-    /// <summary>
-    /// 表示屏蔽列表发生变化的实时事件类型。当用户的屏蔽列表状态（如新增屏蔽用户、解除屏蔽等）发生变化时，会触发此事件。
-    /// </summary>
     BlockedListChanged = 3,
 
     /// <summary>
-    /// 表示会话列表发生变化的实时事件类型。当用户的会话状态（如新增会话、删除会话或会话内容更新）发生变化时，会触发此事件。
+    /// 会话摘要/列表变更（业务名 ConversationChanged）。
+    /// Payload：<c>RealtimeConversationChangedPayload</c>（PayloadVersion≥1）。
     /// </summary>
     ConversationListChanged = 4,
 
     /// <summary>
-    /// 表示接收到新消息的实时事件类型。当应用程序中的用户接收到一条新的即时消息时，会触发此事件。
+    /// 新消息（业务名 MessageReceived）。Payload：<c>RealtimeChatMessagePayload</c>。
+    /// 目标可为接收方，或发送方其他设备回声（跳过来源 SessionId）。
     /// </summary>
     MessageReceived = 5,
 
     /// <summary>
-    /// 表示会话被撤销的实时事件类型。当用户的某个会话（如登录会话）被系统撤销时，会触发此事件。这通常发生在用户从多个设备登录并选择退出其中一个设备的情况，或者因安全原因系统自动撤销了会话。
+    /// 登录会话撤销（业务名 SessionInvalidated）。按 SessionId 精确断开。
     /// </summary>
     SessionRevoked = 6,
 
     /// <summary>
-    /// 表示接收者已经送达或读取消息，事件目标是原消息发送者。
+    /// 送达/已读状态（业务名 MessageDelivered / MessageRead）。
+    /// Payload：<c>RealtimeMessageReceiptPayload</c>，由 ReceiptType 区分；目标为原发送者。
     /// </summary>
     MessageReceiptUpdated = 7,
 
-    /// <summary>
-    /// 用户账号已删除：Realtime 侧应异步清理该用户的消息、会话与相关状态（Saga）。
-    /// </summary>
     UserAccountDeleted = 8,
+    AccountCleanupCompleted = 9,
 
     /// <summary>
-    /// Realtime 侧账号清理已完成（供 Server Saga / 运维对账）。
+    /// 会话未读数变更（业务名 UnreadCountChanged）。
+    /// Payload：<c>RealtimeUnreadCountChangedPayload</c>。
     /// </summary>
-    AccountCleanupCompleted = 9
+    UnreadCountChanged = 10,
+
+    /// <summary>
+    /// 账号删除后需由 Server GC 的附件对象键列表。
+    /// Payload：<c>AttachmentBlobsPurgePayload</c>（可分片）。
+    /// </summary>
+    AttachmentBlobsPurge = 11,
+
+    /// <summary>
+    /// 消息撤回。Payload：<c>RealtimeMessageRecalledPayload</c>。
+    /// 目标可为接收方，或发送方其他设备回声。
+    /// </summary>
+    MessageRecalled = 12
 }

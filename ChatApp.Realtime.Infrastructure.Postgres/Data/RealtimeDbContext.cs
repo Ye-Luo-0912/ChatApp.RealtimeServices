@@ -53,6 +53,14 @@ public sealed class RealtimeDbContext : DbContext
                 .HasColumnName("content")
                 .IsRequired();
 
+            entity.Property(message => message.ContentFingerprint)
+                .HasColumnName("content_fingerprint")
+                .HasMaxLength(64);
+
+            entity.Property(message => message.ConversationId)
+                .HasColumnName("conversation_id")
+                .HasMaxLength(64);
+
             entity.Property(message => message.ReceivedAtMs)
                 .HasColumnName("received_at_ms");
 
@@ -61,6 +69,31 @@ public sealed class RealtimeDbContext : DbContext
 
             entity.Property(message => message.ReadAtMs)
                 .HasColumnName("read_at_ms");
+
+            entity.Property(message => message.ReplyToMessageId)
+                .HasColumnName("reply_to_message_id")
+                .HasMaxLength(64);
+
+            entity.Property(message => message.ReplyToSenderUserId)
+                .HasColumnName("reply_to_sender_user_id");
+
+            entity.Property(message => message.ReplyToPreview)
+                .HasColumnName("reply_to_preview")
+                .HasMaxLength(256);
+
+            entity.Property(message => message.ForwardedFromMessageId)
+                .HasColumnName("forwarded_from_message_id")
+                .HasMaxLength(64);
+
+            entity.Property(message => message.ForwardedFromSenderUserId)
+                .HasColumnName("forwarded_from_sender_user_id");
+
+            entity.Property(message => message.ForwardedFromPreview)
+                .HasColumnName("forwarded_from_preview")
+                .HasMaxLength(256);
+
+            entity.Property(message => message.RecalledAtMs)
+                .HasColumnName("recalled_at_ms");
 
             entity.Property(message => message.CreatedAtMs)
                 .HasColumnName("created_at_ms");
@@ -79,6 +112,12 @@ public sealed class RealtimeDbContext : DbContext
                     message.ReceivedAtMs,
                     message.MessageId
                 });
+            entity.HasIndex(message => new
+                {
+                    message.ConversationId,
+                    message.ReceivedAtMs,
+                    message.MessageId
+                });
         });
 
         modelBuilder.Entity<RealtimeOutboxEntity>(entity =>
@@ -89,6 +128,7 @@ public sealed class RealtimeDbContext : DbContext
             entity.Property(item => item.PayloadJson).HasColumnName("payload_json").IsRequired();
             entity.Property(item => item.TargetUserId).HasColumnName("target_user_id");
             entity.Property(item => item.EventType).HasColumnName("event_type");
+            entity.Property(item => item.Status).HasColumnName("status");
             entity.Property(item => item.CreatedAtMs).HasColumnName("created_at_ms");
             entity.Property(item => item.NextAttemptAtMs).HasColumnName("next_attempt_at_ms");
             entity.Property(item => item.PublishedAtMs).HasColumnName("published_at_ms");

@@ -29,7 +29,9 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
             evt,
             RealtimeJsonSerializerContext.Default.RealtimeEvent);
 
-        var subject = evt.Type is RealtimeEventType.UserAccountDeleted or RealtimeEventType.AccountCleanupCompleted
+        var subject = evt.Type is RealtimeEventType.UserAccountDeleted
+            or RealtimeEventType.AccountCleanupCompleted
+            or RealtimeEventType.AttachmentBlobsPurge
             ? _options.Topics.AccountCleanup
             : _options.Topics.RealtimeEvents;
 

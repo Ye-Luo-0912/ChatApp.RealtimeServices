@@ -103,9 +103,7 @@ public sealed class DefaultMessageReceiptProcessorTests
             RealtimeEvent eventToPublish,
             CancellationToken ct = default) =>
             Task.FromResult(
-                new RealtimeMessagePersistResult(
-                    true,
-                    message.MessageId));
+                RealtimeMessagePersistResult.Created(message.MessageId));
 
         public Task<MessageReceiptPersistResult> ApplyReceiptAsync(
             MessageReceiptRecord receipt,

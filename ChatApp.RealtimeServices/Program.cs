@@ -24,6 +24,7 @@ try
         options.TimestampFormat = "yyyy-MM-dd HH:mm:ss.fff ";
     });
 
+    builder.Services.Configure<OpsOptions>(builder.Configuration.GetSection(OpsOptions.SectionName));
     builder.Services.AddRealtimeServices(builder.Configuration, builder.Environment);
     var observabilityOptions = builder.Services.AddRealtimeObservability(
         builder.Configuration);
@@ -49,6 +50,118 @@ try
             Runtime = metrics.GetSnapshot(),
             Outbox = await outboxStore.GetStatsAsync(ct).ConfigureAwait(false)
         }));
+
+    var ops = app.MapGroup("/ops/outbox");
+    ops.AddEndpointFilter(new OpsApiKeyEndpointFilter());
+    ops.MapGet("/summary", async (IRealtimeOutboxStore outboxStore, CancellationToken ct) =>
+    {
+        var stats = await outboxStore.GetStatsAsync(ct).ConfigureAwait(false);
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        return Results.Ok(new
+        {
+            stats.PendingCount,
+            stats.DeadCount,
+            stats.MaxAttemptCount,
+            stats.OldestPendingAtMs,
+            OldestPendingAgeMs = stats.OldestPendingAtMs is { } oldest
+                ? Math.Max(0, now - oldest)
+                : (long?)null,
+            stats.OldestInFlightAtMs,
+            GeneratedAtMs = now
+        });
+    });
+    ops.MapGet("/", async (
+        string? status,
+        long? targetUserId,
+        int? offset,
+        int? limit,
+        IRealtimeOutboxStore outboxStore,
+        CancellationToken ct) =>
+    {
+        RealtimeOutboxStatus? parsed = null;
+        if (!string.IsNullOrWhiteSpace(status))
+        {
+            if (Enum.TryParse<RealtimeOutboxStatus>(status, ignoreCase: true, out var named))
+                parsed = named;
+            else if (short.TryParse(status, out var numeric)
+                     && Enum.IsDefined(typeof(RealtimeOutboxStatus), numeric))
+                parsed = (RealtimeOutboxStatus)numeric;
+            else
+                return Results.BadRequest(new { error = "invalid_status" });
+        }
+
+        var items = await outboxStore.ListAsync(
+                parsed,
+                targetUserId,
+                offset ?? 0,
+                limit ?? 50,
+                ct)
+            .ConfigureAwait(false);
+        return Results.Ok(new { items, offset = offset ?? 0, limit = limit ?? 50, returned = items.Count });
+    });
+    ops.MapGet("/{eventId}", async (
+        string eventId,
+        IRealtimeOutboxStore outboxStore,
+        CancellationToken ct) =>
+    {
+        var item = await outboxStore.TryGetAsync(eventId, ct).ConfigureAwait(false);
+        return item is null ? Results.NotFound(new { error = "not_found" }) : Results.Ok(item);
+    });
+    ops.MapPost("/{eventId}/replay", async (
+        string eventId,
+        IRealtimeOutboxStore outboxStore,
+        IRealtimeOutboxSignal outboxSignal,
+        RealtimeMetrics metrics,
+        CancellationToken ct) =>
+    {
+        if (string.IsNullOrWhiteSpace(eventId) || eventId.Length > 64)
+            return Results.BadRequest(new { error = "invalid_event_id" });
+
+        var existing = await outboxStore.TryGetAsync(eventId, ct).ConfigureAwait(false);
+        if (existing is null)
+            return Results.NotFound(new { error = "not_found", eventId });
+        if (existing.Status == RealtimeOutboxStatus.Published)
+            return Results.Conflict(new { error = "already_published", eventId });
+        if (existing.Status != RealtimeOutboxStatus.Dead)
+            return Results.Conflict(new { error = "not_dead", eventId, status = existing.Status.ToString() });
+
+        var replayed = await outboxStore.ReplayDeadAsync(eventId, ct).ConfigureAwait(false);
+        if (!replayed)
+            return Results.NotFound(new { error = "not_found_or_not_dead", eventId });
+
+        metrics.RecordOutboxReplay(1);
+        outboxSignal.Notify();
+        return Results.Ok(new { eventId, status = "pending" });
+    });
+    ops.MapPost("/replay", async (
+        ReplayDeadBatchRequest? body,
+        IRealtimeOutboxStore outboxStore,
+        IRealtimeOutboxSignal outboxSignal,
+        RealtimeMetrics metrics,
+        CancellationToken ct) =>
+    {
+        var eventIds = body?.EventIds;
+        if (eventIds is null || eventIds.Count == 0)
+            return Results.BadRequest(new { error = "event_ids_required" });
+        if (eventIds.Count > 500)
+            return Results.BadRequest(new { error = "too_many_event_ids", max = 500 });
+
+        var replayed = await outboxStore
+            .ReplayDeadBatchAsync(eventIds, ct)
+            .ConfigureAwait(false);
+        if (replayed.Count > 0)
+        {
+            metrics.RecordOutboxReplay(replayed.Count);
+            outboxSignal.Notify();
+        }
+
+        return Results.Ok(new
+        {
+            requested = eventIds.Count,
+            replayed = replayed.Count,
+            eventIds = replayed
+        });
+    });
 
     var realtimeOptions = app.Services.GetRequiredService<IOptions<RealtimeOptions>>().Value;
     app.Logger.LogInformation(
@@ -80,4 +193,37 @@ static async Task<int> RunHealthCheckCommandAsync(string[] commandArgs)
     {
         return 1;
     }
+}
+
+file sealed class OpsApiKeyEndpointFilter : IEndpointFilter
+{
+    public async ValueTask<object?> InvokeAsync(
+        EndpointFilterInvocationContext context,
+        EndpointFilterDelegate next)
+    {
+        var http = context.HttpContext;
+        var env = http.RequestServices.GetRequiredService<IHostEnvironment>();
+        var ops = http.RequestServices.GetRequiredService<IOptions<OpsOptions>>().Value;
+        var configured = ops.ApiKey?.Trim();
+
+        if (string.IsNullOrEmpty(configured))
+        {
+            if (env.IsProduction())
+                return Results.Json(new { error = "ops_api_key_required" }, statusCode: 503);
+            return await next(context).ConfigureAwait(false);
+        }
+
+        if (!http.Request.Headers.TryGetValue("X-Ops-Api-Key", out var provided)
+            || !string.Equals(provided.ToString(), configured, StringComparison.Ordinal))
+        {
+            return Results.Json(new { error = "unauthorized" }, statusCode: 401);
+        }
+
+        return await next(context).ConfigureAwait(false);
+    }
+}
+
+file sealed class ReplayDeadBatchRequest
+{
+    public List<string>? EventIds { get; init; }
 }

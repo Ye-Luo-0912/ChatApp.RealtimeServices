@@ -1,0 +1,419 @@
+using System.Text;
+using ChatApp.Realtime.Abstractions.Conversations;
+using ChatApp.Realtime.Abstractions.Messaging.History;
+using ChatApp.Realtime.Abstractions.Protocol;
+using ChatApp.Realtime.Abstractions.Stores;
+using ChatApp.Realtime.Abstractions.Sync;
+using ChatApp.Realtime.Infrastructure.Core.Conversations;
+using ChatApp.Realtime.Infrastructure.Core.Messaging;
+
+namespace ChatApp.Realtime.Infrastructure.Core.Sync;
+
+public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProcessor
+{
+    public const int MaximumListLimit = 100;
+    public const int MaximumHistoryPerConversation = 50;
+    public const int MaximumConversationsWithHistory = 20;
+    public const int MaximumWatermarks = 50;
+    public const int MaximumResponseBytes = RealtimeWireLimits.MaximumResponseBytes;
+
+    private readonly IRealtimeConversationStore _conversationStore;
+    private readonly IRealtimeMessageHistoryStore _historyStore;
+    private readonly IRealtimeDeviceSyncCursorStore _deviceCursorStore;
+    private readonly IRealtimeAttachmentStore _attachmentStore;
+
+    public DefaultSyncBootstrapQueryProcessor(
+        IRealtimeConversationStore conversationStore,
+        IRealtimeMessageHistoryStore historyStore,
+        IRealtimeDeviceSyncCursorStore deviceCursorStore,
+        IRealtimeAttachmentStore attachmentStore)
+    {
+        _conversationStore = conversationStore;
+        _historyStore = historyStore;
+        _deviceCursorStore = deviceCursorStore;
+        _attachmentStore = attachmentStore;
+    }
+
+    public async Task<SyncBootstrapPage> ProcessAsync(
+        SyncBootstrapQuery query,
+        CancellationToken ct = default)
+    {
+        var validationError = Validate(query);
+        if (validationError is not null)
+            return validationError;
+
+        var listLimit = Math.Clamp(
+            query.ListLimit == 0
+                ? DefaultConversationListQueryProcessor.DefaultPageSize
+                : query.ListLimit,
+            1,
+            MaximumListLimit);
+        var historyLimit = Math.Clamp(
+            query.HistoryLimitPerConversation == 0 ? 20 : query.HistoryLimitPerConversation,
+            1,
+            MaximumHistoryPerConversation);
+        var maxCatchUps = Math.Clamp(
+            query.MaxConversationsWithHistory == 0 ? 10 : query.MaxConversationsWithHistory,
+            0,
+            MaximumConversationsWithHistory);
+
+        var listRows = await _conversationStore.QueryListAsync(
+                query.UserId,
+                beforeIsPinned: null,
+                beforePinnedAtMs: null,
+                beforeLastMessageAtMs: null,
+                beforeConversationId: null,
+                take: listLimit + 1,
+                ct)
+            .ConfigureAwait(false);
+
+        var conversations = new List<ConversationListItem>(Math.Min(listLimit, listRows.Count));
+        var responseBytes = 0;
+        foreach (var row in listRows)
+        {
+            if (conversations.Count >= listLimit)
+                break;
+
+            var itemBytes = EstimateConversationBytes(row);
+            if (conversations.Count > 0 && responseBytes + itemBytes > RealtimeWireLimits.PackingBudgetBytes)
+                break;
+
+            conversations.Add(row);
+            responseBytes += itemBytes;
+        }
+
+        var conversationsHasMore = listRows.Count > conversations.Count;
+        var conversationsNextCursor = conversationsHasMore && conversations.Count > 0
+            ? new ConversationListCursor(
+                conversations[^1].IsPinned,
+                conversations[^1].PinnedAtMs,
+                conversations[^1].LastMessageAtMs,
+                conversations[^1].ConversationId)
+            : null;
+
+        var effectiveWatermarks = query.Watermarks;
+        if ((effectiveWatermarks is null || effectiveWatermarks.Count == 0)
+            && query.DeviceIdHash is ulong deviceIdHash)
+        {
+            var stored = await _deviceCursorStore
+                .LoadAsync(query.UserId, deviceIdHash, MaximumWatermarks, ct)
+                .ConfigureAwait(false);
+            if (stored.Count > 0)
+            {
+                effectiveWatermarks = stored
+                    .Select(static cursor => new ConversationSyncWatermark
+                    {
+                        ConversationId = cursor.ConversationId,
+                        AfterReceivedAtMs = cursor.AfterReceivedAtMs,
+                        AfterMessageId = cursor.AfterMessageId
+                    })
+                    .ToArray();
+            }
+        }
+
+        var catchUps = new List<ConversationHistoryCatchUp>(maxCatchUps);
+        Dictionary<string, ResolvedSyncWatermark>? resolvedWatermarks = null;
+        if (maxCatchUps > 0 && responseBytes < RealtimeWireLimits.PackingBudgetBytes)
+        {
+            resolvedWatermarks = await BuildResolvedWatermarkMapAsync(
+                    query.UserId,
+                    effectiveWatermarks,
+                    conversations,
+                    ct)
+                .ConfigureAwait(false);
+
+            var catchUpIds = SelectCatchUpConversationIds(
+                    conversations,
+                    resolvedWatermarks,
+                    maxCatchUps)
+                .ToArray();
+            if (catchUpIds.Length > 0)
+            {
+                var catchUpQueries = catchUpIds
+                    .Select(conversationId =>
+                    {
+                        if (resolvedWatermarks.TryGetValue(conversationId, out var watermark))
+                        {
+                            return new HistoryCatchUpQuery
+                            {
+                                ConversationId = conversationId,
+                                AfterReceivedAtMs = watermark.AfterReceivedAtMs,
+                                AfterMessageId = watermark.AfterMessageId,
+                                Take = historyLimit + 1
+                            };
+                        }
+
+                        return new HistoryCatchUpQuery
+                        {
+                            ConversationId = conversationId,
+                            Take = historyLimit + 1
+                        };
+                    })
+                    .ToArray();
+
+                var batchRows = await _historyStore
+                    .QueryCatchUpsAsync(query.UserId, catchUpQueries, ct)
+                    .ConfigureAwait(false);
+
+                foreach (var conversationId in catchUpIds)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (responseBytes >= RealtimeWireLimits.PackingBudgetBytes)
+                        break;
+
+                    if (!batchRows.TryGetValue(conversationId, out var rows))
+                        rows = Array.Empty<RealtimeHistoryMessage>();
+
+                    rows = await RealtimeHistoryAttachmentEnricher
+                        .EnrichAsync(_attachmentStore, rows, ct)
+                        .ConfigureAwait(false);
+
+                    catchUps.Add(PackCatchUp(
+                        conversationId,
+                        rows,
+                        historyLimit,
+                        ref responseBytes));
+                }
+            }
+        }
+
+        if (query.DeviceIdHash is ulong persistDeviceId)
+        {
+            var toPersist = BuildDeviceCursorsToPersist(catchUps);
+            if (toPersist.Count > 0)
+            {
+                await _deviceCursorStore
+                    .UpsertManyAsync(query.UserId, persistDeviceId, toPersist, ct)
+                    .ConfigureAwait(false);
+            }
+        }
+
+        return SyncBootstrapPage.Success(
+            query.RequestId,
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            conversations,
+            conversationsNextCursor,
+            conversationsHasMore,
+            catchUps);
+    }
+
+    /// <summary>
+    /// 仅持久化 bootstrap 实际返回的最后一条消息。
+    /// 空 catch-up（未来/随机水位钳 tip、打包失败、已同步）不得推进游标，
+    /// 否则单调前进的设备游标会永久跳过未投递历史。
+    /// </summary>
+    private static IReadOnlyList<DeviceSyncCursor> BuildDeviceCursorsToPersist(
+        IReadOnlyList<ConversationHistoryCatchUp> catchUps)
+    {
+        var map = new Dictionary<string, DeviceSyncCursor>(StringComparer.Ordinal);
+        foreach (var catchUp in catchUps)
+        {
+            if (catchUp.Items.Count == 0)
+                continue;
+
+            var last = catchUp.Items[^1];
+            map[catchUp.ConversationId] = new DeviceSyncCursor
+            {
+                ConversationId = catchUp.ConversationId,
+                AfterReceivedAtMs = last.ReceivedAtMs,
+                AfterMessageId = last.MessageId
+            };
+        }
+
+        return map.Values.ToArray();
+    }
+
+    private async Task<Dictionary<string, ResolvedSyncWatermark>> BuildResolvedWatermarkMapAsync(
+        long userId,
+        IReadOnlyList<ConversationSyncWatermark>? watermarks,
+        IReadOnlyList<ConversationListItem> conversations,
+        CancellationToken ct)
+    {
+        var result = new Dictionary<string, ResolvedSyncWatermark>(StringComparer.Ordinal);
+        if (watermarks is null || watermarks.Count == 0)
+            return result;
+
+        var candidates = new Dictionary<string, ConversationSyncWatermark>(StringComparer.Ordinal);
+        foreach (var item in watermarks)
+        {
+            if (string.IsNullOrWhiteSpace(item.ConversationId)
+                || string.IsNullOrWhiteSpace(item.AfterMessageId)
+                || item.AfterReceivedAtMs <= 0)
+            {
+                continue;
+            }
+
+            candidates[item.ConversationId.Trim()] = item;
+        }
+
+        if (candidates.Count == 0)
+            return result;
+
+        var tipByConversation = conversations.ToDictionary(
+            static c => c.ConversationId,
+            static c => c,
+            StringComparer.Ordinal);
+
+        var knownMembers = new HashSet<string>(tipByConversation.Keys, StringComparer.Ordinal);
+        var unknownIds = candidates.Keys
+            .Where(id => !knownMembers.Contains(id))
+            .ToArray();
+        var authorizedUnknown = unknownIds.Length == 0
+            ? (IReadOnlySet<string>)new HashSet<string>(StringComparer.Ordinal)
+            : await _historyStore
+                .FilterMemberConversationIdsAsync(userId, unknownIds, ct)
+                .ConfigureAwait(false);
+
+        var resolveInputs = new List<ConversationSyncWatermarkInput>(candidates.Count);
+        foreach (var (conversationId, watermark) in candidates)
+        {
+            if (!knownMembers.Contains(conversationId) && !authorizedUnknown.Contains(conversationId))
+                continue;
+
+            tipByConversation.TryGetValue(conversationId, out var listItem);
+            resolveInputs.Add(new ConversationSyncWatermarkInput
+            {
+                ConversationId = conversationId,
+                AfterReceivedAtMs = watermark.AfterReceivedAtMs,
+                AfterMessageId = watermark.AfterMessageId,
+                TipReceivedAtMs = listItem?.LastMessageAtMs,
+                TipMessageId = listItem?.LastMessageId
+            });
+        }
+
+        if (resolveInputs.Count == 0)
+            return result;
+
+        var resolved = await _historyStore
+            .ResolveSyncWatermarksAsync(resolveInputs, ct)
+            .ConfigureAwait(false);
+        foreach (var (conversationId, watermark) in resolved)
+            result[conversationId] = watermark;
+
+        return result;
+    }
+
+    private static ConversationHistoryCatchUp PackCatchUp(
+        string conversationId,
+        IReadOnlyList<RealtimeHistoryMessage> rows,
+        int historyLimit,
+        ref int responseBytes)
+    {
+        var items = new List<RealtimeHistoryMessage>(Math.Min(historyLimit, rows.Count));
+        foreach (var row in rows)
+        {
+            if (items.Count >= historyLimit)
+                break;
+
+            var itemBytes = EstimateHistoryBytes(row);
+            if (items.Count > 0 && responseBytes + itemBytes > RealtimeWireLimits.PackingBudgetBytes)
+                break;
+            if (items.Count == 0 && responseBytes + itemBytes > RealtimeWireLimits.PackingBudgetBytes)
+            {
+                return new ConversationHistoryCatchUp
+                {
+                    ConversationId = conversationId,
+                    Items = [],
+                    HasMore = true,
+                    NextCursor = null
+                };
+            }
+
+            items.Add(row);
+            responseBytes += itemBytes;
+        }
+
+        var hasMore = rows.Count > items.Count;
+        var last = items.Count == 0 ? null : items[^1];
+        return new ConversationHistoryCatchUp
+        {
+            ConversationId = conversationId,
+            Items = items,
+            HasMore = hasMore,
+            NextCursor = hasMore && last is not null
+                ? new MessageHistoryCursor(last.ReceivedAtMs, last.MessageId)
+                : null
+        };
+    }
+
+    private static IEnumerable<string> SelectCatchUpConversationIds(
+        IReadOnlyList<ConversationListItem> conversations,
+        Dictionary<string, ResolvedSyncWatermark> watermarks,
+        int maxCatchUps)
+    {
+        var selected = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var item in conversations)
+        {
+            if (item.UnreadCount > 0 && selected.Add(item.ConversationId) && selected.Count >= maxCatchUps)
+                return selected;
+        }
+
+        foreach (var conversationId in watermarks.Keys)
+        {
+            if (selected.Add(conversationId) && selected.Count >= maxCatchUps)
+                return selected;
+        }
+
+        foreach (var item in conversations)
+        {
+            if (selected.Add(item.ConversationId) && selected.Count >= maxCatchUps)
+                return selected;
+        }
+
+        return selected;
+    }
+
+    private static SyncBootstrapPage? Validate(SyncBootstrapQuery query)
+    {
+        if (string.IsNullOrWhiteSpace(query.RequestId) || query.RequestId.Length > 64)
+            return SyncBootstrapPage.Failed(
+                query.RequestId ?? string.Empty,
+                "invalid_request_id",
+                "请求编号不能为空且长度不能超过 64。");
+        if (query.UserId <= 0)
+            return SyncBootstrapPage.Failed(query.RequestId, "invalid_user_id", "用户编号必须大于 0。");
+        if (query.ListLimit < 0
+            || query.HistoryLimitPerConversation < 0
+            || query.MaxConversationsWithHistory < 0)
+        {
+            return SyncBootstrapPage.Failed(query.RequestId, "invalid_limit", "分页参数不能为负数。");
+        }
+
+        if (query.Watermarks is { Count: > MaximumWatermarks })
+            return SyncBootstrapPage.Failed(
+                query.RequestId,
+                "invalid_watermarks",
+                $"水位数量不能超过 {MaximumWatermarks}。");
+
+        return null;
+    }
+
+    private static int EstimateConversationBytes(ConversationListItem item) =>
+        192
+        + Encoding.UTF8.GetByteCount(item.ConversationId)
+        + Encoding.UTF8.GetByteCount(item.LastMessageId ?? string.Empty)
+        + Encoding.UTF8.GetByteCount(item.LastMessagePreview ?? string.Empty);
+
+    private static int EstimateHistoryBytes(RealtimeHistoryMessage item)
+    {
+        var payload =
+            Encoding.UTF8.GetByteCount(item.MessageId)
+            + Encoding.UTF8.GetByteCount(item.ClientMessageId)
+            + Encoding.UTF8.GetByteCount(item.ConversationId ?? string.Empty)
+            + Encoding.UTF8.GetByteCount(item.Content);
+        var attachmentBytes = 0;
+        if (item.Attachments is { Count: > 0 })
+        {
+            foreach (var attachment in item.Attachments)
+            {
+                attachmentBytes += 96
+                    + Encoding.UTF8.GetByteCount(attachment.AttachmentId)
+                    + Encoding.UTF8.GetByteCount(attachment.ContentType)
+                    + Encoding.UTF8.GetByteCount(attachment.FileName ?? string.Empty)
+                    + Encoding.UTF8.GetByteCount(attachment.DownloadApiHint ?? string.Empty);
+            }
+        }
+
+        return 256 + payload + (payload / 16) + attachmentBytes;
+    }
+}

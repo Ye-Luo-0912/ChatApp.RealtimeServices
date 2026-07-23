@@ -65,10 +65,7 @@ public sealed class OutboxTypedColumnDeleteTests : IAsyncLifetime
         await ApplyMigrationsAsync(
             client,
             schema,
-            [
-                new Migration001_BaselineSchema(),
-                new Migration002_OutboxTypedTargetColumns()
-            ]);
+            RealtimeSchemaMigrationRunner.DefaultMigrations());
 
         var store = new NpgsqlRealtimeMessageStore(
             client,

@@ -3,6 +3,7 @@ using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
+using ChatApp.Realtime.Infrastructure.Nats.Configuration;
 using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
 using Microsoft.Extensions.Logging;
 
@@ -11,15 +12,18 @@ namespace ChatApp.Realtime.Infrastructure.Nats.Queueing;
 public sealed class NatsMessageReceiptConsumer : IMessageReceiptConsumer
 {
     private readonly RealtimeQueueOptions _options;
+    private readonly RealtimeNatsTrustSettings _trust;
     private readonly NatsConnectionClient _connectionClient;
     private readonly ILogger<NatsMessageReceiptConsumer> _logger;
 
     public NatsMessageReceiptConsumer(
         RealtimeQueueOptions options,
+        RealtimeNatsTrustSettings trust,
         NatsConnectionClient connectionClient,
         ILogger<NatsMessageReceiptConsumer> logger)
     {
         _options = options;
+        _trust = trust;
         _connectionClient = connectionClient;
         _logger = logger;
     }
@@ -58,10 +62,15 @@ public sealed class NatsMessageReceiptConsumer : IMessageReceiptConsumer
 
             if (command is not null)
             {
+                var (trustedUserId, _) = NatsGatewayIdentity.Extract(
+                    msg.Headers,
+                    _trust.UserIdHeader,
+                    _trust.SessionIdHeader);
                 yield return new MessageReceiptEnvelope(command)
                 {
                     RawPayload = msg.Data,
-                    ParentContext = NatsTraceContext.ExtractParentContext(msg.Headers)
+                    ParentContext = NatsTraceContext.ExtractParentContext(msg.Headers),
+                    TrustedUserId = trustedUserId
                 };
             }
         }

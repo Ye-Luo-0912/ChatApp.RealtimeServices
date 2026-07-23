@@ -24,9 +24,21 @@ public interface IRealtimeMessageStore
         CancellationToken ct = default);
 
     /// <summary>
+    /// 发送方撤回消息：清空内容、写入 recalled_at_ms，并向接收方与发送方其他会话投递 Outbox 事件。
+    /// </summary>
+    Task<MessageRecallPersistResult> ApplyRecallAsync(
+        string messageId,
+        long senderUserId,
+        string senderSessionId,
+        long recalledAtMs,
+        long maxAgeMs,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// 按批删除该用户作为发送方或接收方的全部消息，直到无剩余行为止；
     /// 并尽力清理该用户相关的 Outbox 行（按 typed 列 <c>target_user_id</c> 精确匹配，
-    /// 但保留 <c>AccountCleanupCompleted</c> 完成回传，避免重试抹掉待发布完成事件）。
+    /// 但保留 <c>AccountCleanupCompleted</c> / <c>AttachmentBlobsPurge</c>，
+    /// 避免重试抹掉待发布完成事件或 blob GC 分片）。
     /// 已清理过的用户再次调用是安全的（返回 0）。
     /// </summary>
     /// <returns>累计删除的消息行数。</returns>
