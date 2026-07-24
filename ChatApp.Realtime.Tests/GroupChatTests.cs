@@ -1,0 +1,298 @@
+using ChatApp.Realtime.Abstractions.Conversations;
+using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Messaging;
+using ChatApp.Realtime.Abstractions.Stores;
+using ChatApp.Realtime.Infrastructure.Core.Conversations;
+using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
+using ChatApp.Realtime.Infrastructure.Core.Messaging;
+using ChatApp.Realtime.Infrastructure.Core.Serialization;
+using ChatApp.Realtime.Infrastructure.Postgres.Clients;
+using ChatApp.Realtime.Infrastructure.Postgres.Data;
+using ChatApp.Realtime.Infrastructure.Postgres.Migrations;
+using ChatApp.Realtime.Infrastructure.Postgres.Stores;
+using ChatApp.Realtime.Tests.TestDoubles;
+using Microsoft.Extensions.Logging.Abstractions;
+using Npgsql;
+using System.Text.Json;
+using Testcontainers.PostgreSql;
+
+namespace ChatApp.Realtime.Tests;
+
+public sealed class GroupChatTests : IAsyncLifetime
+{
+    private readonly PostgreSqlContainer _postgres = new PostgreSqlBuilder()
+        .WithImage("postgres:16-alpine")
+        .Build();
+
+    public Task InitializeAsync() => _postgres.StartAsync();
+
+    public Task DisposeAsync() => _postgres.DisposeAsync().AsTask();
+
+    [Fact]
+    public void CreateGroup_IdIsValid()
+    {
+        var id = ConversationId.CreateGroup();
+        Assert.True(ConversationId.IsGroup(id));
+        Assert.False(ConversationId.IsDirect(id));
+        Assert.StartsWith("grp:", id);
+        Assert.Equal(36, id.Length);
+    }
+
+    [Fact]
+    public async Task CreateGroup_AddsOwnerAndMembers_EmitsEvents()
+    {
+        var (client, schema) = await CreateStoreAsync("realtime_group_create");
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var conversationId = ConversationId.CreateGroup();
+
+        var result = await groupStore.CreateGroupAsync(
+            creatorUserId: 1001,
+            conversationId,
+            title: "Squad",
+            memberUserIds: [1002, 1003],
+            actorSessionId: "s1",
+            occurredAtMs: 1_700_000_000_000);
+
+        Assert.True(result.Succeeded);
+        Assert.Equal(3, result.Members!.Count);
+        Assert.Contains(result.Members, m => m.UserId == 1001 && m.Role == ConversationMemberRole.Owner);
+
+        var members = await groupStore.ListMembersAsync(1001, conversationId);
+        Assert.Equal(3, members.Count);
+
+        await using var connection = await client.GetDataSource().OpenConnectionAsync();
+        await using var outbox = new NpgsqlCommand(
+            $"""
+             SELECT COUNT(*) FROM {schema.OutboxTableSql}
+             WHERE event_type = @joined OR event_type = @changed
+             """,
+            connection);
+        outbox.Parameters.AddWithValue("joined", (short)RealtimeEventType.MemberJoined);
+        outbox.Parameters.AddWithValue("changed", (short)RealtimeEventType.ConversationListChanged);
+        Assert.True(Convert.ToInt32(await outbox.ExecuteScalarAsync()) > 0);
+    }
+
+    [Fact]
+    public async Task NonMember_CannotSend_GroupMessage()
+    {
+        var (client, schema) = await CreateStoreAsync("realtime_group_send_gate");
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var messageStore = new NpgsqlRealtimeMessageStore(
+            client,
+            schema,
+            NullLogger<NpgsqlRealtimeMessageStore>.Instance);
+        var conversationId = ConversationId.CreateGroup();
+        await groupStore.CreateGroupAsync(
+            1001,
+            conversationId,
+            "G",
+            [1002],
+            "s1",
+            1_700_000_000_000);
+
+        using var metrics = new RealtimeMetrics();
+        var processor = new DefaultIncomingMessageProcessor(
+            messageStore,
+            groupStore,
+            new RecordingRealtimeOutboxSignal(),
+            metrics,
+            NullLogger<DefaultIncomingMessageProcessor>.Instance);
+
+        var rejected = await processor.ProcessAsync(new IncomingMessageCommand
+        {
+            CommandId = "cmd-out",
+            ClientMessageId = "c-out",
+            SenderUserId = 9999,
+            SenderSessionId = "s-out",
+            ReceiverUserId = 0,
+            ConversationId = conversationId,
+            Content = "nope",
+            ReceivedAtMs = 1_700_000_000_100
+        });
+        Assert.False(rejected.Succeeded);
+        Assert.Equal("forbidden", rejected.ErrorCode);
+
+        var accepted = await processor.ProcessAsync(new IncomingMessageCommand
+        {
+            CommandId = "cmd-in",
+            ClientMessageId = "c-in",
+            SenderUserId = 1001,
+            SenderSessionId = "s-in",
+            ReceiverUserId = 0,
+            ConversationId = conversationId,
+            Content = "hello group",
+            ReceivedAtMs = 1_700_000_000_200
+        });
+        Assert.True(accepted.Succeeded);
+    }
+
+    [Fact]
+    public async Task GroupMessage_FanOut_TargetsAllMembers()
+    {
+        var (client, schema) = await CreateStoreAsync("realtime_group_fanout");
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var messageStore = new NpgsqlRealtimeMessageStore(
+            client,
+            schema,
+            NullLogger<NpgsqlRealtimeMessageStore>.Instance);
+        var conversationId = ConversationId.CreateGroup();
+        await groupStore.CreateGroupAsync(
+            1,
+            conversationId,
+            "Fan",
+            [2, 3],
+            "s1",
+            1_700_000_000_000);
+
+        var message = new RealtimeMessageRecord
+        {
+            MessageId = "g-msg-1",
+            ClientMessageId = "g-client-1",
+            SenderUserId = 1,
+            SenderSessionId = "s1",
+            ReceiverUserId = 0,
+            ConversationId = conversationId,
+            Content = "hi all",
+            ReceivedAtMs = 1_700_000_000_500
+        };
+        var template = new RealtimeEvent
+        {
+            EventId = RealtimeEventContracts.CreateMessageReceivedEventId(1, "g-client-1", 1),
+            Type = RealtimeEventType.MessageReceived,
+            TargetUserId = 1,
+            ActorUserId = 1,
+            MessageId = "g-msg-1",
+            SessionId = "s1",
+            PayloadJson = JsonSerializer.Serialize(
+                new RealtimeChatMessagePayload
+                {
+                    MessageId = "g-msg-1",
+                    ClientMessageId = "g-client-1",
+                    SenderUserId = 1,
+                    SenderSessionId = "s1",
+                    ReceiverUserId = 0,
+                    ConversationId = conversationId,
+                    Content = "hi all",
+                    ReceivedAtMs = 1_700_000_000_500
+                },
+                RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload),
+            OccurredAtMs = 1_700_000_000_500
+        };
+
+        var persisted = await messageStore.SaveAsync(message, template);
+        Assert.Equal(RealtimeMessagePersistKind.Created, persisted.Kind);
+
+        await using var connection = await client.GetDataSource().OpenConnectionAsync();
+        await using var outbox = new NpgsqlCommand(
+            $"""
+             SELECT target_user_id
+             FROM {schema.OutboxTableSql}
+             WHERE event_type = @type
+             ORDER BY target_user_id
+             """,
+            connection);
+        outbox.Parameters.AddWithValue("type", (short)RealtimeEventType.MessageReceived);
+        var targets = new List<long>();
+        await using var reader = await outbox.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            targets.Add(reader.GetInt64(0));
+
+        Assert.Equal([1L, 2L, 3L], targets);
+    }
+
+    [Fact]
+    public async Task RemoveMember_LosesAccess_RoleChecksWork()
+    {
+        var (client, schema) = await CreateStoreAsync("realtime_group_roles");
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var processor = new DefaultGroupConversationProcessor(
+            groupStore,
+            new RecordingRealtimeOutboxSignal());
+        var conversationId = ConversationId.CreateGroup();
+        await groupStore.CreateGroupAsync(
+            10,
+            conversationId,
+            "Roles",
+            [20, 30],
+            "s1",
+            1_700_000_000_000);
+
+        var promote = await processor.ProcessAsync(new GroupConversationCommand
+        {
+            RequestId = "r1",
+            ActorUserId = 10,
+            Operation = GroupConversationOperation.ChangeRole,
+            ConversationId = conversationId,
+            TargetUserId = 20,
+            NewRole = ConversationMemberRole.Admin
+        });
+        Assert.True(promote.Succeeded);
+
+        var memberRemoveAdmin = await processor.ProcessAsync(new GroupConversationCommand
+        {
+            RequestId = "r2",
+            ActorUserId = 30,
+            Operation = GroupConversationOperation.RemoveMember,
+            ConversationId = conversationId,
+            TargetUserId = 20
+        });
+        Assert.False(memberRemoveAdmin.Succeeded);
+        Assert.Equal("forbidden", memberRemoveAdmin.ErrorCode);
+
+        var remove = await processor.ProcessAsync(new GroupConversationCommand
+        {
+            RequestId = "r3",
+            ActorUserId = 10,
+            Operation = GroupConversationOperation.RemoveMember,
+            ConversationId = conversationId,
+            TargetUserId = 30
+        });
+        Assert.True(remove.Succeeded);
+        Assert.False(await groupStore.IsActiveMemberAsync(conversationId, 30));
+
+        var leaveOwner = await processor.ProcessAsync(new GroupConversationCommand
+        {
+            RequestId = "r4",
+            ActorUserId = 10,
+            Operation = GroupConversationOperation.Leave,
+            ConversationId = conversationId
+        });
+        Assert.False(leaveOwner.Succeeded);
+        Assert.Equal("owner_must_transfer", leaveOwner.ErrorCode);
+
+        var transfer = await processor.ProcessAsync(new GroupConversationCommand
+        {
+            RequestId = "r5",
+            ActorUserId = 10,
+            Operation = GroupConversationOperation.ChangeRole,
+            ConversationId = conversationId,
+            TargetUserId = 20,
+            NewRole = ConversationMemberRole.Owner
+        });
+        Assert.True(transfer.Succeeded);
+
+        var leave = await processor.ProcessAsync(new GroupConversationCommand
+        {
+            RequestId = "r6",
+            ActorUserId = 10,
+            Operation = GroupConversationOperation.Leave,
+            ConversationId = conversationId
+        });
+        Assert.True(leave.Succeeded);
+        Assert.False(await groupStore.IsActiveMemberAsync(conversationId, 10));
+    }
+
+    private async Task<(RealtimeDatabaseClient Client, RealtimeDatabaseSchema Schema)> CreateStoreAsync(
+        string schemaName)
+    {
+        var connectionString = _postgres.GetConnectionString();
+        var schema = new RealtimeDatabaseSchema(schemaName);
+        var client = new RealtimeDatabaseClient(
+            connectionString,
+            NullLogger<RealtimeDatabaseClient>.Instance);
+        await using var connection = await client.GetDataSource().OpenConnectionAsync();
+        await new RealtimeSchemaMigrationRunner(schema, NullLogger.Instance)
+            .MigrateAsync(connection);
+        return (client, schema);
+    }
+}

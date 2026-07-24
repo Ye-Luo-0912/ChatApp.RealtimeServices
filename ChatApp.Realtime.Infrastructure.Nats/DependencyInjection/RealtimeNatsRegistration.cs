@@ -37,10 +37,14 @@ public static class RealtimeNatsRegistration
         services.AddSingleton<IConversationMarkReadConsumer, NatsConversationMarkReadConsumer>();
         services.RemoveAll<IConversationSetPrefsConsumer>();
         services.AddSingleton<IConversationSetPrefsConsumer, NatsConversationSetPrefsConsumer>();
+        services.RemoveAll<IGroupConversationConsumer>();
+        services.AddSingleton<IGroupConversationConsumer, NatsGroupConversationConsumer>();
         services.RemoveAll<IMessageRecallConsumer>();
         services.AddSingleton<IMessageRecallConsumer, NatsMessageRecallConsumer>();
         services.RemoveAll<IMessageEditConsumer>();
         services.AddSingleton<IMessageEditConsumer, NatsMessageEditConsumer>();
+        services.RemoveAll<IMessageReactionConsumer>();
+        services.AddSingleton<IMessageReactionConsumer, NatsMessageReactionConsumer>();
         services.RemoveAll<ISyncBootstrapQueryConsumer>();
         services.AddSingleton<ISyncBootstrapQueryConsumer, NatsSyncBootstrapQueryConsumer>();
 

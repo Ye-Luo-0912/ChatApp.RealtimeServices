@@ -48,6 +48,7 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                  c.conversation_id,
                  c.type,
                  m.peer_user_id,
+                 c.title,
                  c.last_message_id,
                  c.last_message_preview,
                  COALESCE(m.last_message_at_ms, c.last_message_at_ms) AS last_message_at_ms,
@@ -105,17 +106,18 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                 ConversationId = reader.GetString(0),
                 Type = (ConversationType)reader.GetInt16(1),
                 PeerUserId = reader.IsDBNull(2) ? null : reader.GetInt64(2),
-                LastMessageId = reader.IsDBNull(3) ? null : reader.GetString(3),
-                LastMessagePreview = reader.IsDBNull(4) ? null : reader.GetString(4),
-                LastMessageAtMs = reader.IsDBNull(5) ? null : reader.GetInt64(5),
-                LastSenderUserId = reader.IsDBNull(6) ? null : reader.GetInt64(6),
-                UnreadCount = reader.GetInt32(7),
-                LastReadMessageId = reader.IsDBNull(8) ? null : reader.GetString(8),
-                LastReadAtMs = reader.IsDBNull(9) ? null : reader.GetInt64(9),
-                IsPinned = reader.GetBoolean(10),
-                PinnedAtMs = reader.IsDBNull(11) ? null : reader.GetInt64(11),
-                IsMuted = reader.GetBoolean(12),
-                MutedUntilMs = reader.IsDBNull(13) ? null : reader.GetInt64(13)
+                Title = reader.IsDBNull(3) ? null : reader.GetString(3),
+                LastMessageId = reader.IsDBNull(4) ? null : reader.GetString(4),
+                LastMessagePreview = reader.IsDBNull(5) ? null : reader.GetString(5),
+                LastMessageAtMs = reader.IsDBNull(6) ? null : reader.GetInt64(6),
+                LastSenderUserId = reader.IsDBNull(7) ? null : reader.GetInt64(7),
+                UnreadCount = reader.GetInt32(8),
+                LastReadMessageId = reader.IsDBNull(9) ? null : reader.GetString(9),
+                LastReadAtMs = reader.IsDBNull(10) ? null : reader.GetInt64(10),
+                IsPinned = reader.GetBoolean(11),
+                PinnedAtMs = reader.IsDBNull(12) ? null : reader.GetInt64(12),
+                IsMuted = reader.GetBoolean(13),
+                MutedUntilMs = reader.IsDBNull(14) ? null : reader.GetInt64(14)
             });
         }
 

@@ -8,7 +8,16 @@ public sealed record IncomingMessageCommand
     public required long SenderUserId { get; init; }
     public required string SenderSessionId { get; init; }
 
+    /// <summary>
+    /// 单聊对端用户。群聊可为 0（广播会话，目标由 ConversationId + 成员表决定）。
+    /// </summary>
     public required long ReceiverUserId { get; init; }
+
+    /// <summary>
+    /// 显式会话 Id。群聊必填（grp:…）；单聊可空（服务端按双方派生）。
+    /// </summary>
+    public string? ConversationId { get; init; }
+
     public required string Content { get; init; }
 
     /// <summary>

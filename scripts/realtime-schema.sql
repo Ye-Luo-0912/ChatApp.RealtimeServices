@@ -108,6 +108,8 @@ CREATE TABLE IF NOT EXISTS realtime.conversations (
     last_message_preview varchar(256) NULL,
     last_message_at_ms bigint NULL,
     last_sender_user_id bigint NULL,
+    title varchar(128) NULL,
+    created_by_user_id bigint NULL,
     CONSTRAINT ck_conversations_type_known CHECK (type IN (1, 2))
 );
 
@@ -123,9 +125,11 @@ CREATE TABLE IF NOT EXISTS realtime.conversation_members (
     pinned_at_ms bigint NULL,
     is_muted boolean NOT NULL DEFAULT false,
     muted_until_ms bigint NULL,
+    role smallint NOT NULL DEFAULT 3,
     PRIMARY KEY (conversation_id, user_id),
     CONSTRAINT ck_conversation_members_user_positive CHECK (user_id > 0),
-    CONSTRAINT ck_conversation_members_unread_nonnegative CHECK (unread_count >= 0)
+    CONSTRAINT ck_conversation_members_unread_nonnegative CHECK (unread_count >= 0),
+    CONSTRAINT ck_conversation_members_role_known CHECK (role IN (1, 2, 3))
 );
 
 ALTER TABLE realtime.messages ADD COLUMN IF NOT EXISTS conversation_id varchar(64) NULL;

@@ -21,6 +21,7 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
     private readonly IRealtimeMessageHistoryStore _historyStore;
     private readonly IRealtimeDeviceSyncCursorStore _deviceCursorStore;
     private readonly IRealtimeAttachmentStore _attachmentStore;
+    private readonly IRealtimeReactionStore _reactionStore;
     private readonly SyncBootstrapOptions _options;
 
     public DefaultSyncBootstrapQueryProcessor(
@@ -28,12 +29,14 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
         IRealtimeMessageHistoryStore historyStore,
         IRealtimeDeviceSyncCursorStore deviceCursorStore,
         IRealtimeAttachmentStore attachmentStore,
+        IRealtimeReactionStore reactionStore,
         SyncBootstrapOptions? options = null)
     {
         _conversationStore = conversationStore;
         _historyStore = historyStore;
         _deviceCursorStore = deviceCursorStore;
         _attachmentStore = attachmentStore;
+        _reactionStore = reactionStore;
         _options = options ?? new SyncBootstrapOptions();
     }
 
@@ -184,6 +187,9 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                         .ToArray();
                 var enrichedFlat = await RealtimeHistoryAttachmentEnricher
                     .EnrichAsync(_attachmentStore, flattened, ct)
+                    .ConfigureAwait(false);
+                enrichedFlat = await RealtimeHistoryReactionEnricher
+                    .EnrichAsync(_reactionStore, enrichedFlat, query.UserId, ct)
                     .ConfigureAwait(false);
                 var enrichedByMessageId = new Dictionary<string, RealtimeHistoryMessage>(
                     enrichedFlat.Count,

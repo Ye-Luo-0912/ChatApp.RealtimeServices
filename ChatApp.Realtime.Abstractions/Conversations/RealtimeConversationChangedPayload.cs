@@ -19,6 +19,9 @@ public sealed class RealtimeConversationChangedPayload
     /// </summary>
     public long? PeerUserId { get; init; }
 
+    /// <summary>群标题；单聊为空。</summary>
+    public string? Title { get; init; }
+
     public string? LastMessageId { get; init; }
 
     public string? LastMessagePreview { get; init; }

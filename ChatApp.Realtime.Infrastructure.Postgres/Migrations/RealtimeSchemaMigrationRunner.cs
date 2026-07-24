@@ -45,7 +45,9 @@ public sealed class RealtimeSchemaMigrationRunner
         new Migration014_MessageRecall(),
         new Migration015_MessageForward(),
         new Migration016_AttachmentContentHash(),
-        new Migration017_MessageEditAndChangeWatermark()
+        new Migration017_MessageEditAndChangeWatermark(),
+        new Migration018_MessageReactions(),
+        new Migration019_GroupConversationRoles()
     ];
 
     public async Task MigrateAsync(

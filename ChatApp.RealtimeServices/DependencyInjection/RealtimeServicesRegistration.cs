@@ -43,6 +43,7 @@ public static class RealtimeServicesRegistration
         services.AddSingleton(Microsoft.Extensions.Options.Options.Create(outboxOptions));
         services.AddSingleton(BindMessageEditOptions(configuration));
         services.AddSingleton(BindMessageRecallOptions(configuration));
+        services.AddSingleton(BindMessageReactionOptions(configuration));
         services.AddSingleton(BindSyncBootstrapOptions(configuration));
         services.AddSingleton(trustSettings);
         services.AddSingleton(new RealtimeConfigurationWarnings(warnings));
@@ -71,8 +72,10 @@ public static class RealtimeServicesRegistration
         services.AddHostedService<ConversationListQueryWorker>();
         services.AddHostedService<ConversationMarkReadWorker>();
         services.AddHostedService<ConversationSetPrefsWorker>();
+        services.AddHostedService<GroupConversationWorker>();
         services.AddHostedService<MessageRecallWorker>();
         services.AddHostedService<MessageEditWorker>();
+        services.AddHostedService<MessageReactionWorker>();
         services.AddHostedService<ConversationSyncBootstrapWorker>();
         services.AddHostedService<OutboxPublisherWorker>();
         services.AddHostedService<OutboxCleanupWorker>();
@@ -95,6 +98,19 @@ public static class RealtimeServicesRegistration
             ?? new MessageRecallOptions();
         if (options.MaxAgeMinutes < 0)
             throw new InvalidOperationException("MessageRecall:MaxAgeMinutes 不能为负数。");
+        return options;
+    }
+
+    private static MessageReactionOptions BindMessageReactionOptions(IConfiguration configuration)
+    {
+        var options = configuration.GetSection(MessageReactionOptions.SectionName).Get<MessageReactionOptions>()
+            ?? new MessageReactionOptions();
+        if (options.MaxDistinctEmojisPerMessage < 0)
+            throw new InvalidOperationException("MessageReaction:MaxDistinctEmojisPerMessage 不能为负数。");
+        if (options.MaxReactionsPerUserPerMessage < 0)
+            throw new InvalidOperationException("MessageReaction:MaxReactionsPerUserPerMessage 不能为负数。");
+        if (options.MaxEmojiLength <= 0 || options.MaxEmojiLength > 32)
+            throw new InvalidOperationException("MessageReaction:MaxEmojiLength 必须在 1–32。");
         return options;
     }
 
@@ -163,8 +179,12 @@ public static class RealtimeServicesRegistration
             throw new InvalidOperationException("Nats:Subjects:MessageRecalls 为必填配置。");
         if (string.IsNullOrWhiteSpace(options.Subjects.MessageEdits))
             throw new InvalidOperationException("Nats:Subjects:MessageEdits 为必填配置。");
+        if (string.IsNullOrWhiteSpace(options.Subjects.MessageReactions))
+            throw new InvalidOperationException("Nats:Subjects:MessageReactions 为必填配置。");
         if (string.IsNullOrWhiteSpace(options.Subjects.SyncBootstrapQueries))
             throw new InvalidOperationException("Nats:Subjects:SyncBootstrapQueries 为必填配置。");
+        if (string.IsNullOrWhiteSpace(options.Subjects.GroupConversations))
+            throw new InvalidOperationException("Nats:Subjects:GroupConversations 为必填配置。");
         if (!options.Mode.Equals("Core", StringComparison.OrdinalIgnoreCase)
             && !options.Mode.Equals("JetStream", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("Nats:Mode 只允许 Core 或 JetStream。");
@@ -261,7 +281,9 @@ public static class RealtimeServicesRegistration
                 ConversationSetPrefs = options.Subjects.ConversationSetPrefs,
                 MessageRecalls = options.Subjects.MessageRecalls,
                 MessageEdits = options.Subjects.MessageEdits,
+                MessageReactions = options.Subjects.MessageReactions,
                 SyncBootstrapQueries = options.Subjects.SyncBootstrapQueries,
+                GroupConversations = options.Subjects.GroupConversations,
                 MessagePersistence = options.Subjects.MessagePersistence,
                 DeadLetters = options.Subjects.DeadLetters
             }

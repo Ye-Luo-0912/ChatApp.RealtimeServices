@@ -29,7 +29,8 @@ public sealed class ConversationHistoryPaginationTests : IAsyncLifetime
         var (messageStore, historyStore, conversationId) = await SeedAsync("realtime_hist_pages");
         var processor = new DefaultMessageHistoryQueryProcessor(
             historyStore,
-            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance));
+            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance),
+            new NoopRealtimeReactionStore(NullLogger<NoopRealtimeReactionStore>.Instance));
 
         var seen = new HashSet<string>(StringComparer.Ordinal);
         MessageHistoryCursor? cursor = null;
@@ -85,7 +86,8 @@ public sealed class ConversationHistoryPaginationTests : IAsyncLifetime
         var (_, historyStore, conversationId) = await SeedSameMillisecondAsync("realtime_hist_tie");
         var processor = new DefaultMessageHistoryQueryProcessor(
             historyStore,
-            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance));
+            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance),
+            new NoopRealtimeReactionStore(NullLogger<NoopRealtimeReactionStore>.Instance));
 
         var page = await processor.ProcessAsync(new MessageHistoryQuery
         {
@@ -106,7 +108,8 @@ public sealed class ConversationHistoryPaginationTests : IAsyncLifetime
         var (_, historyStore, conversationId) = await SeedAsync("realtime_hist_forbid");
         var processor = new DefaultMessageHistoryQueryProcessor(
             historyStore,
-            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance));
+            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance),
+            new NoopRealtimeReactionStore(NullLogger<NoopRealtimeReactionStore>.Instance));
 
         var page = await processor.ProcessAsync(new MessageHistoryQuery
         {

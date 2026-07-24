@@ -53,7 +53,8 @@ public sealed class SyncBootstrapQueryProcessorTests
             conversationStore,
             historyStore,
             new NoopDeviceCursorStore(),
-            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance));
+            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance),
+            new NoopRealtimeReactionStore(NullLogger<NoopRealtimeReactionStore>.Instance));
 
         var page = await processor.ProcessAsync(new SyncBootstrapQuery
         {
@@ -117,7 +118,8 @@ public sealed class SyncBootstrapQueryProcessorTests
             conversationStore,
             historyStore,
             new NoopDeviceCursorStore(),
-            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance));
+            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance),
+            new NoopRealtimeReactionStore(NullLogger<NoopRealtimeReactionStore>.Instance));
 
         var page = await processor.ProcessAsync(new SyncBootstrapQuery
         {
@@ -177,7 +179,8 @@ public sealed class SyncBootstrapQueryProcessorTests
             conversationStore,
             historyStore,
             deviceStore,
-            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance));
+            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance),
+            new NoopRealtimeReactionStore(NullLogger<NoopRealtimeReactionStore>.Instance));
 
         var page = await processor.ProcessAsync(new SyncBootstrapQuery
         {
@@ -202,7 +205,7 @@ public sealed class SyncBootstrapQueryProcessorTests
         var reset = Assert.Single(page.ResetsRequired);
         Assert.Equal(conversationId, reset.ConversationId);
         Assert.Equal(SyncCursorResetReason.MessageNotFound, reset.Reason);
-        // 空 catch-up / reset 不得推进游标：否则未来水位钳 tip 会永久跳过未投递历史。
+        // ??catch-up / reset ?????????????? tip ????????????
         Assert.Empty(deviceStore.Upserted);
     }
 
@@ -238,7 +241,8 @@ public sealed class SyncBootstrapQueryProcessorTests
             conversationStore,
             historyStore,
             new NoopDeviceCursorStore(),
-            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance));
+            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance),
+            new NoopRealtimeReactionStore(NullLogger<NoopRealtimeReactionStore>.Instance));
 
         var page = await processor.ProcessAsync(new SyncBootstrapQuery
         {
@@ -285,7 +289,8 @@ public sealed class SyncBootstrapQueryProcessorTests
             conversationStore,
             historyStore,
             deviceStore,
-            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance));
+            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance),
+            new NoopRealtimeReactionStore(NullLogger<NoopRealtimeReactionStore>.Instance));
 
         var page = await processor.ProcessAsync(new SyncBootstrapQuery
         {
@@ -358,7 +363,8 @@ public sealed class SyncBootstrapQueryProcessorTests
             conversationStore,
             historyStore,
             new NoopDeviceCursorStore(),
-            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance));
+            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance),
+            new NoopRealtimeReactionStore(NullLogger<NoopRealtimeReactionStore>.Instance));
 
         var page = await processor.ProcessAsync(new SyncBootstrapQuery
         {
@@ -446,7 +452,8 @@ public sealed class SyncBootstrapQueryProcessorTests
             conversationStore,
             historyStore,
             deviceStore,
-            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance));
+            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance),
+            new NoopRealtimeReactionStore(NullLogger<NoopRealtimeReactionStore>.Instance));
 
         var page = await processor.ProcessAsync(new SyncBootstrapQuery
         {
@@ -474,7 +481,8 @@ public sealed class SyncBootstrapQueryProcessorTests
             new CapturingConversationStore([]),
             new CapturingHistoryStore("dm:1:2", []),
             new NoopDeviceCursorStore(),
-            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance));
+            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance),
+            new NoopRealtimeReactionStore(NullLogger<NoopRealtimeReactionStore>.Instance));
 
         var page = await processor.ProcessAsync(new SyncBootstrapQuery
         {
@@ -871,6 +879,7 @@ public sealed class SyncBootstrapQueryProcessorTests
             historyStore,
             deviceStore,
             new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance),
+            new NoopRealtimeReactionStore(NullLogger<NoopRealtimeReactionStore>.Instance),
             options);
 
     private sealed class CapturingConversationStore : IRealtimeConversationStore

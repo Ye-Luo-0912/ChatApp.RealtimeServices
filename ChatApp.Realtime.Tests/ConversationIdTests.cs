@@ -39,6 +39,14 @@ public sealed class ConversationIdTests
     }
 
     [Fact]
+    public void CreateGroup_ProducesValidGroupId()
+    {
+        var id = ConversationId.CreateGroup();
+        Assert.True(ConversationId.IsGroup(id));
+        Assert.False(ConversationId.IsDirect(id));
+    }
+
+    [Fact]
     public void CreatePreview_TruncatesWithoutExtraCopyBeyondLimit()
     {
         var content = new string('x', 300);

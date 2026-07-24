@@ -9,7 +9,9 @@ public static class ConversationId
 {
     public const int MaxLength = 64;
     public const int PreviewMaxChars = 256;
+    public const int TitleMaxLength = 128;
     private const string DirectPrefix = "dm:";
+    private const string GroupPrefix = "grp:";
 
     /// <summary>
     /// 由双方用户编号生成单聊会话 ID（较小用户编号在前）。
@@ -78,6 +80,41 @@ public static class ConversationId
 
     public static bool IsDirect(ReadOnlySpan<char> conversationId) =>
         TryParseDirect(conversationId, out _, out _);
+
+    /// <summary>
+    /// 生成群聊会话 ID：<c>grp:{32 hex}</c>（Guid N 格式）。
+    /// </summary>
+    public static string CreateGroup()
+    {
+        var hex = Guid.CreateVersion7().ToString("N");
+        return string.Create(
+            GroupPrefix.Length + hex.Length,
+            hex,
+            static (span, state) =>
+            {
+                GroupPrefix.AsSpan().CopyTo(span);
+                state.AsSpan().CopyTo(span[GroupPrefix.Length..]);
+            });
+    }
+
+    public static bool IsGroup(ReadOnlySpan<char> conversationId)
+    {
+        if (!conversationId.StartsWith(GroupPrefix, StringComparison.Ordinal))
+            return false;
+        if (conversationId.Length != GroupPrefix.Length + 32)
+            return false;
+        var hex = conversationId[GroupPrefix.Length..];
+        foreach (var c in hex)
+        {
+            var isHex = (c is >= '0' and <= '9')
+                        || (c is >= 'a' and <= 'f')
+                        || (c is >= 'A' and <= 'F');
+            if (!isHex)
+                return false;
+        }
+
+        return true;
+    }
 
     /// <summary>
     /// 截断会话列表摘要，避免大正文进入会话投影与事件 payload。

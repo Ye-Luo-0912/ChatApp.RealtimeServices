@@ -15,6 +15,8 @@ public sealed class RealtimeBusinessEventContractTests
     [InlineData(RealtimeEventContracts.SessionInvalidated, RealtimeEventType.SessionRevoked)]
     [InlineData(RealtimeEventContracts.MessageRecalled, RealtimeEventType.MessageRecalled)]
     [InlineData(RealtimeEventContracts.MessageEdited, RealtimeEventType.MessageEdited)]
+    [InlineData(RealtimeEventContracts.ReactionAdded, RealtimeEventType.ReactionAdded)]
+    [InlineData(RealtimeEventContracts.ReactionRemoved, RealtimeEventType.ReactionRemoved)]
     public void BusinessName_MapsToStableWireType(string businessName, RealtimeEventType expected)
     {
         Assert.Equal(expected, RealtimeEventContracts.ToWireType(businessName));

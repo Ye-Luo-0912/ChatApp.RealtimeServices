@@ -125,6 +125,122 @@ internal static class ConversationWriteCommands
         return (advanced, unread);
     }
 
+    /// <summary>
+    /// 群 tip 前进 + 全员 tip 同步 + 非发送方未读递增。不创建成员（成员须已存在）。
+    /// </summary>
+    public static async Task<(bool Advanced, IReadOnlyList<(long UserId, int UnreadCount)> Unreads)>
+        TryAdvanceGroupAndIncrementUnreadAsync(
+            NpgsqlConnection connection,
+            NpgsqlTransaction transaction,
+            RealtimeDatabaseSchema schema,
+            string conversationId,
+            long senderUserId,
+            string messageId,
+            string preview,
+            long receivedAtMs,
+            CancellationToken ct)
+    {
+        await using var batch = new NpgsqlBatch(connection, transaction);
+
+        var advance = new NpgsqlBatchCommand(
+            $"""
+             WITH upsert_conversation AS (
+                 UPDATE {schema.ConversationsTableSql}
+                 SET last_message_id = @message_id,
+                     last_message_preview = @preview,
+                     last_message_at_ms = @received_at_ms,
+                     last_sender_user_id = @sender_user_id,
+                     updated_at_ms = @received_at_ms
+                 WHERE conversation_id = @conversation_id
+                   AND type = @group_type
+                   AND (
+                        last_message_at_ms IS NULL
+                        OR (last_message_at_ms, last_message_id)
+                           < (@received_at_ms, @message_id)
+                   )
+                 RETURNING conversation_id
+             ),
+             sync_tip AS (
+                 UPDATE {schema.ConversationMembersTableSql}
+                 SET last_message_at_ms = @received_at_ms
+                 WHERE conversation_id = @conversation_id
+                   AND EXISTS (SELECT 1 FROM upsert_conversation)
+                   AND (
+                        last_message_at_ms IS NULL
+                        OR last_message_at_ms < @received_at_ms
+                   )
+                 RETURNING user_id
+             )
+             SELECT EXISTS (SELECT 1 FROM upsert_conversation) AS advanced;
+             """);
+        advance.Parameters.AddWithValue("conversation_id", conversationId);
+        advance.Parameters.AddWithValue("group_type", (short)ConversationType.Group);
+        advance.Parameters.AddWithValue("received_at_ms", receivedAtMs);
+        advance.Parameters.AddWithValue("message_id", messageId);
+        advance.Parameters.AddWithValue("preview", preview);
+        advance.Parameters.AddWithValue("sender_user_id", senderUserId);
+        batch.BatchCommands.Add(advance);
+
+        var unreadCmd = new NpgsqlBatchCommand(
+            $"""
+             UPDATE {schema.ConversationMembersTableSql}
+             SET unread_count = LEAST(unread_count + 1, @max_unread)
+             WHERE conversation_id = @conversation_id
+               AND user_id <> @sender_user_id
+               AND (
+                    last_read_at_ms IS NULL
+                    OR last_read_at_ms < @received_at_ms
+                    OR (last_read_at_ms = @received_at_ms
+                        AND (last_read_message_id IS NULL OR last_read_message_id < @message_id))
+               )
+             RETURNING user_id, unread_count;
+             """);
+        unreadCmd.Parameters.AddWithValue("max_unread", MaxTrackedUnreadCount);
+        unreadCmd.Parameters.AddWithValue("conversation_id", conversationId);
+        unreadCmd.Parameters.AddWithValue("sender_user_id", senderUserId);
+        unreadCmd.Parameters.AddWithValue("received_at_ms", receivedAtMs);
+        unreadCmd.Parameters.AddWithValue("message_id", messageId);
+        batch.BatchCommands.Add(unreadCmd);
+
+        await using var reader = await batch.ExecuteReaderAsync(ct).ConfigureAwait(false);
+
+        var advanced = false;
+        if (await reader.ReadAsync(ct).ConfigureAwait(false))
+            advanced = reader.GetBoolean(0);
+
+        var unreads = new List<(long UserId, int UnreadCount)>();
+        if (await reader.NextResultAsync(ct).ConfigureAwait(false))
+        {
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                unreads.Add((reader.GetInt64(0), reader.GetInt32(1)));
+        }
+
+        return (advanced, unreads);
+    }
+
+    public static async Task<IReadOnlyList<long>> ListActiveMemberUserIdsAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        RealtimeDatabaseSchema schema,
+        string conversationId,
+        CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT user_id
+             FROM {schema.ConversationMembersTableSql}
+             WHERE conversation_id = @conversation_id
+             ORDER BY user_id;
+             """,
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("conversation_id", conversationId);
+        var ids = new List<long>();
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            ids.Add(reader.GetInt64(0));
+        return ids;
+    }
 
     public static async Task<bool> TryAdvanceDirectConversationAsync(
         NpgsqlConnection connection,
@@ -315,20 +431,23 @@ internal static class ConversationWriteCommands
     public static RealtimeEvent CreateConversationChangedEvent(
         string conversationId,
         long targetUserId,
-        long peerUserId,
+        long? peerUserId,
         string messageId,
         string preview,
         long receivedAtMs,
         long senderUserId,
         string? traceParent,
         string? traceState,
-        string? eventIdCause = null)
+        string? eventIdCause = null,
+        ConversationType type = ConversationType.Direct,
+        string? title = null)
     {
         var payload = new RealtimeConversationChangedPayload
         {
             ConversationId = conversationId,
-            Type = ConversationType.Direct,
+            Type = type,
             PeerUserId = peerUserId,
+            Title = title,
             LastMessageId = messageId,
             LastMessagePreview = preview,
             LastMessageAtMs = receivedAtMs,

@@ -12,5 +12,10 @@ public enum RealtimeMessagePersistKind : byte
     /// <summary>
     /// 附件绑定失败（缺失 / 非 Confirmed / 非上传者拥有）。事务已回滚。
     /// </summary>
-    AttachmentBindFailed = 3
+    AttachmentBindFailed = 3,
+
+    /// <summary>
+    /// 发送方不是会话成员等权限拒绝。事务已回滚。
+    /// </summary>
+    NotAllowed = 4
 }

@@ -83,6 +83,10 @@ public static class RealtimeHistoryAttachmentEnricher
             ForwardedFromMessageId = message.ForwardedFromMessageId,
             ForwardedFromSenderUserId = message.ForwardedFromSenderUserId,
             ForwardedFromPreview = message.ForwardedFromPreview,
-            RecalledAtMs = message.RecalledAtMs
+            RecalledAtMs = message.RecalledAtMs,
+            EditVersion = message.EditVersion,
+            EditedAtMs = message.EditedAtMs,
+            ChangedAtMs = message.ChangedAtMs,
+            Reactions = message.Reactions
         };
 }

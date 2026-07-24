@@ -16,7 +16,9 @@ public sealed class RealtimeIntegrationOptions
     public string ConversationSetPrefsSubject { get; set; } = "chat.conversation-prefs.set";
     public string MessageRecallsSubject { get; set; } = "chat.message-recall";
     public string MessageEditsSubject { get; set; } = "chat.message-edit";
+    public string MessageReactionsSubject { get; set; } = "chat.message-reaction";
     public string SyncBootstrapQueriesSubject { get; set; } = "chat.sync.bootstrap";
+    public string GroupConversationsSubject { get; set; } = "chat.group-conversation";
     public string DeadLettersSubject { get; set; } = "chat.dead-letters";
 
     /// <summary>NATS Core ephemeral Typing（非 JetStream，每实例全量订阅）。</summary>

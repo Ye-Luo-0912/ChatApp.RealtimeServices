@@ -11,7 +11,9 @@ public sealed class DefaultMessageHistoryQueryProcessorTests
 {
     private static DefaultMessageHistoryQueryProcessor CreateProcessor(
         IRealtimeMessageHistoryStore store) =>
-        new(store, new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance));
+        new(store,
+            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance),
+            new NoopRealtimeReactionStore(NullLogger<NoopRealtimeReactionStore>.Instance));
 
     [Fact]
     public async Task ProcessAsync_ClampsLimitAndReturnsStableCursor()

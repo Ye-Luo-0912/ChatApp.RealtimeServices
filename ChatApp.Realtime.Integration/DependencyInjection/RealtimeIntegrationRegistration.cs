@@ -19,6 +19,7 @@ public static class RealtimeIntegrationRegistration
         ArgumentException.ThrowIfNullOrWhiteSpace(options.MessageRecallsSubject);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.MessageEditsSubject);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.SyncBootstrapQueriesSubject);
+        ArgumentException.ThrowIfNullOrWhiteSpace(options.GroupConversationsSubject);
         if (options.HistoryRequestTimeoutMs <= 0)
             throw new ArgumentOutOfRangeException(nameof(options.HistoryRequestTimeoutMs));
         if (options.Replicas <= 0)

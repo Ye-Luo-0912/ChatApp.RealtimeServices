@@ -258,6 +258,40 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
         }
     }
 
+    public async Task<GroupConversationResult> MutateGroupConversationAsync(
+        GroupConversationCommand command,
+        CancellationToken ct = default)
+    {
+        using var activity = RealtimeIntegrationTelemetry.StartClient(
+            "group_conversation.request",
+            _options.GroupConversationsSubject);
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromMilliseconds(
+                _options.HistoryRequestTimeoutMs));
+
+            var response = await _client.Value.RequestAsync<string, string>(
+                    _options.GroupConversationsSubject,
+                    RealtimeWireSerializer.Serialize(command),
+                    headers: RealtimeIntegrationTelemetry.CreateIdentityHeaders(command.ActorUserId),
+                    cancellationToken: timeout.Token)
+                .ConfigureAwait(false);
+            response.EnsureSuccess();
+
+            if (string.IsNullOrWhiteSpace(response.Data))
+                throw new JsonException("群会话操作返回了空响应。");
+
+            return RealtimeWireSerializer.DeserializeGroupConversationResult(response.Data)
+                   ?? throw new JsonException("群会话操作响应无法反序列化。");
+        }
+        catch (Exception ex)
+        {
+            RealtimeIntegrationTelemetry.RecordException(activity, ex);
+            throw;
+        }
+    }
+
     public async Task<MessageRecallResult> RecallMessageAsync(
         MessageRecallCommand command,
         CancellationToken ct = default)
@@ -322,6 +356,42 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
 
             return RealtimeWireSerializer.DeserializeMessageEditResult(response.Data)
                    ?? throw new JsonException("消息编辑响应无法反序列化。");
+        }
+        catch (Exception ex)
+        {
+            RealtimeIntegrationTelemetry.RecordException(activity, ex);
+            throw;
+        }
+    }
+
+    public async Task<MessageReactionResult> ReactToMessageAsync(
+        MessageReactionCommand command,
+        CancellationToken ct = default)
+    {
+        using var activity = RealtimeIntegrationTelemetry.StartClient(
+            "message_reaction.request",
+            _options.MessageReactionsSubject);
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromMilliseconds(
+                _options.HistoryRequestTimeoutMs));
+
+            var response = await _client.Value.RequestAsync<string, string>(
+                    _options.MessageReactionsSubject,
+                    RealtimeWireSerializer.Serialize(command),
+                    headers: RealtimeIntegrationTelemetry.CreateIdentityHeaders(
+                        command.ActorUserId,
+                        command.ActorSessionId),
+                    cancellationToken: timeout.Token)
+                .ConfigureAwait(false);
+            response.EnsureSuccess();
+
+            if (string.IsNullOrWhiteSpace(response.Data))
+                throw new JsonException("消息反应返回了空响应。");
+
+            return RealtimeWireSerializer.DeserializeMessageReactionResult(response.Data)
+                   ?? throw new JsonException("消息反应响应无法反序列化。");
         }
         catch (Exception ex)
         {

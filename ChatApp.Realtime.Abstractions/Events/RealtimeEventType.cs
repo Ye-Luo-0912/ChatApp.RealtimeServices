@@ -70,5 +70,25 @@ public enum RealtimeEventType : byte
     /// 消息表情反应移除。Payload：<c>RealtimeReactionRemovedPayload</c>。
     /// 目标为消息参与方（接收方 / 发送方其他设备）。
     /// </summary>
-    ReactionRemoved = 15
+    ReactionRemoved = 15,
+
+    /// <summary>
+    /// 群成员加入。Payload：<c>RealtimeMemberJoinedPayload</c>。
+    /// </summary>
+    MemberJoined = 16,
+
+    /// <summary>
+    /// 成员主动退群。Payload：<c>RealtimeMemberLeftPayload</c>。
+    /// </summary>
+    MemberLeft = 17,
+
+    /// <summary>
+    /// 成员被移除。Payload：<c>RealtimeMemberRemovedPayload</c>。
+    /// </summary>
+    MemberRemoved = 18,
+
+    /// <summary>
+    /// 成员角色变更（含转让 Owner）。Payload：<c>RealtimeRoleChangedPayload</c>。
+    /// </summary>
+    RoleChanged = 19
 }

@@ -28,11 +28,17 @@ public static class RealtimeWireSerializer
     public static string Serialize(ConversationSetPrefsCommand command) =>
         JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.ConversationSetPrefsCommand);
 
+    public static string Serialize(GroupConversationCommand command) =>
+        JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.GroupConversationCommand);
+
     public static string Serialize(MessageRecallCommand command) =>
         JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.MessageRecallCommand);
 
     public static string Serialize(MessageEditCommand command) =>
         JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.MessageEditCommand);
+
+    public static string Serialize(MessageReactionCommand command) =>
+        JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.MessageReactionCommand);
 
     public static string Serialize(SyncBootstrapQuery query) =>
         JsonSerializer.Serialize(query, RealtimeIntegrationJsonContext.Default.SyncBootstrapQuery);
@@ -79,11 +85,17 @@ public static class RealtimeWireSerializer
     public static ConversationSetPrefsResult? DeserializeConversationSetPrefsResult(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.ConversationSetPrefsResult);
 
+    public static GroupConversationResult? DeserializeGroupConversationResult(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.GroupConversationResult);
+
     public static MessageRecallResult? DeserializeMessageRecallResult(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.MessageRecallResult);
 
     public static MessageEditResult? DeserializeMessageEditResult(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.MessageEditResult);
+
+    public static MessageReactionResult? DeserializeMessageReactionResult(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.MessageReactionResult);
 
     public static SyncBootstrapPage? DeserializeSyncBootstrapPage(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.SyncBootstrapPage);
@@ -108,6 +120,24 @@ public static class RealtimeWireSerializer
 
     public static RealtimeMessageEditedPayload? DeserializeMessageEdited(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeMessageEditedPayload);
+
+    public static RealtimeReactionAddedPayload? DeserializeReactionAdded(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeReactionAddedPayload);
+
+    public static RealtimeReactionRemovedPayload? DeserializeReactionRemoved(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeReactionRemovedPayload);
+
+    public static RealtimeMemberJoinedPayload? DeserializeMemberJoined(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeMemberJoinedPayload);
+
+    public static RealtimeMemberLeftPayload? DeserializeMemberLeft(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeMemberLeftPayload);
+
+    public static RealtimeMemberRemovedPayload? DeserializeMemberRemoved(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeMemberRemovedPayload);
+
+    public static RealtimeRoleChangedPayload? DeserializeRoleChanged(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeRoleChangedPayload);
 
     public static string Serialize(RealtimeDomainNotificationPayload payload) =>
         JsonSerializer.Serialize(payload, RealtimeIntegrationJsonContext.Default.RealtimeDomainNotificationPayload);

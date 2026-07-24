@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Messaging;
 
 namespace ChatApp.Realtime.Abstractions.Events;
@@ -40,9 +41,33 @@ public static class RealtimeEventContracts
     /// <summary>业务名 ReactionRemoved → 线协议 <see cref="RealtimeEventType.ReactionRemoved"/>。</summary>
     public const string ReactionRemoved = nameof(ReactionRemoved);
 
+    /// <summary>业务名 MemberJoined → 线协议 <see cref="RealtimeEventType.MemberJoined"/>。</summary>
+    public const string MemberJoined = nameof(MemberJoined);
+
+    /// <summary>业务名 MemberLeft → 线协议 <see cref="RealtimeEventType.MemberLeft"/>。</summary>
+    public const string MemberLeft = nameof(MemberLeft);
+
+    /// <summary>业务名 MemberRemoved → 线协议 <see cref="RealtimeEventType.MemberRemoved"/>。</summary>
+    public const string MemberRemoved = nameof(MemberRemoved);
+
+    /// <summary>业务名 RoleChanged → 线协议 <see cref="RealtimeEventType.RoleChanged"/>。</summary>
+    public const string RoleChanged = nameof(RoleChanged);
+
     public static string CreateMessageReceivedEventId(long senderUserId, string clientMessageId)
     {
         var input = Encoding.UTF8.GetBytes($"{senderUserId}:{clientMessageId}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
+    /// <summary>
+    /// 群消息按目标用户拆分 Outbox 行时使用；纳入 target 避免冲突吞掉。
+    /// </summary>
+    public static string CreateMessageReceivedEventId(
+        long senderUserId,
+        string clientMessageId,
+        long targetUserId)
+    {
+        var input = Encoding.UTF8.GetBytes($"{senderUserId}:{clientMessageId}:{targetUserId}");
         return Convert.ToHexStringLower(SHA256.HashData(input));
     }
 
@@ -55,10 +80,13 @@ public static class RealtimeEventContracts
     public static string CreateConversationChangedEventId(
         string conversationId,
         string lastMessageId,
-        long targetUserId)
+        long targetUserId,
+        string? causeToken = null)
     {
         var input = Encoding.UTF8.GetBytes(
-            $"convchg:{conversationId}:{lastMessageId}:{targetUserId}");
+            string.IsNullOrEmpty(causeToken)
+                ? $"convchg:{conversationId}:{lastMessageId}:{targetUserId}"
+                : $"convchg:{conversationId}:{lastMessageId}:{targetUserId}:{causeToken}");
         return Convert.ToHexStringLower(SHA256.HashData(input));
     }
 
@@ -172,6 +200,51 @@ public static class RealtimeEventContracts
         return Convert.ToHexStringLower(SHA256.HashData(input));
     }
 
+    public static string CreateMemberJoinedEventId(
+        string conversationId,
+        long userId,
+        long targetUserId,
+        long occurredAtMs)
+    {
+        var input = Encoding.UTF8.GetBytes(
+            $"memjoin:{conversationId}:{userId}:{targetUserId}:{occurredAtMs}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
+    public static string CreateMemberLeftEventId(
+        string conversationId,
+        long userId,
+        long targetUserId,
+        long occurredAtMs)
+    {
+        var input = Encoding.UTF8.GetBytes(
+            $"memleft:{conversationId}:{userId}:{targetUserId}:{occurredAtMs}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
+    public static string CreateMemberRemovedEventId(
+        string conversationId,
+        long userId,
+        long targetUserId,
+        long occurredAtMs)
+    {
+        var input = Encoding.UTF8.GetBytes(
+            $"memrm:{conversationId}:{userId}:{targetUserId}:{occurredAtMs}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
+    public static string CreateRoleChangedEventId(
+        string conversationId,
+        long userId,
+        ConversationMemberRole newRole,
+        long targetUserId,
+        long occurredAtMs)
+    {
+        var input = Encoding.UTF8.GetBytes(
+            $"rolechg:{conversationId}:{userId}:{(byte)newRole}:{targetUserId}:{occurredAtMs}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
     public static RealtimeEventType ToWireType(string businessName) =>
         businessName switch
         {
@@ -184,6 +257,10 @@ public static class RealtimeEventContracts
             MessageEdited => RealtimeEventType.MessageEdited,
             ReactionAdded => RealtimeEventType.ReactionAdded,
             ReactionRemoved => RealtimeEventType.ReactionRemoved,
+            MemberJoined => RealtimeEventType.MemberJoined,
+            MemberLeft => RealtimeEventType.MemberLeft,
+            MemberRemoved => RealtimeEventType.MemberRemoved,
+            RoleChanged => RealtimeEventType.RoleChanged,
             _ => throw new ArgumentOutOfRangeException(nameof(businessName), businessName, null)
         };
 }

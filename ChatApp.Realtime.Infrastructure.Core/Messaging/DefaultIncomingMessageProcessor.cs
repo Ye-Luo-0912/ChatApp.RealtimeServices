@@ -13,17 +13,20 @@ namespace ChatApp.Realtime.Infrastructure.Core.Messaging;
 public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
 {
     private readonly IRealtimeMessageStore _messageStore;
+    private readonly IRealtimeGroupStore _groupStore;
     private readonly IRealtimeOutboxSignal _outboxSignal;
     private readonly RealtimeMetrics _metrics;
     private readonly ILogger<DefaultIncomingMessageProcessor> _logger;
 
     public DefaultIncomingMessageProcessor(
         IRealtimeMessageStore messageStore,
+        IRealtimeGroupStore groupStore,
         IRealtimeOutboxSignal outboxSignal,
         RealtimeMetrics metrics,
         ILogger<DefaultIncomingMessageProcessor> logger)
     {
         _messageStore = messageStore;
+        _groupStore = groupStore;
         _outboxSignal = outboxSignal;
         _metrics = metrics;
         _logger = logger;
@@ -40,9 +43,51 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             return validationError;
         }
 
-        var conversationId = ConversationId.CreateDirect(
-            command.SenderUserId,
-            command.ReceiverUserId);
+        string conversationId;
+        long receiverUserId;
+        var explicitConversationId = string.IsNullOrWhiteSpace(command.ConversationId)
+            ? null
+            : command.ConversationId.Trim();
+
+        if (explicitConversationId is not null && ConversationId.IsGroup(explicitConversationId))
+        {
+            conversationId = explicitConversationId;
+            receiverUserId = 0;
+            var isMember = await _groupStore
+                .IsActiveMemberAsync(conversationId, command.SenderUserId, ct)
+                .ConfigureAwait(false);
+            if (!isMember)
+            {
+                _metrics.RecordProcessingFailure("not_member");
+                return MessageProcessResult.Failed(
+                    "forbidden",
+                    "无权在该群发送消息。",
+                    MessageFailureKind.Permanent);
+            }
+        }
+        else
+        {
+            if (command.ReceiverUserId <= 0)
+            {
+                _metrics.RecordProcessingFailure("validation");
+                return MessageProcessResult.Failed(
+                    "invalid_user_id",
+                    "发送方和接收方用户编号必须大于 0。");
+            }
+
+            if (command.SenderUserId == command.ReceiverUserId)
+            {
+                _metrics.RecordProcessingFailure("validation");
+                return MessageProcessResult.Failed(
+                    "invalid_self_chat",
+                    "单聊发送方与接收方不能为同一用户。");
+            }
+
+            conversationId = ConversationId.CreateDirect(
+                command.SenderUserId,
+                command.ReceiverUserId);
+            receiverUserId = command.ReceiverUserId;
+        }
 
         var record = new RealtimeMessageRecord
         {
@@ -50,7 +95,7 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             ClientMessageId = command.ClientMessageId,
             SenderUserId = command.SenderUserId,
             SenderSessionId = command.SenderSessionId,
-            ReceiverUserId = command.ReceiverUserId,
+            ReceiverUserId = receiverUserId,
             ConversationId = conversationId,
             Content = command.Content,
             AttachmentIds = command.AttachmentIds,
@@ -65,11 +110,18 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
 
         var evt = new RealtimeEvent
         {
-            EventId = RealtimeEventContracts.CreateMessageReceivedEventId(
-                command.SenderUserId,
-                command.ClientMessageId),
+            EventId = ConversationId.IsGroup(conversationId)
+                ? RealtimeEventContracts.CreateMessageReceivedEventId(
+                    command.SenderUserId,
+                    command.ClientMessageId,
+                    command.SenderUserId)
+                : RealtimeEventContracts.CreateMessageReceivedEventId(
+                    command.SenderUserId,
+                    command.ClientMessageId),
             Type = RealtimeEventType.MessageReceived,
-            TargetUserId = command.ReceiverUserId,
+            TargetUserId = ConversationId.IsGroup(conversationId)
+                ? command.SenderUserId
+                : command.ReceiverUserId,
             ActorUserId = command.SenderUserId,
             MessageId = command.CommandId,
             SessionId = command.SenderSessionId,
@@ -80,7 +132,7 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                     ClientMessageId = command.ClientMessageId,
                     SenderUserId = command.SenderUserId,
                     SenderSessionId = command.SenderSessionId,
-                    ReceiverUserId = command.ReceiverUserId,
+                    ReceiverUserId = receiverUserId,
                     ConversationId = conversationId,
                     Content = command.Content,
                     ReceivedAtMs = command.ReceivedAtMs,
@@ -127,6 +179,15 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                 MessageFailureKind.Permanent);
         }
 
+        if (persisted.IsNotAllowed)
+        {
+            _metrics.RecordProcessingFailure("not_member");
+            return MessageProcessResult.Failed(
+                "forbidden",
+                "无权在该会话发送消息。",
+                MessageFailureKind.Permanent);
+        }
+
         _outboxSignal.Notify();
 
         if (!persisted.IsNew)
@@ -158,10 +219,21 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             return MessageProcessResult.Failed("invalid_command_id", "命令编号不能为空且长度不能超过 64。");
         if (string.IsNullOrWhiteSpace(command.ClientMessageId) || command.ClientMessageId.Length > 128)
             return MessageProcessResult.Failed("invalid_client_message_id", "客户端消息编号不能为空且长度不能超过 128。");
-        if (command.SenderUserId <= 0 || command.ReceiverUserId <= 0)
-            return MessageProcessResult.Failed("invalid_user_id", "发送方和接收方用户编号必须大于 0。");
-        if (command.SenderUserId == command.ReceiverUserId)
-            return MessageProcessResult.Failed("invalid_self_chat", "单聊发送方与接收方不能为同一用户。");
+        if (command.SenderUserId <= 0)
+            return MessageProcessResult.Failed("invalid_user_id", "发送方用户编号必须大于 0。");
+
+        var conversationId = string.IsNullOrWhiteSpace(command.ConversationId)
+            ? null
+            : command.ConversationId.Trim();
+        if (conversationId is not null)
+        {
+            if (conversationId.Length > ConversationId.MaxLength
+                || (!ConversationId.IsGroup(conversationId) && !ConversationId.IsDirect(conversationId)))
+            {
+                return MessageProcessResult.Failed("invalid_conversation_id", "会话编号无效。");
+            }
+        }
+
         if (string.IsNullOrWhiteSpace(command.SenderSessionId) || command.SenderSessionId.Length > 128)
             return MessageProcessResult.Failed("invalid_session_id", "发送会话编号不能为空且长度不能超过 128。");
         if (string.IsNullOrWhiteSpace(command.Content)

@@ -7,6 +7,7 @@ public sealed record RealtimeMessagePersistResult(
     public bool IsNew => Kind == RealtimeMessagePersistKind.Created;
     public bool IsConflict => Kind == RealtimeMessagePersistKind.ContentConflict;
     public bool IsAttachmentBindFailed => Kind == RealtimeMessagePersistKind.AttachmentBindFailed;
+    public bool IsNotAllowed => Kind == RealtimeMessagePersistKind.NotAllowed;
 
     public static RealtimeMessagePersistResult Created(string messageId) =>
         new(RealtimeMessagePersistKind.Created, messageId);
@@ -19,4 +20,7 @@ public sealed record RealtimeMessagePersistResult(
 
     public static RealtimeMessagePersistResult AttachmentBindFailed(string messageId) =>
         new(RealtimeMessagePersistKind.AttachmentBindFailed, messageId);
+
+    public static RealtimeMessagePersistResult NotAllowed(string messageId) =>
+        new(RealtimeMessagePersistKind.NotAllowed, messageId);
 }

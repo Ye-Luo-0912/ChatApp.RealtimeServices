@@ -17,13 +17,16 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
 
     private readonly IRealtimeMessageHistoryStore _store;
     private readonly IRealtimeAttachmentStore _attachmentStore;
+    private readonly IRealtimeReactionStore _reactionStore;
 
     public DefaultMessageHistoryQueryProcessor(
         IRealtimeMessageHistoryStore store,
-        IRealtimeAttachmentStore attachmentStore)
+        IRealtimeAttachmentStore attachmentStore,
+        IRealtimeReactionStore reactionStore)
     {
         _store = store;
         _attachmentStore = attachmentStore;
+        _reactionStore = reactionStore;
     }
 
     public async Task<MessageHistoryPage> ProcessAsync(
@@ -41,10 +44,22 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
                 return MessageHistoryPage.Failed(query.RequestId, "not_found", "消息不存在。");
 
             if (message.SenderUserId != query.UserId && message.ReceiverUserId != query.UserId)
-                return MessageHistoryPage.Failed(query.RequestId, "forbidden", "无权查看该消息。");
+            {
+                var conversationId = message.ConversationId;
+                if (string.IsNullOrWhiteSpace(conversationId)
+                    || !ConversationId.IsGroup(conversationId)
+                    || !await _store.IsConversationMemberAsync(query.UserId, conversationId, ct)
+                        .ConfigureAwait(false))
+                {
+                    return MessageHistoryPage.Failed(query.RequestId, "forbidden", "无权查看该消息。");
+                }
+            }
 
             var enrichedSingle = await RealtimeHistoryAttachmentEnricher
                 .EnrichAsync(_attachmentStore, [message], ct)
+                .ConfigureAwait(false);
+            enrichedSingle = await RealtimeHistoryReactionEnricher
+                .EnrichAsync(_reactionStore, enrichedSingle, query.UserId, ct)
                 .ConfigureAwait(false);
             var single = MessageHistoryPage.Success(query.RequestId, enrichedSingle, null, false);
             if (MeasureUtf8Json(single) > MaximumResponseBytes)
@@ -115,6 +130,9 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
 
         rows = await RealtimeHistoryAttachmentEnricher
             .EnrichAsync(_attachmentStore, rows, ct)
+            .ConfigureAwait(false);
+        rows = await RealtimeHistoryReactionEnricher
+            .EnrichAsync(_reactionStore, rows, query.UserId, ct)
             .ConfigureAwait(false);
 
         return PackByActualUtf8Json(query.RequestId, rows, pageSize);

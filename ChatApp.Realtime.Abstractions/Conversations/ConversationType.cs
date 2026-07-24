@@ -1,7 +1,7 @@
 namespace ChatApp.Realtime.Abstractions.Conversations;
 
 /// <summary>
-/// 会话类型。群聊预留，当前仅实现单聊。
+/// 会话类型。单聊与群聊。
 /// </summary>
 public enum ConversationType : byte
 {

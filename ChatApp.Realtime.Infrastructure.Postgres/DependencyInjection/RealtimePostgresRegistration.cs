@@ -51,12 +51,16 @@ public static class RealtimePostgresRegistration
             services.AddSingleton<IRealtimeMessageHistoryStore, NpgsqlRealtimeMessageHistoryStore>();
             services.RemoveAll<IRealtimeConversationStore>();
             services.AddSingleton<IRealtimeConversationStore, NpgsqlRealtimeConversationStore>();
+            services.RemoveAll<IRealtimeGroupStore>();
+            services.AddSingleton<IRealtimeGroupStore, NpgsqlRealtimeGroupStore>();
             services.RemoveAll<IRealtimeDeviceSyncCursorStore>();
             services.AddSingleton<IRealtimeDeviceSyncCursorStore, NpgsqlRealtimeDeviceSyncCursorStore>();
             services.RemoveAll<IRealtimeOutboxStore>();
             services.AddSingleton<IRealtimeOutboxStore, NpgsqlRealtimeOutboxStore>();
             services.RemoveAll<IRealtimeAttachmentStore>();
             services.AddSingleton<IRealtimeAttachmentStore, NpgsqlRealtimeAttachmentStore>();
+            services.RemoveAll<IRealtimeReactionStore>();
+            services.AddSingleton<IRealtimeReactionStore, NpgsqlRealtimeReactionStore>();
         }
 
         return services;

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Stores;
@@ -20,6 +21,7 @@ public sealed class DefaultIncomingMessageProcessorTests
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             store,
+            new AlwaysMemberGroupStore(),
             signal,
             metrics,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
@@ -53,6 +55,7 @@ public sealed class DefaultIncomingMessageProcessorTests
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             store,
+            new AlwaysMemberGroupStore(),
             new RecordingRealtimeOutboxSignal(),
             metrics,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
@@ -74,11 +77,13 @@ public sealed class DefaultIncomingMessageProcessorTests
 
         await new DefaultIncomingMessageProcessor(
             firstStore,
+            new AlwaysMemberGroupStore(),
             new RecordingRealtimeOutboxSignal(),
             firstMetrics,
             NullLogger<DefaultIncomingMessageProcessor>.Instance).ProcessAsync(command);
         await new DefaultIncomingMessageProcessor(
             secondStore,
+            new AlwaysMemberGroupStore(),
             new RecordingRealtimeOutboxSignal(),
             secondMetrics,
             NullLogger<DefaultIncomingMessageProcessor>.Instance).ProcessAsync(command);
@@ -95,6 +100,7 @@ public sealed class DefaultIncomingMessageProcessorTests
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             store,
+            new AlwaysMemberGroupStore(),
             signal,
             metrics,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
@@ -113,6 +119,7 @@ public sealed class DefaultIncomingMessageProcessorTests
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             store,
+            new AlwaysMemberGroupStore(),
             signal,
             metrics,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
@@ -135,6 +142,7 @@ public sealed class DefaultIncomingMessageProcessorTests
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             store,
+            new AlwaysMemberGroupStore(),
             signal,
             metrics,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
@@ -155,6 +163,7 @@ public sealed class DefaultIncomingMessageProcessorTests
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             store,
+            new AlwaysMemberGroupStore(),
             signal,
             metrics,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
@@ -238,5 +247,71 @@ public sealed class DefaultIncomingMessageProcessorTests
             RealtimeEvent eventToPublish,
             CancellationToken ct = default) =>
             Task.CompletedTask;
+    }
+
+    private sealed class AlwaysMemberGroupStore : IRealtimeGroupStore
+    {
+        public Task<GroupCreatePersistResult> CreateGroupAsync(
+            long creatorUserId,
+            string conversationId,
+            string title,
+            IReadOnlyList<long> memberUserIds,
+            string? actorSessionId,
+            long occurredAtMs,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<GroupMutatePersistResult> AddMembersAsync(
+            long actorUserId,
+            string conversationId,
+            IReadOnlyList<long> memberUserIds,
+            string? actorSessionId,
+            long occurredAtMs,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<GroupMutatePersistResult> RemoveMemberAsync(
+            long actorUserId,
+            string conversationId,
+            long targetUserId,
+            string? actorSessionId,
+            long occurredAtMs,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<GroupMutatePersistResult> LeaveAsync(
+            long actorUserId,
+            string conversationId,
+            string? actorSessionId,
+            long occurredAtMs,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<GroupMutatePersistResult> ChangeRoleAsync(
+            long actorUserId,
+            string conversationId,
+            long targetUserId,
+            ConversationMemberRole newRole,
+            string? actorSessionId,
+            long occurredAtMs,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<IReadOnlyList<ConversationMemberItem>> ListMembersAsync(
+            long actorUserId,
+            string conversationId,
+            CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ConversationMemberItem>>([]);
+
+        public Task<IReadOnlyList<long>> ListActiveMemberUserIdsAsync(
+            string conversationId,
+            CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<long>>([]);
+
+        public Task<bool> IsActiveMemberAsync(
+            string conversationId,
+            long userId,
+            CancellationToken ct = default) =>
+            Task.FromResult(true);
     }
 }

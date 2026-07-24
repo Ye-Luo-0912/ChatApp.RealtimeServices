@@ -19,6 +19,7 @@ public sealed class RealtimeQueueTopics
     public string MessageEdits { get; init; } = "chat.message-edit";
     public string MessageReactions { get; init; } = "chat.message-reaction";
     public string SyncBootstrapQueries { get; init; } = "chat.sync.bootstrap";
+    public string GroupConversations { get; init; } = "chat.group-conversation";
     public string? MessagePersistence { get; init; }
     public string DeadLetters { get; init; } = "chat.dead-letters";
 }

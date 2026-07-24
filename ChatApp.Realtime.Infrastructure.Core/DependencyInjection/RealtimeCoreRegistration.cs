@@ -38,10 +38,13 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IConversationListQueryProcessor, DefaultConversationListQueryProcessor>();
         services.TryAddSingleton<IConversationMarkReadProcessor, DefaultConversationMarkReadProcessor>();
         services.TryAddSingleton<IConversationSetPrefsProcessor, DefaultConversationSetPrefsProcessor>();
+        services.TryAddSingleton<IGroupConversationProcessor, DefaultGroupConversationProcessor>();
         services.TryAddSingleton<IMessageRecallProcessor, DefaultMessageRecallProcessor>();
         services.TryAddSingleton<IMessageEditProcessor, DefaultMessageEditProcessor>();
+        services.TryAddSingleton<IMessageReactionProcessor, DefaultMessageReactionProcessor>();
         services.TryAddSingleton(new MessageEditOptions());
         services.TryAddSingleton(new MessageRecallOptions());
+        services.TryAddSingleton(new MessageReactionOptions());
         services.TryAddSingleton(BindSyncBootstrapOptions);
         services.TryAddSingleton<ISyncBootstrapQueryProcessor, DefaultSyncBootstrapQueryProcessor>();
 
@@ -53,13 +56,17 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IConversationListQueryConsumer, NoopConversationListQueryConsumer>();
         services.TryAddSingleton<IConversationMarkReadConsumer, NoopConversationMarkReadConsumer>();
         services.TryAddSingleton<IConversationSetPrefsConsumer, NoopConversationSetPrefsConsumer>();
+        services.TryAddSingleton<IGroupConversationConsumer, NoopGroupConversationConsumer>();
         services.TryAddSingleton<IMessageRecallConsumer, NoopMessageRecallConsumer>();
         services.TryAddSingleton<IMessageEditConsumer, NoopMessageEditConsumer>();
+        services.TryAddSingleton<IMessageReactionConsumer, NoopMessageReactionConsumer>();
         services.TryAddSingleton<ISyncBootstrapQueryConsumer, NoopSyncBootstrapQueryConsumer>();
         services.TryAddSingleton<IRealtimeMessageStore, NoopRealtimeMessageStore>();
         services.TryAddSingleton<IRealtimeAttachmentStore, NoopRealtimeAttachmentStore>();
+        services.TryAddSingleton<IRealtimeReactionStore, NoopRealtimeReactionStore>();
         services.TryAddSingleton<IRealtimeMessageHistoryStore, NoopRealtimeMessageHistoryStore>();
         services.TryAddSingleton<IRealtimeConversationStore, NoopRealtimeConversationStore>();
+        services.TryAddSingleton<IRealtimeGroupStore, NoopRealtimeGroupStore>();
         services.TryAddSingleton<IRealtimeDeviceSyncCursorStore, NoopRealtimeDeviceSyncCursorStore>();
         services.TryAddSingleton<IRealtimeOutboxStore, NoopRealtimeOutboxStore>();
         services.TryAddSingleton<IDeadLetterPublisher, NoopDeadLetterPublisher>();

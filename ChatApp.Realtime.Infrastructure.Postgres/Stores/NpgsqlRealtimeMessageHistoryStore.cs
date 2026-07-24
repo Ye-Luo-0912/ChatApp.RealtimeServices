@@ -54,7 +54,10 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  history.recalled_at_ms,
                  history.forwarded_from_message_id,
                  history.forwarded_from_sender_user_id,
-                 history.forwarded_from_preview,\n                 history.edit_version,\n                 history.edited_at_ms,\n                 history.changed_at_ms
+                 history.forwarded_from_preview,
+                 history.edit_version,
+                 history.edited_at_ms,
+                 history.changed_at_ms
              FROM (
                  (
                      SELECT
@@ -73,7 +76,10 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                          recalled_at_ms,
                          forwarded_from_message_id,
                          forwarded_from_sender_user_id,
-                         forwarded_from_preview,\n                         edit_version,\n                         edited_at_ms,\n                         changed_at_ms
+                         forwarded_from_preview,
+                         edit_version,
+                         edited_at_ms,
+                         changed_at_ms
                      FROM {_databaseSchema.MessagesTableSql}
                      WHERE receiver_user_id = @user_id
                        AND (
@@ -105,7 +111,10 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                          recalled_at_ms,
                          forwarded_from_message_id,
                          forwarded_from_sender_user_id,
-                         forwarded_from_preview,\n                         edit_version,\n                         edited_at_ms,\n                         changed_at_ms
+                         forwarded_from_preview,
+                         edit_version,
+                         edited_at_ms,
+                         changed_at_ms
                      FROM {_databaseSchema.MessagesTableSql}
                      WHERE sender_user_id = @user_id
                        AND receiver_user_id <> @user_id
@@ -177,7 +186,10 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  msg.recalled_at_ms,
                  msg.forwarded_from_message_id,
                  msg.forwarded_from_sender_user_id,
-                 msg.forwarded_from_preview,\n                 msg.edit_version,\n                 msg.edited_at_ms,\n                 msg.changed_at_ms
+                 msg.forwarded_from_preview,
+                 msg.edit_version,
+                 msg.edited_at_ms,
+                 msg.changed_at_ms
              FROM membership
              LEFT JOIN LATERAL (
                  SELECT
@@ -196,7 +208,10 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                      recalled_at_ms,
                      forwarded_from_message_id,
                      forwarded_from_sender_user_id,
-                     forwarded_from_preview,\n                     edit_version,\n                     edited_at_ms,\n                     changed_at_ms
+                     forwarded_from_preview,
+                     edit_version,
+                     edited_at_ms,
+                     changed_at_ms
                  FROM {_databaseSchema.MessagesTableSql}
                  WHERE conversation_id = @conversation_id
                    AND membership.is_member
@@ -268,7 +283,10 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  msg.recalled_at_ms,
                  msg.forwarded_from_message_id,
                  msg.forwarded_from_sender_user_id,
-                 msg.forwarded_from_preview,\n                 msg.edit_version,\n                 msg.edited_at_ms,\n                 msg.changed_at_ms
+                 msg.forwarded_from_preview,
+                 msg.edit_version,
+                 msg.edited_at_ms,
+                 msg.changed_at_ms
              FROM membership
              LEFT JOIN LATERAL (
                  SELECT
@@ -287,7 +305,10 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                      recalled_at_ms,
                      forwarded_from_message_id,
                      forwarded_from_sender_user_id,
-                     forwarded_from_preview,\n                     edit_version,\n                     edited_at_ms,\n                     changed_at_ms
+                     forwarded_from_preview,
+                     edit_version,
+                     edited_at_ms,
+                     changed_at_ms
                  FROM {_databaseSchema.MessagesTableSql}
                  WHERE conversation_id = @conversation_id
                    AND membership.is_member
@@ -558,7 +579,10 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  msg.recalled_at_ms,
                  msg.forwarded_from_message_id,
                  msg.forwarded_from_sender_user_id,
-                 msg.forwarded_from_preview,\n                 msg.edit_version,\n                 msg.edited_at_ms,\n                 msg.changed_at_ms
+                 msg.forwarded_from_preview,
+                 msg.edit_version,
+                 msg.edited_at_ms,
+                 msg.changed_at_ms
              FROM membership
              LEFT JOIN LATERAL (
                  SELECT
@@ -577,7 +601,10 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                      recalled_at_ms,
                      forwarded_from_message_id,
                      forwarded_from_sender_user_id,
-                     forwarded_from_preview,\n                     edit_version,\n                     edited_at_ms,\n                     changed_at_ms
+                     forwarded_from_preview,
+                     edit_version,
+                     edited_at_ms,
+                     changed_at_ms
                  FROM {_databaseSchema.MessagesTableSql}
                  WHERE conversation_id = membership.conversation_id
                    AND membership.is_member
@@ -673,7 +700,10 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  recalled_at_ms,
                  forwarded_from_message_id,
                  forwarded_from_sender_user_id,
-                 forwarded_from_preview,\n                 edit_version,\n                 edited_at_ms,\n                 changed_at_ms
+                 forwarded_from_preview,
+                 edit_version,
+                 edited_at_ms,
+                 changed_at_ms
              FROM {_databaseSchema.MessagesTableSql}
              WHERE message_id = @message_id
              LIMIT 1;

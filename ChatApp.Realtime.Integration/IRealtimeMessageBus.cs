@@ -23,11 +23,17 @@ public interface IRealtimeMessageBus
     Task<ConversationSetPrefsResult> SetConversationPrefsAsync(
         ConversationSetPrefsCommand command,
         CancellationToken ct = default);
+    Task<GroupConversationResult> MutateGroupConversationAsync(
+        GroupConversationCommand command,
+        CancellationToken ct = default);
     Task<MessageRecallResult> RecallMessageAsync(
         MessageRecallCommand command,
         CancellationToken ct = default);
     Task<MessageEditResult> EditMessageAsync(
         MessageEditCommand command,
+        CancellationToken ct = default);
+    Task<MessageReactionResult> ReactToMessageAsync(
+        MessageReactionCommand command,
         CancellationToken ct = default);
     Task<SyncBootstrapPage> QuerySyncBootstrapAsync(
         SyncBootstrapQuery query,

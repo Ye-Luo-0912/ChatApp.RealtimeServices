@@ -210,23 +210,71 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         var createdEvent = EnrichChatMessagePayload(
             CopyWithMessageId(eventToPublish, message.MessageId),
             boundAttachmentRefs);
-        var outboxEvents = new List<RealtimeEvent>(6) { createdEvent };
+        var outboxEvents = new List<RealtimeEvent>(8);
 
-        // 发送方其他在线设备回声：同事务写入；Gateway 会跳过来源 SessionId。
-        if (message.SenderUserId != message.ReceiverUserId)
-            outboxEvents.Add(CreateSenderEchoEvent(createdEvent, message.SenderUserId));
+        var isGroup = !string.IsNullOrWhiteSpace(message.ConversationId)
+                      && ConversationId.IsGroup(message.ConversationId);
 
-        if (!string.IsNullOrWhiteSpace(message.ConversationId))
+        if (isGroup)
         {
-            await AdvanceConversationAndEnqueueAsync(
+            var memberIds = await ConversationWriteCommands.ListActiveMemberUserIdsAsync(
+                    connection,
+                    transaction,
+                    _databaseSchema,
+                    message.ConversationId!,
+                    ct)
+                .ConfigureAwait(false);
+
+            if (memberIds.Count == 0 || !memberIds.Contains(message.SenderUserId))
+            {
+                await transaction.RollbackAsync(ct).ConfigureAwait(false);
+                _logger.LogWarning(
+                    "群消息写入拒绝：发送方不是成员。消息={MessageId}；会话={ConversationId}；发送用户={SenderUserId}",
+                    message.MessageId,
+                    message.ConversationId,
+                    message.SenderUserId);
+                return RealtimeMessagePersistResult.NotAllowed(message.MessageId);
+            }
+
+            foreach (var targetUserId in memberIds)
+            {
+                outboxEvents.Add(CreateGroupMessageReceivedEvent(
+                    createdEvent,
+                    message,
+                    targetUserId));
+            }
+
+            await AdvanceGroupConversationAndEnqueueAsync(
                     connection,
                     transaction,
                     message,
+                    memberIds,
                     createdEvent.TraceParent,
                     createdEvent.TraceState,
                     outboxEvents,
                     ct)
                 .ConfigureAwait(false);
+        }
+        else
+        {
+            outboxEvents.Add(createdEvent);
+
+            // 发送方其他在线设备回声：同事务写入；Gateway 会跳过来源 SessionId。
+            if (message.SenderUserId != message.ReceiverUserId)
+                outboxEvents.Add(CreateSenderEchoEvent(createdEvent, message.SenderUserId));
+
+            if (!string.IsNullOrWhiteSpace(message.ConversationId))
+            {
+                await AdvanceConversationAndEnqueueAsync(
+                        connection,
+                        transaction,
+                        message,
+                        createdEvent.TraceParent,
+                        createdEvent.TraceState,
+                        outboxEvents,
+                        ct)
+                    .ConfigureAwait(false);
+            }
         }
 
         await InsertOutboxManyAsync(connection, transaction, outboxEvents, ct).ConfigureAwait(false);
@@ -238,6 +286,87 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             message.SenderUserId,
             message.ReceiverUserId);
         return RealtimeMessagePersistResult.Created(message.MessageId);
+    }
+
+    private async Task AdvanceGroupConversationAndEnqueueAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        RealtimeMessageRecord message,
+        IReadOnlyList<long> memberIds,
+        string? traceParent,
+        string? traceState,
+        List<RealtimeEvent> outboxEvents,
+        CancellationToken ct)
+    {
+        var conversationId = message.ConversationId!;
+        var preview = ConversationId.CreatePreview(message.Content);
+
+        var (advanced, unreads) = await ConversationWriteCommands.TryAdvanceGroupAndIncrementUnreadAsync(
+                connection,
+                transaction,
+                _databaseSchema,
+                conversationId,
+                message.SenderUserId,
+                message.MessageId,
+                preview,
+                message.ReceivedAtMs,
+                ct)
+            .ConfigureAwait(false);
+
+        if (advanced)
+        {
+            foreach (var memberId in memberIds)
+            {
+                outboxEvents.Add(ConversationWriteCommands.CreateConversationChangedEvent(
+                    conversationId,
+                    memberId,
+                    peerUserId: null,
+                    message.MessageId,
+                    preview,
+                    message.ReceivedAtMs,
+                    message.SenderUserId,
+                    traceParent,
+                    traceState,
+                    type: ConversationType.Group));
+            }
+        }
+
+        foreach (var (userId, unreadCount) in unreads)
+        {
+            outboxEvents.Add(ConversationWriteCommands.CreateUnreadCountChangedEvent(
+                conversationId,
+                userId,
+                unreadCount,
+                lastReadMessageId: null,
+                lastReadAtMs: null,
+                causeMessageId: message.MessageId,
+                message.ReceivedAtMs,
+                traceParent,
+                traceState));
+        }
+    }
+
+    private static RealtimeEvent CreateGroupMessageReceivedEvent(
+        RealtimeEvent template,
+        RealtimeMessageRecord message,
+        long targetUserId)
+    {
+        return new RealtimeEvent
+        {
+            EventId = RealtimeEventContracts.CreateMessageReceivedEventId(
+                message.SenderUserId,
+                message.ClientMessageId,
+                targetUserId),
+            Type = RealtimeEventType.MessageReceived,
+            TargetUserId = targetUserId,
+            ActorUserId = message.SenderUserId,
+            MessageId = message.MessageId,
+            SessionId = message.SenderSessionId,
+            PayloadJson = template.PayloadJson,
+            OccurredAtMs = template.OccurredAtMs,
+            TraceParent = template.TraceParent,
+            TraceState = template.TraceState
+        };
     }
 
     private async Task AdvanceConversationAndEnqueueAsync(
@@ -1011,63 +1140,116 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             },
             RealtimeJsonSerializerContext.Default.RealtimeMessageRecalledPayload);
 
-        var receiverEvent = new RealtimeEvent
-        {
-            EventId = RealtimeEventContracts.CreateMessageRecalledEventId(messageId, receiverUserId),
-            Type = RealtimeEventType.MessageRecalled,
-            TargetUserId = receiverUserId,
-            ActorUserId = senderUserId,
-            MessageId = messageId,
-            SessionId = senderSessionId,
-            PayloadJson = payloadJson,
-            OccurredAtMs = recalledAtMs,
-            TraceParent = RealtimeTraceContext.CaptureTraceParent(),
-            TraceState = RealtimeTraceContext.CaptureTraceState()
-        };
+        var traceParent = RealtimeTraceContext.CaptureTraceParent();
+        var traceState = RealtimeTraceContext.CaptureTraceState();
+        var events = new List<RealtimeEvent>(8);
+        var isGroup = !string.IsNullOrWhiteSpace(conversationId)
+                      && ConversationId.IsGroup(conversationId);
 
-        var events = new List<RealtimeEvent>(4) { receiverEvent };
-        if (senderUserId != receiverUserId)
+        if (isGroup)
+        {
+            var memberIds = await ConversationWriteCommands.ListActiveMemberUserIdsAsync(
+                    connection,
+                    transaction,
+                    _databaseSchema,
+                    conversationId!,
+                    ct)
+                .ConfigureAwait(false);
+            foreach (var targetUserId in memberIds)
+            {
+                events.Add(new RealtimeEvent
+                {
+                    EventId = RealtimeEventContracts.CreateMessageRecalledEventId(messageId, targetUserId),
+                    Type = RealtimeEventType.MessageRecalled,
+                    TargetUserId = targetUserId,
+                    ActorUserId = senderUserId,
+                    MessageId = messageId,
+                    SessionId = senderSessionId,
+                    PayloadJson = payloadJson,
+                    OccurredAtMs = recalledAtMs,
+                    TraceParent = traceParent,
+                    TraceState = traceState
+                });
+            }
+
+            if (tipPreviewUpdated)
+            {
+                var cause = $"recall:{recalledAtMs}";
+                foreach (var targetUserId in memberIds)
+                {
+                    events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
+                        conversationId!,
+                        targetUserId,
+                        peerUserId: null,
+                        messageId,
+                        "消息已撤回",
+                        receivedAtMs,
+                        senderUserId,
+                        traceParent,
+                        traceState,
+                        cause,
+                        ConversationType.Group));
+                }
+            }
+        }
+        else
         {
             events.Add(new RealtimeEvent
             {
-                EventId = RealtimeEventContracts.CreateMessageRecalledEventId(messageId, senderUserId),
+                EventId = RealtimeEventContracts.CreateMessageRecalledEventId(messageId, receiverUserId),
                 Type = RealtimeEventType.MessageRecalled,
-                TargetUserId = senderUserId,
+                TargetUserId = receiverUserId,
                 ActorUserId = senderUserId,
                 MessageId = messageId,
                 SessionId = senderSessionId,
                 PayloadJson = payloadJson,
                 OccurredAtMs = recalledAtMs,
-                TraceParent = receiverEvent.TraceParent,
-                TraceState = receiverEvent.TraceState
+                TraceParent = traceParent,
+                TraceState = traceState
             });
-        }
+            if (senderUserId != receiverUserId)
+            {
+                events.Add(new RealtimeEvent
+                {
+                    EventId = RealtimeEventContracts.CreateMessageRecalledEventId(messageId, senderUserId),
+                    Type = RealtimeEventType.MessageRecalled,
+                    TargetUserId = senderUserId,
+                    ActorUserId = senderUserId,
+                    MessageId = messageId,
+                    SessionId = senderSessionId,
+                    PayloadJson = payloadJson,
+                    OccurredAtMs = recalledAtMs,
+                    TraceParent = traceParent,
+                    TraceState = traceState
+                });
+            }
 
-        if (tipPreviewUpdated && !string.IsNullOrWhiteSpace(conversationId))
-        {
-            var cause = $"recall:{recalledAtMs}";
-            events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
-                conversationId,
-                senderUserId,
-                receiverUserId,
-                messageId,
-                "消息已撤回",
-                receivedAtMs,
-                senderUserId,
-                receiverEvent.TraceParent,
-                receiverEvent.TraceState,
-                cause));
-            events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
-                conversationId,
-                receiverUserId,
-                senderUserId,
-                messageId,
-                "消息已撤回",
-                receivedAtMs,
-                senderUserId,
-                receiverEvent.TraceParent,
-                receiverEvent.TraceState,
-                cause));
+            if (tipPreviewUpdated && !string.IsNullOrWhiteSpace(conversationId))
+            {
+                var cause = $"recall:{recalledAtMs}";
+                events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
+                    conversationId,
+                    senderUserId,
+                    receiverUserId,
+                    messageId,
+                    "消息已撤回",
+                    receivedAtMs,
+                    senderUserId,
+                    traceParent,
+                    traceState,
+                    cause));
+                events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
+                    conversationId,
+                    receiverUserId,
+                    senderUserId,
+                    messageId,
+                    "消息已撤回",
+                    receivedAtMs,
+                    senderUserId,
+                    traceParent,
+                    traceState,
+                    cause));
+            }
         }
 
         await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
@@ -1406,69 +1588,125 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             },
             RealtimeJsonSerializerContext.Default.RealtimeMessageEditedPayload);
 
-        var receiverEvent = new RealtimeEvent
-        {
-            EventId = RealtimeEventContracts.CreateMessageEditedEventId(
-                messageId,
-                receiverUserId,
-                nextVersion),
-            Type = RealtimeEventType.MessageEdited,
-            TargetUserId = receiverUserId,
-            ActorUserId = senderUserId,
-            MessageId = messageId,
-            SessionId = senderSessionId,
-            PayloadJson = payloadJson,
-            OccurredAtMs = editedAtMs,
-            TraceParent = RealtimeTraceContext.CaptureTraceParent(),
-            TraceState = RealtimeTraceContext.CaptureTraceState()
-        };
+        var traceParent = RealtimeTraceContext.CaptureTraceParent();
+        var traceState = RealtimeTraceContext.CaptureTraceState();
+        var events = new List<RealtimeEvent>(8);
+        var isGroup = !string.IsNullOrWhiteSpace(conversationId)
+                      && ConversationId.IsGroup(conversationId);
 
-        var events = new List<RealtimeEvent>(4) { receiverEvent };
-        if (senderUserId != receiverUserId)
+        if (isGroup)
+        {
+            var memberIds = await ConversationWriteCommands.ListActiveMemberUserIdsAsync(
+                    connection,
+                    transaction,
+                    _databaseSchema,
+                    conversationId!,
+                    ct)
+                .ConfigureAwait(false);
+            foreach (var targetUserId in memberIds)
+            {
+                events.Add(new RealtimeEvent
+                {
+                    EventId = RealtimeEventContracts.CreateMessageEditedEventId(
+                        messageId,
+                        targetUserId,
+                        nextVersion),
+                    Type = RealtimeEventType.MessageEdited,
+                    TargetUserId = targetUserId,
+                    ActorUserId = senderUserId,
+                    MessageId = messageId,
+                    SessionId = senderSessionId,
+                    PayloadJson = payloadJson,
+                    OccurredAtMs = editedAtMs,
+                    TraceParent = traceParent,
+                    TraceState = traceState
+                });
+            }
+
+            if (tipPreviewUpdated)
+            {
+                var cause = $"edit:{nextVersion}";
+                foreach (var targetUserId in memberIds)
+                {
+                    events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
+                        conversationId!,
+                        targetUserId,
+                        peerUserId: null,
+                        messageId,
+                        tipPreview,
+                        receivedAtMs,
+                        senderUserId,
+                        traceParent,
+                        traceState,
+                        cause,
+                        ConversationType.Group));
+                }
+            }
+        }
+        else
         {
             events.Add(new RealtimeEvent
             {
                 EventId = RealtimeEventContracts.CreateMessageEditedEventId(
                     messageId,
-                    senderUserId,
+                    receiverUserId,
                     nextVersion),
                 Type = RealtimeEventType.MessageEdited,
-                TargetUserId = senderUserId,
+                TargetUserId = receiverUserId,
                 ActorUserId = senderUserId,
                 MessageId = messageId,
                 SessionId = senderSessionId,
                 PayloadJson = payloadJson,
                 OccurredAtMs = editedAtMs,
-                TraceParent = receiverEvent.TraceParent,
-                TraceState = receiverEvent.TraceState
+                TraceParent = traceParent,
+                TraceState = traceState
             });
-        }
+            if (senderUserId != receiverUserId)
+            {
+                events.Add(new RealtimeEvent
+                {
+                    EventId = RealtimeEventContracts.CreateMessageEditedEventId(
+                        messageId,
+                        senderUserId,
+                        nextVersion),
+                    Type = RealtimeEventType.MessageEdited,
+                    TargetUserId = senderUserId,
+                    ActorUserId = senderUserId,
+                    MessageId = messageId,
+                    SessionId = senderSessionId,
+                    PayloadJson = payloadJson,
+                    OccurredAtMs = editedAtMs,
+                    TraceParent = traceParent,
+                    TraceState = traceState
+                });
+            }
 
-        if (tipPreviewUpdated && !string.IsNullOrWhiteSpace(conversationId))
-        {
-            var cause = $"edit:{nextVersion}";
-            events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
-                conversationId,
-                senderUserId,
-                receiverUserId,
-                messageId,
-                tipPreview,
-                receivedAtMs,
-                senderUserId,
-                receiverEvent.TraceParent,
-                receiverEvent.TraceState,
-                cause));
-            events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
-                conversationId,
-                receiverUserId,
-                senderUserId,
-                messageId,
-                tipPreview,
-                receivedAtMs,
-                senderUserId,
-                receiverEvent.TraceParent,
-                receiverEvent.TraceState,
-                cause));
+            if (tipPreviewUpdated && !string.IsNullOrWhiteSpace(conversationId))
+            {
+                var cause = $"edit:{nextVersion}";
+                events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
+                    conversationId,
+                    senderUserId,
+                    receiverUserId,
+                    messageId,
+                    tipPreview,
+                    receivedAtMs,
+                    senderUserId,
+                    traceParent,
+                    traceState,
+                    cause));
+                events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
+                    conversationId,
+                    receiverUserId,
+                    senderUserId,
+                    messageId,
+                    tipPreview,
+                    receivedAtMs,
+                    senderUserId,
+                    traceParent,
+                    traceState,
+                    cause));
+            }
         }
 
         await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
