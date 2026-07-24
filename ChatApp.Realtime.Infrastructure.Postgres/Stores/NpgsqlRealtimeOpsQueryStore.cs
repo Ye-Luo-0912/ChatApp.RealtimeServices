@@ -1,8 +1,11 @@
+using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Stores;
+using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using ChatApp.Realtime.Infrastructure.Postgres.Migrations;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Npgsql;
 
 namespace ChatApp.Realtime.Infrastructure.Postgres.Stores;
@@ -11,7 +14,10 @@ public sealed class NpgsqlRealtimeOpsQueryStore(
     RealtimeDatabaseClient client,
     RealtimeDatabaseSchema schema,
     IRealtimeOutboxStore outboxStore,
-    ILogger<NpgsqlRealtimeOpsQueryStore> logger) : IRealtimeOpsQueryStore
+    ILogger<NpgsqlRealtimeOpsQueryStore> logger,
+    IOptions<MessageRetentionOptions>? messageRetentionOptions = null,
+    SyncBootstrapOptions? syncBootstrapOptions = null,
+    IRealtimeMessageRetentionStore? messageRetentionStore = null) : IRealtimeOpsQueryStore
 {
     private static readonly IReadOnlyList<RealtimeMigrationCatalogEntryDto> Catalog =
         RealtimeSchemaMigrationRunner.DefaultMigrations()
@@ -72,6 +78,13 @@ public sealed class NpgsqlRealtimeOpsQueryStore(
         long missingConversationId = 0;
         var attachmentsAvailable = false;
         long ticketed = 0, confirmedUnbound = 0, scanning = 0, abandoned = 0;
+        long? beyondRetention = null;
+        long? oldestPurgeable = null;
+
+        var retention = messageRetentionOptions?.Value ?? new MessageRetentionOptions();
+        var syncHorizon = syncBootstrapOptions?.RetentionHorizonMs ?? 0;
+        var horizonMs = retention.ResolveEffectiveHorizonMs(syncHorizon);
+        var retentionActive = retention.IsEffectivelyEnabled(syncHorizon);
 
         if (client.IsConfigured)
         {
@@ -118,6 +131,30 @@ public sealed class NpgsqlRealtimeOpsQueryStore(
             {
                 logger.LogDebug(ex, "attachments 表不可用，跳过 ops backlog 附件计数");
             }
+
+            if (retentionActive && messageRetentionStore is not null)
+            {
+                try
+                {
+                    var cutoff = now - horizonMs;
+                    if (cutoff > 0)
+                    {
+                        var stats = await messageRetentionStore
+                            .GetPurgeableStatsAsync(cutoff, ct)
+                            .ConfigureAwait(false);
+                        beyondRetention = stats.PurgeableCount;
+                        oldestPurgeable = stats.OldestReceivedAtMs;
+                    }
+                    else
+                    {
+                        beyondRetention = 0;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.LogDebug(ex, "message retention purgeable count failed");
+                }
+            }
         }
 
         return new RealtimeOpsBacklogDto(
@@ -133,6 +170,8 @@ public sealed class NpgsqlRealtimeOpsQueryStore(
             AttachmentConfirmedUnboundCount: confirmedUnbound,
             AttachmentScanningCount: scanning,
             AttachmentAbandonedCount: abandoned,
+            MessagesBeyondRetentionCount: beyondRetention,
+            OldestPurgeableReceivedAtMs: oldestPurgeable,
             CleanupNote:
             "Account cleanup saga / inbox DLQ / blob delete jobs live on ChatApp.Server (/api/admin/account-cleanup-saga, /api/admin/ops).",
             GeneratedAtMs: now);
@@ -215,13 +254,13 @@ public sealed class NpgsqlRealtimeOpsQueryStore(
                 $"""
                  SELECT 1
                  FROM {schema.SchemaMigrationsTableSql}
-                 WHERE version = @v
-                 LIMIT 1
+                 WHERE version = @version
+                 LIMIT 1;
                  """,
                 connection);
-            cmd.Parameters.AddWithValue("v", version);
-            var scalar = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
-            return scalar is not null;
+            cmd.Parameters.AddWithValue("version", version);
+            var result = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+            return result is not null;
         }
         catch (PostgresException ex) when (ex.SqlState is "42P01")
         {
@@ -234,16 +273,9 @@ public sealed class NpgsqlRealtimeOpsQueryStore(
         string sql,
         CancellationToken ct)
     {
-        try
-        {
-            await using var cmd = new NpgsqlCommand(sql, connection);
-            var scalar = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
-            return scalar is long l ? l : Convert.ToInt64(scalar ?? 0L);
-        }
-        catch (PostgresException)
-        {
-            return 0;
-        }
+        await using var cmd = new NpgsqlCommand(sql, connection);
+        var result = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return result is long l ? l : Convert.ToInt64(result);
     }
 }
 
@@ -281,6 +313,8 @@ public sealed class NoopRealtimeOpsQueryStore : IRealtimeOpsQueryStore
             AttachmentConfirmedUnboundCount: 0,
             AttachmentScanningCount: 0,
             AttachmentAbandonedCount: 0,
+            MessagesBeyondRetentionCount: null,
+            OldestPurgeableReceivedAtMs: null,
             CleanupNote:
             "Account cleanup saga / inbox DLQ / blob delete jobs live on ChatApp.Server (/api/admin/account-cleanup-saga, /api/admin/ops).",
             GeneratedAtMs: now));

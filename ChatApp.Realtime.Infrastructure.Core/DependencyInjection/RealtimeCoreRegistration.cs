@@ -69,6 +69,7 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IRealtimeGroupStore, NoopRealtimeGroupStore>();
         services.TryAddSingleton<IRealtimeDeviceSyncCursorStore, NoopRealtimeDeviceSyncCursorStore>();
         services.TryAddSingleton<IRealtimeOutboxStore, NoopRealtimeOutboxStore>();
+        services.TryAddSingleton<IRealtimeMessageRetentionStore, NoopRealtimeMessageRetentionStore>();
         services.TryAddSingleton<IDeadLetterPublisher, NoopDeadLetterPublisher>();
 
         return services;

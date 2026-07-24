@@ -41,5 +41,9 @@ public sealed record RealtimeOpsBacklogDto(
     long AttachmentConfirmedUnboundCount,
     long AttachmentScanningCount,
     long AttachmentAbandonedCount,
+    /// <summary>Null when message retention GC is disabled / horizon 0.</summary>
+    long? MessagesBeyondRetentionCount,
+    /// <summary>Oldest purgeable <c>received_at_ms</c>; null when none or retention off.</summary>
+    long? OldestPurgeableReceivedAtMs,
     string CleanupNote,
     long GeneratedAtMs);

@@ -45,6 +45,9 @@ public static class RealtimeServicesRegistration
         services.AddSingleton(BindMessageRecallOptions(configuration));
         services.AddSingleton(BindMessageReactionOptions(configuration));
         services.AddSingleton(BindSyncBootstrapOptions(configuration));
+        var messageRetentionOptions = BindMessageRetentionOptions(configuration);
+        services.AddSingleton(Microsoft.Extensions.Options.Options.Create(messageRetentionOptions));
+        services.AddSingleton(messageRetentionOptions);
         services.AddSingleton(trustSettings);
         services.AddSingleton(new RealtimeConfigurationWarnings(warnings));
         services.AddSingleton<RealtimeHealthService>();
@@ -79,6 +82,7 @@ public static class RealtimeServicesRegistration
         services.AddHostedService<ConversationSyncBootstrapWorker>();
         services.AddHostedService<OutboxPublisherWorker>();
         services.AddHostedService<OutboxCleanupWorker>();
+        services.AddHostedService<MessageRetentionWorker>();
 
         return services;
     }
@@ -223,6 +227,25 @@ public static class RealtimeServicesRegistration
             throw new InvalidOperationException("SyncBootstrap:MaxCatchUpGapMs 不能为负数。");
         if (options.RetentionHorizonMs < 0)
             throw new InvalidOperationException("SyncBootstrap:RetentionHorizonMs 不能为负数。");
+        return options;
+    }
+
+    private static MessageRetentionOptions BindMessageRetentionOptions(IConfiguration configuration)
+    {
+        var options = configuration.GetSection(MessageRetentionOptions.SectionName).Get<MessageRetentionOptions>()
+            ?? new MessageRetentionOptions();
+        if (options.RetentionHorizonMs < 0)
+            throw new InvalidOperationException("MessageRetention:RetentionHorizonMs 不能为负数。");
+        if (options.RetentionDays < 0)
+            throw new InvalidOperationException("MessageRetention:RetentionDays 不能为负数。");
+        if (options.BatchSize <= 0)
+            throw new InvalidOperationException("MessageRetention:BatchSize 必须大于 0。");
+        if (options.IntervalMs <= 0)
+            throw new InvalidOperationException("MessageRetention:IntervalMs 必须大于 0。");
+        if (options.BatchSleepMs < 0)
+            throw new InvalidOperationException("MessageRetention:BatchSleepMs 不能为负数。");
+        if (options.MaxBatchesPerCycle < 0)
+            throw new InvalidOperationException("MessageRetention:MaxBatchesPerCycle 不能为负数。");
         return options;
     }
 

@@ -4,9 +4,9 @@ namespace ChatApp.Realtime.Abstractions.Sync;
 /// Why a client sync cursor / device watermark requires full local reset for a conversation.
 /// </summary>
 /// <remarks>
-/// Message retention / tombstone horizon invalidation is not implemented yet (no sync retention
-/// horizon in the store). When added, prefer a new reason rather than overloading
-/// <see cref="MessageNotFound"/>.
+/// Retention / tombstone-horizon invalidation is <see cref="BeyondRetention"/>, driven by
+/// <c>SyncBootstrap:RetentionHorizonMs</c> in the bootstrap processor (tip − horizon). Age-based
+/// hard-delete GC (<c>MessageRetention</c>) uses the same window; see docs/message-retention.md.
 /// </remarks>
 public enum SyncCursorResetReason : byte
 {
@@ -26,7 +26,8 @@ public enum SyncCursorResetReason : byte
 
     /// <summary>
     /// Cursor is older than <c>SyncBootstrap:RetentionHorizonMs</c> relative to tip (0 disables).
-    /// Distinct from <see cref="MessageNotFound"/> (random/deleted id).
+    /// Distinct from <see cref="MessageNotFound"/> (random/deleted id). When a missing id is also
+    /// older than the horizon, the processor reclassifies to this reason.
     /// </summary>
     BeyondRetention = 5
 }

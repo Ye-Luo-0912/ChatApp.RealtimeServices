@@ -17,8 +17,8 @@ Auth: header `X-Ops-Api-Key` = `Ops:ApiKey`. Empty key is open in non-Production
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET | `/ops/migrations/progress` | Catalog versions, applied rows, open checkpoints, `NotFullyAppliedVersions`, `HasDeferredInProgress` |
-| GET | `/ops/backlogs/` | Outbox pending/dead ages + mig009 `messages.conversation_id IS NULL` count (if 009 not applied) + attachment status counts |
+| GET | `/ops/backlogs/` | Outbox pending/dead ages + mig009 `messages.conversation_id IS NULL` count (if 009 not applied) + attachment status counts + optional `MessagesBeyondRetentionCount` / `OldestPurgeableReceivedAtMs` when `MessageRetention` is enabled |
 
 Account cleanup saga / inbox DLQ / `T_AttachmentBlobDeleteJob` live on **ChatApp.Server** (`/api/admin/account-cleanup-saga`, `/api/admin/ops/*`).
 
-Related metrics: outbox pending/dead gauges + `OutboxMetricsCollector` reconcile (see [p1-perf-stability.md](p1-perf-stability.md)).
+Related metrics: outbox pending/dead gauges + `OutboxMetricsCollector` reconcile (see [p1-perf-stability.md](p1-perf-stability.md)); message retention GC metrics in [message-retention.md](message-retention.md).

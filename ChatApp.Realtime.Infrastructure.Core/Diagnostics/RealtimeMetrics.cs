@@ -30,6 +30,9 @@ public sealed class RealtimeMetrics : IDisposable
     private readonly Counter<long> _outboxCleanupCounter;
     private readonly Counter<long> _outboxStatsFailureCounter;
     private readonly Counter<long> _idempotencyConflictCounter;
+    private readonly Counter<long> _messageRetentionDeletedCounter;
+    private readonly Counter<long> _messageRetentionErrorCounter;
+    private readonly ObservableGauge<double> _messageRetentionLagGauge;
     private readonly Histogram<double> _processingDuration;
     private readonly Histogram<double> _historyQueryDuration;
 
@@ -50,6 +53,7 @@ public sealed class RealtimeMetrics : IDisposable
     private long _outboxOldestInFlightAtMs = -1;
     private long _outboxMaxAttempts;
     private long _outboxDead;
+    private long _messageRetentionOldestPurgeableAtMs = -1;
 
     public RealtimeMetrics()
     {
@@ -94,6 +98,14 @@ public sealed class RealtimeMetrics : IDisposable
             "realtime.outbox.stats.failures");
         _idempotencyConflictCounter = _meter.CreateCounter<long>(
             "realtime.messages.idempotency_conflicts");
+        _messageRetentionDeletedCounter = _meter.CreateCounter<long>(
+            "realtime.messages.retention.deleted");
+        _messageRetentionErrorCounter = _meter.CreateCounter<long>(
+            "realtime.messages.retention.errors");
+        _messageRetentionLagGauge = _meter.CreateObservableGauge<double>(
+            "realtime.messages.retention.lag",
+            ObserveMessageRetentionLagSeconds,
+            "s");
         _processingDuration = _meter.CreateHistogram<double>("realtime.messages.processing.duration", "ms");
         _historyQueryDuration = _meter.CreateHistogram<double>("realtime.history.duration", "ms");
     }
@@ -175,6 +187,33 @@ public sealed class RealtimeMetrics : IDisposable
 
     public void RecordOutboxCleanup(int deleted) =>
         _outboxCleanupCounter.Add(deleted);
+
+    public void RecordMessageRetentionDeleted(int deleted)
+    {
+        if (deleted > 0)
+            _messageRetentionDeletedCounter.Add(deleted);
+    }
+
+    public void RecordMessageRetentionError() =>
+        _messageRetentionErrorCounter.Add(1);
+
+    /// <summary>
+    /// Lag = how far the oldest purgeable row sits behind the cutoff (seconds). 0 when caught up.
+    /// </summary>
+    public void UpdateMessageRetentionLag(
+        long? oldestPurgeableReceivedAtMs,
+        long cutoffReceivedAtMs,
+        long nowMs)
+    {
+        if (oldestPurgeableReceivedAtMs is null || oldestPurgeableReceivedAtMs >= cutoffReceivedAtMs)
+        {
+            Interlocked.Exchange(ref _messageRetentionOldestPurgeableAtMs, -1);
+            return;
+        }
+
+        Interlocked.Exchange(ref _messageRetentionOldestPurgeableAtMs, oldestPurgeableReceivedAtMs.Value);
+        _ = nowMs;
+    }
 
     public void RecordIdempotencyConflict() =>
         _idempotencyConflictCounter.Add(1);
@@ -284,6 +323,18 @@ public sealed class RealtimeMetrics : IDisposable
 
     private double ObserveOutboxOldestInFlightAgeSeconds() =>
         ObserveAgeSeconds(Interlocked.Read(ref _outboxOldestInFlightAtMs));
+
+    private double ObserveMessageRetentionLagSeconds()
+    {
+        var oldest = Interlocked.Read(ref _messageRetentionOldestPurgeableAtMs);
+        if (oldest < 0)
+            return 0;
+
+        // Lag relative to "now": how old the oldest still-purgeable row is.
+        return Math.Max(
+            0,
+            (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - oldest) / 1000d);
+    }
 
     private static double ObserveAgeSeconds(long oldestAtMs)
     {

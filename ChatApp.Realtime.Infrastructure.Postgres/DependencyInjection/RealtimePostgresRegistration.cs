@@ -61,6 +61,8 @@ public static class RealtimePostgresRegistration
             services.AddSingleton<IRealtimeAttachmentStore, NpgsqlRealtimeAttachmentStore>();
             services.RemoveAll<IRealtimeReactionStore>();
             services.AddSingleton<IRealtimeReactionStore, NpgsqlRealtimeReactionStore>();
+            services.RemoveAll<IRealtimeMessageRetentionStore>();
+            services.AddSingleton<IRealtimeMessageRetentionStore, NpgsqlRealtimeMessageRetentionStore>();
         }
 
         return services;
