@@ -20,5 +20,8 @@ public sealed class RealtimeMessageEntity
     public long? ForwardedFromSenderUserId { get; init; }
     public string? ForwardedFromPreview { get; init; }
     public long? RecalledAtMs { get; set; }
+    public int EditVersion { get; set; } = 1;
+    public long? EditedAtMs { get; set; }
+    public long ChangedAtMs { get; set; }
     public long CreatedAtMs { get; init; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 }

@@ -10,6 +10,7 @@ using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration.Configuration;
+using ChatApp.Realtime.Integration.Ephemeral;
 using ChatApp.Realtime.Integration.Serialization;
 using Microsoft.Extensions.Logging;
 using NATS.Client.Core;
@@ -293,6 +294,42 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
         }
     }
 
+    public async Task<MessageEditResult> EditMessageAsync(
+        MessageEditCommand command,
+        CancellationToken ct = default)
+    {
+        using var activity = RealtimeIntegrationTelemetry.StartClient(
+            "message_edit.request",
+            _options.MessageEditsSubject);
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromMilliseconds(
+                _options.HistoryRequestTimeoutMs));
+
+            var response = await _client.Value.RequestAsync<string, string>(
+                    _options.MessageEditsSubject,
+                    RealtimeWireSerializer.Serialize(command),
+                    headers: RealtimeIntegrationTelemetry.CreateIdentityHeaders(
+                        command.SenderUserId,
+                        command.SenderSessionId),
+                    cancellationToken: timeout.Token)
+                .ConfigureAwait(false);
+            response.EnsureSuccess();
+
+            if (string.IsNullOrWhiteSpace(response.Data))
+                throw new JsonException("消息编辑返回了空响应。");
+
+            return RealtimeWireSerializer.DeserializeMessageEditResult(response.Data)
+                   ?? throw new JsonException("消息编辑响应无法反序列化。");
+        }
+        catch (Exception ex)
+        {
+            RealtimeIntegrationTelemetry.RecordException(activity, ex);
+            throw;
+        }
+    }
+
     public async Task<SyncBootstrapPage> QuerySyncBootstrapAsync(
         SyncBootstrapQuery query,
         CancellationToken ct = default)
@@ -483,6 +520,190 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
                 .ConfigureAwait(false);
         }
     }
+    public async Task PublishEphemeralTypingAsync(EphemeralTypingEvent evt, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(evt);
+        using var activity = RealtimeIntegrationTelemetry.StartProducer(
+            "ephemeral_typing.publish",
+            _options.EphemeralTypingSubject);
+        try
+        {
+            await _client.Value.PublishAsync(
+                    _options.EphemeralTypingSubject,
+                    RealtimeWireSerializer.Serialize(evt),
+                    cancellationToken: ct)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            RealtimeIntegrationTelemetry.RecordException(activity, ex);
+            throw;
+        }
+    }
+
+    public async Task PublishEphemeralPresenceAsync(EphemeralPresenceEvent evt, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(evt);
+        using var activity = RealtimeIntegrationTelemetry.StartProducer(
+            "ephemeral_presence.publish",
+            _options.EphemeralPresenceSubject);
+        try
+        {
+            await _client.Value.PublishAsync(
+                    _options.EphemeralPresenceSubject,
+                    RealtimeWireSerializer.Serialize(evt),
+                    cancellationToken: ct)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            RealtimeIntegrationTelemetry.RecordException(activity, ex);
+            throw;
+        }
+    }
+
+    public async IAsyncEnumerable<EphemeralTypingEvent> ConsumeEphemeralTypingAsync(
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        await foreach (var msg in _client.Value.SubscribeAsync<string>(
+                           _options.EphemeralTypingSubject,
+                           cancellationToken: ct)
+                       .ConfigureAwait(false))
+        {
+            if (string.IsNullOrWhiteSpace(msg.Data))
+                continue;
+
+            EphemeralTypingEvent? evt;
+            try
+            {
+                evt = RealtimeWireSerializer.DeserializeEphemeralTyping(msg.Data);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Ephemeral Typing 反序列化失败");
+                continue;
+            }
+
+            if (evt is not null)
+                yield return evt;
+        }
+    }
+
+    public async IAsyncEnumerable<EphemeralPresenceEvent> ConsumeEphemeralPresenceAsync(
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        await foreach (var msg in _client.Value.SubscribeAsync<string>(
+                           _options.EphemeralPresenceSubject,
+                           cancellationToken: ct)
+                       .ConfigureAwait(false))
+        {
+            if (string.IsNullOrWhiteSpace(msg.Data))
+                continue;
+
+            EphemeralPresenceEvent? evt;
+            try
+            {
+                evt = RealtimeWireSerializer.DeserializeEphemeralPresence(msg.Data);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Ephemeral Presence 反序列化失败");
+                continue;
+            }
+
+            if (evt is not null)
+                yield return evt;
+        }
+    }
+
+    public async Task<PresenceAuthorizeResponse> AuthorizePresenceAsync(
+        PresenceAuthorizeQuery query,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        using var activity = RealtimeIntegrationTelemetry.StartClient(
+            "presence_authorize.request",
+            _options.PresenceAuthorizeSubject);
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromMilliseconds(
+                Math.Max(500, _options.HistoryRequestTimeoutMs)));
+
+            var response = await _client.Value.RequestAsync<string, string>(
+                    _options.PresenceAuthorizeSubject,
+                    RealtimeWireSerializer.Serialize(query),
+                    headers: RealtimeIntegrationTelemetry.CreateIdentityHeaders(query.WatcherUserId),
+                    cancellationToken: timeout.Token)
+                .ConfigureAwait(false);
+            response.EnsureSuccess();
+
+            if (string.IsNullOrWhiteSpace(response.Data))
+                return new PresenceAuthorizeResponse { AllowedUserIds = [] };
+
+            return RealtimeWireSerializer.DeserializePresenceAuthorizeResponse(response.Data)
+                   ?? new PresenceAuthorizeResponse { AllowedUserIds = [] };
+        }
+        catch (Exception ex)
+        {
+            RealtimeIntegrationTelemetry.RecordException(activity, ex);
+            throw;
+        }
+    }
+
+    public async Task ServePresenceAuthorizeAsync(
+        Func<PresenceAuthorizeQuery, CancellationToken, ValueTask<PresenceAuthorizeResponse>> handler,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+        await foreach (var msg in _client.Value.SubscribeAsync<string>(
+                           _options.PresenceAuthorizeSubject,
+                           cancellationToken: ct)
+                       .ConfigureAwait(false))
+        {
+            if (string.IsNullOrWhiteSpace(msg.Data) || string.IsNullOrWhiteSpace(msg.ReplyTo))
+                continue;
+
+            PresenceAuthorizeQuery? query;
+            try
+            {
+                query = RealtimeWireSerializer.DeserializePresenceAuthorizeQuery(msg.Data);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "PresenceAuthorize 请求反序列化失败");
+                continue;
+            }
+
+            if (query is null)
+                continue;
+
+            PresenceAuthorizeResponse response;
+            try
+            {
+                response = await handler(query, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "PresenceAuthorize handler 失败 Watcher={Watcher}", query.WatcherUserId);
+                response = new PresenceAuthorizeResponse { AllowedUserIds = [] };
+            }
+
+            try
+            {
+                await _client.Value.PublishAsync(
+                        msg.ReplyTo,
+                        RealtimeWireSerializer.Serialize(response),
+                        cancellationToken: ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                _logger.LogWarning(ex, "PresenceAuthorize 回复失败");
+            }
+        }
+    }
+
     public async Task<TimeSpan> PingAsync(CancellationToken ct = default) =>
         await _client.Value.PingAsync(ct).ConfigureAwait(false);
 

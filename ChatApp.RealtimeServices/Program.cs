@@ -163,6 +163,16 @@ try
         });
     });
 
+    var opsMigrations = app.MapGroup("/ops/migrations");
+    opsMigrations.AddEndpointFilter(new OpsApiKeyEndpointFilter());
+    opsMigrations.MapGet("/progress", async (IRealtimeOpsQueryStore opsQuery, CancellationToken ct) =>
+        Results.Ok(await opsQuery.GetMigrationProgressAsync(ct).ConfigureAwait(false)));
+
+    var opsBacklogs = app.MapGroup("/ops/backlogs");
+    opsBacklogs.AddEndpointFilter(new OpsApiKeyEndpointFilter());
+    opsBacklogs.MapGet("/", async (IRealtimeOpsQueryStore opsQuery, CancellationToken ct) =>
+        Results.Ok(await opsQuery.GetBacklogsAsync(ct).ConfigureAwait(false)));
+
     var realtimeOptions = app.Services.GetRequiredService<IOptions<RealtimeOptions>>().Value;
     app.Logger.LogInformation(
         "正在启动实时服务。服务名={ServiceName}；实例={InstanceId}；环境={Environment}",

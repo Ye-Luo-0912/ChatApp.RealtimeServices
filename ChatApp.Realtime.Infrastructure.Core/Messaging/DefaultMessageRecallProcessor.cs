@@ -8,13 +8,9 @@ namespace ChatApp.Realtime.Infrastructure.Core.Messaging;
 
 public sealed class DefaultMessageRecallProcessor : IMessageRecallProcessor
 {
-    /// <summary>撤回时间窗：消息收到后 2 分钟内。</summary>
-    public static readonly long DefaultMaxAgeMs = TimeSpan.FromMinutes(2).TotalMilliseconds is var ms
-        ? (long)ms
-        : 120_000;
-
     private readonly IRealtimeMessageStore _messageStore;
     private readonly IRealtimeOutboxSignal _outboxSignal;
+    private readonly MessageRecallOptions _options;
     private readonly RealtimeMetrics _metrics;
     private readonly ILogger<DefaultMessageRecallProcessor> _logger;
 
@@ -22,10 +18,12 @@ public sealed class DefaultMessageRecallProcessor : IMessageRecallProcessor
         IRealtimeMessageStore messageStore,
         IRealtimeOutboxSignal outboxSignal,
         RealtimeMetrics metrics,
-        ILogger<DefaultMessageRecallProcessor> logger)
+        ILogger<DefaultMessageRecallProcessor> logger,
+        MessageRecallOptions? options = null)
     {
         _messageStore = messageStore;
         _outboxSignal = outboxSignal;
+        _options = options ?? new MessageRecallOptions();
         _metrics = metrics;
         _logger = logger;
     }
@@ -38,13 +36,23 @@ public sealed class DefaultMessageRecallProcessor : IMessageRecallProcessor
         if (validationError is not null)
             return validationError;
 
+        var maxAgeMs = _options.MaxAgeMs;
+        if (maxAgeMs <= 0)
+        {
+            return MessageRecallResult.Failed(
+                command.RequestId,
+                "recall_disabled",
+                "消息撤回已关闭。");
+        }
+
         var result = await _messageStore
             .ApplyRecallAsync(
+                command.RequestId.Trim(),
                 command.MessageId.Trim(),
                 command.SenderUserId,
                 command.SenderSessionId,
                 command.OccurredAtMs,
-                DefaultMaxAgeMs,
+                maxAgeMs,
                 ct)
             .ConfigureAwait(false);
 
@@ -87,6 +95,12 @@ public sealed class DefaultMessageRecallProcessor : IMessageRecallProcessor
                     command.RequestId,
                     "recall_window_expired",
                     "已超过可撤回时间。");
+
+            case MessageRecallPersistStatus.RequestConflict:
+                return MessageRecallResult.Failed(
+                    command.RequestId,
+                    "request_id_conflict",
+                    "请求编号已用于其他撤回操作。");
 
             default:
                 throw new InvalidOperationException("未知的消息撤回持久化结果。");

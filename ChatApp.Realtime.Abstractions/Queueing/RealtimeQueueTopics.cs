@@ -16,6 +16,8 @@ public sealed class RealtimeQueueTopics
     public string ConversationMarkReads { get; init; } = "chat.conversation-mark-read";
     public string ConversationSetPrefs { get; init; } = "chat.conversation-prefs.set";
     public string MessageRecalls { get; init; } = "chat.message-recall";
+    public string MessageEdits { get; init; } = "chat.message-edit";
+    public string MessageReactions { get; init; } = "chat.message-reaction";
     public string SyncBootstrapQueries { get; init; } = "chat.sync.bootstrap";
     public string? MessagePersistence { get; init; }
     public string DeadLetters { get; init; } = "chat.dead-letters";

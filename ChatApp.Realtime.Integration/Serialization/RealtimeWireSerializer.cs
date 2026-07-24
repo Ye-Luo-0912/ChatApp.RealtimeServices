@@ -4,6 +4,7 @@ using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Sync;
+using ChatApp.Realtime.Integration.Ephemeral;
 
 namespace ChatApp.Realtime.Integration.Serialization;
 
@@ -30,6 +31,9 @@ public static class RealtimeWireSerializer
     public static string Serialize(MessageRecallCommand command) =>
         JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.MessageRecallCommand);
 
+    public static string Serialize(MessageEditCommand command) =>
+        JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.MessageEditCommand);
+
     public static string Serialize(SyncBootstrapQuery query) =>
         JsonSerializer.Serialize(query, RealtimeIntegrationJsonContext.Default.SyncBootstrapQuery);
 
@@ -38,6 +42,30 @@ public static class RealtimeWireSerializer
 
     public static string Serialize(DeadLetterMessage message) =>
         JsonSerializer.Serialize(message, RealtimeIntegrationJsonContext.Default.DeadLetterMessage);
+
+    public static string Serialize(EphemeralTypingEvent evt) =>
+        JsonSerializer.Serialize(evt, RealtimeIntegrationJsonContext.Default.EphemeralTypingEvent);
+
+    public static string Serialize(EphemeralPresenceEvent evt) =>
+        JsonSerializer.Serialize(evt, RealtimeIntegrationJsonContext.Default.EphemeralPresenceEvent);
+
+    public static string Serialize(PresenceAuthorizeQuery query) =>
+        JsonSerializer.Serialize(query, RealtimeIntegrationJsonContext.Default.PresenceAuthorizeQuery);
+
+    public static string Serialize(PresenceAuthorizeResponse response) =>
+        JsonSerializer.Serialize(response, RealtimeIntegrationJsonContext.Default.PresenceAuthorizeResponse);
+
+    public static EphemeralTypingEvent? DeserializeEphemeralTyping(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.EphemeralTypingEvent);
+
+    public static EphemeralPresenceEvent? DeserializeEphemeralPresence(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.EphemeralPresenceEvent);
+
+    public static PresenceAuthorizeQuery? DeserializePresenceAuthorizeQuery(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.PresenceAuthorizeQuery);
+
+    public static PresenceAuthorizeResponse? DeserializePresenceAuthorizeResponse(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.PresenceAuthorizeResponse);
 
     public static MessageHistoryPage? DeserializeMessageHistoryPage(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.MessageHistoryPage);
@@ -53,6 +81,9 @@ public static class RealtimeWireSerializer
 
     public static MessageRecallResult? DeserializeMessageRecallResult(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.MessageRecallResult);
+
+    public static MessageEditResult? DeserializeMessageEditResult(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.MessageEditResult);
 
     public static SyncBootstrapPage? DeserializeSyncBootstrapPage(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.SyncBootstrapPage);
@@ -74,6 +105,9 @@ public static class RealtimeWireSerializer
 
     public static RealtimeMessageRecalledPayload? DeserializeMessageRecalled(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeMessageRecalledPayload);
+
+    public static RealtimeMessageEditedPayload? DeserializeMessageEdited(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeMessageEditedPayload);
 
     public static string Serialize(RealtimeDomainNotificationPayload payload) =>
         JsonSerializer.Serialize(payload, RealtimeIntegrationJsonContext.Default.RealtimeDomainNotificationPayload);

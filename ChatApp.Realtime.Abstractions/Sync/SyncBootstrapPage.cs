@@ -23,13 +23,20 @@ public sealed class SyncBootstrapPage
     public bool ConversationsHasMore { get; init; }
     public IReadOnlyList<ConversationHistoryCatchUp> CatchUps { get; init; } = [];
 
+    /// <summary>
+    /// Conversations whose client/device cursors are invalid; client must wipe local cache and full-resync.
+    /// Additive: absent/empty means no resets (happy path).
+    /// </summary>
+    public IReadOnlyList<SyncCursorResetRequired> ResetsRequired { get; init; } = [];
+
     public static SyncBootstrapPage Success(
         string requestId,
         long serverTimeMs,
         IReadOnlyList<ConversationListItem> conversations,
         ConversationListCursor? conversationsNextCursor,
         bool conversationsHasMore,
-        IReadOnlyList<ConversationHistoryCatchUp> catchUps) =>
+        IReadOnlyList<ConversationHistoryCatchUp> catchUps,
+        IReadOnlyList<SyncCursorResetRequired>? resetsRequired = null) =>
         new()
         {
             RequestId = requestId,
@@ -38,7 +45,8 @@ public sealed class SyncBootstrapPage
             Conversations = conversations,
             ConversationsNextCursor = conversationsNextCursor,
             ConversationsHasMore = conversationsHasMore,
-            CatchUps = catchUps
+            CatchUps = catchUps,
+            ResetsRequired = resetsRequired ?? []
         };
 
     public static SyncBootstrapPage Failed(

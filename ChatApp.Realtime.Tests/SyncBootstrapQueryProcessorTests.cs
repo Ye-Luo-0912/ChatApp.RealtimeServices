@@ -145,7 +145,7 @@ public sealed class SyncBootstrapQueryProcessorTests
     }
 
     [Fact]
-    public async Task ProcessAsync_ClampsFutureWatermarkToTip()
+    public async Task ProcessAsync_ResetsFutureWatermark()
     {
         var conversationId = "dm:42:43";
         var conversationStore = new CapturingConversationStore(
@@ -197,17 +197,17 @@ public sealed class SyncBootstrapQueryProcessorTests
         });
 
         Assert.True(page.Succeeded);
-        Assert.True(historyStore.AfterQueryCalled);
-        Assert.Equal(200, historyStore.AfterReceivedAtMs);
-        Assert.Equal("msg-2", historyStore.AfterMessageId);
-        var catchUp = Assert.Single(page.CatchUps);
-        Assert.Empty(catchUp.Items);
-        // 空 catch-up 不得推进游标：否则未来水位钳 tip 会永久跳过未投递历史。
+        Assert.False(historyStore.AfterQueryCalled);
+        Assert.Empty(page.CatchUps);
+        var reset = Assert.Single(page.ResetsRequired);
+        Assert.Equal(conversationId, reset.ConversationId);
+        Assert.Equal(SyncCursorResetReason.MessageNotFound, reset.Reason);
+        // 空 catch-up / reset 不得推进游标：否则未来水位钳 tip 会永久跳过未投递历史。
         Assert.Empty(deviceStore.Upserted);
     }
 
     [Fact]
-    public async Task ProcessAsync_ClampsRandomInvalidWatermarkToTip()
+    public async Task ProcessAsync_ResetsRandomInvalidWatermark()
     {
         var conversationId = "dm:42:43";
         var conversationStore = new CapturingConversationStore(
@@ -257,9 +257,12 @@ public sealed class SyncBootstrapQueryProcessorTests
         });
 
         Assert.True(page.Succeeded);
-        Assert.True(historyStore.AfterQueryCalled);
-        Assert.Equal(200, historyStore.AfterReceivedAtMs);
-        Assert.Equal("msg-2", historyStore.AfterMessageId);
+        Assert.False(historyStore.AfterQueryCalled);
+        var reset = Assert.Single(page.ResetsRequired);
+        Assert.Equal(conversationId, reset.ConversationId);
+        Assert.Equal(SyncCursorResetReason.MessageNotFound, reset.Reason);
+        Assert.Equal("msg-2", reset.TipMessageId);
+        Assert.Equal(200, reset.TipReceivedAtMs);
     }
 
     [Fact]
@@ -302,11 +305,15 @@ public sealed class SyncBootstrapQueryProcessorTests
         });
 
         Assert.True(page.Succeeded);
+        var reset = Assert.Single(page.ResetsRequired);
+        Assert.Equal(SyncCursorResetReason.MessageNotFound, reset.Reason);
+        Assert.Null(reset.TipMessageId);
+        Assert.Null(reset.TipReceivedAtMs);
         Assert.Empty(deviceStore.Upserted);
     }
 
     [Fact]
-    public async Task ProcessAsync_IgnoresNonMemberWatermarksInMixedSet()
+    public async Task ProcessAsync_EmitsMembershipLostReset_ForNonMemberWatermark()
     {
         var memberId = "dm:42:43";
         var foreignId = "dm:99:100";
@@ -323,6 +330,16 @@ public sealed class SyncBootstrapQueryProcessorTests
         var historyStore = new CapturingHistoryStore(
             memberId,
             [
+                new RealtimeHistoryMessage
+                {
+                    MessageId = "msg-1",
+                    ClientMessageId = "client-1",
+                    SenderUserId = 43,
+                    ReceiverUserId = 42,
+                    ConversationId = memberId,
+                    Content = "hello",
+                    ReceivedAtMs = 100
+                },
                 new RealtimeHistoryMessage
                 {
                     MessageId = "msg-2",
@@ -371,6 +388,11 @@ public sealed class SyncBootstrapQueryProcessorTests
         Assert.Contains(memberId, historyStore.QueriedConversationIds);
         var catchUp = Assert.Single(page.CatchUps);
         Assert.Equal(memberId, catchUp.ConversationId);
+        Assert.Equal("msg-2", Assert.Single(catchUp.Items).MessageId);
+        var reset = Assert.Single(page.ResetsRequired);
+        Assert.Equal(foreignId, reset.ConversationId);
+        Assert.Equal(SyncCursorResetReason.MembershipLost, reset.Reason);
+        Assert.Null(reset.TipMessageId);
     }
 
     [Fact]
@@ -500,11 +522,14 @@ public sealed class SyncBootstrapQueryProcessorTests
         });
 
         Assert.True(page.Succeeded);
-        var catchUp = Assert.Single(page.CatchUps);
-        Assert.Empty(catchUp.Items);
+        Assert.Empty(page.CatchUps);
         Assert.Empty(deviceStore.Upserted);
-        Assert.Equal(200, historyStore.AfterReceivedAtMs);
-        Assert.Equal("msg-2", historyStore.AfterMessageId);
+        var reset = Assert.Single(page.ResetsRequired);
+        Assert.Equal(conversationId, reset.ConversationId);
+        Assert.Equal(SyncCursorResetReason.MessageNotFound, reset.Reason);
+        Assert.Equal(200, reset.TipReceivedAtMs);
+        Assert.Equal("msg-2", reset.TipMessageId);
+        Assert.False(historyStore.AfterQueryCalled);
     }
 
     [Fact]
@@ -557,8 +582,10 @@ public sealed class SyncBootstrapQueryProcessorTests
 
         Assert.True(page.Succeeded);
         Assert.Empty(deviceStore.Upserted);
-        Assert.Equal(200, historyStore.AfterReceivedAtMs);
-        Assert.Equal("msg-2", historyStore.AfterMessageId);
+        Assert.False(historyStore.AfterQueryCalled);
+        var reset = Assert.Single(page.ResetsRequired);
+        Assert.Equal(SyncCursorResetReason.MessageNotFound, reset.Reason);
+        Assert.Equal("msg-2", reset.TipMessageId);
     }
 
     [Fact]
@@ -626,15 +653,225 @@ public sealed class SyncBootstrapQueryProcessorTests
         Assert.NotEqual("msg-1", persisted.AfterMessageId);
     }
 
+    [Fact]
+    public async Task ProcessAsync_EmitsAheadOfTipReset_WhenWatermarkMessageIsBeyondTip()
+    {
+        var conversationId = "dm:42:43";
+        var conversationStore = new CapturingConversationStore(
+        [
+            new ConversationListItem
+            {
+                ConversationId = conversationId,
+                UnreadCount = 0,
+                LastMessageId = "msg-1",
+                LastMessageAtMs = 100
+            }
+        ]);
+        var historyStore = new CapturingHistoryStore(
+            conversationId,
+            [
+                new RealtimeHistoryMessage
+                {
+                    MessageId = "msg-1",
+                    ClientMessageId = "client-1",
+                    SenderUserId = 43,
+                    ReceiverUserId = 42,
+                    ConversationId = conversationId,
+                    Content = "hello",
+                    ReceivedAtMs = 100
+                },
+                new RealtimeHistoryMessage
+                {
+                    MessageId = "msg-2",
+                    ClientMessageId = "client-2",
+                    SenderUserId = 43,
+                    ReceiverUserId = 42,
+                    ConversationId = conversationId,
+                    Content = "world",
+                    ReceivedAtMs = 200
+                }
+            ]);
+        var deviceStore = new CapturingDeviceCursorStore([]);
+        var processor = CreateProcessor(conversationStore, historyStore, deviceStore);
+
+        var page = await processor.ProcessAsync(new SyncBootstrapQuery
+        {
+            RequestId = "sync-ahead",
+            UserId = 42,
+            DeviceIdHash = 7,
+            MaxConversationsWithHistory = 5,
+            Watermarks =
+            [
+                new ConversationSyncWatermark
+                {
+                    ConversationId = conversationId,
+                    AfterReceivedAtMs = 200,
+                    AfterMessageId = "msg-2"
+                }
+            ]
+        });
+
+        Assert.True(page.Succeeded);
+        Assert.False(historyStore.AfterQueryCalled);
+        var reset = Assert.Single(page.ResetsRequired);
+        Assert.Equal(conversationId, reset.ConversationId);
+        Assert.Equal(SyncCursorResetReason.AheadOfTip, reset.Reason);
+        Assert.Equal("msg-1", reset.TipMessageId);
+        Assert.Equal(100, reset.TipReceivedAtMs);
+        Assert.Empty(deviceStore.Upserted);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_EmitsGapTooLargeReset_WhenConfiguredAndLagExceedsThreshold()
+    {
+        var conversationId = "dm:42:43";
+        var conversationStore = new CapturingConversationStore(
+        [
+            new ConversationListItem
+            {
+                ConversationId = conversationId,
+                UnreadCount = 0,
+                LastMessageId = "msg-2",
+                LastMessageAtMs = 10_000
+            }
+        ]);
+        var historyStore = new CapturingHistoryStore(
+            conversationId,
+            [
+                new RealtimeHistoryMessage
+                {
+                    MessageId = "msg-1",
+                    ClientMessageId = "client-1",
+                    SenderUserId = 43,
+                    ReceiverUserId = 42,
+                    ConversationId = conversationId,
+                    Content = "hello",
+                    ReceivedAtMs = 100
+                },
+                new RealtimeHistoryMessage
+                {
+                    MessageId = "msg-2",
+                    ClientMessageId = "client-2",
+                    SenderUserId = 43,
+                    ReceiverUserId = 42,
+                    ConversationId = conversationId,
+                    Content = "world",
+                    ReceivedAtMs = 10_000
+                }
+            ]);
+        var deviceStore = new CapturingDeviceCursorStore([]);
+        var processor = CreateProcessor(
+            conversationStore,
+            historyStore,
+            deviceStore,
+            new SyncBootstrapOptions { MaxCatchUpGapMs = 1_000 });
+
+        var page = await processor.ProcessAsync(new SyncBootstrapQuery
+        {
+            RequestId = "sync-gap",
+            UserId = 42,
+            DeviceIdHash = 12,
+            MaxConversationsWithHistory = 5,
+            Watermarks =
+            [
+                new ConversationSyncWatermark
+                {
+                    ConversationId = conversationId,
+                    AfterReceivedAtMs = 100,
+                    AfterMessageId = "msg-1"
+                }
+            ]
+        });
+
+        Assert.True(page.Succeeded);
+        Assert.False(historyStore.AfterQueryCalled);
+        var reset = Assert.Single(page.ResetsRequired);
+        Assert.Equal(SyncCursorResetReason.GapTooLarge, reset.Reason);
+        Assert.Equal("msg-2", reset.TipMessageId);
+        Assert.Equal(10_000, reset.TipReceivedAtMs);
+        Assert.Empty(deviceStore.Upserted);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_ValidWatermark_RemainsIncremental_WithoutReset()
+    {
+        var conversationId = "dm:42:43";
+        var conversationStore = new CapturingConversationStore(
+        [
+            new ConversationListItem
+            {
+                ConversationId = conversationId,
+                UnreadCount = 0,
+                LastMessageId = "msg-2",
+                LastMessageAtMs = 200
+            }
+        ]);
+        var historyStore = new CapturingHistoryStore(
+            conversationId,
+            [
+                new RealtimeHistoryMessage
+                {
+                    MessageId = "msg-1",
+                    ClientMessageId = "client-1",
+                    SenderUserId = 43,
+                    ReceiverUserId = 42,
+                    ConversationId = conversationId,
+                    Content = "hello",
+                    ReceivedAtMs = 100
+                },
+                new RealtimeHistoryMessage
+                {
+                    MessageId = "msg-2",
+                    ClientMessageId = "client-2",
+                    SenderUserId = 43,
+                    ReceiverUserId = 42,
+                    ConversationId = conversationId,
+                    Content = "world",
+                    ReceivedAtMs = 200
+                }
+            ]);
+        var deviceStore = new CapturingDeviceCursorStore([]);
+        var processor = CreateProcessor(conversationStore, historyStore, deviceStore);
+
+        var page = await processor.ProcessAsync(new SyncBootstrapQuery
+        {
+            RequestId = "sync-valid",
+            UserId = 42,
+            DeviceIdHash = 13,
+            MaxConversationsWithHistory = 5,
+            Watermarks =
+            [
+                new ConversationSyncWatermark
+                {
+                    ConversationId = conversationId,
+                    AfterReceivedAtMs = 100,
+                    AfterMessageId = "msg-1"
+                }
+            ]
+        });
+
+        Assert.True(page.Succeeded);
+        Assert.Empty(page.ResetsRequired);
+        Assert.True(historyStore.AfterQueryCalled);
+        Assert.Equal(100, historyStore.AfterReceivedAtMs);
+        Assert.Equal("msg-1", historyStore.AfterMessageId);
+        var catchUp = Assert.Single(page.CatchUps);
+        Assert.Equal("msg-2", Assert.Single(catchUp.Items).MessageId);
+        var persisted = Assert.Single(deviceStore.Upserted);
+        Assert.Equal("msg-2", persisted.AfterMessageId);
+    }
+
     private static DefaultSyncBootstrapQueryProcessor CreateProcessor(
         CapturingConversationStore conversationStore,
         CapturingHistoryStore historyStore,
-        IRealtimeDeviceSyncCursorStore deviceStore) =>
+        IRealtimeDeviceSyncCursorStore deviceStore,
+        SyncBootstrapOptions? options = null) =>
         new(
             conversationStore,
             historyStore,
             deviceStore,
-            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance));
+            new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance),
+            options);
 
     private sealed class CapturingConversationStore : IRealtimeConversationStore
     {
@@ -841,15 +1078,30 @@ public sealed class SyncBootstrapQueryProcessorTests
                         .ThenByDescending(m => m.MessageId, StringComparer.Ordinal)
                         .FirstOrDefault();
                     if (tip is null)
+                    {
+                        map[item.ConversationId] = new ResolvedSyncWatermark
+                        {
+                            ConversationId = item.ConversationId,
+                            AfterReceivedAtMs = 0,
+                            AfterMessageId = string.Empty,
+                            IsValid = false,
+                            InvalidationKind = SyncWatermarkInvalidationKind.MessageNotFound,
+                            TipReceivedAtMs = null,
+                            TipMessageId = null,
+                            ClientAfterReceivedAtMs = item.AfterReceivedAtMs,
+                            ClientAfterMessageId = item.AfterMessageId
+                        };
                         continue;
+                    }
+
                     tipAt = tip.ReceivedAtMs;
                     tipId = tip.MessageId;
                 }
 
+                // Match on message id only (aligned with Npgsql resolve SQL).
                 var matched = _messages.FirstOrDefault(m =>
                     string.Equals(m.ConversationId, item.ConversationId, StringComparison.Ordinal)
-                    && string.Equals(m.MessageId, item.AfterMessageId, StringComparison.Ordinal)
-                    && m.ReceivedAtMs == item.AfterReceivedAtMs);
+                    && string.Equals(m.MessageId, item.AfterMessageId, StringComparison.Ordinal));
 
                 if (matched is not null
                     && (matched.ReceivedAtMs < tipAt
@@ -860,7 +1112,27 @@ public sealed class SyncBootstrapQueryProcessorTests
                     {
                         ConversationId = item.ConversationId,
                         AfterReceivedAtMs = matched.ReceivedAtMs,
-                        AfterMessageId = matched.MessageId
+                        AfterMessageId = matched.MessageId,
+                        IsValid = true,
+                        TipReceivedAtMs = tipAt,
+                        TipMessageId = tipId,
+                        ClientAfterReceivedAtMs = item.AfterReceivedAtMs,
+                        ClientAfterMessageId = item.AfterMessageId
+                    };
+                }
+                else if (matched is not null)
+                {
+                    map[item.ConversationId] = new ResolvedSyncWatermark
+                    {
+                        ConversationId = item.ConversationId,
+                        AfterReceivedAtMs = tipAt.Value,
+                        AfterMessageId = tipId!,
+                        IsValid = false,
+                        InvalidationKind = SyncWatermarkInvalidationKind.AheadOfTip,
+                        TipReceivedAtMs = tipAt,
+                        TipMessageId = tipId,
+                        ClientAfterReceivedAtMs = item.AfterReceivedAtMs,
+                        ClientAfterMessageId = item.AfterMessageId
                     };
                 }
                 else
@@ -869,7 +1141,13 @@ public sealed class SyncBootstrapQueryProcessorTests
                     {
                         ConversationId = item.ConversationId,
                         AfterReceivedAtMs = tipAt.Value,
-                        AfterMessageId = tipId
+                        AfterMessageId = tipId!,
+                        IsValid = false,
+                        InvalidationKind = SyncWatermarkInvalidationKind.MessageNotFound,
+                        TipReceivedAtMs = tipAt,
+                        TipMessageId = tipId,
+                        ClientAfterReceivedAtMs = item.AfterReceivedAtMs,
+                        ClientAfterMessageId = item.AfterMessageId
                     };
                 }
             }
@@ -894,6 +1172,13 @@ public sealed class SyncBootstrapQueryProcessorTests
             CancellationToken ct = default) =>
             Task.CompletedTask;
 
+        public Task DeleteAsync(
+            long userId,
+            ulong deviceIdHash,
+            IReadOnlyList<string> conversationIds,
+            CancellationToken ct = default) =>
+            Task.CompletedTask;
+
         public Task<long> DeleteByUserAsync(long userId, CancellationToken ct = default) =>
             Task.FromResult(0L);
     }
@@ -908,6 +1193,7 @@ public sealed class SyncBootstrapQueryProcessorTests
         }
 
         public List<DeviceSyncCursor> Upserted { get; } = [];
+        public List<string> Deleted { get; } = [];
 
         public Task<IReadOnlyList<DeviceSyncCursor>> LoadAsync(
             long userId,
@@ -923,6 +1209,16 @@ public sealed class SyncBootstrapQueryProcessorTests
             CancellationToken ct = default)
         {
             Upserted.AddRange(cursors);
+            return Task.CompletedTask;
+        }
+
+        public Task DeleteAsync(
+            long userId,
+            ulong deviceIdHash,
+            IReadOnlyList<string> conversationIds,
+            CancellationToken ct = default)
+        {
+            Deleted.AddRange(conversationIds);
             return Task.CompletedTask;
         }
 

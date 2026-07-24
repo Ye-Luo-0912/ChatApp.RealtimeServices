@@ -15,8 +15,19 @@ public sealed class RealtimeIntegrationOptions
     public string ConversationMarkReadsSubject { get; set; } = "chat.conversation-mark-read";
     public string ConversationSetPrefsSubject { get; set; } = "chat.conversation-prefs.set";
     public string MessageRecallsSubject { get; set; } = "chat.message-recall";
+    public string MessageEditsSubject { get; set; } = "chat.message-edit";
     public string SyncBootstrapQueriesSubject { get; set; } = "chat.sync.bootstrap";
     public string DeadLettersSubject { get; set; } = "chat.dead-letters";
+
+    /// <summary>NATS Core ephemeral Typing（非 JetStream，每实例全量订阅）。</summary>
+    public string EphemeralTypingSubject { get; set; } = "chat.ephemeral.typing";
+
+    /// <summary>NATS Core ephemeral Presence（非 JetStream，每实例全量订阅）。</summary>
+    public string EphemeralPresenceSubject { get; set; } = "chat.ephemeral.presence";
+
+    /// <summary>NATS Core request/reply：Presence 好友鉴权。</summary>
+    public string PresenceAuthorizeSubject { get; set; } = "chat.presence.authorize";
+
     public string IncomingMessagesStream { get; set; } = "INCOMING_MESSAGES";
     public string MessageReceiptsStream { get; set; } = "MESSAGE_RECEIPTS";
     public string RealtimeEventsStream { get; set; } = "REALTIME_EVENTS";

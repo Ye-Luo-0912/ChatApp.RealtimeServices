@@ -3,6 +3,7 @@ using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using Npgsql;
+using NpgsqlTypes;
 
 namespace ChatApp.Realtime.Infrastructure.Postgres.Stores;
 
@@ -117,6 +118,45 @@ public sealed class NpgsqlRealtimeDeviceSyncCursorStore : IRealtimeDeviceSyncCur
         }
 
         await transaction.CommitAsync(ct).ConfigureAwait(false);
+    }
+
+    public async Task DeleteAsync(
+        long userId,
+        ulong deviceIdHash,
+        IReadOnlyList<string> conversationIds,
+        CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(userId);
+        if (conversationIds.Count == 0)
+            return;
+
+        var distinctIds = conversationIds
+            .Where(static id => !string.IsNullOrWhiteSpace(id))
+            .Select(static id => id.Trim())
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (distinctIds.Length == 0)
+            return;
+
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            $"""
+             DELETE FROM {_databaseSchema.DeviceSyncCursorsTableSql}
+             WHERE user_id = @user_id
+               AND device_id_hash = @device_id_hash
+               AND conversation_id = ANY(@conversation_ids);
+             """,
+            connection);
+        command.Parameters.AddWithValue("user_id", userId);
+        command.Parameters.AddWithValue("device_id_hash", unchecked((long)deviceIdHash));
+        var idsParam = command.Parameters.Add(
+            "conversation_ids",
+            NpgsqlDbType.Array | NpgsqlDbType.Text);
+        idsParam.Value = distinctIds;
+        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
     public async Task<long> DeleteByUserAsync(long userId, CancellationToken ct = default)

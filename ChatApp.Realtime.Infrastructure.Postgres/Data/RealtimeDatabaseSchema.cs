@@ -13,9 +13,11 @@ public sealed class RealtimeDatabaseSchema
 
     public string MessagesTableSql => $"{QuotedSchema}.\"messages\"";
     public string AttachmentsTableSql => $"{QuotedSchema}.\"attachments\"";
+    public string MessageReactionsTableSql => $"{QuotedSchema}.\"message_reactions\"";
     public string ConversationsTableSql => $"{QuotedSchema}.\"conversations\"";
     public string ConversationMembersTableSql => $"{QuotedSchema}.\"conversation_members\"";
     public string DeviceSyncCursorsTableSql => $"{QuotedSchema}.\"device_sync_cursors\"";
+    public string MessageMutationRequestsTableSql => $"{QuotedSchema}.\"message_mutation_requests\"";
     public string OutboxTableSql => $"{QuotedSchema}.\"outbox\"";
     public string SchemaMigrationsTableSql => $"{QuotedSchema}.\"schema_migrations\"";
     public string SchemaMigrationCheckpointsTableSql =>

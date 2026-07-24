@@ -63,7 +63,9 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 reply_to_preview,
                 forwarded_from_message_id,
                 forwarded_from_sender_user_id,
-                forwarded_from_preview
+                forwarded_from_preview,
+                edit_version,
+                changed_at_ms
             )
             VALUES (
                 @message_id,
@@ -81,7 +83,9 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 @reply_to_preview,
                 @forwarded_from_message_id,
                 @forwarded_from_sender_user_id,
-                @forwarded_from_preview
+                @forwarded_from_preview,
+                1,
+                @received_at_ms
             )
             ON CONFLICT (sender_user_id, client_message_id) DO NOTHING;
             """,
@@ -168,7 +172,7 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 .Count();
             try
             {
-                var bound = await AttachmentWriteCommands.BindConfirmedToMessageAsync(
+                var boundRecords = await AttachmentWriteCommands.BindConfirmedToMessageAsync(
                         connection,
                         transaction,
                         _databaseSchema,
@@ -178,23 +182,18 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                         message.AttachmentIds,
                         ct)
                     .ConfigureAwait(false);
-                if (bound != expected)
+                if (boundRecords.Count != expected)
                 {
                     await transaction.RollbackAsync(ct).ConfigureAwait(false);
                     _logger.LogWarning(
                         "附件绑定失败。消息={MessageId}；期望={Expected}；实际={Bound}",
                         message.MessageId,
                         expected,
-                        bound);
+                        boundRecords.Count);
                     return RealtimeMessagePersistResult.AttachmentBindFailed(message.MessageId);
                 }
 
-                boundAttachmentRefs = await LoadAttachmentRefsForMessageAsync(
-                        connection,
-                        transaction,
-                        message.MessageId,
-                        ct)
-                    .ConfigureAwait(false);
+                boundAttachmentRefs = AttachmentRefMapper.FromRecords(boundRecords);
             }
             catch (InvalidOperationException ex)
             {
@@ -588,51 +587,6 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         return ids;
     }
 
-    private async Task<IReadOnlyList<AttachmentRef>> LoadAttachmentRefsForMessageAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        string messageId,
-        CancellationToken ct)
-    {
-        await using var command = new NpgsqlCommand(
-            $"""
-             SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
-                    size_bytes, original_name, status, message_id, conversation_id,
-                    client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms
-             FROM {_databaseSchema.AttachmentsTableSql}
-             WHERE message_id = @message_id
-             ORDER BY created_at_ms, attachment_id;
-             """,
-            connection,
-            transaction);
-        command.Parameters.AddWithValue("message_id", messageId);
-        var refs = new List<AttachmentRef>();
-        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
-        while (await reader.ReadAsync(ct).ConfigureAwait(false))
-        {
-            var record = new RealtimeAttachmentRecord
-            {
-                AttachmentId = reader.GetString(0),
-                UploaderUserId = reader.GetInt64(1),
-                ObjectKey = reader.GetString(2),
-                PublicUrl = reader.IsDBNull(3) ? null : reader.GetString(3),
-                ContentType = reader.GetString(4),
-                SizeBytes = reader.GetInt64(5),
-                OriginalName = reader.IsDBNull(6) ? null : reader.GetString(6),
-                Status = (AttachmentStatus)reader.GetInt16(7),
-                MessageId = reader.IsDBNull(8) ? null : reader.GetString(8),
-                ConversationId = reader.IsDBNull(9) ? null : reader.GetString(9),
-                ClientAttachmentId = reader.IsDBNull(10) ? null : reader.GetString(10),
-                CreatedAtMs = reader.GetInt64(11),
-                ConfirmedAtMs = reader.IsDBNull(12) ? null : reader.GetInt64(12),
-                BoundAtMs = reader.IsDBNull(13) ? null : reader.GetInt64(13)
-            };
-            refs.Add(AttachmentRefMapper.FromRecord(record));
-        }
-
-        return refs;
-    }
-
     private static RealtimeEvent EnrichChatMessagePayload(
         RealtimeEvent evt,
         IReadOnlyList<AttachmentRef>? attachments)
@@ -788,6 +742,7 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
     }
 
     public async Task<MessageRecallPersistResult> ApplyRecallAsync(
+        string requestId,
         string messageId,
         long senderUserId,
         string senderSessionId,
@@ -795,10 +750,16 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         long maxAgeMs,
         CancellationToken ct = default)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(requestId);
         ArgumentException.ThrowIfNullOrWhiteSpace(messageId);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(senderUserId);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(recalledAtMs);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxAgeMs);
+
+        var payloadFingerprint = ComputeMutationFingerprint(
+            operation: 2,
+            messageId,
+            content: string.Empty);
 
         await using var connection = await _databaseClient
             .GetDataSource()
@@ -807,6 +768,35 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         await using var transaction = await connection
             .BeginTransactionAsync(ct)
             .ConfigureAwait(false);
+
+        var prior = await TryReadMutationRequestAsync(
+                connection,
+                transaction,
+                senderUserId,
+                requestId,
+                ct)
+            .ConfigureAwait(false);
+        if (prior is not null)
+        {
+            if (prior.Operation != 2
+                || !string.Equals(prior.MessageId, messageId, StringComparison.Ordinal)
+                || !string.Equals(prior.PayloadFingerprint, payloadFingerprint, StringComparison.Ordinal))
+            {
+                await transaction.RollbackAsync(ct).ConfigureAwait(false);
+                return new MessageRecallPersistResult(
+                    MessageRecallPersistStatus.RequestConflict,
+                    messageId);
+            }
+
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            return prior.Succeeded
+                ? new MessageRecallPersistResult(
+                    MessageRecallPersistStatus.Unchanged,
+                    messageId,
+                    ConversationId: prior.ConversationId,
+                    RecalledAtMs: prior.RecalledAtMs)
+                : MapRecallFailure(prior.ErrorCode, messageId, prior.ConversationId);
+        }
 
         long dbSenderUserId;
         long receiverUserId;
@@ -830,7 +820,24 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 .ConfigureAwait(false);
             if (!await reader.ReadAsync(ct).ConfigureAwait(false))
             {
-                await transaction.RollbackAsync(ct).ConfigureAwait(false);
+                await InsertMutationRequestAsync(
+                        connection,
+                        transaction,
+                        senderUserId,
+                        requestId,
+                        operation: 2,
+                        messageId,
+                        payloadFingerprint,
+                        succeeded: false,
+                        errorCode: "message_not_found",
+                        conversationId: null,
+                        content: null,
+                        editVersion: null,
+                        editedAtMs: null,
+                        recalledAtMs: null,
+                        ct)
+                    .ConfigureAwait(false);
+                await transaction.CommitAsync(ct).ConfigureAwait(false);
                 return new MessageRecallPersistResult(
                     MessageRecallPersistStatus.NotFound,
                     messageId);
@@ -845,7 +852,24 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
 
         if (dbSenderUserId != senderUserId)
         {
-            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            await InsertMutationRequestAsync(
+                    connection,
+                    transaction,
+                    senderUserId,
+                    requestId,
+                    operation: 2,
+                    messageId,
+                    payloadFingerprint,
+                    succeeded: false,
+                    errorCode: "recall_not_allowed",
+                    conversationId,
+                    content: null,
+                    editVersion: null,
+                    editedAtMs: null,
+                    recalledAtMs: null,
+                    ct)
+                .ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
             return new MessageRecallPersistResult(
                 MessageRecallPersistStatus.NotAllowed,
                 messageId,
@@ -855,6 +879,23 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
 
         if (existingRecalledAtMs is long already)
         {
+            await InsertMutationRequestAsync(
+                    connection,
+                    transaction,
+                    senderUserId,
+                    requestId,
+                    operation: 2,
+                    messageId,
+                    payloadFingerprint,
+                    succeeded: true,
+                    errorCode: null,
+                    conversationId,
+                    content: null,
+                    editVersion: null,
+                    editedAtMs: null,
+                    recalledAtMs: already,
+                    ct)
+                .ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
             return new MessageRecallPersistResult(
                 MessageRecallPersistStatus.Unchanged,
@@ -866,7 +907,24 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
 
         if (recalledAtMs - receivedAtMs > maxAgeMs)
         {
-            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            await InsertMutationRequestAsync(
+                    connection,
+                    transaction,
+                    senderUserId,
+                    requestId,
+                    operation: 2,
+                    messageId,
+                    payloadFingerprint,
+                    succeeded: false,
+                    errorCode: "recall_window_expired",
+                    conversationId,
+                    content: null,
+                    editVersion: null,
+                    editedAtMs: null,
+                    recalledAtMs: null,
+                    ct)
+                .ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
             return new MessageRecallPersistResult(
                 MessageRecallPersistStatus.WindowExpired,
                 messageId,
@@ -879,6 +937,7 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                           UPDATE {_databaseSchema.MessagesTableSql}
                           SET content = '',
                               recalled_at_ms = @recalled_at_ms,
+                              changed_at_ms = @recalled_at_ms,
                               reply_to_message_id = NULL,
                               reply_to_sender_user_id = NULL,
                               reply_to_preview = NULL,
@@ -896,6 +955,23 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             var affected = await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             if (affected == 0)
             {
+                await InsertMutationRequestAsync(
+                        connection,
+                        transaction,
+                        senderUserId,
+                        requestId,
+                        operation: 2,
+                        messageId,
+                        payloadFingerprint,
+                        succeeded: true,
+                        errorCode: null,
+                        conversationId,
+                        content: null,
+                        editVersion: null,
+                        editedAtMs: null,
+                        recalledAtMs: recalledAtMs,
+                        ct)
+                    .ConfigureAwait(false);
                 await transaction.CommitAsync(ct).ConfigureAwait(false);
                 return new MessageRecallPersistResult(
                     MessageRecallPersistStatus.Unchanged,
@@ -906,6 +982,7 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             }
         }
 
+        var tipPreviewUpdated = false;
         if (!string.IsNullOrWhiteSpace(conversationId))
         {
             await using var previewCmd = new NpgsqlCommand(
@@ -920,7 +997,7 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             previewCmd.Parameters.AddWithValue("preview", "消息已撤回");
             previewCmd.Parameters.AddWithValue("conversation_id", conversationId);
             previewCmd.Parameters.AddWithValue("message_id", messageId);
-            await previewCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            tipPreviewUpdated = await previewCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) > 0;
         }
 
         var payloadJson = JsonSerializer.Serialize(
@@ -948,7 +1025,7 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             TraceState = RealtimeTraceContext.CaptureTraceState()
         };
 
-        var events = new List<RealtimeEvent>(2) { receiverEvent };
+        var events = new List<RealtimeEvent>(4) { receiverEvent };
         if (senderUserId != receiverUserId)
         {
             events.Add(new RealtimeEvent
@@ -966,7 +1043,51 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             });
         }
 
+        if (tipPreviewUpdated && !string.IsNullOrWhiteSpace(conversationId))
+        {
+            var cause = $"recall:{recalledAtMs}";
+            events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
+                conversationId,
+                senderUserId,
+                receiverUserId,
+                messageId,
+                "消息已撤回",
+                receivedAtMs,
+                senderUserId,
+                receiverEvent.TraceParent,
+                receiverEvent.TraceState,
+                cause));
+            events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
+                conversationId,
+                receiverUserId,
+                senderUserId,
+                messageId,
+                "消息已撤回",
+                receivedAtMs,
+                senderUserId,
+                receiverEvent.TraceParent,
+                receiverEvent.TraceState,
+                cause));
+        }
+
         await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
+        await InsertMutationRequestAsync(
+                connection,
+                transaction,
+                senderUserId,
+                requestId,
+                operation: 2,
+                messageId,
+                payloadFingerprint,
+                succeeded: true,
+                errorCode: null,
+                conversationId,
+                content: null,
+                editVersion: null,
+                editedAtMs: null,
+                recalledAtMs: recalledAtMs,
+                ct)
+            .ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
 
         return new MessageRecallPersistResult(
@@ -975,6 +1096,588 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             receiverUserId,
             conversationId,
             recalledAtMs);
+    }
+
+    public async Task<MessageEditPersistResult> ApplyEditAsync(
+        string requestId,
+        string messageId,
+        long senderUserId,
+        string senderSessionId,
+        string content,
+        long editedAtMs,
+        long maxAgeMs,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(requestId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(messageId);
+        ArgumentNullException.ThrowIfNull(content);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(senderUserId);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(editedAtMs);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxAgeMs);
+
+        var payloadFingerprint = ComputeMutationFingerprint(
+            operation: 1,
+            messageId,
+            content);
+
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+        await using var transaction = await connection
+            .BeginTransactionAsync(ct)
+            .ConfigureAwait(false);
+
+        var prior = await TryReadMutationRequestAsync(
+                connection,
+                transaction,
+                senderUserId,
+                requestId,
+                ct)
+            .ConfigureAwait(false);
+        if (prior is not null)
+        {
+            if (prior.Operation != 1
+                || !string.Equals(prior.MessageId, messageId, StringComparison.Ordinal)
+                || !string.Equals(prior.PayloadFingerprint, payloadFingerprint, StringComparison.Ordinal))
+            {
+                await transaction.RollbackAsync(ct).ConfigureAwait(false);
+                return new MessageEditPersistResult(
+                    MessageEditPersistStatus.RequestConflict,
+                    messageId);
+            }
+
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            return prior.Succeeded
+                ? new MessageEditPersistResult(
+                    MessageEditPersistStatus.Unchanged,
+                    messageId,
+                    ConversationId: prior.ConversationId,
+                    Content: prior.Content,
+                    EditVersion: prior.EditVersion,
+                    EditedAtMs: prior.EditedAtMs)
+                : MapEditFailure(prior.ErrorCode, messageId, prior.ConversationId);
+        }
+
+        long dbSenderUserId;
+        long receiverUserId;
+        string? conversationId;
+        long receivedAtMs;
+        long? recalledAtMs;
+        string existingContent;
+        int editVersion;
+
+        await using (var command = new NpgsqlCommand(
+                         $"""
+                          SELECT sender_user_id, receiver_user_id, conversation_id, received_at_ms,
+                                 recalled_at_ms, content, edit_version
+                          FROM {_databaseSchema.MessagesTableSql}
+                          WHERE message_id = @message_id
+                          FOR UPDATE
+                          """,
+                         connection,
+                         transaction))
+        {
+            command.Parameters.AddWithValue("message_id", messageId);
+            await using var reader = await command
+                .ExecuteReaderAsync(ct)
+                .ConfigureAwait(false);
+            if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+            {
+                await InsertMutationRequestAsync(
+                        connection,
+                        transaction,
+                        senderUserId,
+                        requestId,
+                        operation: 1,
+                        messageId,
+                        payloadFingerprint,
+                        succeeded: false,
+                        errorCode: "message_not_found",
+                        conversationId: null,
+                        content: null,
+                        editVersion: null,
+                        editedAtMs: null,
+                        recalledAtMs: null,
+                        ct)
+                    .ConfigureAwait(false);
+                await transaction.CommitAsync(ct).ConfigureAwait(false);
+                return new MessageEditPersistResult(
+                    MessageEditPersistStatus.NotFound,
+                    messageId);
+            }
+
+            dbSenderUserId = reader.GetInt64(0);
+            receiverUserId = reader.GetInt64(1);
+            conversationId = reader.IsDBNull(2) ? null : reader.GetString(2);
+            receivedAtMs = reader.GetInt64(3);
+            recalledAtMs = reader.IsDBNull(4) ? null : reader.GetInt64(4);
+            existingContent = reader.GetString(5);
+            editVersion = reader.GetInt32(6);
+        }
+
+        if (dbSenderUserId != senderUserId)
+        {
+            await InsertMutationRequestAsync(
+                    connection,
+                    transaction,
+                    senderUserId,
+                    requestId,
+                    operation: 1,
+                    messageId,
+                    payloadFingerprint,
+                    succeeded: false,
+                    errorCode: "edit_not_allowed",
+                    conversationId,
+                    content: null,
+                    editVersion: null,
+                    editedAtMs: null,
+                    recalledAtMs: null,
+                    ct)
+                .ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            return new MessageEditPersistResult(
+                MessageEditPersistStatus.NotAllowed,
+                messageId,
+                receiverUserId,
+                conversationId);
+        }
+
+        if (recalledAtMs is not null)
+        {
+            await InsertMutationRequestAsync(
+                    connection,
+                    transaction,
+                    senderUserId,
+                    requestId,
+                    operation: 1,
+                    messageId,
+                    payloadFingerprint,
+                    succeeded: false,
+                    errorCode: "message_recalled",
+                    conversationId,
+                    content: null,
+                    editVersion: null,
+                    editedAtMs: null,
+                    recalledAtMs: recalledAtMs,
+                    ct)
+                .ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            return new MessageEditPersistResult(
+                MessageEditPersistStatus.AlreadyRecalled,
+                messageId,
+                receiverUserId,
+                conversationId);
+        }
+
+        if (editedAtMs - receivedAtMs > maxAgeMs)
+        {
+            await InsertMutationRequestAsync(
+                    connection,
+                    transaction,
+                    senderUserId,
+                    requestId,
+                    operation: 1,
+                    messageId,
+                    payloadFingerprint,
+                    succeeded: false,
+                    errorCode: "edit_window_expired",
+                    conversationId,
+                    content: null,
+                    editVersion: null,
+                    editedAtMs: null,
+                    recalledAtMs: null,
+                    ct)
+                .ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            return new MessageEditPersistResult(
+                MessageEditPersistStatus.WindowExpired,
+                messageId,
+                receiverUserId,
+                conversationId);
+        }
+
+        if (string.Equals(existingContent, content, StringComparison.Ordinal))
+        {
+            await InsertMutationRequestAsync(
+                    connection,
+                    transaction,
+                    senderUserId,
+                    requestId,
+                    operation: 1,
+                    messageId,
+                    payloadFingerprint,
+                    succeeded: true,
+                    errorCode: null,
+                    conversationId,
+                    content: existingContent,
+                    editVersion: editVersion,
+                    editedAtMs: editedAtMs,
+                    recalledAtMs: null,
+                    ct)
+                .ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            return new MessageEditPersistResult(
+                MessageEditPersistStatus.Unchanged,
+                messageId,
+                receiverUserId,
+                conversationId,
+                existingContent,
+                editVersion,
+                editedAtMs);
+        }
+
+        var nextVersion = editVersion + 1;
+        await using (var command = new NpgsqlCommand(
+                         $"""
+                          UPDATE {_databaseSchema.MessagesTableSql}
+                          SET content = @content,
+                              edit_version = @edit_version,
+                              edited_at_ms = @edited_at_ms,
+                              changed_at_ms = @edited_at_ms
+                          WHERE message_id = @message_id
+                            AND recalled_at_ms IS NULL
+                          """,
+                         connection,
+                         transaction))
+        {
+            command.Parameters.AddWithValue("message_id", messageId);
+            command.Parameters.AddWithValue("content", content);
+            command.Parameters.AddWithValue("edit_version", nextVersion);
+            command.Parameters.AddWithValue("edited_at_ms", editedAtMs);
+            var affected = await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            if (affected == 0)
+            {
+                await InsertMutationRequestAsync(
+                        connection,
+                        transaction,
+                        senderUserId,
+                        requestId,
+                        operation: 1,
+                        messageId,
+                        payloadFingerprint,
+                        succeeded: false,
+                        errorCode: "message_recalled",
+                        conversationId,
+                        content: null,
+                        editVersion: null,
+                        editedAtMs: null,
+                        recalledAtMs: null,
+                        ct)
+                    .ConfigureAwait(false);
+                await transaction.CommitAsync(ct).ConfigureAwait(false);
+                return new MessageEditPersistResult(
+                    MessageEditPersistStatus.AlreadyRecalled,
+                    messageId,
+                    receiverUserId,
+                    conversationId);
+            }
+        }
+
+        var tipPreviewUpdated = false;
+        var tipPreview = ConversationId.CreatePreview(content);
+        if (!string.IsNullOrWhiteSpace(conversationId))
+        {
+            await using var previewCmd = new NpgsqlCommand(
+                $"""
+                 UPDATE {_databaseSchema.ConversationsTableSql}
+                 SET last_message_preview = @preview
+                 WHERE conversation_id = @conversation_id
+                   AND last_message_id = @message_id
+                 """,
+                connection,
+                transaction);
+            previewCmd.Parameters.AddWithValue("preview", tipPreview);
+            previewCmd.Parameters.AddWithValue("conversation_id", conversationId);
+            previewCmd.Parameters.AddWithValue("message_id", messageId);
+            tipPreviewUpdated = await previewCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) > 0;
+        }
+
+        var payloadJson = JsonSerializer.Serialize(
+            new RealtimeMessageEditedPayload
+            {
+                MessageId = messageId,
+                ConversationId = conversationId,
+                SenderUserId = senderUserId,
+                ReceiverUserId = receiverUserId,
+                Content = content,
+                EditVersion = nextVersion,
+                EditedAtMs = editedAtMs
+            },
+            RealtimeJsonSerializerContext.Default.RealtimeMessageEditedPayload);
+
+        var receiverEvent = new RealtimeEvent
+        {
+            EventId = RealtimeEventContracts.CreateMessageEditedEventId(
+                messageId,
+                receiverUserId,
+                nextVersion),
+            Type = RealtimeEventType.MessageEdited,
+            TargetUserId = receiverUserId,
+            ActorUserId = senderUserId,
+            MessageId = messageId,
+            SessionId = senderSessionId,
+            PayloadJson = payloadJson,
+            OccurredAtMs = editedAtMs,
+            TraceParent = RealtimeTraceContext.CaptureTraceParent(),
+            TraceState = RealtimeTraceContext.CaptureTraceState()
+        };
+
+        var events = new List<RealtimeEvent>(4) { receiverEvent };
+        if (senderUserId != receiverUserId)
+        {
+            events.Add(new RealtimeEvent
+            {
+                EventId = RealtimeEventContracts.CreateMessageEditedEventId(
+                    messageId,
+                    senderUserId,
+                    nextVersion),
+                Type = RealtimeEventType.MessageEdited,
+                TargetUserId = senderUserId,
+                ActorUserId = senderUserId,
+                MessageId = messageId,
+                SessionId = senderSessionId,
+                PayloadJson = payloadJson,
+                OccurredAtMs = editedAtMs,
+                TraceParent = receiverEvent.TraceParent,
+                TraceState = receiverEvent.TraceState
+            });
+        }
+
+        if (tipPreviewUpdated && !string.IsNullOrWhiteSpace(conversationId))
+        {
+            var cause = $"edit:{nextVersion}";
+            events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
+                conversationId,
+                senderUserId,
+                receiverUserId,
+                messageId,
+                tipPreview,
+                receivedAtMs,
+                senderUserId,
+                receiverEvent.TraceParent,
+                receiverEvent.TraceState,
+                cause));
+            events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
+                conversationId,
+                receiverUserId,
+                senderUserId,
+                messageId,
+                tipPreview,
+                receivedAtMs,
+                senderUserId,
+                receiverEvent.TraceParent,
+                receiverEvent.TraceState,
+                cause));
+        }
+
+        await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
+        await InsertMutationRequestAsync(
+                connection,
+                transaction,
+                senderUserId,
+                requestId,
+                operation: 1,
+                messageId,
+                payloadFingerprint,
+                succeeded: true,
+                errorCode: null,
+                conversationId,
+                content: content,
+                editVersion: nextVersion,
+                editedAtMs: editedAtMs,
+                recalledAtMs: null,
+                ct)
+            .ConfigureAwait(false);
+        await transaction.CommitAsync(ct).ConfigureAwait(false);
+
+        return new MessageEditPersistResult(
+            MessageEditPersistStatus.Applied,
+            messageId,
+            receiverUserId,
+            conversationId,
+            content,
+            nextVersion,
+            editedAtMs);
+    }
+
+    private static MessageRecallPersistResult MapRecallFailure(
+        string? errorCode,
+        string messageId,
+        string? conversationId) =>
+        errorCode switch
+        {
+            "message_not_found" => new MessageRecallPersistResult(
+                MessageRecallPersistStatus.NotFound,
+                messageId),
+            "recall_not_allowed" => new MessageRecallPersistResult(
+                MessageRecallPersistStatus.NotAllowed,
+                messageId,
+                ConversationId: conversationId),
+            "recall_window_expired" => new MessageRecallPersistResult(
+                MessageRecallPersistStatus.WindowExpired,
+                messageId,
+                ConversationId: conversationId),
+            _ => new MessageRecallPersistResult(
+                MessageRecallPersistStatus.NotAllowed,
+                messageId,
+                ConversationId: conversationId)
+        };
+
+    private static MessageEditPersistResult MapEditFailure(
+        string? errorCode,
+        string messageId,
+        string? conversationId) =>
+        errorCode switch
+        {
+            "message_not_found" => new MessageEditPersistResult(
+                MessageEditPersistStatus.NotFound,
+                messageId),
+            "edit_not_allowed" => new MessageEditPersistResult(
+                MessageEditPersistStatus.NotAllowed,
+                messageId,
+                ConversationId: conversationId),
+            "edit_window_expired" => new MessageEditPersistResult(
+                MessageEditPersistStatus.WindowExpired,
+                messageId,
+                ConversationId: conversationId),
+            "message_recalled" => new MessageEditPersistResult(
+                MessageEditPersistStatus.AlreadyRecalled,
+                messageId,
+                ConversationId: conversationId),
+            _ => new MessageEditPersistResult(
+                MessageEditPersistStatus.NotAllowed,
+                messageId,
+                ConversationId: conversationId)
+        };
+
+    private static string ComputeMutationFingerprint(
+        short operation,
+        string messageId,
+        string content)
+    {
+        var input = System.Text.Encoding.UTF8.GetBytes($"{operation}\n{messageId}\n{content}");
+        return Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(input));
+    }
+
+    private sealed record MutationRequestRow(
+        short Operation,
+        string MessageId,
+        string PayloadFingerprint,
+        bool Succeeded,
+        string? ErrorCode,
+        string? ConversationId,
+        string? Content,
+        int? EditVersion,
+        long? EditedAtMs,
+        long? RecalledAtMs);
+
+    private async Task<MutationRequestRow?> TryReadMutationRequestAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        long actorUserId,
+        string requestId,
+        CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT operation, message_id, payload_fingerprint, succeeded, error_code,
+                    conversation_id, content, edit_version, edited_at_ms, recalled_at_ms
+             FROM {_databaseSchema.MessageMutationRequestsTableSql}
+             WHERE actor_user_id = @actor_user_id
+               AND request_id = @request_id
+             FOR UPDATE
+             """,
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("actor_user_id", actorUserId);
+        command.Parameters.AddWithValue("request_id", requestId);
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+            return null;
+
+        return new MutationRequestRow(
+            reader.GetInt16(0),
+            reader.GetString(1),
+            reader.GetString(2),
+            reader.GetBoolean(3),
+            reader.IsDBNull(4) ? null : reader.GetString(4),
+            reader.IsDBNull(5) ? null : reader.GetString(5),
+            reader.IsDBNull(6) ? null : reader.GetString(6),
+            reader.IsDBNull(7) ? null : reader.GetInt32(7),
+            reader.IsDBNull(8) ? null : reader.GetInt64(8),
+            reader.IsDBNull(9) ? null : reader.GetInt64(9));
+    }
+
+    private async Task InsertMutationRequestAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        long actorUserId,
+        string requestId,
+        short operation,
+        string messageId,
+        string payloadFingerprint,
+        bool succeeded,
+        string? errorCode,
+        string? conversationId,
+        string? content,
+        int? editVersion,
+        long? editedAtMs,
+        long? recalledAtMs,
+        CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand(
+            $"""
+             INSERT INTO {_databaseSchema.MessageMutationRequestsTableSql} (
+                 actor_user_id,
+                 request_id,
+                 operation,
+                 message_id,
+                 payload_fingerprint,
+                 succeeded,
+                 error_code,
+                 conversation_id,
+                 content,
+                 edit_version,
+                 edited_at_ms,
+                 recalled_at_ms,
+                 created_at_ms
+             )
+             VALUES (
+                 @actor_user_id,
+                 @request_id,
+                 @operation,
+                 @message_id,
+                 @payload_fingerprint,
+                 @succeeded,
+                 @error_code,
+                 @conversation_id,
+                 @content,
+                 @edit_version,
+                 @edited_at_ms,
+                 @recalled_at_ms,
+                 @created_at_ms
+             )
+             ON CONFLICT (actor_user_id, request_id) DO NOTHING;
+             """,
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("actor_user_id", actorUserId);
+        command.Parameters.AddWithValue("request_id", requestId);
+        command.Parameters.AddWithValue("operation", operation);
+        command.Parameters.AddWithValue("message_id", messageId);
+        command.Parameters.AddWithValue("payload_fingerprint", payloadFingerprint);
+        command.Parameters.AddWithValue("succeeded", succeeded);
+        command.Parameters.AddWithValue("error_code", (object?)errorCode ?? DBNull.Value);
+        command.Parameters.AddWithValue("conversation_id", (object?)conversationId ?? DBNull.Value);
+        command.Parameters.AddWithValue("content", (object?)content ?? DBNull.Value);
+        command.Parameters.AddWithValue("edit_version", editVersion.HasValue ? editVersion.Value : DBNull.Value);
+        command.Parameters.AddWithValue("edited_at_ms", editedAtMs.HasValue ? editedAtMs.Value : DBNull.Value);
+        command.Parameters.AddWithValue("recalled_at_ms", recalledAtMs.HasValue ? recalledAtMs.Value : DBNull.Value);
+        command.Parameters.AddWithValue(
+            "created_at_ms",
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
     public async Task<long> DeleteByUserAsync(

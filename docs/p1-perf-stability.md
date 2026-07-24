@@ -4,12 +4,13 @@
 - Hot-path gauges (`pending` / `dead`) update on publish success, dead-letter, and dead replay.
 - `OutboxMetricsCollector` reconciles Pending/Dead aggregates on a long interval (default 5m), not every 5s.
 - `GetStatsAsync` only aggregates `status IN (Pending, Dead)` via index-friendly subqueries (ops `/ops/outbox/summary` and rare reconcile).
+- Human/ops curl: also `/ops/migrations/progress` and `/ops/backlogs/` (see [ops.md](ops.md)).
 
 ## SaveAsync (Npgsql production path)
 Created path round-trips (same transaction):
 1. `INSERT messages … ON CONFLICT DO NOTHING`
-2. CTE: conversation tip + ensure members + member tip
-3. Receiver unread `UPDATE` (separate statement — PG modifying CTEs share a snapshot and cannot see sibling inserts)
+2. Optional attachment bind (`UPDATE … RETURNING`)
+3. `NpgsqlBatch`: conversation tip CTE + receiver unread `UPDATE`（两语句一往返；未读仍须独立语句，因 PG modifying CTE 快照限制）
 4. Multi-row `INSERT outbox … ON CONFLICT DO NOTHING`
 
 Duplicate path: no Outbox re-insert (message + outbox were committed atomically).

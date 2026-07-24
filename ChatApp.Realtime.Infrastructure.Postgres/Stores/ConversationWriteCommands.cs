@@ -15,7 +15,7 @@ internal static class ConversationWriteCommands
     public const int MaxTrackedUnreadCount = 10_000;
 
     /// <summary>
-    /// 会话 tip UPSERT + 成员确保 + member tip（一条 SQL），再单独递增未读（同事务第二语句）。
+    /// 会话 tip UPSERT + 成员确保 + member tip，与接收方未读递增合并为一次 NpgsqlBatch（两语句、一往返）。
     /// 未读必须与 ensure_members 分开：PG modifying CTE 共享快照，看不到同 WITH 内新插入的成员行。
     /// </summary>
     public static async Task<(bool Advanced, int? UnreadCount)> TryAdvanceAndIncrementUnreadAsync(
@@ -30,82 +30,101 @@ internal static class ConversationWriteCommands
         long receivedAtMs,
         CancellationToken ct)
     {
-        bool advanced;
-        await using (var command = new NpgsqlCommand(
-                           $"""
-                            WITH upsert_conversation AS (
-                                INSERT INTO {schema.ConversationsTableSql} (
-                                    conversation_id, type, created_at_ms, updated_at_ms,
-                                    last_message_id, last_message_preview, last_message_at_ms, last_sender_user_id
-                                ) VALUES (
-                                    @conversation_id, @type, @received_at_ms, @received_at_ms,
-                                    @message_id, @preview, @received_at_ms, @sender_user_id
-                                )
-                                ON CONFLICT (conversation_id) DO UPDATE SET
-                                    last_message_id = EXCLUDED.last_message_id,
-                                    last_message_preview = EXCLUDED.last_message_preview,
-                                    last_message_at_ms = EXCLUDED.last_message_at_ms,
-                                    last_sender_user_id = EXCLUDED.last_sender_user_id,
-                                    updated_at_ms = EXCLUDED.updated_at_ms
-                                WHERE {schema.ConversationsTableSql}.last_message_at_ms IS NULL
-                                   OR ({schema.ConversationsTableSql}.last_message_at_ms, {schema.ConversationsTableSql}.last_message_id)
-                                      < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
-                                RETURNING conversation_id
-                            ),
-                            ensure_members AS (
-                                INSERT INTO {schema.ConversationMembersTableSql} (
-                                    conversation_id, user_id, peer_user_id, joined_at_ms, last_message_at_ms
-                                ) VALUES
-                                    (@conversation_id, @sender_user_id, @receiver_user_id, @received_at_ms, @received_at_ms),
-                                    (@conversation_id, @receiver_user_id, @sender_user_id, @received_at_ms, @received_at_ms)
-                                ON CONFLICT (conversation_id, user_id) DO NOTHING
-                                RETURNING user_id
-                            ),
-                            members_ready AS (
-                                SELECT COALESCE((SELECT COUNT(*)::int FROM ensure_members), 0) AS ensured
-                            ),
-                            sync_tip AS (
-                                UPDATE {schema.ConversationMembersTableSql}
-                                SET last_message_at_ms = @received_at_ms
-                                WHERE conversation_id = @conversation_id
-                                  AND EXISTS (SELECT 1 FROM upsert_conversation)
-                                  AND (SELECT ensured FROM members_ready) >= 0
-                                  AND (
-                                       last_message_at_ms IS NULL
-                                       OR last_message_at_ms < @received_at_ms
-                                  )
-                                RETURNING user_id
-                            )
-                            SELECT EXISTS (SELECT 1 FROM upsert_conversation) AS advanced;
-                            """,
-                           connection,
-                           transaction))
+        await using var batch = new NpgsqlBatch(connection, transaction);
+
+        var advance = new NpgsqlBatchCommand(
+            $"""
+             WITH upsert_conversation AS (
+                 INSERT INTO {schema.ConversationsTableSql} (
+                     conversation_id, type, created_at_ms, updated_at_ms,
+                     last_message_id, last_message_preview, last_message_at_ms, last_sender_user_id
+                 ) VALUES (
+                     @conversation_id, @type, @received_at_ms, @received_at_ms,
+                     @message_id, @preview, @received_at_ms, @sender_user_id
+                 )
+                 ON CONFLICT (conversation_id) DO UPDATE SET
+                     last_message_id = EXCLUDED.last_message_id,
+                     last_message_preview = EXCLUDED.last_message_preview,
+                     last_message_at_ms = EXCLUDED.last_message_at_ms,
+                     last_sender_user_id = EXCLUDED.last_sender_user_id,
+                     updated_at_ms = EXCLUDED.updated_at_ms
+                 WHERE {schema.ConversationsTableSql}.last_message_at_ms IS NULL
+                    OR ({schema.ConversationsTableSql}.last_message_at_ms, {schema.ConversationsTableSql}.last_message_id)
+                       < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
+                 RETURNING conversation_id
+             ),
+             ensure_members AS (
+                 INSERT INTO {schema.ConversationMembersTableSql} (
+                     conversation_id, user_id, peer_user_id, joined_at_ms, last_message_at_ms
+                 ) VALUES
+                     (@conversation_id, @sender_user_id, @receiver_user_id, @received_at_ms, @received_at_ms),
+                     (@conversation_id, @receiver_user_id, @sender_user_id, @received_at_ms, @received_at_ms)
+                 ON CONFLICT (conversation_id, user_id) DO NOTHING
+                 RETURNING user_id
+             ),
+             members_ready AS (
+                 SELECT COALESCE((SELECT COUNT(*)::int FROM ensure_members), 0) AS ensured
+             ),
+             sync_tip AS (
+                 UPDATE {schema.ConversationMembersTableSql}
+                 SET last_message_at_ms = @received_at_ms
+                 WHERE conversation_id = @conversation_id
+                   AND EXISTS (SELECT 1 FROM upsert_conversation)
+                   AND (SELECT ensured FROM members_ready) >= 0
+                   AND (
+                        last_message_at_ms IS NULL
+                        OR last_message_at_ms < @received_at_ms
+                   )
+                 RETURNING user_id
+             )
+             SELECT EXISTS (SELECT 1 FROM upsert_conversation) AS advanced;
+             """);
+        advance.Parameters.AddWithValue("conversation_id", conversationId);
+        advance.Parameters.AddWithValue("type", (short)ConversationType.Direct);
+        advance.Parameters.AddWithValue("received_at_ms", receivedAtMs);
+        advance.Parameters.AddWithValue("message_id", messageId);
+        advance.Parameters.AddWithValue("preview", preview);
+        advance.Parameters.AddWithValue("sender_user_id", senderUserId);
+        advance.Parameters.AddWithValue("receiver_user_id", receiverUserId);
+        batch.BatchCommands.Add(advance);
+
+        var unreadCmd = new NpgsqlBatchCommand(
+            $"""
+             UPDATE {schema.ConversationMembersTableSql}
+             SET unread_count = LEAST(unread_count + 1, @max_unread)
+             WHERE conversation_id = @conversation_id
+               AND user_id = @receiver_user_id
+               AND (
+                    last_read_at_ms IS NULL
+                    OR last_read_at_ms < @received_at_ms
+                    OR (last_read_at_ms = @received_at_ms
+                        AND (last_read_message_id IS NULL OR last_read_message_id < @message_id))
+               )
+             RETURNING unread_count;
+             """);
+        unreadCmd.Parameters.AddWithValue("max_unread", MaxTrackedUnreadCount);
+        unreadCmd.Parameters.AddWithValue("conversation_id", conversationId);
+        unreadCmd.Parameters.AddWithValue("receiver_user_id", receiverUserId);
+        unreadCmd.Parameters.AddWithValue("received_at_ms", receivedAtMs);
+        unreadCmd.Parameters.AddWithValue("message_id", messageId);
+        batch.BatchCommands.Add(unreadCmd);
+
+        await using var reader = await batch.ExecuteReaderAsync(ct).ConfigureAwait(false);
+
+        var advanced = false;
+        if (await reader.ReadAsync(ct).ConfigureAwait(false))
+            advanced = reader.GetBoolean(0);
+
+        int? unread = null;
+        if (await reader.NextResultAsync(ct).ConfigureAwait(false)
+            && await reader.ReadAsync(ct).ConfigureAwait(false))
         {
-            command.Parameters.AddWithValue("conversation_id", conversationId);
-            command.Parameters.AddWithValue("type", (short)ConversationType.Direct);
-            command.Parameters.AddWithValue("received_at_ms", receivedAtMs);
-            command.Parameters.AddWithValue("message_id", messageId);
-            command.Parameters.AddWithValue("preview", preview);
-            command.Parameters.AddWithValue("sender_user_id", senderUserId);
-            command.Parameters.AddWithValue("receiver_user_id", receiverUserId);
-
-            var result = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
-            advanced = result is true;
+            unread = reader.GetInt32(0);
         }
-
-        var unread = await TryIncrementReceiverUnreadAsync(
-                connection,
-                transaction,
-                schema,
-                conversationId,
-                receiverUserId,
-                messageId,
-                receivedAtMs,
-                ct)
-            .ConfigureAwait(false);
 
         return (advanced, unread);
     }
+
 
     public static async Task<bool> TryAdvanceDirectConversationAsync(
         NpgsqlConnection connection,
@@ -302,7 +321,8 @@ internal static class ConversationWriteCommands
         long receivedAtMs,
         long senderUserId,
         string? traceParent,
-        string? traceState)
+        string? traceState,
+        string? eventIdCause = null)
     {
         var payload = new RealtimeConversationChangedPayload
         {
@@ -317,7 +337,11 @@ internal static class ConversationWriteCommands
 
         return new RealtimeEvent
         {
-            EventId = CreateConversationChangedEventId(conversationId, messageId, targetUserId),
+            EventId = CreateConversationChangedEventId(
+                conversationId,
+                messageId,
+                targetUserId,
+                eventIdCause),
             Type = RealtimeEventType.ConversationListChanged,
             TargetUserId = targetUserId,
             ActorUserId = senderUserId,
@@ -385,11 +409,13 @@ internal static class ConversationWriteCommands
     public static string CreateConversationChangedEventId(
         string conversationId,
         string messageId,
-        long targetUserId) =>
+        long targetUserId,
+        string? causeToken = null) =>
         RealtimeEventContracts.CreateConversationChangedEventId(
             conversationId,
             messageId,
-            targetUserId);
+            targetUserId,
+            causeToken);
 
     public static string CreateConversationPrefsChangedEventId(
         string conversationId,

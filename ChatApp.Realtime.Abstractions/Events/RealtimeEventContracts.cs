@@ -31,6 +31,15 @@ public static class RealtimeEventContracts
     /// <summary>业务名 MessageRecalled → 线协议 <see cref="RealtimeEventType.MessageRecalled"/>。</summary>
     public const string MessageRecalled = nameof(MessageRecalled);
 
+    /// <summary>业务名 MessageEdited → 线协议 <see cref="RealtimeEventType.MessageEdited"/>。</summary>
+    public const string MessageEdited = nameof(MessageEdited);
+
+    /// <summary>业务名 ReactionAdded → 线协议 <see cref="RealtimeEventType.ReactionAdded"/>。</summary>
+    public const string ReactionAdded = nameof(ReactionAdded);
+
+    /// <summary>业务名 ReactionRemoved → 线协议 <see cref="RealtimeEventType.ReactionRemoved"/>。</summary>
+    public const string ReactionRemoved = nameof(ReactionRemoved);
+
     public static string CreateMessageReceivedEventId(long senderUserId, string clientMessageId)
     {
         var input = Encoding.UTF8.GetBytes($"{senderUserId}:{clientMessageId}");
@@ -111,6 +120,49 @@ public static class RealtimeEventContracts
         return Convert.ToHexStringLower(SHA256.HashData(input));
     }
 
+    /// <summary>
+    /// 编辑事件幂等 Id。必须纳入 <paramref name="editVersion"/>，
+    /// 否则连续编辑会被 Outbox 冲突吞掉。
+    /// </summary>
+    public static string CreateMessageEditedEventId(
+        string messageId,
+        long targetUserId,
+        int editVersion)
+    {
+        var input = Encoding.UTF8.GetBytes($"msgedit:{messageId}:{targetUserId}:{editVersion}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
+    /// <summary>
+    /// 反应新增事件幂等 Id。纳入 reactor + emoji + occurredAt，避免重复点赞/取消再点被吞。
+    /// </summary>
+    public static string CreateReactionAddedEventId(
+        string messageId,
+        long targetUserId,
+        long reactorUserId,
+        string emoji,
+        long occurredAtMs)
+    {
+        var input = Encoding.UTF8.GetBytes(
+            $"reactadd:{messageId}:{targetUserId}:{reactorUserId}:{emoji}:{occurredAtMs}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
+    /// <summary>
+    /// 反应移除事件幂等 Id。纳入 reactor + emoji + occurredAt。
+    /// </summary>
+    public static string CreateReactionRemovedEventId(
+        string messageId,
+        long targetUserId,
+        long reactorUserId,
+        string emoji,
+        long occurredAtMs)
+    {
+        var input = Encoding.UTF8.GetBytes(
+            $"reactrm:{messageId}:{targetUserId}:{reactorUserId}:{emoji}:{occurredAtMs}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
     public static string CreateAttachmentBlobsPurgeEventId(
         string cleanupEventId,
         int chunkIndex)
@@ -129,6 +181,9 @@ public static class RealtimeEventContracts
             MessageReceiptUpdated => RealtimeEventType.MessageReceiptUpdated,
             SessionInvalidated => RealtimeEventType.SessionRevoked,
             MessageRecalled => RealtimeEventType.MessageRecalled,
+            MessageEdited => RealtimeEventType.MessageEdited,
+            ReactionAdded => RealtimeEventType.ReactionAdded,
+            ReactionRemoved => RealtimeEventType.ReactionRemoved,
             _ => throw new ArgumentOutOfRangeException(nameof(businessName), businessName, null)
         };
 }

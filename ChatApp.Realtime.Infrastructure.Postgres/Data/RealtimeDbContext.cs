@@ -95,6 +95,15 @@ public sealed class RealtimeDbContext : DbContext
             entity.Property(message => message.RecalledAtMs)
                 .HasColumnName("recalled_at_ms");
 
+            entity.Property(message => message.EditVersion)
+                .HasColumnName("edit_version");
+
+            entity.Property(message => message.EditedAtMs)
+                .HasColumnName("edited_at_ms");
+
+            entity.Property(message => message.ChangedAtMs)
+                .HasColumnName("changed_at_ms");
+
             entity.Property(message => message.CreatedAtMs)
                 .HasColumnName("created_at_ms");
 

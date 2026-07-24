@@ -27,10 +27,24 @@ public interface IRealtimeMessageStore
     /// 发送方撤回消息：清空内容、写入 recalled_at_ms，并向接收方与发送方其他会话投递 Outbox 事件。
     /// </summary>
     Task<MessageRecallPersistResult> ApplyRecallAsync(
+        string requestId,
         string messageId,
         long senderUserId,
         string senderSessionId,
         long recalledAtMs,
+        long maxAgeMs,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// 发送方编辑消息正文（不改附件）：递增 edit_version，写入 edited_at_ms / changed_at_ms，并投递 Outbox。
+    /// </summary>
+    Task<MessageEditPersistResult> ApplyEditAsync(
+        string requestId,
+        string messageId,
+        long senderUserId,
+        string senderSessionId,
+        string content,
+        long editedAtMs,
         long maxAgeMs,
         CancellationToken ct = default);
 

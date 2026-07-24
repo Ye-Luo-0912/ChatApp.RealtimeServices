@@ -16,6 +16,7 @@ using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Infrastructure.Core.State;
 using ChatApp.Realtime.Infrastructure.Core.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Sync;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -38,6 +39,10 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IConversationMarkReadProcessor, DefaultConversationMarkReadProcessor>();
         services.TryAddSingleton<IConversationSetPrefsProcessor, DefaultConversationSetPrefsProcessor>();
         services.TryAddSingleton<IMessageRecallProcessor, DefaultMessageRecallProcessor>();
+        services.TryAddSingleton<IMessageEditProcessor, DefaultMessageEditProcessor>();
+        services.TryAddSingleton(new MessageEditOptions());
+        services.TryAddSingleton(new MessageRecallOptions());
+        services.TryAddSingleton(BindSyncBootstrapOptions);
         services.TryAddSingleton<ISyncBootstrapQueryProcessor, DefaultSyncBootstrapQueryProcessor>();
 
         services.TryAddSingleton<IRealtimeEventPublisher, NoopRealtimeEventPublisher>();
@@ -49,6 +54,7 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IConversationMarkReadConsumer, NoopConversationMarkReadConsumer>();
         services.TryAddSingleton<IConversationSetPrefsConsumer, NoopConversationSetPrefsConsumer>();
         services.TryAddSingleton<IMessageRecallConsumer, NoopMessageRecallConsumer>();
+        services.TryAddSingleton<IMessageEditConsumer, NoopMessageEditConsumer>();
         services.TryAddSingleton<ISyncBootstrapQueryConsumer, NoopSyncBootstrapQueryConsumer>();
         services.TryAddSingleton<IRealtimeMessageStore, NoopRealtimeMessageStore>();
         services.TryAddSingleton<IRealtimeAttachmentStore, NoopRealtimeAttachmentStore>();
@@ -59,5 +65,21 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IDeadLetterPublisher, NoopDeadLetterPublisher>();
 
         return services;
+    }
+
+    /// <summary>
+    /// Fallback factory used when the host (e.g. RealtimeServicesRegistration) has not already
+    /// registered a bound/validated <see cref="SyncBootstrapOptions"/> singleton. Binds directly
+    /// from <c>SyncBootstrap</c> when an <see cref="IConfiguration"/> is available; otherwise
+    /// falls back to defaults (all knobs disabled).
+    /// </summary>
+    private static SyncBootstrapOptions BindSyncBootstrapOptions(IServiceProvider provider)
+    {
+        var configuration = provider.GetService<IConfiguration>();
+        if (configuration is null)
+            return new SyncBootstrapOptions();
+
+        return configuration.GetSection(SyncBootstrapOptions.SectionName).Get<SyncBootstrapOptions>()
+            ?? new SyncBootstrapOptions();
     }
 }

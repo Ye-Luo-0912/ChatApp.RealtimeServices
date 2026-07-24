@@ -167,7 +167,7 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
             .ConfigureAwait(false);
         await using var transaction = await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
 
-        var bound = await AttachmentWriteCommands.BindConfirmedToMessageAsync(
+        var boundRecords = await AttachmentWriteCommands.BindConfirmedToMessageAsync(
                 connection,
                 transaction,
                 _databaseSchema,
@@ -182,15 +182,15 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
             .Where(id => !string.IsNullOrWhiteSpace(id))
             .Distinct(StringComparer.Ordinal)
             .Count();
-        if (bound != expected)
+        if (boundRecords.Count != expected)
         {
             await transaction.RollbackAsync(ct).ConfigureAwait(false);
             throw new InvalidOperationException(
-                $"附件绑定失败：期望 {expected}，实际 {bound}。");
+                $"附件绑定失败：期望 {expected}，实际 {boundRecords.Count}。");
         }
 
         await transaction.CommitAsync(ct).ConfigureAwait(false);
-        return bound;
+        return boundRecords.Count;
     }
 
     public async Task<IReadOnlyList<RealtimeAttachmentRecord>> ListByMessageIdsAsync(
@@ -216,7 +216,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
             $"""
              SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                     size_bytes, original_name, status, message_id, conversation_id,
-                    client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms
+                    client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
+                    content_hash
              FROM {_databaseSchema.AttachmentsTableSql}
              WHERE message_id = ANY(@message_ids)
              ORDER BY message_id, created_at_ms, attachment_id;
@@ -246,7 +247,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
             ? $"""
                SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                       size_bytes, original_name, status, message_id, conversation_id,
-                      client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms
+                      client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
+                      content_hash
                FROM {_databaseSchema.AttachmentsTableSql}
                WHERE uploader_user_id = @user_id
                ORDER BY attachment_id
@@ -255,7 +257,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
             : $"""
                SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                       size_bytes, original_name, status, message_id, conversation_id,
-                      client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms
+                      client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
+                      content_hash
                FROM {_databaseSchema.AttachmentsTableSql}
                WHERE uploader_user_id = @user_id
                  AND attachment_id > @after_id
@@ -392,7 +395,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
             $"""
              SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                     size_bytes, original_name, status, message_id, conversation_id,
-                    client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms
+                    client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
+                    content_hash
              FROM {_databaseSchema.AttachmentsTableSql}
              WHERE attachment_id = @attachment_id;
              """,
@@ -414,7 +418,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
             $"""
              SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                     size_bytes, original_name, status, message_id, conversation_id,
-                    client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms
+                    client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
+                    content_hash
              FROM {_databaseSchema.AttachmentsTableSql}
              WHERE uploader_user_id = @uploader_user_id
                AND client_attachment_id = @client_attachment_id;
@@ -454,6 +459,9 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
         ClientAttachmentId = reader.IsDBNull(10) ? null : reader.GetString(10),
         CreatedAtMs = reader.GetInt64(11),
         ConfirmedAtMs = reader.IsDBNull(12) ? null : reader.GetInt64(12),
-        BoundAtMs = reader.IsDBNull(13) ? null : reader.GetInt64(13)
+        BoundAtMs = reader.IsDBNull(13) ? null : reader.GetInt64(13),
+        ContentHash = reader.FieldCount > 14 && !reader.IsDBNull(14)
+            ? reader.GetString(14)
+            : null
     };
 }

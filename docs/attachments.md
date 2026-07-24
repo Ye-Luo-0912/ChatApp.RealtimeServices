@@ -28,11 +28,24 @@ Same content + same attachment set (any order) → Duplicate; same content + dif
 Nullable/legacy (v1) stored fingerprints still compare by recomputing v2 from DB-bound attachment ids.
 
 ### Download hint
-No permanent public URL. Clients use `downloadApiHint` (or attachmentId) against ChatApp.Server auth download.
+No permanent public URL. Clients use `downloadApiHint` (usually attachmentId) against ChatApp.Server:
+
+1. `POST /api/attachments/{id}/ticket` (session auth) → short-lived single-use `ticket`
+2. `GET /api/attachments/{id}/download?ticket=...` (or session-auth download without ticket)
+
+`downloadToken` on the wire remains optional / null unless Server fills it; Realtime does not mint tickets.
 
 ### Sync device cursors
-Bootstrap resolves client watermarks to a real in-conversation message or clamps the **query** to tip.
-Device cursor upsert persists **only** the last message actually returned in catch-up — never raw client watermarks and never tip-only clamps on empty catch-up (avoids skipping undelivered history).
+Bootstrap resolves client watermarks to a real in-conversation message for incremental catch-up.
+Invalid / unusable cursors emit additive `ResetsRequired` (with tip hints + `SyncCursorResetReason`) instead of silent tip-clamp success:
+- `MessageNotFound` — missing/deleted/random message id (or empty tip)
+- `AheadOfTip` — watermark message is ahead of conversation tip
+- `MembershipLost` — client watermark for a conversation the user is not a member of
+- `GapTooLarge` — optional when `SyncBootstrap:MaxCatchUpGapMs` is set and tip lag exceeds it
+
+Device cursor upsert persists **only** the last message actually returned in catch-up — never raw client watermarks and never ResetRequired tips (avoids skipping undelivered history).
+
+**Not implemented:** message retention / tombstone-horizon driven cursor invalidation.
 
 ## Status (DB)
 `realtime.attachments.status` smallint: `0=Ticketed`, `1=Confirmed`, `2=Bound`, `3=Abandoned`.
@@ -41,7 +54,7 @@ Device cursor upsert persists **only** the last message actually returned in cat
 - Schema + `NpgsqlRealtimeAttachmentStore`
 - `SaveAsync` bind (Confirmed → Bound) when `IncomingMessageCommand.AttachmentIds` present
 - History/Sync enrich via `RealtimeHistoryAttachmentEnricher` (batch `ListByMessageIdsAsync`)
-- Sync bootstrap clamps via `ResolveSyncWatermarksAsync`
+- Sync bootstrap resolves watermarks via `ResolveSyncWatermarksAsync` (ResetRequired for invalid/future cursors; no silent tip-clamp)
 - Account delete: delete rows → enqueue chunked `AttachmentBlobsPurge` → `AccountCleanupCompleted`
 
 ## Online migrations 009–011
@@ -52,14 +65,16 @@ Device cursor upsert persists **only** the last message actually returned in cat
 
 ## Server responsibilities (not in this repo)
 - Blob ticket/upload/confirm; write Confirmed rows via same Postgres
+- Confirm enqueues content scan (Scanning until worker Confirmed/Rejected); bind/download blocked while Scanning
 - Consume `AttachmentBlobsPurge` on account-cleanup subject and delete object keys
 - Export prefers formal attachment rows; URL-scan remains legacy fallback
-- Implement `GET /api/attachments/{id}/download` (authz + optional token)
+- Implement `GET /api/attachments/{id}/download` (authz + optional short-lived ticket) and `POST .../ticket`
 
 ## Residuals / deferred
+- Message retention / tombstone-horizon cursor invalidation is **not implemented**
 - EfCore message store does **not** bind attachments (production path is Npgsql); conflict compare treats existing attachments as empty
 - No Ticketed insert API in Realtime yet (Server may insert Confirmed directly after upload confirm)
-- No Abandoned sweeper worker for unbound Ticketed/Confirmed age index
+- No Abandoned sweeper worker for unbound Ticketed/Confirmed age index → **landed**: Server `AttachmentAbandonedAgeSweeper` (via `AttachmentCleanupWorker`) marks aged unbound Ticketed/Confirmed → Abandoned and enqueues blob delete tombs.
 - Orphan `message_id` when peer messages deleted but uploader differs (uploader rows purged only on uploader account delete)
 - `scripts/realtime-schema.sql` still omits migrations 8–11 DDL history; appends attachments + version 12 for Job bootstrap
 - Multi-device attachment sync beyond message fanout

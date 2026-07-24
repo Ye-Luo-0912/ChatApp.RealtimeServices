@@ -21,17 +21,20 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
     private readonly IRealtimeMessageHistoryStore _historyStore;
     private readonly IRealtimeDeviceSyncCursorStore _deviceCursorStore;
     private readonly IRealtimeAttachmentStore _attachmentStore;
+    private readonly SyncBootstrapOptions _options;
 
     public DefaultSyncBootstrapQueryProcessor(
         IRealtimeConversationStore conversationStore,
         IRealtimeMessageHistoryStore historyStore,
         IRealtimeDeviceSyncCursorStore deviceCursorStore,
-        IRealtimeAttachmentStore attachmentStore)
+        IRealtimeAttachmentStore attachmentStore,
+        SyncBootstrapOptions? options = null)
     {
         _conversationStore = conversationStore;
         _historyStore = historyStore;
         _deviceCursorStore = deviceCursorStore;
         _attachmentStore = attachmentStore;
+        _options = options ?? new SyncBootstrapOptions();
     }
 
     public async Task<SyncBootstrapPage> ProcessAsync(
@@ -112,27 +115,44 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
         }
 
         var catchUps = new List<ConversationHistoryCatchUp>(maxCatchUps);
-        Dictionary<string, ResolvedSyncWatermark>? resolvedWatermarks = null;
-        if (maxCatchUps > 0 && responseBytes < RealtimeWireLimits.PackingBudgetBytes)
+        Dictionary<string, ResolvedSyncWatermark>? incrementalWatermarks = null;
+        IReadOnlyList<SyncCursorResetRequired> allResets = [];
+        IReadOnlyList<SyncCursorResetRequired> resetsRequired = [];
+        if (effectiveWatermarks is { Count: > 0 })
         {
-            resolvedWatermarks = await BuildResolvedWatermarkMapAsync(
+            var resolution = await BuildWatermarkResolutionAsync(
                     query.UserId,
                     effectiveWatermarks,
                     conversations,
                     ct)
                 .ConfigureAwait(false);
+            incrementalWatermarks = resolution.Incremental;
+            allResets = resolution.ResetsRequired;
+
+            var (kept, resetBytes) = PackResetsForBudget(allResets, responseBytes);
+            resetsRequired = kept;
+            responseBytes += resetBytes;
+        }
+
+        if (maxCatchUps > 0 && responseBytes < RealtimeWireLimits.PackingBudgetBytes)
+        {
+            incrementalWatermarks ??= new Dictionary<string, ResolvedSyncWatermark>(StringComparer.Ordinal);
+            var resetIds = new HashSet<string>(
+                allResets.Select(static r => r.ConversationId),
+                StringComparer.Ordinal);
 
             var catchUpIds = SelectCatchUpConversationIds(
                     conversations,
-                    resolvedWatermarks,
+                    incrementalWatermarks,
                     maxCatchUps)
+                .Where(id => !resetIds.Contains(id))
                 .ToArray();
             if (catchUpIds.Length > 0)
             {
                 var catchUpQueries = catchUpIds
                     .Select(conversationId =>
                     {
-                        if (resolvedWatermarks.TryGetValue(conversationId, out var watermark))
+                        if (incrementalWatermarks.TryGetValue(conversationId, out var watermark))
                         {
                             return new HistoryCatchUpQuery
                             {
@@ -155,6 +175,22 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                     .QueryCatchUpsAsync(query.UserId, catchUpQueries, ct)
                     .ConfigureAwait(false);
 
+                // Batch-enrich attachments for ALL catch-up conversations in one call instead of
+                // per-conversation N+1 round-trips to the attachment store.
+                var flattened = batchRows.Count == 0
+                    ? Array.Empty<RealtimeHistoryMessage>()
+                    : batchRows.Values
+                        .SelectMany(static rows => rows)
+                        .ToArray();
+                var enrichedFlat = await RealtimeHistoryAttachmentEnricher
+                    .EnrichAsync(_attachmentStore, flattened, ct)
+                    .ConfigureAwait(false);
+                var enrichedByMessageId = new Dictionary<string, RealtimeHistoryMessage>(
+                    enrichedFlat.Count,
+                    StringComparer.Ordinal);
+                foreach (var message in enrichedFlat)
+                    enrichedByMessageId[message.MessageId] = message;
+
                 foreach (var conversationId in catchUpIds)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -164,21 +200,39 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                     if (!batchRows.TryGetValue(conversationId, out var rows))
                         rows = Array.Empty<RealtimeHistoryMessage>();
 
-                    rows = await RealtimeHistoryAttachmentEnricher
-                        .EnrichAsync(_attachmentStore, rows, ct)
-                        .ConfigureAwait(false);
+                    var enrichedRows = rows.Count == 0
+                        ? rows
+                        : rows
+                            .Select(row => enrichedByMessageId.TryGetValue(row.MessageId, out var enriched)
+                                ? enriched
+                                : row)
+                            .ToArray();
 
                     catchUps.Add(PackCatchUp(
                         conversationId,
-                        rows,
+                        enrichedRows,
                         historyLimit,
                         ref responseBytes));
                 }
             }
         }
 
+        if (query.DeviceIdHash is ulong resetDeviceId && allResets.Count > 0)
+        {
+            // Purge poisoned device cursors for reset conversations so the next bootstrap doesn't
+            // keep re-loading a cursor that will only ever resolve to a reset.
+            await _deviceCursorStore
+                .DeleteAsync(
+                    query.UserId,
+                    resetDeviceId,
+                    allResets.Select(static r => r.ConversationId).ToArray(),
+                    ct)
+                .ConfigureAwait(false);
+        }
+
         if (query.DeviceIdHash is ulong persistDeviceId)
         {
+            // Only persist last returned catch-up messages — never raw/reset client watermarks.
             var toPersist = BuildDeviceCursorsToPersist(catchUps);
             if (toPersist.Count > 0)
             {
@@ -194,12 +248,13 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
             conversations,
             conversationsNextCursor,
             conversationsHasMore,
-            catchUps);
+            catchUps,
+            resetsRequired);
     }
 
     /// <summary>
     /// 仅持久化 bootstrap 实际返回的最后一条消息。
-    /// 空 catch-up（未来/随机水位钳 tip、打包失败、已同步）不得推进游标，
+    /// 空 catch-up / ResetRequired 不得推进游标，
     /// 否则单调前进的设备游标会永久跳过未投递历史。
     /// </summary>
     private static IReadOnlyList<DeviceSyncCursor> BuildDeviceCursorsToPersist(
@@ -223,15 +278,17 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
         return map.Values.ToArray();
     }
 
-    private async Task<Dictionary<string, ResolvedSyncWatermark>> BuildResolvedWatermarkMapAsync(
-        long userId,
-        IReadOnlyList<ConversationSyncWatermark>? watermarks,
-        IReadOnlyList<ConversationListItem> conversations,
-        CancellationToken ct)
+    private async Task<(
+            Dictionary<string, ResolvedSyncWatermark> Incremental,
+            IReadOnlyList<SyncCursorResetRequired> ResetsRequired)>
+        BuildWatermarkResolutionAsync(
+            long userId,
+            IReadOnlyList<ConversationSyncWatermark> watermarks,
+            IReadOnlyList<ConversationListItem> conversations,
+            CancellationToken ct)
     {
-        var result = new Dictionary<string, ResolvedSyncWatermark>(StringComparer.Ordinal);
-        if (watermarks is null || watermarks.Count == 0)
-            return result;
+        var incremental = new Dictionary<string, ResolvedSyncWatermark>(StringComparer.Ordinal);
+        var resets = new Dictionary<string, SyncCursorResetRequired>(StringComparer.Ordinal);
 
         var candidates = new Dictionary<string, ConversationSyncWatermark>(StringComparer.Ordinal);
         foreach (var item in watermarks)
@@ -247,7 +304,7 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
         }
 
         if (candidates.Count == 0)
-            return result;
+            return (incremental, []);
 
         var tipByConversation = conversations.ToDictionary(
             static c => c.ConversationId,
@@ -268,7 +325,18 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
         foreach (var (conversationId, watermark) in candidates)
         {
             if (!knownMembers.Contains(conversationId) && !authorizedUnknown.Contains(conversationId))
+            {
+                resets[conversationId] = new SyncCursorResetRequired
+                {
+                    ConversationId = conversationId,
+                    Reason = SyncCursorResetReason.MembershipLost,
+                    TipMessageId = null,
+                    TipReceivedAtMs = null,
+                    ClientAfterReceivedAtMs = watermark.AfterReceivedAtMs,
+                    ClientAfterMessageId = watermark.AfterMessageId
+                };
                 continue;
+            }
 
             tipByConversation.TryGetValue(conversationId, out var listItem);
             resolveInputs.Add(new ConversationSyncWatermarkInput
@@ -281,16 +349,126 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
             });
         }
 
-        if (resolveInputs.Count == 0)
-            return result;
+        if (resolveInputs.Count > 0)
+        {
+            var resolved = await _historyStore
+                .ResolveSyncWatermarksAsync(resolveInputs, ct)
+                .ConfigureAwait(false);
 
-        var resolved = await _historyStore
-            .ResolveSyncWatermarksAsync(resolveInputs, ct)
-            .ConfigureAwait(false);
-        foreach (var (conversationId, watermark) in resolved)
-            result[conversationId] = watermark;
+            var maxGapMs = _options.MaxCatchUpGapMs > 0
+                ? _options.MaxCatchUpGapMs
+                : (long?)null;
+            var retentionHorizonMs = _options.RetentionHorizonMs > 0
+                ? _options.RetentionHorizonMs
+                : (long?)null;
 
-        return result;
+            foreach (var (conversationId, watermark) in resolved)
+            {
+                if (!watermark.IsValid)
+                {
+                    var reason = MapInvalidation(watermark.InvalidationKind);
+                    // 随机/已删消息 vs 已过期历史：无效游标若明显早于 tip−retention，标为 BeyondRetention。
+                    if (reason == SyncCursorResetReason.MessageNotFound
+                        && retentionHorizonMs is long retentionForInvalid
+                        && (watermark.TipReceivedAtMs ?? tipByConversation.GetValueOrDefault(conversationId)?.LastMessageAtMs)
+                            is long tipForInvalid
+                        && (watermark.ClientAfterReceivedAtMs > 0
+                            ? watermark.ClientAfterReceivedAtMs
+                            : watermark.AfterReceivedAtMs) is var clientForInvalid
+                        && clientForInvalid > 0
+                        && clientForInvalid < tipForInvalid - retentionForInvalid)
+                    {
+                        reason = SyncCursorResetReason.BeyondRetention;
+                    }
+
+                    resets[conversationId] = ToResetRequired(watermark, reason);
+                    continue;
+                }
+
+                tipByConversation.TryGetValue(conversationId, out var listItem);
+                var tipAt = watermark.TipReceivedAtMs ?? listItem?.LastMessageAtMs;
+                var clientAfter = watermark.ClientAfterReceivedAtMs > 0
+                    ? watermark.ClientAfterReceivedAtMs
+                    : watermark.AfterReceivedAtMs;
+
+                // Retention takes precedence over a plain gap: a cursor beyond the retention
+                // horizon can never be served incrementally regardless of gap policy.
+                if (retentionHorizonMs is long retention
+                    && tipAt is long retentionTip
+                    && clientAfter < retentionTip - retention)
+                {
+                    resets[conversationId] = new SyncCursorResetRequired
+                    {
+                        ConversationId = conversationId,
+                        Reason = SyncCursorResetReason.BeyondRetention,
+                        TipMessageId = watermark.TipMessageId ?? listItem?.LastMessageId,
+                        TipReceivedAtMs = tipAt,
+                        ClientAfterReceivedAtMs = clientAfter,
+                        ClientAfterMessageId = string.IsNullOrWhiteSpace(watermark.ClientAfterMessageId)
+                            ? null
+                            : watermark.ClientAfterMessageId
+                    };
+                    continue;
+                }
+
+                if (maxGapMs is long gap
+                    && tipAt is long tip
+                    && tip - clientAfter > gap)
+                {
+                    resets[conversationId] = new SyncCursorResetRequired
+                    {
+                        ConversationId = conversationId,
+                        Reason = SyncCursorResetReason.GapTooLarge,
+                        TipMessageId = watermark.TipMessageId ?? listItem?.LastMessageId,
+                        TipReceivedAtMs = tipAt,
+                        ClientAfterReceivedAtMs = clientAfter,
+                        ClientAfterMessageId = string.IsNullOrWhiteSpace(watermark.ClientAfterMessageId)
+                            ? null
+                            : watermark.ClientAfterMessageId
+                    };
+                    continue;
+                }
+
+                incremental[conversationId] = watermark;
+            }
+        }
+
+        return (incremental, resets.Values.ToArray());
+    }
+
+    private static SyncCursorResetReason MapInvalidation(
+        SyncWatermarkInvalidationKind? kind) =>
+        kind switch
+        {
+            SyncWatermarkInvalidationKind.AheadOfTip => SyncCursorResetReason.AheadOfTip,
+            SyncWatermarkInvalidationKind.BeyondRetention => SyncCursorResetReason.BeyondRetention,
+            _ => SyncCursorResetReason.MessageNotFound
+        };
+
+    private static SyncCursorResetRequired ToResetRequired(
+        ResolvedSyncWatermark watermark,
+        SyncCursorResetReason reason)
+    {
+        var tipId = !string.IsNullOrWhiteSpace(watermark.TipMessageId)
+            ? watermark.TipMessageId
+            : (string.IsNullOrWhiteSpace(watermark.AfterMessageId)
+                ? null
+                : watermark.AfterMessageId);
+        var tipAt = watermark.TipReceivedAtMs
+                    ?? (watermark.AfterReceivedAtMs > 0 ? watermark.AfterReceivedAtMs : null);
+        return new SyncCursorResetRequired
+        {
+            ConversationId = watermark.ConversationId,
+            Reason = reason,
+            TipMessageId = tipId,
+            TipReceivedAtMs = tipAt,
+            ClientAfterReceivedAtMs = watermark.ClientAfterReceivedAtMs > 0
+                ? watermark.ClientAfterReceivedAtMs
+                : null,
+            ClientAfterMessageId = string.IsNullOrWhiteSpace(watermark.ClientAfterMessageId)
+                ? null
+                : watermark.ClientAfterMessageId
+        };
     }
 
     private static ConversationHistoryCatchUp PackCatchUp(
@@ -331,7 +509,7 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
             Items = items,
             HasMore = hasMore,
             NextCursor = hasMore && last is not null
-                ? new MessageHistoryCursor(last.ReceivedAtMs, last.MessageId)
+                ? new MessageHistoryCursor(last.ChangedAtMs > 0 ? last.ChangedAtMs : last.ReceivedAtMs, last.MessageId)
                 : null
         };
     }
@@ -387,6 +565,52 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
 
         return null;
     }
+
+    /// <summary>
+    /// Applies the shared response byte budget to resets, dropping the least-urgent entries first
+    /// when the estimated payload would overflow <see cref="RealtimeWireLimits.PackingBudgetBytes"/>.
+    /// MembershipLost/BeyondRetention are kept preferentially since they indicate the client cannot
+    /// recover on its own (unlike GapTooLarge/MessageNotFound/AheadOfTip, which are still actionable
+    /// on a later bootstrap).
+    /// </summary>
+    private static (IReadOnlyList<SyncCursorResetRequired> Kept, int Bytes) PackResetsForBudget(
+        IReadOnlyList<SyncCursorResetRequired> resets,
+        int responseBytesSoFar)
+    {
+        if (resets.Count == 0)
+            return (resets, 0);
+
+        var ordered = resets
+            .OrderBy(static r => ResetPriority(r.Reason))
+            .ToArray();
+
+        var kept = new List<SyncCursorResetRequired>(ordered.Length);
+        var bytes = 0;
+        foreach (var reset in ordered)
+        {
+            var itemBytes = EstimateResetBytes(reset);
+            if (kept.Count > 0 && responseBytesSoFar + bytes + itemBytes > RealtimeWireLimits.PackingBudgetBytes)
+                break;
+
+            kept.Add(reset);
+            bytes += itemBytes;
+        }
+
+        return (kept, bytes);
+    }
+
+    private static int ResetPriority(SyncCursorResetReason reason) => reason switch
+    {
+        SyncCursorResetReason.MembershipLost => 0,
+        SyncCursorResetReason.BeyondRetention => 0,
+        _ => 1
+    };
+
+    private static int EstimateResetBytes(SyncCursorResetRequired reset) =>
+        128
+        + Encoding.UTF8.GetByteCount(reset.ConversationId)
+        + Encoding.UTF8.GetByteCount(reset.TipMessageId ?? string.Empty)
+        + Encoding.UTF8.GetByteCount(reset.ClientAfterMessageId ?? string.Empty);
 
     private static int EstimateConversationBytes(ConversationListItem item) =>
         192

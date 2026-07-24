@@ -25,6 +25,16 @@ public sealed class NoopRealtimeDeviceSyncCursorStore : IRealtimeDeviceSyncCurso
         return Task.CompletedTask;
     }
 
+    public Task DeleteAsync(
+        long userId,
+        ulong deviceIdHash,
+        IReadOnlyList<string> conversationIds,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.CompletedTask;
+    }
+
     public Task<long> DeleteByUserAsync(long userId, CancellationToken ct = default)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(userId);

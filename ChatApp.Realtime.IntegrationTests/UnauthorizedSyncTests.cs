@@ -36,7 +36,7 @@ public sealed class UnauthorizedSyncTests
     }
 
     [Fact]
-    public async Task SyncBootstrap_IgnoresNonMemberConversationWatermark()
+    public async Task SyncBootstrap_EmitsMembershipLost_ForNonMemberConversationWatermark()
     {
         await using var bus = _fixture.CreateBus("sync-authz");
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
@@ -97,5 +97,9 @@ public sealed class UnauthorizedSyncTests
         Assert.DoesNotContain(
             sync.CatchUps,
             item => item.ConversationId == privateConversation);
+        var reset = Assert.Single(
+            sync.ResetsRequired,
+            item => item.ConversationId == privateConversation);
+        Assert.Equal(SyncCursorResetReason.MembershipLost, reset.Reason);
     }
 }

@@ -16,4 +16,7 @@ public sealed class RealtimeAttachmentRecord
     public long CreatedAtMs { get; init; }
     public long? ConfirmedAtMs { get; init; }
     public long? BoundAtMs { get; init; }
+
+    /// <summary>SHA-256 十六进制（小写），上传或扫描写入；可空。</summary>
+    public string? ContentHash { get; init; }
 }

@@ -180,6 +180,13 @@ public sealed class DefaultUserAccountDeletedProcessorTests
             CancellationToken ct = default) =>
             Task.CompletedTask;
 
+        public Task DeleteAsync(
+            long userId,
+            ulong deviceIdHash,
+            IReadOnlyList<string> conversationIds,
+            CancellationToken ct = default) =>
+            Task.CompletedTask;
+
         public Task<long> DeleteByUserAsync(long userId, CancellationToken ct = default)
         {
             DeleteByUserCalls++;
@@ -274,6 +281,27 @@ public sealed class DefaultUserAccountDeletedProcessorTests
                 new MessageReceiptPersistResult(
                     MessageReceiptPersistStatus.Unchanged,
                     receipt.MessageId));
+
+        public Task<MessageRecallPersistResult> ApplyRecallAsync(
+            string requestId,
+            string messageId,
+            long senderUserId,
+            string senderSessionId,
+            long recalledAtMs,
+            long maxAgeMs,
+            CancellationToken ct = default) =>
+            Task.FromResult(new MessageRecallPersistResult(MessageRecallPersistStatus.NotFound, messageId));
+
+        public Task<MessageEditPersistResult> ApplyEditAsync(
+            string requestId,
+            string messageId,
+            long senderUserId,
+            string senderSessionId,
+            string content,
+            long editedAtMs,
+            long maxAgeMs,
+            CancellationToken ct = default) =>
+            Task.FromResult(new MessageEditPersistResult(MessageEditPersistStatus.NotFound, messageId));
 
         public Task<long> DeleteByUserAsync(
             long userId, int batchSize = 1000, CancellationToken ct = default)

@@ -409,6 +409,7 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
         };
 
     public Task<MessageRecallPersistResult> ApplyRecallAsync(
+        string requestId,
         string messageId,
         long senderUserId,
         string senderSessionId,
@@ -417,6 +418,18 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
         CancellationToken ct = default) =>
         throw new NotSupportedException(
             "EfCoreRealtimeMessageStore 不支持撤回；请使用 NpgsqlRealtimeMessageStore。");
+
+    public Task<MessageEditPersistResult> ApplyEditAsync(
+        string requestId,
+        string messageId,
+        long senderUserId,
+        string senderSessionId,
+        string content,
+        long editedAtMs,
+        long maxAgeMs,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "EfCoreRealtimeMessageStore 不支持编辑；请使用 NpgsqlRealtimeMessageStore。");
 
     public async Task<long> DeleteByUserAsync(
         long userId,

@@ -1,4 +1,6 @@
+using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Queueing;
+using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Infrastructure.Core.DependencyInjection;
 using ChatApp.Realtime.Infrastructure.Nats.Configuration;
 using ChatApp.Realtime.Infrastructure.Nats.DependencyInjection;
@@ -39,6 +41,9 @@ public static class RealtimeServicesRegistration
         services.AddSingleton(Microsoft.Extensions.Options.Options.Create(databaseOptions));
         services.AddSingleton(Microsoft.Extensions.Options.Options.Create(connectionOptions));
         services.AddSingleton(Microsoft.Extensions.Options.Options.Create(outboxOptions));
+        services.AddSingleton(BindMessageEditOptions(configuration));
+        services.AddSingleton(BindMessageRecallOptions(configuration));
+        services.AddSingleton(BindSyncBootstrapOptions(configuration));
         services.AddSingleton(trustSettings);
         services.AddSingleton(new RealtimeConfigurationWarnings(warnings));
         services.AddSingleton<RealtimeHealthService>();
@@ -67,11 +72,30 @@ public static class RealtimeServicesRegistration
         services.AddHostedService<ConversationMarkReadWorker>();
         services.AddHostedService<ConversationSetPrefsWorker>();
         services.AddHostedService<MessageRecallWorker>();
+        services.AddHostedService<MessageEditWorker>();
         services.AddHostedService<ConversationSyncBootstrapWorker>();
         services.AddHostedService<OutboxPublisherWorker>();
         services.AddHostedService<OutboxCleanupWorker>();
 
         return services;
+    }
+
+    private static MessageEditOptions BindMessageEditOptions(IConfiguration configuration)
+    {
+        var options = configuration.GetSection(MessageEditOptions.SectionName).Get<MessageEditOptions>()
+            ?? new MessageEditOptions();
+        if (options.MaxAgeMinutes < 0)
+            throw new InvalidOperationException("MessageEdit:MaxAgeMinutes 不能为负数。");
+        return options;
+    }
+
+    private static MessageRecallOptions BindMessageRecallOptions(IConfiguration configuration)
+    {
+        var options = configuration.GetSection(MessageRecallOptions.SectionName).Get<MessageRecallOptions>()
+            ?? new MessageRecallOptions();
+        if (options.MaxAgeMinutes < 0)
+            throw new InvalidOperationException("MessageRecall:MaxAgeMinutes 不能为负数。");
+        return options;
     }
 
     private static RealtimeOptions BindRealtimeOptions(IConfiguration configuration)
@@ -137,6 +161,8 @@ public static class RealtimeServicesRegistration
             throw new InvalidOperationException("Nats:Subjects:ConversationSetPrefs 为必填配置。");
         if (string.IsNullOrWhiteSpace(options.Subjects.MessageRecalls))
             throw new InvalidOperationException("Nats:Subjects:MessageRecalls 为必填配置。");
+        if (string.IsNullOrWhiteSpace(options.Subjects.MessageEdits))
+            throw new InvalidOperationException("Nats:Subjects:MessageEdits 为必填配置。");
         if (string.IsNullOrWhiteSpace(options.Subjects.SyncBootstrapQueries))
             throw new InvalidOperationException("Nats:Subjects:SyncBootstrapQueries 为必填配置。");
         if (!options.Mode.Equals("Core", StringComparison.OrdinalIgnoreCase)
@@ -166,6 +192,17 @@ public static class RealtimeServicesRegistration
             throw new InvalidOperationException("Outbox 配置值必须大于 0。");
         if (options.PublishedRetentionHours < 0)
             throw new InvalidOperationException("Outbox:PublishedRetentionHours 不能为负数。");
+        return options;
+    }
+
+    private static SyncBootstrapOptions BindSyncBootstrapOptions(IConfiguration configuration)
+    {
+        var options = configuration.GetSection(SyncBootstrapOptions.SectionName).Get<SyncBootstrapOptions>()
+            ?? new SyncBootstrapOptions();
+        if (options.MaxCatchUpGapMs < 0)
+            throw new InvalidOperationException("SyncBootstrap:MaxCatchUpGapMs 不能为负数。");
+        if (options.RetentionHorizonMs < 0)
+            throw new InvalidOperationException("SyncBootstrap:RetentionHorizonMs 不能为负数。");
         return options;
     }
 
@@ -223,6 +260,7 @@ public static class RealtimeServicesRegistration
                 ConversationMarkReads = options.Subjects.ConversationMarkReads,
                 ConversationSetPrefs = options.Subjects.ConversationSetPrefs,
                 MessageRecalls = options.Subjects.MessageRecalls,
+                MessageEdits = options.Subjects.MessageEdits,
                 SyncBootstrapQueries = options.Subjects.SyncBootstrapQueries,
                 MessagePersistence = options.Subjects.MessagePersistence,
                 DeadLetters = options.Subjects.DeadLetters

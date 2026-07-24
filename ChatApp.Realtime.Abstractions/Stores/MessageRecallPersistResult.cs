@@ -6,7 +6,8 @@ public enum MessageRecallPersistStatus
     Unchanged = 2,
     NotFound = 3,
     NotAllowed = 4,
-    WindowExpired = 5
+    WindowExpired = 5,
+    RequestConflict = 6
 }
 
 public sealed record MessageRecallPersistResult(

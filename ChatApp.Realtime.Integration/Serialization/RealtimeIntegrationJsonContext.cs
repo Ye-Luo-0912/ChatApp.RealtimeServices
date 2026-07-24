@@ -4,6 +4,7 @@ using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Sync;
+using ChatApp.Realtime.Integration.Ephemeral;
 
 namespace ChatApp.Realtime.Integration.Serialization;
 
@@ -35,14 +36,25 @@ namespace ChatApp.Realtime.Integration.Serialization;
 [JsonSerializable(typeof(MessageRecallCommand))]
 [JsonSerializable(typeof(MessageRecallResult))]
 [JsonSerializable(typeof(RealtimeMessageRecalledPayload))]
+[JsonSerializable(typeof(MessageEditCommand))]
+[JsonSerializable(typeof(MessageEditResult))]
+[JsonSerializable(typeof(RealtimeMessageEditedPayload))]
 [JsonSerializable(typeof(SyncBootstrapQuery))]
 [JsonSerializable(typeof(SyncBootstrapPage))]
 [JsonSerializable(typeof(ConversationSyncWatermark))]
 [JsonSerializable(typeof(List<ConversationSyncWatermark>))]
 [JsonSerializable(typeof(ConversationHistoryCatchUp))]
 [JsonSerializable(typeof(List<ConversationHistoryCatchUp>))]
+[JsonSerializable(typeof(SyncCursorResetRequired))]
+[JsonSerializable(typeof(List<SyncCursorResetRequired>))]
+[JsonSerializable(typeof(SyncCursorResetReason))]
 [JsonSerializable(typeof(RealtimeUnreadCountChangedPayload))]
 [JsonSerializable(typeof(AttachmentBlobsPurgePayload))]
+[JsonSerializable(typeof(EphemeralTypingEvent))]
+[JsonSerializable(typeof(EphemeralPresenceEvent))]
+[JsonSerializable(typeof(PresenceAuthorizeQuery))]
+[JsonSerializable(typeof(PresenceAuthorizeResponse))]
+[JsonSerializable(typeof(List<long>))]
 internal sealed partial class RealtimeIntegrationJsonContext : JsonSerializerContext
 {
 }

@@ -54,7 +54,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  history.recalled_at_ms,
                  history.forwarded_from_message_id,
                  history.forwarded_from_sender_user_id,
-                 history.forwarded_from_preview
+                 history.forwarded_from_preview,\n                 history.edit_version,\n                 history.edited_at_ms,\n                 history.changed_at_ms
              FROM (
                  (
                      SELECT
@@ -73,7 +73,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                          recalled_at_ms,
                          forwarded_from_message_id,
                          forwarded_from_sender_user_id,
-                         forwarded_from_preview
+                         forwarded_from_preview,\n                         edit_version,\n                         edited_at_ms,\n                         changed_at_ms
                      FROM {_databaseSchema.MessagesTableSql}
                      WHERE receiver_user_id = @user_id
                        AND (
@@ -105,7 +105,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                          recalled_at_ms,
                          forwarded_from_message_id,
                          forwarded_from_sender_user_id,
-                         forwarded_from_preview
+                         forwarded_from_preview,\n                         edit_version,\n                         edited_at_ms,\n                         changed_at_ms
                      FROM {_databaseSchema.MessagesTableSql}
                      WHERE sender_user_id = @user_id
                        AND receiver_user_id <> @user_id
@@ -177,7 +177,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  msg.recalled_at_ms,
                  msg.forwarded_from_message_id,
                  msg.forwarded_from_sender_user_id,
-                 msg.forwarded_from_preview
+                 msg.forwarded_from_preview,\n                 msg.edit_version,\n                 msg.edited_at_ms,\n                 msg.changed_at_ms
              FROM membership
              LEFT JOIN LATERAL (
                  SELECT
@@ -196,7 +196,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                      recalled_at_ms,
                      forwarded_from_message_id,
                      forwarded_from_sender_user_id,
-                     forwarded_from_preview
+                     forwarded_from_preview,\n                     edit_version,\n                     edited_at_ms,\n                     changed_at_ms
                  FROM {_databaseSchema.MessagesTableSql}
                  WHERE conversation_id = @conversation_id
                    AND membership.is_member
@@ -268,7 +268,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  msg.recalled_at_ms,
                  msg.forwarded_from_message_id,
                  msg.forwarded_from_sender_user_id,
-                 msg.forwarded_from_preview
+                 msg.forwarded_from_preview,\n                 msg.edit_version,\n                 msg.edited_at_ms,\n                 msg.changed_at_ms
              FROM membership
              LEFT JOIN LATERAL (
                  SELECT
@@ -287,18 +287,18 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                      recalled_at_ms,
                      forwarded_from_message_id,
                      forwarded_from_sender_user_id,
-                     forwarded_from_preview
+                     forwarded_from_preview,\n                     edit_version,\n                     edited_at_ms,\n                     changed_at_ms
                  FROM {_databaseSchema.MessagesTableSql}
                  WHERE conversation_id = @conversation_id
                    AND membership.is_member
                    AND (
-                        received_at_ms > @after_received_at_ms
+                        changed_at_ms > @after_received_at_ms
                         OR (
-                            received_at_ms = @after_received_at_ms
+                            changed_at_ms = @after_received_at_ms
                             AND message_id > @after_message_id
                         )
                    )
-                 ORDER BY received_at_ms ASC, message_id ASC
+                 ORDER BY changed_at_ms ASC, message_id ASC
                  LIMIT @take
              ) AS msg ON TRUE;
              """,
@@ -558,7 +558,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  msg.recalled_at_ms,
                  msg.forwarded_from_message_id,
                  msg.forwarded_from_sender_user_id,
-                 msg.forwarded_from_preview
+                 msg.forwarded_from_preview,\n                 msg.edit_version,\n                 msg.edited_at_ms,\n                 msg.changed_at_ms
              FROM membership
              LEFT JOIN LATERAL (
                  SELECT
@@ -577,30 +577,30 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                      recalled_at_ms,
                      forwarded_from_message_id,
                      forwarded_from_sender_user_id,
-                     forwarded_from_preview
+                     forwarded_from_preview,\n                     edit_version,\n                     edited_at_ms,\n                     changed_at_ms
                  FROM {_databaseSchema.MessagesTableSql}
                  WHERE conversation_id = membership.conversation_id
                    AND membership.is_member
                    AND (
                         CASE
                             WHEN membership.has_after THEN
-                                received_at_ms > membership.after_at
+                                changed_at_ms > membership.after_at
                                 OR (
-                                    received_at_ms = membership.after_at
+                                    changed_at_ms = membership.after_at
                                     AND message_id > membership.after_id
                                 )
                             ELSE TRUE
                         END
                    )
                  ORDER BY
-                     CASE WHEN membership.has_after THEN received_at_ms END ASC,
+                     CASE WHEN membership.has_after THEN changed_at_ms END ASC,
                      CASE WHEN membership.has_after THEN message_id END ASC,
                      CASE WHEN NOT membership.has_after THEN received_at_ms END DESC,
                      CASE WHEN NOT membership.has_after THEN message_id END DESC
                  LIMIT membership.take
              ) AS msg ON TRUE
              ORDER BY membership.ord,
-                      CASE WHEN membership.has_after THEN msg.received_at_ms END ASC,
+                      CASE WHEN membership.has_after THEN msg.changed_at_ms END ASC,
                       CASE WHEN membership.has_after THEN msg.message_id END ASC,
                       CASE WHEN NOT membership.has_after THEN msg.received_at_ms END DESC,
                       CASE WHEN NOT membership.has_after THEN msg.message_id END DESC;
@@ -673,7 +673,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  recalled_at_ms,
                  forwarded_from_message_id,
                  forwarded_from_sender_user_id,
-                 forwarded_from_preview
+                 forwarded_from_preview,\n                 edit_version,\n                 edited_at_ms,\n                 changed_at_ms
              FROM {_databaseSchema.MessagesTableSql}
              WHERE message_id = @message_id
              LIMIT 1;
@@ -829,35 +829,73 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
         while (await reader.ReadAsync(ct).ConfigureAwait(false))
         {
             var conversationId = reader.GetString(0);
-            if (reader.IsDBNull(3) || reader.IsDBNull(4))
+            var clientAfterAt = reader.IsDBNull(1) ? 0L : reader.GetInt64(1);
+            var clientAfterId = reader.IsDBNull(2) ? string.Empty : reader.GetString(2);
+            long? tipAt = reader.IsDBNull(3) ? null : reader.GetInt64(3);
+            string? tipId = reader.IsDBNull(4) ? null : reader.GetString(4);
+            if (tipAt is not > 0 || string.IsNullOrWhiteSpace(tipId))
+            {
+                result[conversationId] = new ResolvedSyncWatermark
+                {
+                    ConversationId = conversationId,
+                    AfterReceivedAtMs = 0,
+                    AfterMessageId = string.Empty,
+                    IsValid = false,
+                    InvalidationKind = SyncWatermarkInvalidationKind.MessageNotFound,
+                    TipReceivedAtMs = tipAt,
+                    TipMessageId = tipId,
+                    ClientAfterReceivedAtMs = clientAfterAt,
+                    ClientAfterMessageId = clientAfterId
+                };
                 continue;
-
-            var tipAt = reader.GetInt64(3);
-            var tipId = reader.GetString(4);
-            if (tipAt <= 0 || string.IsNullOrWhiteSpace(tipId))
-                continue;
+            }
 
             if (!reader.IsDBNull(5) && !reader.IsDBNull(6))
             {
                 var msgAt = reader.GetInt64(5);
                 var msgId = reader.GetString(6);
-                if (!IsAfter(msgAt, msgId, tipAt, tipId))
+                if (IsAfter(msgAt, msgId, tipAt.Value, tipId))
                 {
                     result[conversationId] = new ResolvedSyncWatermark
                     {
                         ConversationId = conversationId,
-                        AfterReceivedAtMs = msgAt,
-                        AfterMessageId = msgId
+                        AfterReceivedAtMs = tipAt.Value,
+                        AfterMessageId = tipId,
+                        IsValid = false,
+                        InvalidationKind = SyncWatermarkInvalidationKind.AheadOfTip,
+                        TipReceivedAtMs = tipAt,
+                        TipMessageId = tipId,
+                        ClientAfterReceivedAtMs = clientAfterAt,
+                        ClientAfterMessageId = clientAfterId
                     };
                     continue;
                 }
+
+                result[conversationId] = new ResolvedSyncWatermark
+                {
+                    ConversationId = conversationId,
+                    AfterReceivedAtMs = msgAt,
+                    AfterMessageId = msgId,
+                    IsValid = true,
+                    TipReceivedAtMs = tipAt,
+                    TipMessageId = tipId,
+                    ClientAfterReceivedAtMs = clientAfterAt,
+                    ClientAfterMessageId = clientAfterId
+                };
+                continue;
             }
 
             result[conversationId] = new ResolvedSyncWatermark
             {
                 ConversationId = conversationId,
-                AfterReceivedAtMs = tipAt,
-                AfterMessageId = tipId
+                AfterReceivedAtMs = tipAt.Value,
+                AfterMessageId = tipId,
+                IsValid = false,
+                InvalidationKind = SyncWatermarkInvalidationKind.MessageNotFound,
+                TipReceivedAtMs = tipAt,
+                TipMessageId = tipId,
+                ClientAfterReceivedAtMs = clientAfterAt,
+                ClientAfterMessageId = clientAfterId
             };
         }
 
@@ -947,6 +985,11 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
             RecalledAtMs = reader.IsDBNull(offset + 12) ? null : reader.GetInt64(offset + 12),
             ForwardedFromMessageId = reader.IsDBNull(offset + 13) ? null : reader.GetString(offset + 13),
             ForwardedFromSenderUserId = reader.IsDBNull(offset + 14) ? null : reader.GetInt64(offset + 14),
-            ForwardedFromPreview = reader.IsDBNull(offset + 15) ? null : reader.GetString(offset + 15)
+            ForwardedFromPreview = reader.IsDBNull(offset + 15) ? null : reader.GetString(offset + 15),
+            EditVersion = reader.IsDBNull(offset + 16) ? 1 : reader.GetInt32(offset + 16),
+            EditedAtMs = reader.IsDBNull(offset + 17) ? null : reader.GetInt64(offset + 17),
+            ChangedAtMs = reader.IsDBNull(offset + 18)
+                ? reader.GetInt64(offset + 6)
+                : reader.GetInt64(offset + 18)
         };
 }

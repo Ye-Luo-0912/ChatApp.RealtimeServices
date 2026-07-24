@@ -206,6 +206,28 @@ public sealed class DefaultIncomingMessageProcessorTests
                 new MessageReceiptPersistResult(
                     MessageReceiptPersistStatus.Unchanged,
                     receipt.MessageId));
+
+        public Task<MessageRecallPersistResult> ApplyRecallAsync(
+            string requestId,
+            string messageId,
+            long senderUserId,
+            string senderSessionId,
+            long recalledAtMs,
+            long maxAgeMs,
+            CancellationToken ct = default) =>
+            Task.FromResult(new MessageRecallPersistResult(MessageRecallPersistStatus.NotFound, messageId));
+
+        public Task<MessageEditPersistResult> ApplyEditAsync(
+            string requestId,
+            string messageId,
+            long senderUserId,
+            string senderSessionId,
+            string content,
+            long editedAtMs,
+            long maxAgeMs,
+            CancellationToken ct = default) =>
+            Task.FromResult(new MessageEditPersistResult(MessageEditPersistStatus.NotFound, messageId));
+
         public Task<long> DeleteByUserAsync(
             long userId,
             int batchSize = 1000,

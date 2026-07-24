@@ -52,5 +52,23 @@ public enum RealtimeEventType : byte
     /// 消息撤回。Payload：<c>RealtimeMessageRecalledPayload</c>。
     /// 目标可为接收方，或发送方其他设备回声。
     /// </summary>
-    MessageRecalled = 12
+    MessageRecalled = 12,
+
+    /// <summary>
+    /// 消息编辑。Payload：<c>RealtimeMessageEditedPayload</c>。
+    /// 目标可为接收方，或发送方其他设备回声。
+    /// </summary>
+    MessageEdited = 13,
+
+    /// <summary>
+    /// 消息表情反应新增。Payload：<c>RealtimeReactionAddedPayload</c>。
+    /// 目标为消息参与方（接收方 / 发送方其他设备）。
+    /// </summary>
+    ReactionAdded = 14,
+
+    /// <summary>
+    /// 消息表情反应移除。Payload：<c>RealtimeReactionRemovedPayload</c>。
+    /// 目标为消息参与方（接收方 / 发送方其他设备）。
+    /// </summary>
+    ReactionRemoved = 15
 }

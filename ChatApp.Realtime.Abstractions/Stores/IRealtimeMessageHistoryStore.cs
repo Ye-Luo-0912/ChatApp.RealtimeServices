@@ -60,8 +60,12 @@ public interface IRealtimeMessageHistoryStore
     Task<RealtimeHistoryMessage?> TryGetByIdAsync(string messageId, CancellationToken ct = default);
 
     /// <summary>
-    /// 将客户端同步水位解析为会话内真实消息，或钳制到会话 tip。
-    /// 随机/已删消息 Id → tip；超前 tip → tip；无 tip 时跳过该会话。
+    /// 将客户端同步水位解析为可增量 catch-up 的真实消息，或标记失效。
+    /// 消息不存在/已删 → <see cref="SyncWatermarkInvalidationKind.MessageNotFound"/>（After*/Tip* 为 tip 提示，若有）；
+    /// 超前 tip → <see cref="SyncWatermarkInvalidationKind.AheadOfTip"/>；
+    /// 无 tip 时仍返回该会话并标记 MessageNotFound（tip 提示为空）。
+    /// 处理器将 InvalidationKind 映射为协议层 <c>SyncCursorResetReason</c>；Store 不依赖协议枚举。
+    /// 不再静默 tip-clamp 伪装成“已同步”。
     /// </summary>
     Task<IReadOnlyDictionary<string, ResolvedSyncWatermark>> ResolveSyncWatermarksAsync(
         IReadOnlyList<ConversationSyncWatermarkInput> watermarks,

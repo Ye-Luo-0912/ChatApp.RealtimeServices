@@ -29,6 +29,9 @@ namespace ChatApp.Realtime.Infrastructure.Core.Serialization;
 [JsonSerializable(typeof(MessageRecallCommand))]
 [JsonSerializable(typeof(MessageRecallResult))]
 [JsonSerializable(typeof(RealtimeMessageRecalledPayload))]
+[JsonSerializable(typeof(MessageEditCommand))]
+[JsonSerializable(typeof(MessageEditResult))]
+[JsonSerializable(typeof(RealtimeMessageEditedPayload))]
 [JsonSerializable(typeof(MessageReceiptCommand))]
 [JsonSerializable(typeof(RealtimeMessageReceiptPayload))]
 [JsonSerializable(typeof(RealtimeDomainNotificationPayload))]
@@ -43,6 +46,9 @@ namespace ChatApp.Realtime.Infrastructure.Core.Serialization;
 [JsonSerializable(typeof(List<ConversationSyncWatermark>))]
 [JsonSerializable(typeof(ConversationHistoryCatchUp))]
 [JsonSerializable(typeof(List<ConversationHistoryCatchUp>))]
+[JsonSerializable(typeof(SyncCursorResetRequired))]
+[JsonSerializable(typeof(List<SyncCursorResetRequired>))]
+[JsonSerializable(typeof(SyncCursorResetReason))]
 public sealed partial class RealtimeJsonSerializerContext : JsonSerializerContext
 {
 }

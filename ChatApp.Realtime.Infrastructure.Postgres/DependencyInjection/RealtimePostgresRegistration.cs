@@ -23,6 +23,8 @@ public static class RealtimePostgresRegistration
             sp.GetRequiredService<ILogger<RealtimeDatabaseClient>>()));
 
         services.AddSingleton(new RealtimeDatabaseSchema(schema));
+        services.RemoveAll<IRealtimeOpsQueryStore>();
+        services.AddSingleton<IRealtimeOpsQueryStore, NpgsqlRealtimeOpsQueryStore>();
 
         if (ShouldUseEfCoreMessageStore(connectionString, messageStoreProvider))
         {
