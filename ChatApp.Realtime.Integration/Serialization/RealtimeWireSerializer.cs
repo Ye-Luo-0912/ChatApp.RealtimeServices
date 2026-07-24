@@ -112,6 +112,9 @@ public static class RealtimeWireSerializer
     public static RealtimeUnreadCountChangedPayload? DeserializeUnreadCountChanged(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeUnreadCountChangedPayload);
 
+    public static RealtimeConversationReadPayload? DeserializeConversationRead(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeConversationReadPayload);
+
     public static RealtimeMessageReceiptPayload? DeserializeMessageReceipt(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeMessageReceiptPayload);
 

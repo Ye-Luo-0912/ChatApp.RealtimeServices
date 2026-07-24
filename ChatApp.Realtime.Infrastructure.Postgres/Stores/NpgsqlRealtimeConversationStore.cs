@@ -308,11 +308,12 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
         await using var transaction = await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
         _ = readAtMs; // 权威时间由 messageId 解析；保留参数以兼容调用方。
 
-        long? tipAtMs;
-        string? tipMessageId;
-        long? currentReadAtMs;
-        string? currentReadMessageId;
-        int currentUnread;
+        long? tipAtMs = null;
+        string? tipMessageId = null;
+        long? currentReadAtMs = null;
+        string? currentReadMessageId = null;
+        var currentUnread = 0;
+        var memberFound = false;
 
         await using (var load = new NpgsqlCommand(
                            $"""
@@ -335,17 +336,21 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
             load.Parameters.AddWithValue("conversation_id", conversationId);
             load.Parameters.AddWithValue("user_id", userId);
             await using var reader = await load.ExecuteReaderAsync(ct).ConfigureAwait(false);
-            if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+            if (await reader.ReadAsync(ct).ConfigureAwait(false))
             {
-                await transaction.RollbackAsync(ct).ConfigureAwait(false);
-                return new ConversationReadAdvanceResult(false, false, 0, null, null);
+                memberFound = true;
+                tipAtMs = reader.IsDBNull(0) ? null : reader.GetInt64(0);
+                tipMessageId = reader.IsDBNull(1) ? null : reader.GetString(1);
+                currentReadAtMs = reader.IsDBNull(2) ? null : reader.GetInt64(2);
+                currentReadMessageId = reader.IsDBNull(3) ? null : reader.GetString(3);
+                currentUnread = reader.GetInt32(4);
             }
+        }
 
-            tipAtMs = reader.IsDBNull(0) ? null : reader.GetInt64(0);
-            tipMessageId = reader.IsDBNull(1) ? null : reader.GetString(1);
-            currentReadAtMs = reader.IsDBNull(2) ? null : reader.GetInt64(2);
-            currentReadMessageId = reader.IsDBNull(3) ? null : reader.GetString(3);
-            currentUnread = reader.GetInt32(4);
+        if (!memberFound)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return new ConversationReadAdvanceResult(false, false, 0, null, null);
         }
 
         long targetAtMs;
@@ -466,6 +471,34 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                     traceState),
                 ct)
             .ConfigureAwait(false);
+
+        var memberIds = await ConversationWriteCommands.ListActiveMemberUserIdsAsync(
+                connection,
+                transaction,
+                _databaseSchema,
+                conversationId,
+                ct)
+            .ConfigureAwait(false);
+        foreach (var memberId in memberIds)
+        {
+            if (memberId == userId)
+                continue;
+
+            await InsertOutboxAsync(
+                    connection,
+                    transaction,
+                    ConversationWriteCommands.CreateConversationReadEvent(
+                        conversationId,
+                        memberId,
+                        userId,
+                        targetMessageId,
+                        targetAtMs,
+                        now,
+                        traceParent,
+                        traceState),
+                    ct)
+                .ConfigureAwait(false);
+        }
 
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return new ConversationReadAdvanceResult(

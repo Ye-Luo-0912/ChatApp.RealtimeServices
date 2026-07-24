@@ -17,6 +17,7 @@ public sealed class RealtimeBusinessEventContractTests
     [InlineData(RealtimeEventContracts.MessageEdited, RealtimeEventType.MessageEdited)]
     [InlineData(RealtimeEventContracts.ReactionAdded, RealtimeEventType.ReactionAdded)]
     [InlineData(RealtimeEventContracts.ReactionRemoved, RealtimeEventType.ReactionRemoved)]
+    [InlineData(RealtimeEventContracts.ConversationRead, RealtimeEventType.ConversationRead)]
     public void BusinessName_MapsToStableWireType(string businessName, RealtimeEventType expected)
     {
         Assert.Equal(expected, RealtimeEventContracts.ToWireType(businessName));
@@ -88,6 +89,19 @@ public sealed class RealtimeBusinessEventContractTests
             receiptId,
             RealtimeEventContracts.CreateMessageReceiptUpdatedEventId("msg-1", 2, MessageReceiptType.Read));
         Assert.NotEqual(messageId, echoId);
+
+        var conversationReadId = RealtimeEventContracts.CreateConversationReadEventId(
+            "grp:abc",
+            2,
+            "msg-1",
+            10,
+            1);
+        Assert.Equal(
+            conversationReadId,
+            RealtimeEventContracts.CreateConversationReadEventId("grp:abc", 2, "msg-1", 10, 1));
+        Assert.NotEqual(
+            conversationReadId,
+            RealtimeEventContracts.CreateConversationReadEventId("grp:abc", 2, "msg-1", 10, 3));
     }
 
     [Fact]

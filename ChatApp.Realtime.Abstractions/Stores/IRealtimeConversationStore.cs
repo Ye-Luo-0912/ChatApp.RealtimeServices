@@ -17,7 +17,7 @@ public interface IRealtimeConversationStore
     /// 将已读游标推进到指定位置（仅前进）。
     /// <paramref name="readMessageId"/> 为空时推进到会话当前最后消息；
     /// 非空时以库内该消息的 received_at_ms 为准（忽略 <paramref name="readAtMs"/>），并钳到 tip。
-    /// 变更时同事务写入 UnreadCountChanged（及可选 ConversationListChanged）Outbox。
+    /// 变更时同事务写入 UnreadCountChanged（读者）与 ConversationRead（其他活跃成员）Outbox。
     /// </summary>
     Task<ConversationReadAdvanceResult> AdvanceReadCursorAsync(
         long userId,

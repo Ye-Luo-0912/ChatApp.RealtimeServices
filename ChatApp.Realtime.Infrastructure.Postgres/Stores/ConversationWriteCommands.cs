@@ -428,6 +428,45 @@ internal static class ConversationWriteCommands
             lastReadAtMs,
             causeMessageId);
 
+    public static RealtimeEvent CreateConversationReadEvent(
+        string conversationId,
+        long targetUserId,
+        long readerUserId,
+        string lastReadMessageId,
+        long lastReadAtMs,
+        long occurredAtMs,
+        string? traceParent,
+        string? traceState)
+    {
+        var payload = new RealtimeConversationReadPayload
+        {
+            ConversationId = conversationId,
+            ReaderUserId = readerUserId,
+            LastReadMessageId = lastReadMessageId,
+            LastReadAtMs = lastReadAtMs
+        };
+
+        return new RealtimeEvent
+        {
+            EventId = RealtimeEventContracts.CreateConversationReadEventId(
+                conversationId,
+                readerUserId,
+                lastReadMessageId,
+                lastReadAtMs,
+                targetUserId),
+            Type = RealtimeEventType.ConversationRead,
+            TargetUserId = targetUserId,
+            ActorUserId = readerUserId,
+            MessageId = lastReadMessageId,
+            PayloadJson = JsonSerializer.Serialize(
+                payload,
+                RealtimeJsonSerializerContext.Default.RealtimeConversationReadPayload),
+            OccurredAtMs = occurredAtMs,
+            TraceParent = traceParent,
+            TraceState = traceState
+        };
+    }
+
     public static RealtimeEvent CreateConversationChangedEvent(
         string conversationId,
         long targetUserId,

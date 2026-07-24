@@ -90,5 +90,12 @@ public enum RealtimeEventType : byte
     /// <summary>
     /// 成员角色变更（含转让 Owner）。Payload：<c>RealtimeRoleChangedPayload</c>。
     /// </summary>
-    RoleChanged = 19
+    RoleChanged = 19,
+
+    /// <summary>
+    /// 成员会话已读水位推进（业务名 ConversationRead）。
+    /// Payload：<c>RealtimeConversationReadPayload</c>。
+    /// 目标为会话其他活跃成员（不含读者本人；读者通过 UnreadCountChanged 同步）。
+    /// </summary>
+    ConversationRead = 20
 }

@@ -63,6 +63,7 @@ namespace ChatApp.Realtime.Integration.Serialization;
 [JsonSerializable(typeof(List<SyncCursorResetRequired>))]
 [JsonSerializable(typeof(SyncCursorResetReason))]
 [JsonSerializable(typeof(RealtimeUnreadCountChangedPayload))]
+[JsonSerializable(typeof(RealtimeConversationReadPayload))]
 [JsonSerializable(typeof(AttachmentBlobsPurgePayload))]
 [JsonSerializable(typeof(EphemeralTypingEvent))]
 [JsonSerializable(typeof(EphemeralPresenceEvent))]

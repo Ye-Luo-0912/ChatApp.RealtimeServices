@@ -53,6 +53,9 @@ public static class RealtimeEventContracts
     /// <summary>业务名 RoleChanged → 线协议 <see cref="RealtimeEventType.RoleChanged"/>。</summary>
     public const string RoleChanged = nameof(RoleChanged);
 
+    /// <summary>业务名 ConversationRead → 线协议 <see cref="RealtimeEventType.ConversationRead"/>。</summary>
+    public const string ConversationRead = nameof(ConversationRead);
+
     public static string CreateMessageReceivedEventId(long senderUserId, string clientMessageId)
     {
         var input = Encoding.UTF8.GetBytes($"{senderUserId}:{clientMessageId}");
@@ -245,6 +248,22 @@ public static class RealtimeEventContracts
         return Convert.ToHexStringLower(SHA256.HashData(input));
     }
 
+    /// <summary>
+    /// 已读水位事件幂等 Id。纳入水位消息与 target，避免重复 MarkRead / 多目标冲突吞掉。
+    /// </summary>
+    public static string CreateConversationReadEventId(
+        string conversationId,
+        long readerUserId,
+        string lastReadMessageId,
+        long lastReadAtMs,
+        long targetUserId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(lastReadMessageId);
+        var input = Encoding.UTF8.GetBytes(
+            $"convread:{conversationId}:{readerUserId}:{lastReadMessageId}:{lastReadAtMs}:{targetUserId}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
     public static RealtimeEventType ToWireType(string businessName) =>
         businessName switch
         {
@@ -261,6 +280,7 @@ public static class RealtimeEventContracts
             MemberLeft => RealtimeEventType.MemberLeft,
             MemberRemoved => RealtimeEventType.MemberRemoved,
             RoleChanged => RealtimeEventType.RoleChanged,
+            ConversationRead => RealtimeEventType.ConversationRead,
             _ => throw new ArgumentOutOfRangeException(nameof(businessName), businessName, null)
         };
 }

@@ -41,6 +41,9 @@ One Outbox row per `TargetUserId` (same pattern as reactions):
 - Only active members may send; removed members fail `forbidden`
 - History by conversation already membership-gated; by message-id allows group members
 - Conversation mark-read / prefs continue to use membership rows
+- **Read state (v1):** per-member watermark on `conversation_members`; MarkRead emits
+  `UnreadCountChanged` to the reader and `ConversationRead` to other members
+  (see [receipts.md](receipts.md)). Per-message delivered/read receipts remain DM-only.
 
 ## Residuals (out of scope for v1)
 
@@ -49,5 +52,5 @@ One Outbox row per `TargetUserId` (same pattern as reactions):
 - Announcement channels
 - Mute-at-group level beyond per-member prefs already present
 - Fine-grained permission matrix beyond Owner / Admin / Member
-- Per-message delivered/read receipts for groups (still DM-oriented; use conversation mark-read)
+- Per-message delivered/read receipts for groups (use conversation mark-read + `ConversationRead`)
 - User profile enrichment on create (Realtime does not call ChatApp.Server for display names)
