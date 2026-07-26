@@ -97,5 +97,11 @@ public enum RealtimeEventType : byte
     /// Payload：<c>RealtimeConversationReadPayload</c>。
     /// 目标为会话其他活跃成员（不含读者本人；读者通过 UnreadCountChanged 同步）。
     /// </summary>
-    ConversationRead = 20
+    ConversationRead = 20,
+
+    /// <summary>
+    /// 附件生命周期变更（上传确认/扫描/可用/拒绝/过期/缩略图更新）。
+    /// Payload：<c>RealtimeAttachmentLifecyclePayload</c>；目标为上传者本人。
+    /// </summary>
+    AttachmentLifecycleChanged = 21
 }
