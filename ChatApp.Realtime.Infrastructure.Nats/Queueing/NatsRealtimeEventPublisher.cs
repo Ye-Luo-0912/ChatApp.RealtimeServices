@@ -170,11 +170,11 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
                 cancellationToken: ct)
             .ConfigureAwait(false);
 
-        _logger.LogInformation(
-            "实时事件已发布到 NATS。事件编号={EventId}；类型={Type}；目标用户={TargetUserId}；Subject={Subject}",
-            evt.EventId,
+        // P1-5：热路径逐事件 Information 日志在高扇出场景下会放大日志量（分片模式按 Gateway 实例重复）。
+        // 降级为 Debug；正常吞吐依赖 RoutingMetrics 的 Counter/Histogram，失败与广播回退保留 Warning。
+        _logger.LogDebug(
+            "实时事件已发布到 NATS。事件类型={Type}；Subject={Subject}",
             evt.Type,
-            evt.TargetUserId,
             subject);
     }
 }

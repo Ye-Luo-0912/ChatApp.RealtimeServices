@@ -17,6 +17,7 @@ public sealed class RoutingMetrics : IDisposable
     private readonly Meter _meter;
     private readonly Counter<long> _shardPublishes;
     private readonly Counter<long> _broadcastFallback;
+    private readonly Counter<long> _directoryLookupFailed;
     private readonly Histogram<double> _directoryQueryDuration;
     private readonly Histogram<long> _directoryInstanceCount;
     private readonly Histogram<long> _fanoutTargetCount;
@@ -30,6 +31,8 @@ public sealed class RoutingMetrics : IDisposable
             "chatapp.routing.shard.publishes");
         _broadcastFallback = _meter.CreateCounter<long>(
             "chatapp.routing.broadcast.fallback");
+        _directoryLookupFailed = _meter.CreateCounter<long>(
+            "chatapp.routing.directory.lookup.failed");
         _directoryQueryDuration = _meter.CreateHistogram<double>(
             "chatapp.routing.directory.query.duration",
             "ms");
@@ -68,6 +71,22 @@ public sealed class RoutingMetrics : IDisposable
             1,
             new KeyValuePair<string, object?>("channel", Normalize(channel)),
             new KeyValuePair<string, object?>("reason", Normalize(reason)));
+    }
+
+    /// <summary>
+    /// 记录一次路由目录查询失败（网络异常 / Redis 不可用 / 超时等）。
+    /// <para>
+    /// 失败时调用方回退到广播模式（保证不丢事件），但持续失败需要告警。
+    /// </para>
+    /// </summary>
+    /// <param name="kind">目录类型：gateway / watcher。</param>
+    /// <param name="operation">操作：single / many / register / unregister。</param>
+    public void RecordDirectoryLookupFailed(string kind, string operation)
+    {
+        _directoryLookupFailed.Add(
+            1,
+            new KeyValuePair<string, object?>("kind", Normalize(kind)),
+            new KeyValuePair<string, object?>("operation", Normalize(operation)));
     }
 
     /// <summary>

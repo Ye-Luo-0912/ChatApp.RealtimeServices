@@ -300,84 +300,91 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
         IReadOnlyCollection<string> conversationIds,
         CancellationToken ct)
     {
+        // P1-2：集合 SQL 修复，替代按会话逐条 N+1。
+        // 一次 DISTINCT ON 取所有受影响会话的最新消息，一次 UPDATE conversations，
+        // 一次 UPDATE conversation_members，持锁时间与受影响会话数解耦。
+        // LEFT(content, 256) 复现 ConversationId.CreatePreview 的截断语义（PreviewMaxChars=256）；
+        // 当会话所有消息都被清理时，通过 target LEFT JOIN latest 将 tip 置 NULL。
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var ids = conversationIds.ToArray();
+
         var repaired = 0;
-        foreach (var conversationId in conversationIds)
-        {
-            string? tipMessageId = null;
-            string? tipPreview = null;
-            long? tipAtMs = null;
-            long? tipSender = null;
-
-            await using (var tipCmd = new NpgsqlCommand(
-                             $"""
-                              SELECT message_id, content, received_at_ms, sender_user_id, recalled_at_ms
+        await using (var updateConv = new NpgsqlCommand(
+                         $"""
+                          WITH target AS (
+                              SELECT UNNEST(@conversation_ids) AS conversation_id
+                          ),
+                          latest AS (
+                              SELECT DISTINCT ON (conversation_id)
+                                  conversation_id, message_id, content, received_at_ms, sender_user_id,
+                                  recalled_at_ms IS NOT NULL AS is_recalled
                               FROM {databaseSchema.MessagesTableSql}
-                              WHERE conversation_id = @conversation_id
-                              ORDER BY received_at_ms DESC, message_id DESC
-                              LIMIT 1;
-                              """,
-                             connection,
-                             transaction))
-            {
-                tipCmd.Parameters.AddWithValue("conversation_id", conversationId);
-                await using var reader = await tipCmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
-                if (await reader.ReadAsync(ct).ConfigureAwait(false))
-                {
-                    tipMessageId = reader.GetString(0);
-                    var content = reader.GetString(1);
-                    tipAtMs = reader.GetInt64(2);
-                    tipSender = reader.GetInt64(3);
-                    var recalled = !reader.IsDBNull(4);
-                    tipPreview = recalled
-                        ? "消息已撤回"
-                        : ConversationId.CreatePreview(content);
-                }
-            }
+                              WHERE conversation_id = ANY(@conversation_ids)
+                              ORDER BY conversation_id, received_at_ms DESC, message_id DESC
+                          ),
+                          computed AS (
+                              SELECT
+                                  t.conversation_id,
+                                  l.message_id,
+                                  CASE WHEN l.is_recalled THEN '消息已撤回'
+                                       WHEN l.content IS NULL THEN NULL
+                                       ELSE LEFT(l.content, 256) END AS preview,
+                                  l.received_at_ms,
+                                  l.sender_user_id
+                              FROM target t
+                              LEFT JOIN latest l USING (conversation_id)
+                          )
+                          UPDATE {databaseSchema.ConversationsTableSql} AS c
+                          SET last_message_id = comp.message_id,
+                              last_message_preview = comp.preview,
+                              last_message_at_ms = comp.received_at_ms,
+                              last_sender_user_id = comp.sender_user_id,
+                              updated_at_ms = @now
+                          FROM computed comp
+                          WHERE c.conversation_id = comp.conversation_id
+                            AND (
+                                 c.last_message_id IS DISTINCT FROM comp.message_id
+                              OR c.last_message_at_ms IS DISTINCT FROM comp.received_at_ms
+                              OR c.last_message_preview IS DISTINCT FROM comp.preview
+                              OR c.last_sender_user_id IS DISTINCT FROM comp.sender_user_id
+                            );
+                          """,
+                         connection,
+                         transaction))
+        {
+            updateConv.Parameters.AddWithValue("conversation_ids", ids);
+            updateConv.Parameters.AddWithValue("now", now);
+            repaired = await updateConv.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
 
-            await using (var updateConv = new NpgsqlCommand(
-                             $"""
-                              UPDATE {databaseSchema.ConversationsTableSql}
-                              SET last_message_id = @message_id,
-                                  last_message_preview = @preview,
-                                  last_message_at_ms = @at_ms,
-                                  last_sender_user_id = @sender_user_id,
-                                  updated_at_ms = @now
-                              WHERE conversation_id = @conversation_id
-                                AND (
-                                     last_message_id IS DISTINCT FROM @message_id
-                                  OR last_message_at_ms IS DISTINCT FROM @at_ms
-                                  OR last_message_preview IS DISTINCT FROM @preview
-                                  OR last_sender_user_id IS DISTINCT FROM @sender_user_id
-                                );
-                              """,
-                             connection,
-                             transaction))
-            {
-                updateConv.Parameters.AddWithValue("conversation_id", conversationId);
-                updateConv.Parameters.AddWithValue("message_id", (object?)tipMessageId ?? DBNull.Value);
-                updateConv.Parameters.AddWithValue("preview", (object?)tipPreview ?? DBNull.Value);
-                updateConv.Parameters.AddWithValue("at_ms", (object?)tipAtMs ?? DBNull.Value);
-                updateConv.Parameters.AddWithValue("sender_user_id", (object?)tipSender ?? DBNull.Value);
-                updateConv.Parameters.AddWithValue("now", now);
-                repaired += await updateConv.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-            }
-
-            // Keep member sort key aligned with conversation tip (or clear when empty).
-            await using (var updateMembers = new NpgsqlCommand(
-                             $"""
-                              UPDATE {databaseSchema.ConversationMembersTableSql}
-                              SET last_message_at_ms = @at_ms
-                              WHERE conversation_id = @conversation_id
-                                AND last_message_at_ms IS DISTINCT FROM @at_ms;
-                              """,
-                             connection,
-                             transaction))
-            {
-                updateMembers.Parameters.AddWithValue("conversation_id", conversationId);
-                updateMembers.Parameters.AddWithValue("at_ms", (object?)tipAtMs ?? DBNull.Value);
-                await updateMembers.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-            }
+        await using (var updateMembers = new NpgsqlCommand(
+                         $"""
+                          WITH target AS (
+                              SELECT UNNEST(@conversation_ids) AS conversation_id
+                          ),
+                          latest AS (
+                              SELECT DISTINCT ON (conversation_id)
+                                  conversation_id, received_at_ms
+                              FROM {databaseSchema.MessagesTableSql}
+                              WHERE conversation_id = ANY(@conversation_ids)
+                              ORDER BY conversation_id, received_at_ms DESC, message_id DESC
+                          ),
+                          computed AS (
+                              SELECT t.conversation_id, l.received_at_ms
+                              FROM target t
+                              LEFT JOIN latest l USING (conversation_id)
+                          )
+                          UPDATE {databaseSchema.ConversationMembersTableSql} AS m
+                          SET last_message_at_ms = comp.received_at_ms
+                          FROM computed comp
+                          WHERE m.conversation_id = comp.conversation_id
+                            AND m.last_message_at_ms IS DISTINCT FROM comp.received_at_ms;
+                          """,
+                         connection,
+                         transaction))
+        {
+            updateMembers.Parameters.AddWithValue("conversation_ids", ids);
+            await updateMembers.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
 
         return repaired;

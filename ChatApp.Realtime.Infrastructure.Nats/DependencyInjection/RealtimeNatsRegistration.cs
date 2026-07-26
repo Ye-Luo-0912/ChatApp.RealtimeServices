@@ -54,8 +54,10 @@ public static class RealtimeNatsRegistration
         if (IsJetStream(queueOptions))
         {
             services.AddSingleton(jetStreamOptions ?? new JetStreamOptions());
-            services.TryAddSingleton<IGatewayDirectory, NullGatewayDirectory>();
-            services.TryAddSingleton<IWatcherGatewayDirectory, NullWatcherGatewayDirectory>();
+            // Null* 仅暴露私有构造函数 + 静态 Instance（单例），不能用 TryAddSingleton<TImpl>
+            // 让 DI 容器构造；直接注册实例，避免 ValidateOnBuild 失败。
+            services.TryAddSingleton<IGatewayDirectory>(NullGatewayDirectory.Instance);
+            services.TryAddSingleton<IWatcherGatewayDirectory>(NullWatcherGatewayDirectory.Instance);
             services.AddSingleton<JetStreamContextManager>(static sp =>
             {
                 var shardPattern = sp.GetRequiredService<RealtimeQueueOptions>()
@@ -89,8 +91,10 @@ public static class RealtimeNatsRegistration
         }
         else
         {
-            services.TryAddSingleton<IGatewayDirectory, NullGatewayDirectory>();
-            services.TryAddSingleton<IWatcherGatewayDirectory, NullWatcherGatewayDirectory>();
+            // Null* 仅暴露私有构造函数 + 静态 Instance（单例），不能用 TryAddSingleton<TImpl>
+            // 让 DI 容器构造；直接注册实例，避免 ValidateOnBuild 失败。
+            services.TryAddSingleton<IGatewayDirectory>(NullGatewayDirectory.Instance);
+            services.TryAddSingleton<IWatcherGatewayDirectory>(NullWatcherGatewayDirectory.Instance);
             services.RemoveAll<IRealtimeEventPublisher>();
             services.AddSingleton<IRealtimeEventPublisher>(static sp =>
             {

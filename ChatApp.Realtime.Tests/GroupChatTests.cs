@@ -61,15 +61,83 @@ public sealed class GroupChatTests : IAsyncLifetime
         Assert.Equal(3, members.Count);
 
         await using var connection = await client.GetDataSource().OpenConnectionAsync();
+        // P0-1 聚合投递：建群不再产生逐成员 MemberJoined，而是 ConversationListChanged + MembersAdded。
         await using var outbox = new NpgsqlCommand(
             $"""
-             SELECT COUNT(*) FROM {schema.OutboxTableSql}
-             WHERE event_type = @joined OR event_type = @changed
+             SELECT event_type, target_user_ids
+             FROM {schema.OutboxTableSql}
+             WHERE event_type IN (@changed, @members_added, @joined)
              """,
             connection);
-        outbox.Parameters.AddWithValue("joined", (short)RealtimeEventType.MemberJoined);
         outbox.Parameters.AddWithValue("changed", (short)RealtimeEventType.ConversationListChanged);
-        Assert.True(Convert.ToInt32(await outbox.ExecuteScalarAsync()) > 0);
+        outbox.Parameters.AddWithValue("members_added", (short)RealtimeEventType.MembersAdded);
+        outbox.Parameters.AddWithValue("joined", (short)RealtimeEventType.MemberJoined);
+
+        var changedCount = 0;
+        var membersAddedCount = 0;
+        var joinedCount = 0;
+        long[]? membersAddedTargets = null;
+        await using (var reader = await outbox.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+            {
+                var type = (RealtimeEventType)reader.GetInt16(0);
+                if (type == RealtimeEventType.ConversationListChanged)
+                    changedCount++;
+                else if (type == RealtimeEventType.MembersAdded)
+                {
+                    membersAddedCount++;
+                    if (!reader.IsDBNull(1))
+                        membersAddedTargets = (long[])reader.GetValue(1);
+                }
+                else if (type == RealtimeEventType.MemberJoined)
+                    joinedCount++;
+            }
+        }
+
+        Assert.Equal(1, changedCount);
+        Assert.Equal(1, membersAddedCount);
+        Assert.Equal(0, joinedCount); // 不再产生 O(N²) 的逐成员事件
+        Assert.NotNull(membersAddedTargets);
+        Array.Sort(membersAddedTargets!);
+        Assert.Equal([1001L, 1002L, 1003L], membersAddedTargets);
+    }
+
+    [Fact]
+    public async Task CreateGroup_LargeGroup_AggregatesFanOut()
+    {
+        // P0-1 验证：满 50 人建群只产生 2 个 Outbox 事件（ConversationCreated + MembersAdded），
+        // 不再是 1 + 50×50 = 2501 个事件。
+        var (client, schema) = await CreateStoreAsync("realtime_group_aggregation");
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var conversationId = ConversationId.CreateGroup();
+
+        var memberIds = Enumerable.Range(2000, 49).Select(i => (long)i).ToArray();
+        var result = await groupStore.CreateGroupAsync(
+            creatorUserId: 1001,
+            conversationId,
+            title: "Big",
+            memberUserIds: memberIds,
+            actorSessionId: "s1",
+            occurredAtMs: 1_700_000_000_000);
+
+        Assert.True(result.Succeeded);
+
+        await using var connection = await client.GetDataSource().OpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            $"""
+             SELECT COUNT(*)::int, COUNT(*) FILTER (WHERE event_type = @joined)::int
+             FROM {schema.OutboxTableSql}
+             """,
+            connection);
+        cmd.Parameters.AddWithValue("joined", (short)RealtimeEventType.MemberJoined);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        var totalEvents = reader.GetInt32(0);
+        var joinedEvents = reader.GetInt32(1);
+
+        Assert.Equal(2, totalEvents); // ConversationCreated + MembersAdded
+        Assert.Equal(0, joinedEvents); // 不再产生 O(N²) 的 MemberJoined
     }
 
     [Fact]

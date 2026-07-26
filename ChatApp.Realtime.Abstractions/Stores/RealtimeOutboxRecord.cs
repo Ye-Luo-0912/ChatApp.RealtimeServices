@@ -6,4 +6,5 @@ public sealed record RealtimeOutboxRecord(
     string EventId,
     RealtimeEvent Event,
     int AttemptCount,
-    string LockOwner);
+    string LockOwner,
+    string ClaimToken);

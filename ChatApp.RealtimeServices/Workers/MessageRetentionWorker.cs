@@ -15,6 +15,8 @@ namespace ChatApp.RealtimeServices.Workers;
 /// </summary>
 public sealed class MessageRetentionWorker : BackgroundService
 {
+    private const int StatsSampleEveryNCycles = 10;
+
     private readonly IRealtimeMessageRetentionStore _store;
     private readonly IRealtimeOutboxSignal _outboxSignal;
     private readonly RealtimeMetrics _metrics;
@@ -22,6 +24,7 @@ public sealed class MessageRetentionWorker : BackgroundService
     private readonly SyncBootstrapOptions _syncBootstrap;
     private readonly TimeSpan _interval;
     private readonly ILogger<MessageRetentionWorker> _logger;
+    private int _statsSkipCycles;
 
     public MessageRetentionWorker(
         IRealtimeMessageRetentionStore store,
@@ -110,18 +113,25 @@ public sealed class MessageRetentionWorker : BackgroundService
                 await Task.Delay(sleep, ct).ConfigureAwait(false);
         }
 
-        try
+        // P1-2：GetPurgeableStatsAsync 每轮执行精确 COUNT(*)，大数据量时是扫描热点。
+        // 降频采样：仅在未清理数据的 cycle 上每 10 轮采样一次（已清理数据的 lag 通过
+        // RecordMessageRetentionDeleted 间接反映），减少不必要的全表扫描。
+        if (totalDeleted == 0 && Interlocked.Decrement(ref _statsSkipCycles) <= 0)
         {
-            var stats = await _store.GetPurgeableStatsAsync(cutoff, ct).ConfigureAwait(false);
-            _metrics.UpdateMessageRetentionLag(
-                stats.OldestReceivedAtMs,
-                cutoff,
-                now);
-        }
-        catch (Exception ex)
-        {
-            _metrics.RecordMessageRetentionError();
-            _logger.LogDebug(ex, "Message retention lag stats failed.");
+            _statsSkipCycles = StatsSampleEveryNCycles;
+            try
+            {
+                var stats = await _store.GetPurgeableStatsAsync(cutoff, ct).ConfigureAwait(false);
+                _metrics.UpdateMessageRetentionLag(
+                    stats.OldestReceivedAtMs,
+                    cutoff,
+                    now);
+            }
+            catch (Exception ex)
+            {
+                _metrics.RecordMessageRetentionError();
+                _logger.LogDebug(ex, "Message retention lag stats failed.");
+            }
         }
 
         if (totalDeleted > 0)

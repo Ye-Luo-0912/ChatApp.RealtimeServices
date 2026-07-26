@@ -25,6 +25,28 @@ public interface IRealtimeOutboxStore
         CancellationToken ct = default);
 
     /// <summary>
+    /// 批量将认领中的事件标记为已发布。用 UNNEST 配对 event_id + claim_token 校验所有权，
+    /// 单次 UPDATE 完成，避免逐事件数据库往返。
+    /// </summary>
+    Task MarkPublishedBatchAsync(
+        IReadOnlyList<RealtimeOutboxRecord> records,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// 批量将认领中的事件标记为失败（待重试）。每条携带各自的 error 和 retryDelay。
+    /// </summary>
+    Task MarkFailedBatchAsync(
+        IReadOnlyList<(RealtimeOutboxRecord Record, string Error, TimeSpan RetryDelay)> failures,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// 批量将认领中的事件标记为死信。每条携带各自的 error。
+    /// </summary>
+    Task MarkDeadBatchAsync(
+        IReadOnlyList<(RealtimeOutboxRecord Record, string Error)> deadLetters,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// 将死信事件重置为 Pending，供运维重放。返回是否找到并重置。
     /// </summary>
     Task<bool> ReplayDeadAsync(string eventId, CancellationToken ct = default);

@@ -1,5 +1,6 @@
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Queueing;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Infrastructure.Core.DependencyInjection;
 using ChatApp.Realtime.Infrastructure.Nats.Configuration;
@@ -203,7 +204,8 @@ public static class RealtimeServicesRegistration
             Subjects = options.Subjects,
             JetStream = options.JetStream,
             Auth = options.Auth ?? new NatsAuthOptions(),
-            Trust = options.Trust ?? new NatsTrustOptions()
+            Trust = options.Trust ?? new NatsTrustOptions(),
+            Routing = options.Routing ?? new NatsRoutingOptions()
         };
     }
 
@@ -283,6 +285,16 @@ public static class RealtimeServicesRegistration
 
     private static RealtimeQueueOptions CreateRealtimeQueueOptions(NatsOptions options)
     {
+        // P0-2：将路由分片配置映射到 RealtimeQueueOptions，使 Server 端默认装配路径接通分片。
+        // Sharded 模式下使用配置的 pattern；留空则保持 null（广播，向后兼容）。
+        string? shardPattern = null;
+        if (options.Routing.Mode == EventRoutingMode.Sharded)
+        {
+            shardPattern = string.IsNullOrWhiteSpace(options.Routing.RealtimeEventsShardSubjectPattern)
+                ? "chat.realtime-events.{0}"
+                : options.Routing.RealtimeEventsShardSubjectPattern;
+        }
+
         return new RealtimeQueueOptions
         {
             Provider = string.IsNullOrWhiteSpace(options.Url)
@@ -309,7 +321,8 @@ public static class RealtimeServicesRegistration
                 GroupConversations = options.Subjects.GroupConversations,
                 MessagePersistence = options.Subjects.MessagePersistence,
                 DeadLetters = options.Subjects.DeadLetters
-            }
+            },
+            RealtimeEventsShardSubjectPattern = shardPattern
         };
     }
 
@@ -371,6 +384,16 @@ public static class RealtimeServicesRegistration
             throw new InvalidOperationException(
                 "非开发环境禁止 RealtimeDatabase:InitializeSchemaOnStart=true。" +
                 "009/010 等重迁移应由独立 Job/CLI 执行（CREATE INDEX CONCURRENTLY + 检查点续跑）。");
+        }
+
+        // P0-2：分片模式要求真实路由目录（Redis/Garnet），否则会回退到广播，规模上去后无收益。
+        if (natsOptions.Routing.Mode == EventRoutingMode.Sharded
+            && string.IsNullOrWhiteSpace(connectionOptions.Garnet))
+        {
+            throw new InvalidOperationException(
+                "非开发环境启用 Nats:Routing:Mode=Sharded 时必须配置 ConnectionStrings:Garnet，" +
+                "以注册真实的 IGatewayDirectory / IWatcherGatewayDirectory。" +
+                "未配置 Garnet 时仅能注册 Null* 目录，分片路由会回退到广播，违背分片目的。");
         }
     }
 

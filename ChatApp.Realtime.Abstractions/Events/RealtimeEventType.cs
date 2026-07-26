@@ -103,5 +103,14 @@ public enum RealtimeEventType : byte
     /// 附件生命周期变更（上传确认/扫描/可用/拒绝/过期/缩略图更新）。
     /// Payload：<c>RealtimeAttachmentLifecyclePayload</c>；目标为上传者本人。
     /// </summary>
-    AttachmentLifecycleChanged = 21
+    AttachmentLifecycleChanged = 21,
+
+    /// <summary>
+    /// 群成员批量加入（业务名 MembersAdded）。Payload：<c>RealtimeMembersAddedPayload</c>。
+    /// <para>
+    /// 建群 / 批量加人时替代逐成员 MemberJoined 的聚合事件：
+    /// <see cref="RealtimeEvent.TargetUserIds"/> 携带全部目标成员，Payload.Members 携带本次新增成员。
+    /// </para>
+    /// </summary>
+    MembersAdded = 22
 }

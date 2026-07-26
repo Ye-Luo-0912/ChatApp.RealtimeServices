@@ -1,4 +1,4 @@
-namespace ChatApp.Realtime.Integration.Configuration;
+namespace ChatApp.Realtime.Abstractions.Routing;
 
 /// <summary>
 /// Realtime Event 投递路由模式。

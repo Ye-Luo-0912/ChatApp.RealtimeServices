@@ -50,7 +50,8 @@ public sealed class RealtimeSchemaMigrationRunner
         new Migration019_GroupConversationRoles(),
         new Migration020_MessageRetentionAgeIndex(),
         new Migration021_MessageMentions(),
-        new Migration022_OutboxTargetUserIdsColumn()
+        new Migration022_OutboxTargetUserIdsColumn(),
+        new Migration023_OutboxClaimTokenColumn()
     ];
 
     public async Task MigrateAsync(

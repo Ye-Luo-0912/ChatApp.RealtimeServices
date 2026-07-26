@@ -19,4 +19,30 @@ public static class RealtimeWireLimits
 
     /// <summary>实际打包循环使用的预算上限。</summary>
     public const int PackingBudgetBytes = MaximumResponseBytes - ResponsePackingSafetyMarginBytes;
+
+    // ---- 群成员事件聚合硬限制 ----
+
+    /// <summary>
+    /// 单个聚合事件 <see cref="Events.RealtimeEvent.TargetUserIds"/> 的最大长度。
+    /// 与 <c>NpgsqlRealtimeGroupStore.MaxMembersPerGroup</c> 对齐，覆盖满员群全员投递。
+    /// </summary>
+    public const int MaxTargetUserIdsPerEvent = 200;
+
+    /// <summary>
+    /// 单次群成员变更（建群 / 加人）的最大人数。
+    /// 超过该值的请求必须在应用层分批，避免单事务事件过大。
+    /// </summary>
+    public const int MaxMembersPerGroupChange = 50;
+
+    /// <summary>
+    /// 单个 Outbox payload（<c>payload_json</c>）的最大字节数。
+    /// 聚合事件携带 TargetUserIds 与 Members 列表，需防止异常大 payload 撑爆 JetStream 消息上限。
+    /// </summary>
+    public const int MaxOutboxPayloadBytes = 256 * 1024;
+
+    /// <summary>
+    /// 单事务内写入 Outbox 事件的最大条数。
+    /// 聚合后建群事件数应远低于该值；超过则视为异常并拒绝事务。
+    /// </summary>
+    public const int MaxEventsPerTransaction = 1_000;
 }

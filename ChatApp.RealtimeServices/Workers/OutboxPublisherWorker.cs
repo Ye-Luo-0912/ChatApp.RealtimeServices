@@ -70,14 +70,7 @@ public sealed class OutboxPublisherWorker : BackgroundService
                         continue;
                     }
 
-                    await Parallel.ForEachAsync(
-                        records,
-                        new ParallelOptions
-                        {
-                            MaxDegreeOfParallelism = _options.PublishConcurrency,
-                            CancellationToken = stoppingToken
-                        },
-                        PublishOneAsync).ConfigureAwait(false);
+                    await PublishBatchAsync(records, stoppingToken).ConfigureAwait(false);
                     retryAttempt = 0;
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -116,56 +109,111 @@ public sealed class OutboxPublisherWorker : BackgroundService
         return TimeSpan.FromMilliseconds(milliseconds + Random.Shared.Next(0, 500));
     }
 
-    private async ValueTask PublishOneAsync(RealtimeOutboxRecord record, CancellationToken ct)
+    /// <summary>
+    /// P1-3：并行发布一批记录，收集结果后按状态分组批量更新，避免逐事件数据库往返。
+    /// 发布与状态更新解耦：发布失败但 lease 未过期的记录会在下一轮被原实例或其它实例重新认领。
+    /// </summary>
+    private async Task PublishBatchAsync(IReadOnlyList<RealtimeOutboxRecord> records, CancellationToken ct)
     {
-        var parentContext = RealtimeTraceContext.Parse(
-            record.Event.TraceParent,
-            record.Event.TraceState);
-        using var activity = RealtimeTelemetry.StartOutboxPublish(parentContext);
-        activity?.SetTag("chat.event.type", record.Event.Type.ToString());
-        try
-        {
-            if (record.Event.TargetUserIds is { Length: > 0 })
+        var published = new List<RealtimeOutboxRecord>(records.Count);
+        var failed = new List<(RealtimeOutboxRecord Record, string Error, TimeSpan Delay)>(records.Count);
+        var deadLetters = new List<(RealtimeOutboxRecord Record, string Error)>(records.Count);
+
+        var results = new PublishOutcome[records.Count];
+        await Parallel.ForEachAsync(
+            Enumerable.Range(0, records.Count),
+            new ParallelOptions
             {
-                await _publisher.PublishToManyAsync(record.Event, ct).ConfigureAwait(false);
+                MaxDegreeOfParallelism = _options.PublishConcurrency,
+                CancellationToken = ct
+            },
+            async (index, token) =>
+            {
+                var record = records[index];
+                var parentContext = RealtimeTraceContext.Parse(
+                    record.Event.TraceParent,
+                    record.Event.TraceState);
+                using var activity = RealtimeTelemetry.StartOutboxPublish(parentContext);
+                activity?.SetTag("chat.event.type", record.Event.Type.ToString());
+                try
+                {
+                    if (record.Event.TargetUserIds is { Length: > 0 })
+                    {
+                        await _publisher.PublishToManyAsync(record.Event, token).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await _publisher.PublishAsync(record.Event, token).ConfigureAwait(false);
+                    }
+                    results[index] = new PublishOutcome(record, Succeeded: true, Error: null);
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    RealtimeTelemetry.RecordException(activity, ex);
+                    _metrics.RecordOutboxFailure();
+                    results[index] = new PublishOutcome(record, Succeeded: false, Error: ex.Message);
+                }
+            }).ConfigureAwait(false);
+
+        // 按状态分组
+        foreach (var outcome in results)
+        {
+            if (outcome.Succeeded)
+            {
+                published.Add(outcome.Record);
+                _metrics.RecordOutboxPublished();
+            }
+            else if (outcome.Record.AttemptCount >= _options.MaxAttempts)
+            {
+                deadLetters.Add((outcome.Record, outcome.Error!));
+                _metrics.RecordOutboxDeadLetter();
             }
             else
             {
-                await _publisher.PublishAsync(record.Event, ct).ConfigureAwait(false);
+                var delay = CalculateRetryDelay(outcome.Record.AttemptCount);
+                failed.Add((outcome.Record, outcome.Error!, delay));
             }
-            await _outboxStore.MarkPublishedAsync(record, ct).ConfigureAwait(false);
-            _metrics.RecordOutboxPublished();
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            RealtimeTelemetry.RecordException(activity, ex);
-            _metrics.RecordOutboxFailure();
-            if (record.AttemptCount >= _options.MaxAttempts)
-            {
-                await _outboxStore
-                    .MarkDeadAsync(record, ex.Message, ct)
-                    .ConfigureAwait(false);
-                _metrics.RecordOutboxDeadLetter();
-                _logger.LogError(
-                    ex,
-                    "Outbox 事件已进入死信。事件编号={EventId}；尝试次数={AttemptCount}",
-                    record.EventId,
-                    record.AttemptCount);
-                return;
-            }
 
-            var delay = CalculateRetryDelay(record.AttemptCount);
-            await _outboxStore.MarkFailedAsync(record, ex.Message, delay, ct).ConfigureAwait(false);
-            _logger.LogWarning(
-                ex,
-                "Outbox 事件发布失败，将重试。事件编号={EventId}；尝试次数={AttemptCount}；延迟={Delay}",
-                record.EventId,
-                record.AttemptCount,
-                delay);
+        // 批量状态更新
+        if (published.Count > 0)
+            await _outboxStore.MarkPublishedBatchAsync(published, ct).ConfigureAwait(false);
+
+        if (failed.Count > 0)
+        {
+            await _outboxStore.MarkFailedBatchAsync(failed, ct).ConfigureAwait(false);
+            if (_logger.IsEnabled(LogLevel.Warning))
+            {
+                foreach (var (record, error, delay) in failed)
+                {
+                    _logger.LogWarning(
+                        "Outbox 事件发布失败，将重试。事件编号={EventId}；尝试次数={AttemptCount}；延迟={Delay}; 错误={Error}",
+                        record.EventId,
+                        record.AttemptCount,
+                        delay,
+                        error);
+                }
+            }
+        }
+
+        if (deadLetters.Count > 0)
+        {
+            await _outboxStore.MarkDeadBatchAsync(deadLetters, ct).ConfigureAwait(false);
+            if (_logger.IsEnabled(LogLevel.Error))
+            {
+                foreach (var (record, error) in deadLetters)
+                {
+                    _logger.LogError(
+                        "Outbox 事件已进入死信。事件编号={EventId}；尝试次数={AttemptCount}; 错误={Error}",
+                        record.EventId,
+                        record.AttemptCount,
+                        error);
+                }
+            }
         }
     }
 
@@ -176,4 +224,9 @@ public sealed class OutboxPublisherWorker : BackgroundService
             Math.Pow(2, Math.Min(attemptCount, 10)));
         return TimeSpan.FromMilliseconds(seconds * 1000 + Random.Shared.Next(0, 500));
     }
+
+    private readonly record struct PublishOutcome(
+        RealtimeOutboxRecord Record,
+        bool Succeeded,
+        string? Error);
 }

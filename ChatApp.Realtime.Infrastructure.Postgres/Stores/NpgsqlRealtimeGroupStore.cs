@@ -2,11 +2,13 @@ using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Protocol;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using Npgsql;
+using NpgsqlTypes;
 
 namespace ChatApp.Realtime.Infrastructure.Postgres.Stores;
 
@@ -41,6 +43,12 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             return GroupCreatePersistResult.Fail(
                 "too_many_members",
                 $"群成员数不能超过 {MaxMembersPerGroup}。");
+        }
+        if (members.Count > RealtimeWireLimits.MaxTargetUserIdsPerEvent)
+        {
+            return GroupCreatePersistResult.Fail(
+                "too_many_members",
+                $"群成员数超过单事件目标上限 {RealtimeWireLimits.MaxTargetUserIdsPerEvent}。");
         }
 
         await using var connection = await _databaseClient
@@ -83,20 +91,16 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         }
 
         var memberItems = new List<ConversationMemberItem>(members.Count);
-        foreach (var userId in members)
+        var userIds = new long[members.Count];
+        var roles = new short[members.Count];
+        for (var i = 0; i < members.Count; i++)
         {
+            var userId = members[i];
             var role = userId == creatorUserId
                 ? ConversationMemberRole.Owner
                 : ConversationMemberRole.Member;
-            await InsertMemberAsync(
-                    connection,
-                    transaction,
-                    conversationId,
-                    userId,
-                    role,
-                    occurredAtMs,
-                    ct)
-                .ConfigureAwait(false);
+            userIds[i] = userId;
+            roles[i] = (short)role;
             memberItems.Add(new ConversationMemberItem
             {
                 UserId = userId,
@@ -105,39 +109,45 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             });
         }
 
-        var events = new List<RealtimeEvent>(memberItems.Count * 2);
+        await InsertMembersBatchAsync(
+                connection,
+                transaction,
+                conversationId,
+                userIds,
+                roles,
+                occurredAtMs,
+                ct)
+            .ConfigureAwait(false);
+
+        var events = new List<RealtimeEvent>(2);
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
+        var targetUserIds = memberItems.Select(m => m.UserId).ToArray();
 
-        foreach (var target in memberItems)
+        events.Add(CreateConversationCreatedAggregatedEvent(
+            conversationId,
+            title,
+            creatorUserId,
+            targetUserIds,
+            occurredAtMs,
+            actorSessionId,
+            traceParent,
+            traceState,
+            causeToken: $"group-created:{occurredAtMs}"));
+
+        var addedMembers = memberItems.Where(m => m.UserId != creatorUserId).ToList();
+        if (addedMembers.Count > 0)
         {
-            events.Add(CreateConversationCreatedEvent(
+            events.Add(CreateMembersAddedEvent(
                 conversationId,
                 title,
-                target.UserId,
+                addedMembers,
                 creatorUserId,
+                targetUserIds,
                 occurredAtMs,
                 actorSessionId,
                 traceParent,
                 traceState));
-        }
-
-        foreach (var joined in memberItems.Where(m => m.UserId != creatorUserId))
-        {
-            foreach (var target in memberItems)
-            {
-                events.Add(CreateMemberJoinedEvent(
-                    conversationId,
-                    title,
-                    joined.UserId,
-                    joined.Role,
-                    creatorUserId,
-                    target.UserId,
-                    occurredAtMs,
-                    actorSessionId,
-                    traceParent,
-                    traceState));
-            }
         }
 
         await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
@@ -161,6 +171,12 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             return GroupMutatePersistResult.Fail(
                 "too_many_members",
                 $"单次添加不能超过 {MaxAddMembersPerRequest} 人。");
+        }
+        if (toAdd.Count > RealtimeWireLimits.MaxMembersPerGroupChange)
+        {
+            return GroupMutatePersistResult.Fail(
+                "too_many_members",
+                $"单次成员变更超过上限 {RealtimeWireLimits.MaxMembersPerGroupChange}，请分批。");
         }
 
         await using var connection = await _databaseClient
@@ -198,32 +214,18 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 $"群成员数不能超过 {MaxMembersPerGroup}。");
         }
 
-        var newlyAdded = new List<ConversationMemberItem>();
-        foreach (var userId in toAdd)
-        {
-            if (userId == actorUserId)
-                continue;
-            var inserted = await TryInsertMemberAsync(
-                    connection,
-                    transaction,
-                    conversationId,
-                    userId,
-                    ConversationMemberRole.Member,
-                    occurredAtMs,
-                    ct)
-                .ConfigureAwait(false);
-            if (inserted)
-            {
-                newlyAdded.Add(new ConversationMemberItem
-                {
-                    UserId = userId,
-                    Role = ConversationMemberRole.Member,
-                    JoinedAtMs = occurredAtMs
-                });
-            }
-        }
+        var candidates = toAdd.Where(id => id != actorUserId).ToArray();
+        var insertedUserIds = await TryInsertMembersBatchAsync(
+                connection,
+                transaction,
+                conversationId,
+                candidates,
+                ConversationMemberRole.Member,
+                occurredAtMs,
+                ct)
+            .ConfigureAwait(false);
 
-        if (newlyAdded.Count == 0)
+        if (insertedUserIds.Count == 0)
         {
             await transaction.RollbackAsync(ct).ConfigureAwait(false);
             return GroupMutatePersistResult.Ok(conversationId, title);
@@ -231,38 +233,50 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
 
         var allMembers = await ListMembersInTxAsync(connection, transaction, conversationId, ct)
             .ConfigureAwait(false);
-        var events = new List<RealtimeEvent>(newlyAdded.Count * allMembers.Count + allMembers.Count);
+        if (allMembers.Count > RealtimeWireLimits.MaxTargetUserIdsPerEvent)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupMutatePersistResult.Fail(
+                "too_many_members",
+                $"群成员数超过单事件目标上限 {RealtimeWireLimits.MaxTargetUserIdsPerEvent}。");
+        }
+
+        var newlyAdded = insertedUserIds
+            .Select(id => new ConversationMemberItem
+            {
+                UserId = id,
+                Role = ConversationMemberRole.Member,
+                JoinedAtMs = occurredAtMs
+            })
+            .ToList();
+
+        var events = new List<RealtimeEvent>(2);
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
+        var allTargets = allMembers.Select(m => m.UserId).ToArray();
 
-        foreach (var joined in newlyAdded)
-        {
-            foreach (var target in allMembers)
-            {
-                events.Add(CreateMemberJoinedEvent(
-                    conversationId,
-                    title,
-                    joined.UserId,
-                    joined.Role,
-                    actorUserId,
-                    target.UserId,
-                    occurredAtMs,
-                    actorSessionId,
-                    traceParent,
-                    traceState));
-            }
+        events.Add(CreateMembersAddedEvent(
+            conversationId,
+            title,
+            newlyAdded,
+            actorUserId,
+            allTargets,
+            occurredAtMs,
+            actorSessionId,
+            traceParent,
+            traceState));
 
-            events.Add(CreateConversationCreatedEvent(
-                conversationId,
-                title,
-                joined.UserId,
-                actorUserId,
-                occurredAtMs,
-                actorSessionId,
-                traceParent,
-                traceState,
-                causeToken: $"join:{joined.UserId}:{occurredAtMs}"));
-        }
+        // 新成员需要看到 ConversationCreated 以初始化会话列表。
+        events.Add(CreateConversationCreatedAggregatedEvent(
+            conversationId,
+            title,
+            actorUserId,
+            newlyAdded.Select(m => m.UserId).ToArray(),
+            occurredAtMs,
+            actorSessionId,
+            traceParent,
+            traceState,
+            causeToken: $"join-batch:{occurredAtMs}"));
 
         await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
@@ -332,6 +346,13 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
 
         var notifyTargets = await ListMemberUserIdsInTxAsync(connection, transaction, conversationId, ct)
             .ConfigureAwait(false);
+        if (notifyTargets.Count > RealtimeWireLimits.MaxTargetUserIdsPerEvent)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupMutatePersistResult.Fail(
+                "too_many_members",
+                $"群成员数超过单事件目标上限 {RealtimeWireLimits.MaxTargetUserIdsPerEvent}。");
+        }
 
         await using (var delete = new NpgsqlCommand(
                          $"""
@@ -346,23 +367,19 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             await delete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
 
-        var events = new List<RealtimeEvent>(notifyTargets.Count);
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
-        foreach (var target in notifyTargets)
-        {
-            events.Add(CreateMemberRemovedEvent(
-                conversationId,
-                targetUserId,
-                actorUserId,
-                target,
-                occurredAtMs,
-                actorSessionId,
-                traceParent,
-                traceState));
-        }
+        var evt = CreateMemberRemovedAggregatedEvent(
+            conversationId,
+            targetUserId,
+            actorUserId,
+            notifyTargets.ToArray(),
+            occurredAtMs,
+            actorSessionId,
+            traceParent,
+            traceState);
 
-        await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
+        await InsertOutboxManyAsync(connection, transaction, [evt], ct).ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return GroupMutatePersistResult.Ok(conversationId, title);
     }
@@ -415,6 +432,13 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
 
         var notifyTargets = await ListMemberUserIdsInTxAsync(connection, transaction, conversationId, ct)
             .ConfigureAwait(false);
+        if (notifyTargets.Count > RealtimeWireLimits.MaxTargetUserIdsPerEvent)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupMutatePersistResult.Fail(
+                "too_many_members",
+                $"群成员数超过单事件目标上限 {RealtimeWireLimits.MaxTargetUserIdsPerEvent}。");
+        }
 
         await using (var delete = new NpgsqlCommand(
                          $"""
@@ -429,22 +453,18 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             await delete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
 
-        var events = new List<RealtimeEvent>(notifyTargets.Count);
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
-        foreach (var target in notifyTargets)
-        {
-            events.Add(CreateMemberLeftEvent(
-                conversationId,
-                actorUserId,
-                target,
-                occurredAtMs,
-                actorSessionId,
-                traceParent,
-                traceState));
-        }
+        var evt = CreateMemberLeftAggregatedEvent(
+            conversationId,
+            actorUserId,
+            notifyTargets.ToArray(),
+            occurredAtMs,
+            actorSessionId,
+            traceParent,
+            traceState);
 
-        await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
+        await InsertOutboxManyAsync(connection, transaction, [evt], ct).ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return GroupMutatePersistResult.Ok(conversationId, title);
     }
@@ -556,38 +576,44 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
 
         var notifyTargets = await ListMemberUserIdsInTxAsync(connection, transaction, conversationId, ct)
             .ConfigureAwait(false);
-        var events = new List<RealtimeEvent>(notifyTargets.Count * (newRole == ConversationMemberRole.Owner ? 2 : 1));
+        if (notifyTargets.Count > RealtimeWireLimits.MaxTargetUserIdsPerEvent)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupMutatePersistResult.Fail(
+                "too_many_members",
+                $"群成员数超过单事件目标上限 {RealtimeWireLimits.MaxTargetUserIdsPerEvent}。");
+        }
+
+        var events = new List<RealtimeEvent>(newRole == ConversationMemberRole.Owner ? 2 : 1);
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
+        var targets = notifyTargets.ToArray();
 
-        foreach (var target in notifyTargets)
+        events.Add(CreateRoleChangedAggregatedEvent(
+            conversationId,
+            targetUserId,
+            previousRole.Value,
+            newRole,
+            actorUserId,
+            targets,
+            occurredAtMs,
+            actorSessionId,
+            traceParent,
+            traceState));
+
+        if (newRole == ConversationMemberRole.Owner)
         {
-            events.Add(CreateRoleChangedEvent(
+            events.Add(CreateRoleChangedAggregatedEvent(
                 conversationId,
-                targetUserId,
-                previousRole.Value,
-                newRole,
                 actorUserId,
-                target,
+                ConversationMemberRole.Owner,
+                ConversationMemberRole.Admin,
+                actorUserId,
+                targets,
                 occurredAtMs,
                 actorSessionId,
                 traceParent,
                 traceState));
-
-            if (newRole == ConversationMemberRole.Owner)
-            {
-                events.Add(CreateRoleChangedEvent(
-                    conversationId,
-                    actorUserId,
-                    ConversationMemberRole.Owner,
-                    ConversationMemberRole.Admin,
-                    actorUserId,
-                    target,
-                    occurredAtMs,
-                    actorSessionId,
-                    traceParent,
-                    traceState));
-            }
         }
 
         await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
@@ -683,59 +709,85 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         return (title, role, count);
     }
 
-    private async Task InsertMemberAsync(
+    /// <summary>
+    /// 使用 UNNEST 一次性写入全部成员（建群场景，已知全部新增）。
+    /// </summary>
+    private async Task InsertMembersBatchAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
         string conversationId,
-        long userId,
-        ConversationMemberRole role,
+        long[] userIds,
+        short[] roles,
         long joinedAtMs,
         CancellationToken ct)
     {
+        if (userIds.Length == 0)
+            return;
+
         await using var command = new NpgsqlCommand(
             $"""
              INSERT INTO {_databaseSchema.ConversationMembersTableSql} (
                  conversation_id, user_id, peer_user_id, joined_at_ms, role, last_message_at_ms
-             ) VALUES (
-                 @conversation_id, @user_id, NULL, @joined_at_ms, @role, @joined_at_ms
-             );
+             )
+             SELECT @conversation_id, t.user_id, NULL, @joined_at_ms, t.role, @joined_at_ms
+             FROM UNNEST(@user_ids, @roles) AS t(user_id, role)
+             ON CONFLICT (conversation_id, user_id) DO NOTHING;
              """,
             connection,
             transaction);
         command.Parameters.AddWithValue("conversation_id", conversationId);
-        command.Parameters.AddWithValue("user_id", userId);
         command.Parameters.AddWithValue("joined_at_ms", joinedAtMs);
-        command.Parameters.AddWithValue("role", (short)role);
+        command.Parameters.Add(new NpgsqlParameter("user_ids", NpgsqlDbType.Bigint | NpgsqlDbType.Array)
+        {
+            Value = userIds
+        });
+        command.Parameters.Add(new NpgsqlParameter("roles", NpgsqlDbType.Smallint | NpgsqlDbType.Array)
+        {
+            Value = roles
+        });
         await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
-    private async Task<bool> TryInsertMemberAsync(
+    /// <summary>
+    /// 使用 UNNEST 批量尝试写入成员，返回实际新增的 user_id 列表（ON CONFLICT DO NOTHING + RETURNING）。
+    /// </summary>
+    private async Task<IReadOnlyList<long>> TryInsertMembersBatchAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
         string conversationId,
-        long userId,
+        long[] userIds,
         ConversationMemberRole role,
         long joinedAtMs,
         CancellationToken ct)
     {
+        if (userIds.Length == 0)
+            return Array.Empty<long>();
+
         await using var command = new NpgsqlCommand(
             $"""
              INSERT INTO {_databaseSchema.ConversationMembersTableSql} (
                  conversation_id, user_id, peer_user_id, joined_at_ms, role, last_message_at_ms
-             ) VALUES (
-                 @conversation_id, @user_id, NULL, @joined_at_ms, @role, @joined_at_ms
              )
+             SELECT @conversation_id, t.user_id, NULL, @joined_at_ms, @role, @joined_at_ms
+             FROM UNNEST(@user_ids) AS t(user_id)
              ON CONFLICT (conversation_id, user_id) DO NOTHING
              RETURNING user_id;
              """,
             connection,
             transaction);
         command.Parameters.AddWithValue("conversation_id", conversationId);
-        command.Parameters.AddWithValue("user_id", userId);
         command.Parameters.AddWithValue("joined_at_ms", joinedAtMs);
         command.Parameters.AddWithValue("role", (short)role);
-        var scalar = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
-        return scalar is not null;
+        command.Parameters.Add(new NpgsqlParameter("user_ids", NpgsqlDbType.Bigint | NpgsqlDbType.Array)
+        {
+            Value = userIds
+        });
+
+        var inserted = new List<long>(userIds.Length);
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            inserted.Add(reader.GetInt64(0));
+        return inserted;
     }
 
     private async Task<ConversationMemberRole?> TryGetRoleAsync(
@@ -863,16 +915,16 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         return set.ToList();
     }
 
-    private static RealtimeEvent CreateConversationCreatedEvent(
+    private static RealtimeEvent CreateConversationCreatedAggregatedEvent(
         string conversationId,
         string title,
-        long targetUserId,
         long actorUserId,
+        long[] targetUserIds,
         long occurredAtMs,
         string? actorSessionId,
         string? traceParent,
         string? traceState,
-        string? causeToken = null)
+        string causeToken)
     {
         var payload = new RealtimeConversationChangedPayload
         {
@@ -888,13 +940,12 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
 
         return new RealtimeEvent
         {
-            EventId = RealtimeEventContracts.CreateConversationChangedEventId(
+            EventId = RealtimeEventContracts.CreateConversationCreatedAggregatedEventId(
                 conversationId,
-                lastMessageId: causeToken ?? $"group-created:{occurredAtMs}",
-                targetUserId,
-                causeToken ?? "group-created"),
+                causeToken,
+                occurredAtMs),
             Type = RealtimeEventType.ConversationListChanged,
-            TargetUserId = targetUserId,
+            TargetUserId = targetUserIds.Length > 0 ? targetUserIds[0] : actorUserId,
             ActorUserId = actorUserId,
             SessionId = actorSessionId,
             PayloadJson = JsonSerializer.Serialize(
@@ -902,65 +953,69 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 RealtimeJsonSerializerContext.Default.RealtimeConversationChangedPayload),
             OccurredAtMs = occurredAtMs,
             TraceParent = traceParent,
-            TraceState = traceState
+            TraceState = traceState,
+            TargetUserIds = targetUserIds
         };
     }
 
-    private static RealtimeEvent CreateMemberJoinedEvent(
+    private static RealtimeEvent CreateMembersAddedEvent(
         string conversationId,
         string title,
-        long joinedUserId,
-        ConversationMemberRole role,
+        IReadOnlyList<ConversationMemberItem> addedMembers,
         long actorUserId,
-        long targetUserId,
+        long[] targetUserIds,
         long occurredAtMs,
         string? actorSessionId,
         string? traceParent,
-        string? traceState) =>
-        new()
+        string? traceState)
+    {
+        var payload = new RealtimeMembersAddedPayload
         {
-            EventId = RealtimeEventContracts.CreateMemberJoinedEventId(
+            ConversationId = conversationId,
+            Members = addedMembers,
+            ActorUserId = actorUserId,
+            Title = title,
+            OccurredAtMs = occurredAtMs
+        };
+
+        var addedUserIds = addedMembers.Select(m => m.UserId).ToArray();
+
+        return new RealtimeEvent
+        {
+            EventId = RealtimeEventContracts.CreateMembersAddedEventId(
                 conversationId,
-                joinedUserId,
-                targetUserId,
+                addedUserIds,
                 occurredAtMs),
-            Type = RealtimeEventType.MemberJoined,
-            TargetUserId = targetUserId,
+            Type = RealtimeEventType.MembersAdded,
+            TargetUserId = targetUserIds.Length > 0 ? targetUserIds[0] : actorUserId,
             ActorUserId = actorUserId,
             SessionId = actorSessionId,
             PayloadJson = JsonSerializer.Serialize(
-                new RealtimeMemberJoinedPayload
-                {
-                    ConversationId = conversationId,
-                    UserId = joinedUserId,
-                    Role = role,
-                    ActorUserId = actorUserId,
-                    Title = title,
-                    OccurredAtMs = occurredAtMs
-                },
-                RealtimeJsonSerializerContext.Default.RealtimeMemberJoinedPayload),
+                payload,
+                RealtimeJsonSerializerContext.Default.RealtimeMembersAddedPayload),
             OccurredAtMs = occurredAtMs,
             TraceParent = traceParent,
-            TraceState = traceState
+            TraceState = traceState,
+            TargetUserIds = targetUserIds
         };
+    }
 
-    private static RealtimeEvent CreateMemberLeftEvent(
+    private static RealtimeEvent CreateMemberLeftAggregatedEvent(
         string conversationId,
         long leftUserId,
-        long targetUserId,
+        long[] targetUserIds,
         long occurredAtMs,
         string? actorSessionId,
         string? traceParent,
         string? traceState) =>
         new()
         {
-            EventId = RealtimeEventContracts.CreateMemberLeftEventId(
+            EventId = RealtimeEventContracts.CreateMemberLeftAggregatedEventId(
                 conversationId,
                 leftUserId,
-                targetUserId,
                 occurredAtMs),
             Type = RealtimeEventType.MemberLeft,
-            TargetUserId = targetUserId,
+            TargetUserId = targetUserIds.Length > 0 ? targetUserIds[0] : leftUserId,
             ActorUserId = leftUserId,
             SessionId = actorSessionId,
             PayloadJson = JsonSerializer.Serialize(
@@ -973,27 +1028,27 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 RealtimeJsonSerializerContext.Default.RealtimeMemberLeftPayload),
             OccurredAtMs = occurredAtMs,
             TraceParent = traceParent,
-            TraceState = traceState
+            TraceState = traceState,
+            TargetUserIds = targetUserIds
         };
 
-    private static RealtimeEvent CreateMemberRemovedEvent(
+    private static RealtimeEvent CreateMemberRemovedAggregatedEvent(
         string conversationId,
         long removedUserId,
         long actorUserId,
-        long targetUserId,
+        long[] targetUserIds,
         long occurredAtMs,
         string? actorSessionId,
         string? traceParent,
         string? traceState) =>
         new()
         {
-            EventId = RealtimeEventContracts.CreateMemberRemovedEventId(
+            EventId = RealtimeEventContracts.CreateMemberRemovedAggregatedEventId(
                 conversationId,
                 removedUserId,
-                targetUserId,
                 occurredAtMs),
             Type = RealtimeEventType.MemberRemoved,
-            TargetUserId = targetUserId,
+            TargetUserId = targetUserIds.Length > 0 ? targetUserIds[0] : removedUserId,
             ActorUserId = actorUserId,
             SessionId = actorSessionId,
             PayloadJson = JsonSerializer.Serialize(
@@ -1007,30 +1062,30 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 RealtimeJsonSerializerContext.Default.RealtimeMemberRemovedPayload),
             OccurredAtMs = occurredAtMs,
             TraceParent = traceParent,
-            TraceState = traceState
+            TraceState = traceState,
+            TargetUserIds = targetUserIds
         };
 
-    private static RealtimeEvent CreateRoleChangedEvent(
+    private static RealtimeEvent CreateRoleChangedAggregatedEvent(
         string conversationId,
         long userId,
         ConversationMemberRole previousRole,
         ConversationMemberRole newRole,
         long actorUserId,
-        long targetUserId,
+        long[] targetUserIds,
         long occurredAtMs,
         string? actorSessionId,
         string? traceParent,
         string? traceState) =>
         new()
         {
-            EventId = RealtimeEventContracts.CreateRoleChangedEventId(
+            EventId = RealtimeEventContracts.CreateRoleChangedAggregatedEventId(
                 conversationId,
                 userId,
                 newRole,
-                targetUserId,
                 occurredAtMs),
             Type = RealtimeEventType.RoleChanged,
-            TargetUserId = targetUserId,
+            TargetUserId = targetUserIds.Length > 0 ? targetUserIds[0] : userId,
             ActorUserId = actorUserId,
             SessionId = actorSessionId,
             PayloadJson = JsonSerializer.Serialize(
@@ -1046,7 +1101,8 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 RealtimeJsonSerializerContext.Default.RealtimeRoleChangedPayload),
             OccurredAtMs = occurredAtMs,
             TraceParent = traceParent,
-            TraceState = traceState
+            TraceState = traceState,
+            TargetUserIds = targetUserIds
         };
 
     private async Task InsertOutboxManyAsync(
@@ -1058,8 +1114,15 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         if (events.Count == 0)
             return;
 
+        if (events.Count > RealtimeWireLimits.MaxEventsPerTransaction)
+        {
+            throw new InvalidOperationException(
+                $"单事务 Outbox 事件数 {events.Count} 超过上限 {RealtimeWireLimits.MaxEventsPerTransaction}。");
+        }
+
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        const int chunkSize = 50;
+        // 聚合后事件数大幅下降，可使用更大 chunk 减少往返。
+        const int chunkSize = 100;
         for (var offset = 0; offset < events.Count; offset += chunkSize)
         {
             var count = Math.Min(chunkSize, events.Count - offset);
@@ -1072,14 +1135,31 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             for (var i = 0; i < count; i++)
             {
                 var evt = events[offset + i];
+                var payloadJson = JsonSerializer.Serialize(
+                    evt,
+                    RealtimeJsonSerializerContext.Default.RealtimeEvent);
+
+                if (payloadJson.Length > RealtimeWireLimits.MaxOutboxPayloadBytes)
+                {
+                    throw new InvalidOperationException(
+                        $"Outbox payload 字节数 {payloadJson.Length} 超过上限 {RealtimeWireLimits.MaxOutboxPayloadBytes}；" +
+                        $"事件 {evt.EventId} 无法写入。");
+                }
+
+                var hasTargetUserIds = evt.TargetUserIds is { Length: > 0 };
                 values.Add(
-                    $"(@event_id_{i}, @payload_json_{i}, @target_user_id_{i}, @event_type_{i}, @status, @created_at_ms, @next_attempt_at_ms, 0)");
+                    $"(@event_id_{i}, @payload_json_{i}, @target_user_id_{i}, @event_type_{i}, @status, @created_at_ms, @next_attempt_at_ms, 0, @target_user_ids_{i})");
                 command.Parameters.AddWithValue($"event_id_{i}", evt.EventId);
-                command.Parameters.AddWithValue(
-                    $"payload_json_{i}",
-                    JsonSerializer.Serialize(evt, RealtimeJsonSerializerContext.Default.RealtimeEvent));
+                command.Parameters.AddWithValue($"payload_json_{i}", payloadJson);
                 command.Parameters.AddWithValue($"target_user_id_{i}", evt.TargetUserId);
                 command.Parameters.AddWithValue($"event_type_{i}", (short)evt.Type);
+                var targetIdsParam = new NpgsqlParameter(
+                    $"target_user_ids_{i}",
+                    NpgsqlDbType.Bigint | NpgsqlDbType.Array)
+                {
+                    Value = hasTargetUserIds ? (object)evt.TargetUserIds! : DBNull.Value
+                };
+                command.Parameters.Add(targetIdsParam);
             }
 
             command.Parameters.AddWithValue("status", (short)RealtimeOutboxStatus.Pending);
@@ -1089,7 +1169,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 $"""
                  INSERT INTO {_databaseSchema.OutboxTableSql} (
                      event_id, payload_json, target_user_id, event_type, status,
-                     created_at_ms, next_attempt_at_ms, attempt_count
+                     created_at_ms, next_attempt_at_ms, attempt_count, target_user_ids
                  ) VALUES {string.Join(", ", values)}
                  ON CONFLICT (event_id) DO NOTHING;
                  """;

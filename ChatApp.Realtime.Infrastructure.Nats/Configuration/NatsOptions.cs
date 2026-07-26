@@ -1,3 +1,5 @@
+using ChatApp.Realtime.Abstractions.Routing;
+
 namespace ChatApp.Realtime.Infrastructure.Nats.Configuration;
 
 public sealed class NatsOptions
@@ -9,6 +11,35 @@ public sealed class NatsOptions
     public JetStreamOptions? JetStream { get; init; }
     public NatsAuthOptions Auth { get; init; } = new();
     public NatsTrustOptions Trust { get; init; } = new();
+    /// <summary>
+    /// Realtime Event 投递路由配置。默认广播；设为 Sharded 启用按 Gateway 分片投递。
+    /// <para>
+    /// Sharded 模式要求 <c>ConnectionStrings:Garnet</c> 已配置（注册真实 <c>IGatewayDirectory</c>）；
+    /// 否则启动校验会失败（生产）或回退到广播（开发）。
+    /// </para>
+    /// </summary>
+    public NatsRoutingOptions Routing { get; init; } = new();
+}
+
+/// <summary>
+/// NATS 路由分片配置。映射到 <see cref="RealtimeQueueOptions.RealtimeEventsShardSubjectPattern"/>。
+/// </summary>
+public sealed class NatsRoutingOptions
+{
+    /// <summary>
+    /// 路由模式。默认 <see cref="EventRoutingMode.Broadcast"/>（向后兼容）。
+    /// </summary>
+    public EventRoutingMode Mode { get; init; } = EventRoutingMode.Broadcast;
+
+    /// <summary>
+    /// Realtime Event 分片 subject 模板，使用 {0} 作为实例 ID 占位符。
+    /// <para>
+    /// Sharded 模式下，Gateway 订阅此 subject（填入自身 InstanceId），
+    /// 发布方按目标用户的在线 Gateway 集合定向投递。
+    /// 留空则使用默认 <c>chat.realtime-events.{0}</c>。
+    /// </para>
+    /// </summary>
+    public string? RealtimeEventsShardSubjectPattern { get; init; }
 }
 
 public sealed class NatsAuthOptions

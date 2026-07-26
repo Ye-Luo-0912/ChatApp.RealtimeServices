@@ -1,3 +1,4 @@
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Infrastructure.Core.Health;
 using ChatApp.Realtime.Infrastructure.Nats.Configuration;
 using ChatApp.Realtime.Infrastructure.Nats.JetStream;
@@ -89,6 +90,29 @@ public sealed class RealtimeStartupReporter : IHostedService
         {
             await jetStream.EnsureStreamsAsync(cancellationToken).ConfigureAwait(false);
             _logger.LogInformation("JetStream 入站、回执、事件与死信流已完成校准。");
+        }
+
+        // P0-2：运行时校验分片路由目录装配，并记录路由模式与目录实现类型。
+        var gatewayDirectory = _services.GetService<IGatewayDirectory>();
+        var watcherDirectory = _services.GetService<IWatcherGatewayDirectory>();
+        var gatewayDirType = gatewayDirectory?.GetType().Name ?? "<未注册>";
+        var watcherDirType = watcherDirectory?.GetType().Name ?? "<未注册>";
+        var routingMode = nats.Routing.Mode;
+        _logger.LogInformation(
+            "实时事件路由已装配。模式={RoutingMode}；网关目录={GatewayDirectory}；watcher 目录={WatcherDirectory}",
+            routingMode,
+            gatewayDirType,
+            watcherDirType);
+
+        // 生产环境：分片模式 + Null 目录视为配置错误（回退到广播违背分片目的）。
+        if (routingMode == EventRoutingMode.Sharded
+            && !_environment.IsDevelopment()
+            && (gatewayDirectory is null or NullGatewayDirectory
+                || watcherDirectory is null or NullWatcherGatewayDirectory))
+        {
+            throw new InvalidOperationException(
+                $"Nats:Routing:Mode=Sharded 但路由目录为 Null（gateway={gatewayDirType}, watcher={watcherDirType}）。" +
+                "请配置 ConnectionStrings:Garnet 以注册 RedisGatewayDirectory / RedisWatcherGatewayDirectory。");
         }
 
         var snapshot = _readinessState.GetSnapshot();

@@ -53,6 +53,9 @@ public static class RealtimeEventContracts
     /// <summary>业务名 RoleChanged → 线协议 <see cref="RealtimeEventType.RoleChanged"/>。</summary>
     public const string RoleChanged = nameof(RoleChanged);
 
+    /// <summary>业务名 MembersAdded → 线协议 <see cref="RealtimeEventType.MembersAdded"/>。</summary>
+    public const string MembersAdded = nameof(MembersAdded);
+
     /// <summary>业务名 ConversationRead → 线协议 <see cref="RealtimeEventType.ConversationRead"/>。</summary>
     public const string ConversationRead = nameof(ConversationRead);
 
@@ -227,6 +230,23 @@ public static class RealtimeEventContracts
         return Convert.ToHexStringLower(SHA256.HashData(input));
     }
 
+    /// <summary>
+    /// 批量成员加入聚合事件的幂等键：按 (conversationId, 成员指纹, occurredAtMs) 派生，
+    /// 不再按 target 拆分。同一批加人只产生一个 EventId。
+    /// </summary>
+    public static string CreateMembersAddedEventId(
+        string conversationId,
+        IReadOnlyList<long> addedUserIds,
+        long occurredAtMs)
+    {
+        var joined = addedUserIds.Count == 0
+            ? string.Empty
+            : string.Join(",", addedUserIds);
+        var input = Encoding.UTF8.GetBytes(
+            $"memsadd:{conversationId}:{joined}:{occurredAtMs}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
     public static string CreateMemberLeftEventId(
         string conversationId,
         long userId,
@@ -262,6 +282,52 @@ public static class RealtimeEventContracts
     }
 
     /// <summary>
+    /// 聚合事件（多目标 <see cref="RealtimeEvent.TargetUserIds"/>）的幂等键派生：
+    /// 不纳入 target，避免同一业务变化为每个目标生成不同 EventId 而被拆成多行 Outbox。
+    /// </summary>
+    public static string CreateConversationCreatedAggregatedEventId(
+        string conversationId,
+        string causeToken,
+        long occurredAtMs)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(causeToken);
+        var input = Encoding.UTF8.GetBytes(
+            $"convchgagg:{conversationId}:{causeToken}:{occurredAtMs}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
+    public static string CreateMemberLeftAggregatedEventId(
+        string conversationId,
+        long userId,
+        long occurredAtMs)
+    {
+        var input = Encoding.UTF8.GetBytes(
+            $"memleftagg:{conversationId}:{userId}:{occurredAtMs}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
+    public static string CreateMemberRemovedAggregatedEventId(
+        string conversationId,
+        long userId,
+        long occurredAtMs)
+    {
+        var input = Encoding.UTF8.GetBytes(
+            $"memrmagg:{conversationId}:{userId}:{occurredAtMs}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
+    public static string CreateRoleChangedAggregatedEventId(
+        string conversationId,
+        long userId,
+        ConversationMemberRole newRole,
+        long occurredAtMs)
+    {
+        var input = Encoding.UTF8.GetBytes(
+            $"rolechgagg:{conversationId}:{userId}:{(byte)newRole}:{occurredAtMs}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
+    /// <summary>
     /// 已读水位事件幂等 Id。纳入水位消息与 target，避免重复 MarkRead / 多目标冲突吞掉。
     /// </summary>
     public static string CreateConversationReadEventId(
@@ -293,6 +359,7 @@ public static class RealtimeEventContracts
             MemberLeft => RealtimeEventType.MemberLeft,
             MemberRemoved => RealtimeEventType.MemberRemoved,
             RoleChanged => RealtimeEventType.RoleChanged,
+            MembersAdded => RealtimeEventType.MembersAdded,
             ConversationRead => RealtimeEventType.ConversationRead,
             _ => throw new ArgumentOutOfRangeException(nameof(businessName), businessName, null)
         };

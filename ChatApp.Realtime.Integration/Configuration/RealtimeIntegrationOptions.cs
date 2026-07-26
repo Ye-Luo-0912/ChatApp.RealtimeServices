@@ -1,3 +1,5 @@
+using ChatApp.Realtime.Abstractions.Routing;
+
 namespace ChatApp.Realtime.Integration.Configuration;
 
 public sealed class RealtimeIntegrationOptions

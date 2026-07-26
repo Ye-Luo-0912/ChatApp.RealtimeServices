@@ -29,6 +29,9 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var lockedUntil = now + (long)leaseDuration.TotalMilliseconds;
+        // P1-3：每次 claim 生成不可复用的 lease token，避免同一实例标识在 lease 过期并
+        // 重新领取后，旧任务误完成新 lease。
+        var claimToken = Guid.NewGuid().ToString("N");
         await using var connection = await _databaseClient.GetDataSource()
             .OpenConnectionAsync(ct).ConfigureAwait(false);
         await using var command = new NpgsqlCommand(
@@ -46,16 +49,18 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
              )
              UPDATE {_databaseSchema.OutboxTableSql} AS item
              SET locked_by = @instance_id,
+                 claim_token = @claim_token,
                  locked_until_ms = @locked_until,
                  attempt_count = item.attempt_count + 1
              FROM candidates
              WHERE item.event_id = candidates.event_id
-             RETURNING item.event_id, item.payload_json, item.attempt_count, item.locked_by;
+             RETURNING item.event_id, item.payload_json, item.attempt_count, item.locked_by, item.claim_token;
              """,
             connection);
         command.Parameters.AddWithValue("now", now);
         command.Parameters.AddWithValue("batch_size", batchSize);
         command.Parameters.AddWithValue("instance_id", instanceId);
+        command.Parameters.AddWithValue("claim_token", claimToken);
         command.Parameters.AddWithValue("locked_until", lockedUntil);
 
         var records = new List<RealtimeOutboxRecord>(batchSize);
@@ -70,7 +75,8 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
                 reader.GetString(0),
                 evt,
                 reader.GetInt32(2),
-                reader.GetString(3)));
+                reader.GetString(3),
+                reader.GetString(4)));
         }
 
         return records;
@@ -346,6 +352,87 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
             reader.IsDBNull(10) ? null : reader.GetString(10));
     }
 
+    public Task MarkPublishedBatchAsync(
+        IReadOnlyList<RealtimeOutboxRecord> records,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+        if (records.Count == 0)
+            return Task.CompletedTask;
+
+        var eventIds = records.Select(r => r.EventId).ToArray();
+        var claimTokens = records.Select(r => r.ClaimToken).ToArray();
+        return ExecuteBatchUpdateAsync(
+            $"""
+             published_at_ms = @now,
+             status = {(short)RealtimeOutboxStatus.Published},
+             locked_by = NULL,
+             locked_until_ms = NULL,
+             last_error = NULL,
+             claim_token = NULL
+             """,
+            eventIds,
+            claimTokens,
+            nextAttempts: null,
+            errors: null,
+            ct);
+    }
+
+    public Task MarkFailedBatchAsync(
+        IReadOnlyList<(RealtimeOutboxRecord Record, string Error, TimeSpan RetryDelay)> failures,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(failures);
+        if (failures.Count == 0)
+            return Task.CompletedTask;
+
+        var eventIds = failures.Select(f => f.Record.EventId).ToArray();
+        var claimTokens = failures.Select(f => f.Record.ClaimToken).ToArray();
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var nextAttempts = failures
+            .Select(f => now + (long)f.RetryDelay.TotalMilliseconds)
+            .ToArray();
+        var errors = failures
+            .Select(f => f.Error.Length <= 2048 ? f.Error : f.Error[..2048])
+            .ToArray();
+        return ExecuteBatchUpdateAsync(
+            "next_attempt_at_ms = arr.next_attempt, locked_by = NULL, locked_until_ms = NULL, last_error = arr.error, claim_token = NULL",
+            eventIds,
+            claimTokens,
+            nextAttempts,
+            errors,
+            ct);
+    }
+
+    public Task MarkDeadBatchAsync(
+        IReadOnlyList<(RealtimeOutboxRecord Record, string Error)> deadLetters,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(deadLetters);
+        if (deadLetters.Count == 0)
+            return Task.CompletedTask;
+
+        var eventIds = deadLetters.Select(d => d.Record.EventId).ToArray();
+        var claimTokens = deadLetters.Select(d => d.Record.ClaimToken).ToArray();
+        var errors = deadLetters
+            .Select(d => d.Error.Length <= 2048 ? d.Error : d.Error[..2048])
+            .ToArray();
+        return ExecuteBatchUpdateAsync(
+            $"""
+             status = {(short)RealtimeOutboxStatus.Dead},
+             locked_by = NULL,
+             locked_until_ms = NULL,
+             last_error = arr.error,
+             next_attempt_at_ms = @now,
+             claim_token = NULL
+             """,
+            eventIds,
+            claimTokens,
+            nextAttempts: null,
+            errors,
+            ct);
+    }
+
     private async Task UpdateAsync(
         RealtimeOutboxRecord record,
         string setClause,
@@ -355,12 +442,14 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         await using var connection = await _databaseClient.GetDataSource()
             .OpenConnectionAsync(ct).ConfigureAwait(false);
+        // P1-3：用 claim_token 替代 locked_by 做所有权校验，避免同一实例标识在 lease
+        // 过期并重新领取后，旧任务误完成新 lease。
         await using var command = new NpgsqlCommand(
-            $"UPDATE {_databaseSchema.OutboxTableSql} SET {setClause} WHERE event_id = @event_id AND locked_by = @lock_owner",
+            $"UPDATE {_databaseSchema.OutboxTableSql} SET {setClause} WHERE event_id = @event_id AND claim_token = @claim_token",
             connection);
         command.Parameters.AddWithValue("now", now);
         command.Parameters.AddWithValue("event_id", record.EventId);
-        command.Parameters.AddWithValue("lock_owner", record.LockOwner);
+        command.Parameters.AddWithValue("claim_token", record.ClaimToken);
         if (failure is not null)
         {
             command.Parameters.AddWithValue(
@@ -368,6 +457,56 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
                 now + (long)failure.Value.Delay.TotalMilliseconds);
             command.Parameters.AddWithValue("error", failure.Value.Error);
         }
+
+        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// P1-3：批量状态更新。用 UNNEST 配对 event_id + claim_token 校验所有权，
+    /// 单次 UPDATE 完成一批记录的状态变更，避免逐事件数据库往返。
+    /// </summary>
+    private async Task ExecuteBatchUpdateAsync(
+        string setClause,
+        string[] eventIds,
+        string[] claimTokens,
+        long[]? nextAttempts,
+        string[]? errors,
+        CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        await using var connection = await _databaseClient.GetDataSource()
+            .OpenConnectionAsync(ct).ConfigureAwait(false);
+
+        // 当 setClause 引用 arr.next_attempt / arr.error 时，UNNEST 必须提供这些列。
+        var unnestColumns = "event_id, claim_token";
+        var unnestArgs = "@event_ids, @claim_tokens";
+        if (nextAttempts is not null)
+        {
+            unnestColumns += ", next_attempt";
+            unnestArgs += ", @next_attempts";
+        }
+        if (errors is not null)
+        {
+            unnestColumns += ", error";
+            unnestArgs += ", @errors";
+        }
+
+        await using var command = new NpgsqlCommand(
+            $"""
+             UPDATE {_databaseSchema.OutboxTableSql} AS item
+             SET {setClause}
+             FROM UNNEST({unnestArgs}) AS arr({unnestColumns})
+             WHERE item.event_id = arr.event_id
+               AND item.claim_token = arr.claim_token
+             """,
+            connection);
+        command.Parameters.AddWithValue("now", now);
+        command.Parameters.AddWithValue("event_ids", eventIds);
+        command.Parameters.AddWithValue("claim_tokens", claimTokens);
+        if (nextAttempts is not null)
+            command.Parameters.AddWithValue("next_attempts", nextAttempts);
+        if (errors is not null)
+            command.Parameters.AddWithValue("errors", errors);
 
         await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
