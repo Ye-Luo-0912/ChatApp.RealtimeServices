@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace ChatApp.Realtime.Abstractions.Events;
 
 /// <summary>
@@ -33,4 +35,16 @@ public sealed class RealtimeEvent
     /// 为空时回退到 <see cref="TargetUserId"/> 单目标路径。
     /// </summary>
     public long[]? TargetUserIds { get; init; }
+
+    /// <summary>
+    /// P1-4：应用层（如 <c>DefaultIncomingMessageProcessor</c>）可将已构造的 payload 对象通过此属性
+    /// 直接传给 <c>IRealtimeMessageStore</c>，避免在 Processor 中先序列化、Store 又反序列化回对象
+    /// 才能绑定附件。Store 在最终写入 Outbox 前会调用 <c>EnrichChatMessagePayload</c> 物化一次得到
+    /// <see cref="PayloadJson"/>，物化后应清空此引用。
+    /// <para>
+    /// 该字段不参与 JSON 序列化：Outbox 表中的 <c>payload_json</c> 仅保存物化后的 <see cref="PayloadJson"/>。
+    /// </para>
+    /// </summary>
+    [JsonIgnore]
+    public object? Payload { get; init; }
 }

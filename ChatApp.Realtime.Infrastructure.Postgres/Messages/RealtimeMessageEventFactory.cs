@@ -18,19 +18,25 @@ internal static class RealtimeMessageEventFactory
         RealtimeEvent evt,
         IReadOnlyList<AttachmentRef>? attachments)
     {
-        if (string.IsNullOrWhiteSpace(evt.PayloadJson))
-            return evt;
-
-        RealtimeChatMessagePayload? payload;
-        try
+        // P1-4：优先使用应用层传入的 Payload 对象，省去一次 deserialize + reserialize。
+        // 仅当 Payload 缺失（如旧调用方/测试）且 PayloadJson 存在时，才回退到反序列化路径。
+        RealtimeChatMessagePayload? payload = null;
+        if (evt.Payload is RealtimeChatMessagePayload typedPayload)
         {
-            payload = JsonSerializer.Deserialize(
-                evt.PayloadJson,
-                RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload);
+            payload = typedPayload;
         }
-        catch (JsonException)
+        else if (!string.IsNullOrWhiteSpace(evt.PayloadJson))
         {
-            return evt;
+            try
+            {
+                payload = JsonSerializer.Deserialize(
+                    evt.PayloadJson,
+                    RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload);
+            }
+            catch (JsonException)
+            {
+                return evt;
+            }
         }
 
         if (payload is null)
@@ -58,6 +64,12 @@ internal static class RealtimeMessageEventFactory
             MentionedRoles = payload.MentionedRoles
         };
 
+        // 一次性物化：把 enriched 对象序列化为 PayloadJson。
+        // 此后所有派生事件（聚合 / 回声 / 拷贝）直接复用此 PayloadJson，不再重复序列化。
+        var payloadJson = JsonSerializer.Serialize(
+            enriched,
+            RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload);
+
         return new RealtimeEvent
         {
             EventId = evt.EventId,
@@ -66,12 +78,11 @@ internal static class RealtimeMessageEventFactory
             ActorUserId = evt.ActorUserId,
             MessageId = evt.MessageId,
             SessionId = evt.SessionId,
-            PayloadJson = JsonSerializer.Serialize(
-                enriched,
-                RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload),
+            PayloadJson = payloadJson,
             OccurredAtMs = evt.OccurredAtMs,
             TraceParent = evt.TraceParent,
             TraceState = evt.TraceState
+            // Payload 故意不传递：已物化为 PayloadJson，避免持有冗余引用。
         };
     }
 
@@ -149,6 +160,9 @@ internal static class RealtimeMessageEventFactory
         PayloadJson = evt.PayloadJson,
         OccurredAtMs = evt.OccurredAtMs,
         TraceParent = evt.TraceParent,
-        TraceState = evt.TraceState
+        TraceState = evt.TraceState,
+        // P1-4：保留 Payload 对象引用，让后续 EnrichChatMessagePayload 能直接消费
+        // 而不必走 PayloadJson 反序列化回退路径。
+        Payload = evt.Payload
     };
 }

@@ -1,7 +1,9 @@
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Stores;
+using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using ChatApp.Realtime.Infrastructure.Postgres.Migrations;
@@ -51,6 +53,77 @@ public sealed class P1PerfStabilityTests : IAsyncLifetime
         Assert.Single(map[memberConvo]);
         Assert.Equal("secret-member", map[memberConvo][0].Content);
         Assert.Empty(map[otherConvo]);
+    }
+
+    [Fact]
+    public async Task SaveAsync_MaterializesPayloadObjectOnceIntoOutboxJson()
+    {
+        // P1-4：应用层（DefaultIncomingMessageProcessor）传 Payload 对象，不预先序列化 PayloadJson。
+        // NpgsqlRealtimeMessageStore.SaveAsync 调用 EnrichChatMessagePayload 一次性物化为 PayloadJson，
+        // 写入 Outbox 的 payload_json 应包含完整 ChatMessagePayload。
+        var (client, schema) = await CreateDatabaseAsync("realtime_p1_payload_materialize");
+        var messageStore = new NpgsqlRealtimeMessageStore(
+            client,
+            schema,
+            NullLogger<NpgsqlRealtimeMessageStore>.Instance);
+
+        var conversationId = ConversationId.CreateDirect(501, 502);
+        var message = new RealtimeMessageRecord
+        {
+            MessageId = "msg-payload",
+            ClientMessageId = "client-payload",
+            SenderUserId = 501,
+            SenderSessionId = "session-p1",
+            ReceiverUserId = 502,
+            ConversationId = conversationId,
+            Content = "payload-once",
+            ReceivedAtMs = 100
+        };
+        // 模拟 Processor：仅设置 Payload，不设置 PayloadJson
+        var evt = new RealtimeEvent
+        {
+            EventId = "evt-payload-once",
+            Type = RealtimeEventType.MessageReceived,
+            TargetUserId = 502,
+            ActorUserId = 501,
+            MessageId = "msg-payload",
+            SessionId = "session-p1",
+            Payload = new RealtimeChatMessagePayload
+            {
+                MessageId = "msg-payload",
+                ClientMessageId = "client-payload",
+                SenderUserId = 501,
+                SenderSessionId = "session-p1",
+                ReceiverUserId = 502,
+                ConversationId = conversationId,
+                Content = "payload-once",
+                ReceivedAtMs = 100
+            },
+            OccurredAtMs = 100
+        };
+
+        var result = await messageStore.SaveAsync(message, evt);
+        Assert.Equal(RealtimeMessagePersistKind.Created, result.Kind);
+
+        // 直接从 Outbox 表读取 payload_json 验证物化结果
+        await using var connection = await client.GetDataSource().OpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            $"SELECT payload_json FROM {schema.OutboxTableSql} WHERE event_id = @id",
+            connection);
+        cmd.Parameters.AddWithValue("id", evt.EventId);
+        var payloadJson = (string)(await cmd.ExecuteScalarAsync())!;
+
+        var outboxEvent = System.Text.Json.JsonSerializer.Deserialize(
+            payloadJson,
+            RealtimeJsonSerializerContext.Default.RealtimeEvent)!;
+        Assert.NotNull(outboxEvent.PayloadJson);
+        var chatPayload = System.Text.Json.JsonSerializer.Deserialize(
+            outboxEvent.PayloadJson!,
+            RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload)!;
+        Assert.Equal("payload-once", chatPayload.Content);
+        Assert.Equal(conversationId, chatPayload.ConversationId);
+        Assert.Equal(501, chatPayload.SenderUserId);
+        Assert.Equal(502, chatPayload.ReceiverUserId);
     }
 
     [Fact]

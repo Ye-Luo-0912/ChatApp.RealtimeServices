@@ -4,7 +4,6 @@ using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Messaging;
-using ChatApp.Realtime.Integration.Serialization;
 using ChatApp.Realtime.Tests.TestDoubles;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -43,12 +42,11 @@ public sealed class MentionRoundTripTests
         Assert.Equal(command.MentionedUserIds, store.Message!.MentionedUserIds);
         Assert.Equal(command.MentionedRoles, store.Message!.MentionedRoles);
 
-        // 事件载荷经序列化/反序列化后 mention 字段保持一致
-        var payload = RealtimeWireSerializer.DeserializeChatMessage(store.Event!.PayloadJson!);
-        Assert.NotNull(payload);
-        Assert.Equal(command.MentionedUserIds, payload!.MentionedUserIds);
+        // P1-4：Processor 传 Payload 对象（不预序列化 PayloadJson），Store 负责一次性物化。
+        // 这里直接校验 Payload 对象的 mention 字段。
+        var payload = Assert.IsType<RealtimeChatMessagePayload>(store.Event!.Payload);
+        Assert.Equal(command.MentionedUserIds, payload.MentionedUserIds);
         Assert.Equal(command.MentionedRoles, payload.MentionedRoles);
-        Assert.Equal(RealtimeChatMessagePayload.CurrentPayloadVersion, payload.PayloadVersion);
     }
 
     [Fact]
@@ -71,9 +69,8 @@ public sealed class MentionRoundTripTests
         Assert.Null(store.Message!.MentionedUserIds);
         Assert.Null(store.Message!.MentionedRoles);
 
-        var payload = RealtimeWireSerializer.DeserializeChatMessage(store.Event!.PayloadJson!);
-        Assert.NotNull(payload);
-        Assert.Null(payload!.MentionedUserIds);
+        var payload = Assert.IsType<RealtimeChatMessagePayload>(store.Event!.Payload);
+        Assert.Null(payload.MentionedUserIds);
         Assert.Null(payload.MentionedRoles);
     }
 
@@ -104,9 +101,8 @@ public sealed class MentionRoundTripTests
         Assert.Equal(command.MentionedUserIds, store.Message!.MentionedUserIds);
         Assert.Equal(command.MentionedRoles, store.Message!.MentionedRoles);
 
-        var payload = RealtimeWireSerializer.DeserializeChatMessage(store.Event!.PayloadJson!);
-        Assert.NotNull(payload);
-        Assert.Equal(command.MentionedUserIds, payload!.MentionedUserIds);
+        var payload = Assert.IsType<RealtimeChatMessagePayload>(store.Event!.Payload);
+        Assert.Equal(command.MentionedUserIds, payload.MentionedUserIds);
         Assert.Equal(command.MentionedRoles, payload.MentionedRoles);
     }
 

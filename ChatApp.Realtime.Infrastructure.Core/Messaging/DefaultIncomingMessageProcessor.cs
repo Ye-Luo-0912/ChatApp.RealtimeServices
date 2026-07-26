@@ -1,11 +1,9 @@
-using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
-using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using Microsoft.Extensions.Logging;
 
 namespace ChatApp.Realtime.Infrastructure.Core.Messaging;
@@ -127,27 +125,28 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             ActorUserId = command.SenderUserId,
             MessageId = command.CommandId,
             SessionId = command.SenderSessionId,
-            PayloadJson = JsonSerializer.Serialize(
-                new RealtimeChatMessagePayload
-                {
-                    MessageId = command.CommandId,
-                    ClientMessageId = command.ClientMessageId,
-                    SenderUserId = command.SenderUserId,
-                    SenderSessionId = command.SenderSessionId,
-                    ReceiverUserId = receiverUserId,
-                    ConversationId = conversationId,
-                    Content = command.Content,
-                    ReceivedAtMs = command.ReceivedAtMs,
-                    ReplyToMessageId = command.ReplyToMessageId,
-                    ReplyToSenderUserId = command.ReplyToSenderUserId,
-                    ReplyToPreview = command.ReplyToPreview,
-                    ForwardedFromMessageId = command.ForwardedFromMessageId,
-                    ForwardedFromSenderUserId = command.ForwardedFromSenderUserId,
-                    ForwardedFromPreview = command.ForwardedFromPreview,
-                    MentionedUserIds = command.MentionedUserIds,
-                    MentionedRoles = command.MentionedRoles
-                },
-                RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload),
+            // P1-4：直接传 payload 对象给 Store，由 Store 在附件绑定后调用
+            // EnrichChatMessagePayload 一次性物化为 PayloadJson，省去 Processor
+            // 序列化 + Store 反序列化的重复工作。Outbox 仅看到物化后的 PayloadJson。
+            Payload = new RealtimeChatMessagePayload
+            {
+                MessageId = command.CommandId,
+                ClientMessageId = command.ClientMessageId,
+                SenderUserId = command.SenderUserId,
+                SenderSessionId = command.SenderSessionId,
+                ReceiverUserId = receiverUserId,
+                ConversationId = conversationId,
+                Content = command.Content,
+                ReceivedAtMs = command.ReceivedAtMs,
+                ReplyToMessageId = command.ReplyToMessageId,
+                ReplyToSenderUserId = command.ReplyToSenderUserId,
+                ReplyToPreview = command.ReplyToPreview,
+                ForwardedFromMessageId = command.ForwardedFromMessageId,
+                ForwardedFromSenderUserId = command.ForwardedFromSenderUserId,
+                ForwardedFromPreview = command.ForwardedFromPreview,
+                MentionedUserIds = command.MentionedUserIds,
+                MentionedRoles = command.MentionedRoles
+            },
             OccurredAtMs = command.ReceivedAtMs,
             TraceParent = RealtimeTraceContext.CaptureTraceParent(),
             TraceState = RealtimeTraceContext.CaptureTraceState()

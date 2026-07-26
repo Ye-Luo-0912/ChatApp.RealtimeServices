@@ -5,7 +5,6 @@ using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Messaging;
-using ChatApp.Realtime.Integration.Serialization;
 using ChatApp.Realtime.Tests.TestDoubles;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -37,8 +36,10 @@ public sealed class DefaultIncomingMessageProcessorTests
         Assert.Equal(command.CommandId, store.Event.MessageId);
         Assert.Equal(RealtimeEventType.MessageReceived, store.Event.Type);
         Assert.Equal(command.ReceiverUserId, store.Event.TargetUserId);
-        var payload = RealtimeWireSerializer.DeserializeChatMessage(store.Event.PayloadJson!);
-        Assert.NotNull(payload);
+        // P1-4：Processor 不再预先序列化 PayloadJson，而是把 payload 对象通过 Payload 传给 Store。
+        // Store（Npgsql/EfCore）会在附件绑定后调用 EnrichChatMessagePayload 一次性物化。
+        Assert.Null(store.Event.PayloadJson);
+        var payload = Assert.IsType<RealtimeChatMessagePayload>(store.Event.Payload);
         Assert.Equal(command.Content, payload.Content);
         Assert.Equal(command.ClientMessageId, payload.ClientMessageId);
         Assert.Equal("dm:1001:1002", payload.ConversationId);

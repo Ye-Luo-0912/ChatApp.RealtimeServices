@@ -6,6 +6,7 @@ using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using ChatApp.Realtime.Infrastructure.Postgres.Data.Entities;
+using ChatApp.Realtime.Infrastructure.Postgres.Messages;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
@@ -38,6 +39,11 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
             message.ReceiverUserId,
             message.Content,
             message.AttachmentIds);
+
+        // P1-4：EfCore 路径不绑定附件，但仍需要把应用层传入的 Payload 对象物化为 PayloadJson，
+        // 否则 Outbox 行会缺少 payload。附件参数为 null，保留原 payload 字段不变。
+        // 若 eventToPublish 已有 PayloadJson（旧调用方/测试），EnrichChatMessagePayload 也能处理。
+        eventToPublish = RealtimeMessageEventFactory.EnrichChatMessagePayload(eventToPublish, attachments: null);
 
         await using var dbContext = await _dbContextFactory
             .CreateDbContextAsync(ct)
