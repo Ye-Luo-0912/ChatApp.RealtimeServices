@@ -92,6 +92,12 @@ public sealed class RealtimeDbContext : DbContext
                 .HasColumnName("forwarded_from_preview")
                 .HasMaxLength(256);
 
+            entity.Property(message => message.MentionedUserIds)
+                .HasColumnName("mentioned_user_ids");
+
+            entity.Property(message => message.MentionedRoles)
+                .HasColumnName("mentioned_roles");
+
             entity.Property(message => message.RecalledAtMs)
                 .HasColumnName("recalled_at_ms");
 

@@ -4,7 +4,7 @@ using Npgsql;
 namespace ChatApp.Realtime.Infrastructure.Postgres.Migrations;
 
 /// <summary>
-/// Outbox 生命周期：显�?status（Pending/Published/Dead）、死信可查询，以及已发布行清理索引�?
+/// Outbox 生命周期：显�?status（Pending/Published/Dead）、死信可查询，以及已发布行清理索引�?
 /// </summary>
 public sealed class Migration003_OutboxLifecycle : IRealtimeSchemaMigration
 {

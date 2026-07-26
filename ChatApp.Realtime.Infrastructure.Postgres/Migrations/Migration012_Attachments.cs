@@ -4,7 +4,7 @@ using Npgsql;
 namespace ChatApp.Realtime.Infrastructure.Postgres.Migrations;
 
 /// <summary>
-/// 正式附件元数据表：Ticketed �?Confirmed �?Bound（或 Abandoned）�?
+/// 附件元数据表，记录附件生命周期状态（Ticketed、Confirmed、Bound、Abandoned）。
 /// </summary>
 public sealed class Migration012_Attachments : IRealtimeSchemaMigration
 {

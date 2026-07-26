@@ -4,7 +4,7 @@ using Npgsql;
 namespace ChatApp.Realtime.Infrastructure.Postgres.Migrations;
 
 /// <summary>
-/// 设备级同步游标：�?(user, device, conversation) 保存 catch-up 水位�?
+/// 设备级同步游标：�?(user, device, conversation) 保存 catch-up 水位�?
 /// </summary>
 public sealed class Migration008_DeviceSyncCursors : IRealtimeSchemaMigration
 {

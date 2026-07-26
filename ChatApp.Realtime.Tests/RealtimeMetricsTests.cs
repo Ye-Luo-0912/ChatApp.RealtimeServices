@@ -1,9 +1,11 @@
 using System.Diagnostics.Metrics;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
+using Xunit;
 
 namespace ChatApp.Realtime.Tests;
 
+[Collection("MeterListenerSerial")]
 public sealed class RealtimeMetricsTests
 {
     [Fact]
@@ -43,3 +45,9 @@ public sealed class RealtimeMetricsTests
             10);
     }
 }
+
+/// <summary>
+/// 标记使用 MeterListener 的测试类串行执行，避免并行捕获干扰指标。
+/// </summary>
+[CollectionDefinition("MeterListenerSerial", DisableParallelization = true)]
+public sealed class MeterListenerSerialDefinition { }

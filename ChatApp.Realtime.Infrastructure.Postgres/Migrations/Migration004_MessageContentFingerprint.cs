@@ -4,8 +4,8 @@ using Npgsql;
 namespace ChatApp.Realtime.Infrastructure.Postgres.Migrations;
 
 /// <summary>
-/// 消息内容指纹：同 (sender_user_id, client_message_id) 下区分真幂等重放与内容冲突�?
-/// 历史行允�?NULL；读取冲突路径时由应用按 receiver+content 计算�?
+/// 消息内容指纹：同 (sender_user_id, client_message_id) 下区分真幂等重放与内容冲突。
+/// 历史行允许 NULL；读取冲突路径时由应用按 receiver+content 计算。
 /// </summary>
 public sealed class Migration004_MessageContentFingerprint : IRealtimeSchemaMigration
 {

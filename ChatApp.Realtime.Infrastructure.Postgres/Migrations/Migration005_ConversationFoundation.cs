@@ -4,8 +4,8 @@ using Npgsql;
 namespace ChatApp.Realtime.Infrastructure.Postgres.Migrations;
 
 /// <summary>
-/// 会话基础模型：conversations / conversation_members、messages.conversation_id 与索引�?
-/// 历史数据回填�?<see cref="Migration009_ConversationBackfillBatches"/>（分批、幂等）�?
+/// 会话基础模型：conversations / conversation_members、messages.conversation_id 与索引�?
+/// 历史数据回填�?<see cref="Migration009_ConversationBackfillBatches"/>（分批、幂等）�?
 /// </summary>
 public sealed class Migration005_ConversationFoundation : IRealtimeSchemaMigration
 {

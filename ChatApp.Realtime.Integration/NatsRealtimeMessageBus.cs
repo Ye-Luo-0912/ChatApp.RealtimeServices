@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -11,6 +12,7 @@ using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.Ephemeral;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Integration.Serialization;
 using Microsoft.Extensions.Logging;
 using NATS.Client.Core;
@@ -21,10 +23,16 @@ namespace ChatApp.Realtime.Integration;
 
 public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposable
 {
+    private string RealtimeEventsShardWildcard =>
+        ShardedSubjectFormatter.ToWildcard(_options.RealtimeEventsShardSubjectPattern);
+
     private readonly RealtimeIntegrationOptions _options;
     private readonly NatsTransportMetrics _metrics;
     private readonly bool _ownsMetrics;
     private readonly ILogger<NatsRealtimeMessageBus> _logger;
+    private readonly IGatewayDirectory _gatewayDirectory;
+    private readonly IWatcherGatewayDirectory _watcherGatewayDirectory;
+    private readonly RoutingMetrics? _routingMetrics;
     private readonly Lazy<NatsConnection> _client;
     private readonly Lazy<INatsJSContext> _context;
     private readonly ConcurrentDictionary<string, Task<INatsJSStream>> _streams = new(StringComparer.Ordinal);
@@ -36,6 +44,8 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
             options,
             logger,
             new NatsTransportMetrics(RealtimeIntegrationTelemetry.ActivitySourceName),
+            gatewayDirectory: NullGatewayDirectory.Instance,
+            watcherGatewayDirectory: NullWatcherGatewayDirectory.Instance,
             ownsMetrics: true)
     {
     }
@@ -44,7 +54,27 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
         RealtimeIntegrationOptions options,
         ILogger<NatsRealtimeMessageBus> logger,
         NatsTransportMetrics metrics)
-        : this(options, logger, metrics, ownsMetrics: false)
+        : this(options, logger, metrics, NullGatewayDirectory.Instance, NullWatcherGatewayDirectory.Instance, ownsMetrics: false)
+    {
+    }
+
+    public NatsRealtimeMessageBus(
+        RealtimeIntegrationOptions options,
+        ILogger<NatsRealtimeMessageBus> logger,
+        NatsTransportMetrics metrics,
+        IGatewayDirectory gatewayDirectory)
+        : this(options, logger, metrics, gatewayDirectory, NullWatcherGatewayDirectory.Instance, ownsMetrics: false)
+    {
+    }
+
+    public NatsRealtimeMessageBus(
+        RealtimeIntegrationOptions options,
+        ILogger<NatsRealtimeMessageBus> logger,
+        NatsTransportMetrics metrics,
+        IGatewayDirectory gatewayDirectory,
+        IWatcherGatewayDirectory watcherGatewayDirectory,
+        RoutingMetrics? routingMetrics)
+        : this(options, logger, metrics, gatewayDirectory, watcherGatewayDirectory, ownsMetrics: false, routingMetrics)
     {
     }
 
@@ -52,15 +82,46 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
         RealtimeIntegrationOptions options,
         ILogger<NatsRealtimeMessageBus> logger,
         NatsTransportMetrics metrics,
-        bool ownsMetrics)
+        IGatewayDirectory gatewayDirectory,
+        IWatcherGatewayDirectory watcherGatewayDirectory,
+        bool ownsMetrics,
+        RoutingMetrics? routingMetrics = null)
     {
         _options = options;
         _logger = logger;
         _metrics = metrics;
         _ownsMetrics = ownsMetrics;
+        _gatewayDirectory = gatewayDirectory ?? NullGatewayDirectory.Instance;
+        _watcherGatewayDirectory = watcherGatewayDirectory ?? NullWatcherGatewayDirectory.Instance;
+        _routingMetrics = routingMetrics;
         _client = new Lazy<NatsConnection>(CreateClient);
         _context = new Lazy<INatsJSContext>(() => new NatsJSContext(_client.Value));
     }
+
+    /// <summary>
+    /// 是否启用按 Gateway 分片投递 Realtime Event / Ephemeral Typing。
+    /// </summary>
+    private bool IsShardedRoutingEnabled =>
+        _options.RoutingMode is EventRoutingMode.Sharded
+        && ShardedSubjectFormatter.IsSharded(_options.RealtimeEventsShardSubjectPattern);
+
+    /// <summary>
+    /// 当前实例订阅的 Realtime Event 分片 subject。
+    /// </summary>
+    private string RealtimeEventsShardSubject =>
+        ShardedSubjectFormatter.Format(_options.RealtimeEventsShardSubjectPattern, _options.InstanceId);
+
+    /// <summary>
+    /// 当前实例订阅的 Ephemeral Typing 分片 subject。
+    /// </summary>
+    private string EphemeralTypingShardSubject =>
+        ShardedSubjectFormatter.Format(_options.EphemeralTypingShardSubjectPattern, _options.InstanceId);
+
+    /// <summary>
+    /// 当前实例订阅的 Ephemeral Presence 分片 subject。
+    /// </summary>
+    private string EphemeralPresenceShardSubject =>
+        ShardedSubjectFormatter.Format(_options.EphemeralPresenceShardSubjectPattern, _options.InstanceId);
 
     public async Task PublishIncomingMessageAsync(
         IncomingMessageCommand command,
@@ -457,27 +518,90 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
 
     public async Task PublishEventAsync(RealtimeEvent evt, CancellationToken ct = default)
     {
-        var subject = evt.Type is RealtimeEventType.UserAccountDeleted
+        // 账号清理事件始终广播（Server Saga 共享 durable consumer）。
+        var isAccountCleanup = evt.Type is RealtimeEventType.UserAccountDeleted
             or RealtimeEventType.AccountCleanupCompleted
-            or RealtimeEventType.AttachmentBlobsPurge
+            or RealtimeEventType.AttachmentBlobsPurge;
+        var subject = isAccountCleanup
             ? _options.AccountCleanupSubject
             : _options.RealtimeEventsSubject;
+
         using var activity = RealtimeIntegrationTelemetry.StartProducer(
             "realtime_event.publish",
             subject);
         try
         {
+            // 账号清理事件或非分片模式：广播到全量 subject。
+            if (isAccountCleanup || !IsShardedRoutingEnabled)
+            {
+                _routingMetrics?.RecordBroadcastFallback(
+                    "realtime",
+                    isAccountCleanup ? "account_cleanup" : "no_pattern");
+                await EnsureStreamAsync(
+                    _options.RealtimeEventsStream,
+                    subject,
+                    _options.MaxAgeHours,
+                    ct).ConfigureAwait(false);
+                await PublishJetStreamWithReconnectRetryAsync(
+                    subject,
+                    RealtimeWireSerializer.Serialize(evt),
+                    evt.EventId,
+                    RealtimeIntegrationTelemetry.CreatePropagationHeaders(),
+                    ct).ConfigureAwait(false);
+                return;
+            }
+
+            // 分片模式：查询目标用户在线 Gateway 集合并定向发布。
+            var sw = Stopwatch.StartNew();
+            var gateways = await _gatewayDirectory
+                .GetOnlineGatewaysAsync(evt.TargetUserId, ct)
+                .ConfigureAwait(false);
+            sw.Stop();
+            _routingMetrics?.RecordDirectoryQuery("gateway", "single", sw.Elapsed, gateways.Count);
+
+            if (gateways.Count == 0)
+            {
+                // 路由目录为空（用户离线或查询失败）：回退到广播，避免事件丢失。
+                _routingMetrics?.RecordBroadcastFallback("realtime", "empty_directory");
+                await EnsureStreamAsync(
+                    _options.RealtimeEventsStream,
+                    subject,
+                    _options.MaxAgeHours,
+                    ct).ConfigureAwait(false);
+                await PublishJetStreamWithReconnectRetryAsync(
+                    subject,
+                    RealtimeWireSerializer.Serialize(evt),
+                    evt.EventId,
+                    RealtimeIntegrationTelemetry.CreatePropagationHeaders(),
+                    ct).ConfigureAwait(false);
+                return;
+            }
+
             await EnsureStreamAsync(
                 _options.RealtimeEventsStream,
-                subject,
+                RealtimeEventsShardWildcard,
                 _options.MaxAgeHours,
                 ct).ConfigureAwait(false);
-            await PublishJetStreamWithReconnectRetryAsync(
-                subject,
-                RealtimeWireSerializer.Serialize(evt),
-                evt.EventId,
-                RealtimeIntegrationTelemetry.CreatePropagationHeaders(),
-                ct).ConfigureAwait(false);
+
+            var payload = RealtimeWireSerializer.Serialize(evt);
+            var headers = RealtimeIntegrationTelemetry.CreatePropagationHeaders();
+            foreach (var instanceId in gateways)
+            {
+                if (string.IsNullOrWhiteSpace(instanceId))
+                    continue;
+
+                var shardSubject = ShardedSubjectFormatter.Format(
+                    _options.RealtimeEventsShardSubjectPattern,
+                    instanceId);
+                await PublishJetStreamWithReconnectRetryAsync(
+                    shardSubject,
+                    payload,
+                    evt.EventId + ":" + instanceId,
+                    headers,
+                    ct).ConfigureAwait(false);
+            }
+
+            _routingMetrics?.RecordShardPublish("realtime", "single", gateways.Count);
         }
         catch (Exception ex)
         {
@@ -485,11 +609,19 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
             throw;
         }
     }
+
     public IAsyncEnumerable<RealtimeEventDelivery> ConsumeEventsAsync(
-        CancellationToken ct = default) => ConsumeEventSubjectAsync(
-            _options.RealtimeEventsSubject,
+        CancellationToken ct = default)
+    {
+        // 分片模式：订阅本实例专属 subject；广播模式：订阅全量 subject。
+        var subject = IsShardedRoutingEnabled
+            ? RealtimeEventsShardSubject
+            : _options.RealtimeEventsSubject;
+        return ConsumeEventSubjectAsync(
+            subject,
             CreateConsumerName(_options.GatewayConsumerPrefix, _options.InstanceId),
             ct);
+    }
 
     public IAsyncEnumerable<RealtimeEventDelivery> ConsumeAccountCleanupEventsAsync(
         CancellationToken ct = default)
@@ -590,16 +722,70 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
                 .ConfigureAwait(false);
         }
     }
+
     public async Task PublishEphemeralTypingAsync(EphemeralTypingEvent evt, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(evt);
+
+        // 非分片模式或目标用户无效：广播。
+        if (!IsShardedRoutingEnabled || evt.TargetUserId <= 0)
+        {
+            _routingMetrics?.RecordBroadcastFallback("typing", "no_pattern");
+            await PublishEphemeralTypingToSubjectAsync(
+                _options.EphemeralTypingSubject,
+                evt,
+                ct).ConfigureAwait(false);
+            return;
+        }
+
+        // 分片模式：查询目标用户在线 Gateway 集合并定向发布。
+        var sw = Stopwatch.StartNew();
+        var gateways = await _gatewayDirectory
+            .GetOnlineGatewaysAsync(evt.TargetUserId, ct)
+            .ConfigureAwait(false);
+        sw.Stop();
+        _routingMetrics?.RecordDirectoryQuery("gateway", "single", sw.Elapsed, gateways.Count);
+
+        if (gateways.Count == 0)
+        {
+            // 路由目录为空：回退到广播，保证至少有一次投递尝试。
+            _routingMetrics?.RecordBroadcastFallback("typing", "empty_directory");
+            await PublishEphemeralTypingToSubjectAsync(
+                _options.EphemeralTypingSubject,
+                evt,
+                ct).ConfigureAwait(false);
+            return;
+        }
+
+        foreach (var instanceId in gateways)
+        {
+            if (string.IsNullOrWhiteSpace(instanceId))
+                continue;
+
+            var shardSubject = ShardedSubjectFormatter.Format(
+                _options.EphemeralTypingShardSubjectPattern,
+                instanceId);
+            await PublishEphemeralTypingToSubjectAsync(
+                shardSubject,
+                evt,
+                ct).ConfigureAwait(false);
+        }
+
+        _routingMetrics?.RecordShardPublish("typing", "single", gateways.Count);
+    }
+
+    private async Task PublishEphemeralTypingToSubjectAsync(
+        string subject,
+        EphemeralTypingEvent evt,
+        CancellationToken ct)
+    {
         using var activity = RealtimeIntegrationTelemetry.StartProducer(
             "ephemeral_typing.publish",
-            _options.EphemeralTypingSubject);
+            subject);
         try
         {
             await _client.Value.PublishAsync(
-                    _options.EphemeralTypingSubject,
+                    subject,
                     RealtimeWireSerializer.Serialize(evt),
                     cancellationToken: ct)
                 .ConfigureAwait(false);
@@ -614,13 +800,66 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
     public async Task PublishEphemeralPresenceAsync(EphemeralPresenceEvent evt, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(evt);
+
+        // 非分片模式或被观察用户无效：广播。
+        if (!IsShardedRoutingEnabled || evt.UserId <= 0)
+        {
+            _routingMetrics?.RecordBroadcastFallback("presence", "no_pattern");
+            await PublishEphemeralPresenceToSubjectAsync(
+                _options.EphemeralPresenceSubject,
+                evt,
+                ct).ConfigureAwait(false);
+            return;
+        }
+
+        // 分片模式：查询有哪些 Gateway 实例的本地用户正在观察此用户，定向投递。
+        var sw = Stopwatch.StartNew();
+        var gateways = await _watcherGatewayDirectory
+            .GetWatcherGatewaysAsync(evt.UserId, ct)
+            .ConfigureAwait(false);
+        sw.Stop();
+        _routingMetrics?.RecordDirectoryQuery("watcher", "single", sw.Elapsed, gateways.Count);
+
+        if (gateways.Count == 0)
+        {
+            // 观察者目录为空（无人观察或查询失败）：回退到广播，保证至少有一次投递尝试。
+            _routingMetrics?.RecordBroadcastFallback("presence", "empty_directory");
+            await PublishEphemeralPresenceToSubjectAsync(
+                _options.EphemeralPresenceSubject,
+                evt,
+                ct).ConfigureAwait(false);
+            return;
+        }
+
+        foreach (var instanceId in gateways)
+        {
+            if (string.IsNullOrWhiteSpace(instanceId))
+                continue;
+
+            var shardSubject = ShardedSubjectFormatter.Format(
+                _options.EphemeralPresenceShardSubjectPattern,
+                instanceId);
+            await PublishEphemeralPresenceToSubjectAsync(
+                shardSubject,
+                evt,
+                ct).ConfigureAwait(false);
+        }
+
+        _routingMetrics?.RecordShardPublish("presence", "single", gateways.Count);
+    }
+
+    private async Task PublishEphemeralPresenceToSubjectAsync(
+        string subject,
+        EphemeralPresenceEvent evt,
+        CancellationToken ct)
+    {
         using var activity = RealtimeIntegrationTelemetry.StartProducer(
             "ephemeral_presence.publish",
-            _options.EphemeralPresenceSubject);
+            subject);
         try
         {
             await _client.Value.PublishAsync(
-                    _options.EphemeralPresenceSubject,
+                    subject,
                     RealtimeWireSerializer.Serialize(evt),
                     cancellationToken: ct)
                 .ConfigureAwait(false);
@@ -635,8 +874,13 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
     public async IAsyncEnumerable<EphemeralTypingEvent> ConsumeEphemeralTypingAsync(
         [EnumeratorCancellation] CancellationToken ct = default)
     {
+        // 分片模式：订阅本实例专属 subject；广播模式：订阅全量 subject。
+        var subject = IsShardedRoutingEnabled
+            ? EphemeralTypingShardSubject
+            : _options.EphemeralTypingSubject;
+
         await foreach (var msg in _client.Value.SubscribeAsync<string>(
-                           _options.EphemeralTypingSubject,
+                           subject,
                            cancellationToken: ct)
                        .ConfigureAwait(false))
         {
@@ -662,8 +906,13 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
     public async IAsyncEnumerable<EphemeralPresenceEvent> ConsumeEphemeralPresenceAsync(
         [EnumeratorCancellation] CancellationToken ct = default)
     {
+        // 分片模式：订阅本实例专属 subject；广播模式：订阅全量 subject。
+        var subject = IsShardedRoutingEnabled
+            ? EphemeralPresenceShardSubject
+            : _options.EphemeralPresenceSubject;
+
         await foreach (var msg in _client.Value.SubscribeAsync<string>(
-                           _options.EphemeralPresenceSubject,
+                           subject,
                            cancellationToken: ct)
                        .ConfigureAwait(false))
         {
@@ -866,7 +1115,7 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
         }
 
         var subjects = streamName.Equals(_options.RealtimeEventsStream, StringComparison.Ordinal)
-            ? new[] { _options.RealtimeEventsSubject, _options.AccountCleanupSubject }
+            ? BuildRealtimeEventsStreamSubjects()
             : new[] { subject };
         var config = new StreamConfig(streamName, subjects)
         {
@@ -880,6 +1129,30 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
             NumReplicas = _options.Replicas
         };
         return await _context.Value.CreateOrUpdateStreamAsync(config, CancellationToken.None).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 构建 REALTIME_EVENTS 流的 subject 列表。
+    /// <para>
+    /// 分片模式下额外包含通配符 subject（<c>chat.realtime-events.&gt;</c>），
+    /// 使流能够接收所有 Gateway 实例的分片投递。
+    /// </para>
+    /// </summary>
+    private string[] BuildRealtimeEventsStreamSubjects()
+    {
+        var list = new List<string>(3)
+        {
+            _options.RealtimeEventsSubject,
+            _options.AccountCleanupSubject
+        };
+
+        if (IsShardedRoutingEnabled
+            && ShardedSubjectFormatter.IsSharded(_options.RealtimeEventsShardSubjectPattern))
+        {
+            list.Add(RealtimeEventsShardWildcard);
+        }
+
+        return list.ToArray();
     }
 
     private NatsConnection CreateClient()

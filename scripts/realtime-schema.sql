@@ -186,6 +186,10 @@ CREATE INDEX IF NOT EXISTS ix_attachments_unbound_age
     ON realtime.attachments (created_at_ms)
     WHERE status IN (0, 1);
 
+-- Migration020: age-based retention GC keyset index
+CREATE INDEX IF NOT EXISTS ix_messages_received_at
+    ON realtime.messages (received_at_ms, message_id);
+
 INSERT INTO realtime.schema_migrations (version, name, applied_at_ms)
 VALUES
     (1, 'baseline_schema', (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint),
@@ -195,5 +199,6 @@ VALUES
     (5, 'conversation_foundation', (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint),
     (6, 'conversation_list_index', (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint),
     (7, 'conversation_member_prefs', (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint),
-    (12, 'attachments', (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint)
+    (12, 'attachments', (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint),
+    (20, 'message_retention_age_index', (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint)
 ON CONFLICT (version) DO NOTHING;

@@ -59,6 +59,40 @@ public sealed class RealtimeIntegrationOptions
 
     /// <summary>NATS 客户端认证（与 RealtimeServices Nats:Auth 对齐）。</summary>
     public RealtimeIntegrationAuthOptions Auth { get; set; } = new();
+
+    // ---- 第三阶段：大规模路由 ----
+
+    /// <summary>
+    /// Realtime Event 投递路由模式。默认广播（向后兼容），设为 Sharded 启用按 Gateway 分片投递。
+    /// </summary>
+    public EventRoutingMode RoutingMode { get; set; } = EventRoutingMode.Broadcast;
+
+    /// <summary>
+    /// Realtime Event 分片 subject 模板，使用 {0} 作为实例 ID 占位符。
+    /// <para>
+    /// Sharded 模式下，Gateway 订阅此 subject（填入自身 InstanceId），
+    /// 发布方按目标用户的在线 Gateway 集合定向投递到此 subject。
+    /// </para>
+    /// </summary>
+    public string RealtimeEventsShardSubjectPattern { get; set; } = "chat.realtime-events.{0}";
+
+    /// <summary>
+    /// Ephemeral Typing 分片 subject 模板，使用 {0} 作为实例 ID 占位符。
+    /// <para>
+    /// Sharded 模式下，Gateway 订阅此 subject（填入自身 InstanceId），
+    /// 发布方按目标用户的在线 Gateway 集合定向投递。
+    /// </para>
+    /// </summary>
+    public string EphemeralTypingShardSubjectPattern { get; set; } = "chat.ephemeral.typing.{0}";
+
+    /// <summary>
+    /// Ephemeral Presence 分片 subject 模板，使用 {0} 作为实例 ID 占位符。
+    /// <para>
+    /// Sharded 模式下，Gateway 订阅此 subject（填入自身 InstanceId），
+    /// 发布方按观察者的在线 Gateway 集合定向投递。
+    /// </para>
+    /// </summary>
+    public string EphemeralPresenceShardSubjectPattern { get; set; } = "chat.ephemeral.presence.{0}";
 }
 
 public sealed class RealtimeIntegrationAuthOptions

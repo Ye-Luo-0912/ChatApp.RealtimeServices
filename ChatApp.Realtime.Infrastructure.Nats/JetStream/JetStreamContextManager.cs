@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using ChatApp.Realtime.Abstractions.Queueing;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Infrastructure.Nats.Configuration;
 using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Nats.Queueing;
@@ -16,6 +17,7 @@ public sealed class JetStreamContextManager
     private readonly RealtimeQueueOptions _queueOptions;
     private readonly JetStreamOptions _options;
     private readonly ILogger<JetStreamContextManager> _logger;
+    private readonly string? _shardSubjectPattern;
     private readonly Lazy<INatsJSContext> _context;
     private readonly ConcurrentDictionary<string, Task<INatsJSStream>> _streams =
         new(StringComparer.Ordinal);
@@ -24,12 +26,16 @@ public sealed class JetStreamContextManager
         NatsConnectionClient connectionClient,
         RealtimeQueueOptions queueOptions,
         JetStreamOptions options,
-        ILogger<JetStreamContextManager> logger)
+        ILogger<JetStreamContextManager> logger,
+        string? shardSubjectPattern = null)
     {
         _connectionClient = connectionClient;
         _queueOptions = queueOptions;
         _options = options;
         _logger = logger;
+        _shardSubjectPattern = string.IsNullOrWhiteSpace(shardSubjectPattern)
+            ? null
+            : shardSubjectPattern;
         _context = new Lazy<INatsJSContext>(CreateContext);
     }
 
@@ -80,7 +86,7 @@ public sealed class JetStreamContextManager
                 ct),
             GetOrCreateStreamAsync(
                 _options.Streams.RealtimeEvents,
-                [_queueOptions.Topics.RealtimeEvents, _queueOptions.Topics.AccountCleanup],
+                BuildRealtimeEventsStreamSubjects(),
                 _options.MaxAgeHours,
                 ct),
             GetOrCreateStreamAsync(
@@ -95,7 +101,7 @@ public sealed class JetStreamContextManager
     {
         var stream = await GetOrCreateStreamAsync(
             _options.Streams.RealtimeEvents,
-            [_queueOptions.Topics.RealtimeEvents, _queueOptions.Topics.AccountCleanup],
+            BuildRealtimeEventsStreamSubjects(),
             _options.MaxAgeHours,
             ct).ConfigureAwait(false);
         return await CreateOrUpdateConsumerAsync(
@@ -113,7 +119,7 @@ public sealed class JetStreamContextManager
     {
         var stream = await GetOrCreateStreamAsync(
             _options.Streams.RealtimeEvents,
-            [_queueOptions.Topics.RealtimeEvents, _queueOptions.Topics.AccountCleanup],
+            BuildRealtimeEventsStreamSubjects(),
             _options.MaxAgeHours,
             ct).ConfigureAwait(false);
         return await CreateOrUpdateConsumerAsync(
@@ -132,6 +138,17 @@ public sealed class JetStreamContextManager
             eventId,
             payload,
             ct).ConfigureAwait(false);
+
+    /// <summary>
+    /// 将实时事件发布到指定 subject（用于分片投递）。
+    /// </summary>
+    public async Task PublishRealtimeEventToSubjectAsync(
+        string subject,
+        string eventId,
+        string payload,
+        CancellationToken ct = default)
+        => await PublishToSubjectAsync(subject, eventId, payload, ct)
+            .ConfigureAwait(false);
 
     public async Task PublishAccountCleanupEventAsync(
         string eventId,
@@ -269,9 +286,25 @@ public sealed class JetStreamContextManager
 
     private static NatsJSPubOpts CreatePublishOptions(
         string messageId) => new()
+    {
+        MsgId = messageId,
+        RetryAttempts = 3,
+        RetryWaitBetweenAttempts = TimeSpan.FromMilliseconds(200)
+    };
+
+    private IReadOnlyCollection<string> BuildRealtimeEventsStreamSubjects()
+    {
+        var subjects = new List<string>(3)
         {
-            MsgId = messageId,
-            RetryAttempts = 3,
-            RetryWaitBetweenAttempts = TimeSpan.FromMilliseconds(200)
+            _queueOptions.Topics.RealtimeEvents,
+            _queueOptions.Topics.AccountCleanup
         };
+
+        if (!string.IsNullOrWhiteSpace(_shardSubjectPattern))
+        {
+            subjects.Add(ShardedSubjectFormatter.ToWildcard(_shardSubjectPattern));
+        }
+
+        return subjects;
+    }
 }

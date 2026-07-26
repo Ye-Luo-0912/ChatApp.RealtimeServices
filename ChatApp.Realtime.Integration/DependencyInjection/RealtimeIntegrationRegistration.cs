@@ -1,6 +1,8 @@
 using ChatApp.Realtime.Abstractions.Diagnostics;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Integration.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace ChatApp.Realtime.Integration.DependencyInjection;
 
@@ -28,6 +30,9 @@ public static class RealtimeIntegrationRegistration
         services.AddSingleton(options);
         services.AddSingleton(_ => new NatsTransportMetrics(
             RealtimeIntegrationTelemetry.ActivitySourceName));
+        services.TryAddSingleton<RoutingMetrics>();
+        services.TryAddSingleton<IGatewayDirectory, NullGatewayDirectory>();
+        services.TryAddSingleton<IWatcherGatewayDirectory, NullWatcherGatewayDirectory>();
         services.AddSingleton<IRealtimeMessageBus, NatsRealtimeMessageBus>();
         return services;
     }

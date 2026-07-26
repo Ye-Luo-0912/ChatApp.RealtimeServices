@@ -74,6 +74,19 @@ public static class RealtimeEventContracts
         return Convert.ToHexStringLower(SHA256.HashData(input));
     }
 
+    /// <summary>
+    /// 群聊聚合事件的幂等键：按 (senderUserId, clientMessageId, conversationId) 派生，
+    /// 不再按 target 拆分。同一群消息只产生一个 EventId，避免 per-member 拆分时的冲突吞掉。
+    /// </summary>
+    public static string CreateGroupMessageReceivedEventId(
+        long senderUserId,
+        string clientMessageId,
+        string conversationId)
+    {
+        var input = Encoding.UTF8.GetBytes($"grpmsg:{senderUserId}:{clientMessageId}:{conversationId}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
     public static string CreateSenderEchoEventId(string messageId, long senderUserId)
     {
         var input = Encoding.UTF8.GetBytes($"msgecho:{messageId}:{senderUserId}");

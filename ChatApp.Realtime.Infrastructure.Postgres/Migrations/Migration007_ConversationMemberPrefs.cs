@@ -4,7 +4,7 @@ using Npgsql;
 namespace ChatApp.Realtime.Infrastructure.Postgres.Migrations;
 
 /// <summary>
-/// 会话成员偏好：置�?/ 免打扰�?
+/// 会话成员偏好表，记录免打扰与静音等成员级偏好设置。
 /// </summary>
 public sealed class Migration007_ConversationMemberPrefs : IRealtimeSchemaMigration
 {

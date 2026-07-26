@@ -105,6 +105,8 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             ForwardedFromMessageId = command.ForwardedFromMessageId,
             ForwardedFromSenderUserId = command.ForwardedFromSenderUserId,
             ForwardedFromPreview = command.ForwardedFromPreview,
+            MentionedUserIds = command.MentionedUserIds,
+            MentionedRoles = command.MentionedRoles,
             ReceivedAtMs = command.ReceivedAtMs
         };
 
@@ -141,7 +143,9 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                     ReplyToPreview = command.ReplyToPreview,
                     ForwardedFromMessageId = command.ForwardedFromMessageId,
                     ForwardedFromSenderUserId = command.ForwardedFromSenderUserId,
-                    ForwardedFromPreview = command.ForwardedFromPreview
+                    ForwardedFromPreview = command.ForwardedFromPreview,
+                    MentionedUserIds = command.MentionedUserIds,
+                    MentionedRoles = command.MentionedRoles
                 },
                 RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload),
             OccurredAtMs = command.ReceivedAtMs,

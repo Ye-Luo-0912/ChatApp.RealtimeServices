@@ -185,19 +185,26 @@ public sealed class GroupChatTests : IAsyncLifetime
         await using var connection = await client.GetDataSource().OpenConnectionAsync();
         await using var outbox = new NpgsqlCommand(
             $"""
-             SELECT target_user_id
+             SELECT target_user_ids
              FROM {schema.OutboxTableSql}
              WHERE event_type = @type
-             ORDER BY target_user_id
              """,
             connection);
         outbox.Parameters.AddWithValue("type", (short)RealtimeEventType.MessageReceived);
-        var targets = new List<long>();
         await using var reader = await outbox.ExecuteReaderAsync();
+        long[]? aggregated = null;
         while (await reader.ReadAsync())
-            targets.Add(reader.GetInt64(0));
+        {
+            if (!reader.IsDBNull(0))
+            {
+                aggregated = (long[])reader.GetValue(0);
+                break;
+            }
+        }
 
-        Assert.Equal([1L, 2L, 3L], targets);
+        Assert.NotNull(aggregated);
+        Array.Sort(aggregated!);
+        Assert.Equal([1L, 2L, 3L], aggregated);
     }
 
     [Fact]

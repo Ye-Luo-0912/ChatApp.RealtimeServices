@@ -125,7 +125,14 @@ public sealed class OutboxPublisherWorker : BackgroundService
         activity?.SetTag("chat.event.type", record.Event.Type.ToString());
         try
         {
-            await _publisher.PublishAsync(record.Event, ct).ConfigureAwait(false);
+            if (record.Event.TargetUserIds is { Length: > 0 })
+            {
+                await _publisher.PublishToManyAsync(record.Event, ct).ConfigureAwait(false);
+            }
+            else
+            {
+                await _publisher.PublishAsync(record.Event, ct).ConfigureAwait(false);
+            }
             await _outboxStore.MarkPublishedAsync(record, ct).ConfigureAwait(false);
             _metrics.RecordOutboxPublished();
         }

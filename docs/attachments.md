@@ -54,7 +54,8 @@ Device cursor upsert persists **only** the last message actually returned in cat
 - `SaveAsync` bind (Confirmed → Bound) when `IncomingMessageCommand.AttachmentIds` present
 - History/Sync enrich via `RealtimeHistoryAttachmentEnricher` (batch `ListByMessageIdsAsync`)
 - Sync bootstrap resolves watermarks via `ResolveSyncWatermarksAsync` (ResetRequired for invalid/future cursors; no silent tip-clamp)
-- Account delete: delete rows → enqueue chunked `AttachmentBlobsPurge` → `AccountCleanupCompleted`
+- Account delete: list object keys → enqueue chunked `AttachmentBlobsPurge` → delete rows → `AccountCleanupCompleted`
+- Retention GC: after hard-deleting aged messages, Bound attachments on those messages are unbound → Abandoned and chunked `AttachmentBlobsPurge` is enqueued (Confirmed-unbound uploads untouched)
 
 ## Online migrations 009–011
 - `IRealtimeSchemaMigration.RequiresTransaction` (default true); runner skips outer txn when false
@@ -70,13 +71,11 @@ Device cursor upsert persists **only** the last message actually returned in cat
 - Implement `GET /api/attachments/{id}/download` (authz + optional short-lived ticket) and `POST .../ticket`
 
 ## Residuals / deferred
-- Age-based message purge/tombstone GC → **landed**: `MessageRetentionWorker` + [message-retention.md](message-retention.md) (hard-delete + tip repair; Bound attachment blobs left for orphan/account GC)
+- Age-based message purge/tombstone GC → **landed**: `MessageRetentionWorker` + [message-retention.md](message-retention.md) (hard-delete + tip repair + Bound unbind/Abandoned + `AttachmentBlobsPurge` + unread recount)
 - EfCore message store does **not** bind attachments (production path is Npgsql); conflict compare treats existing attachments as empty
 - No Ticketed insert API in Realtime yet (Server may insert Confirmed directly after upload confirm)
 - No Abandoned sweeper worker for unbound Ticketed/Confirmed age index → **landed**: Server `AttachmentAbandonedAgeSweeper` (via `AttachmentCleanupWorker`) marks aged unbound Ticketed/Confirmed → Abandoned and enqueues blob delete tombs.
-- Orphan `message_id` when peer messages deleted but uploader differs (uploader rows purged only on uploader account delete) — also applies after retention GC leaves Bound attachments pointing at purged messages
-- Retention GC does not recompute denormalized `unread_count` (unlikely issue for long horizons)
 - Soft-tombstone then hard-delete / ConversationChanged fanout not implemented (v1 is silent hard-delete)
-- `scripts/realtime-schema.sql` still omits migrations 8–11 DDL history; appends attachments + version 12 for Job bootstrap
+- `scripts/realtime-schema.sql` still omits migrations 8–11 DDL history; appends attachments + version 12 for Job bootstrap (retention age index appended as version 20)
 - Multi-device attachment sync beyond message fanout
 - Thumbnail generation pipeline not implemented

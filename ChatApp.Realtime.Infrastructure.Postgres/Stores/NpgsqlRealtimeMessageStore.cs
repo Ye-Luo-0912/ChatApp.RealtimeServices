@@ -64,6 +64,8 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 forwarded_from_message_id,
                 forwarded_from_sender_user_id,
                 forwarded_from_preview,
+                mentioned_user_ids,
+                mentioned_roles,
                 edit_version,
                 changed_at_ms
             )
@@ -84,6 +86,8 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 @forwarded_from_message_id,
                 @forwarded_from_sender_user_id,
                 @forwarded_from_preview,
+                @mentioned_user_ids,
+                @mentioned_roles,
                 1,
                 @received_at_ms
             )
@@ -126,6 +130,16 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         command.Parameters.AddWithValue(
             "forwarded_from_preview",
             (object?)message.ForwardedFromPreview ?? DBNull.Value);
+        command.Parameters.AddWithValue(
+            "mentioned_user_ids",
+            message.MentionedUserIds is { Count: > 0 }
+                ? (object)message.MentionedUserIds.ToArray()
+                : DBNull.Value);
+        command.Parameters.AddWithValue(
+            "mentioned_roles",
+            message.MentionedRoles is { Count: > 0 }
+                ? (object)message.MentionedRoles.ToArray()
+                : DBNull.Value);
 
         var affectedRows = await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         if (affectedRows == 0)
@@ -236,13 +250,10 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 return RealtimeMessagePersistResult.NotAllowed(message.MessageId);
             }
 
-            foreach (var targetUserId in memberIds)
-            {
-                outboxEvents.Add(CreateGroupMessageReceivedEvent(
-                    createdEvent,
-                    message,
-                    targetUserId));
-            }
+            outboxEvents.Add(CreateGroupMessageAggregatedEvent(
+                createdEvent,
+                message,
+                memberIds));
 
             await AdvanceGroupConversationAndEnqueueAsync(
                     connection,
@@ -346,26 +357,27 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         }
     }
 
-    private static RealtimeEvent CreateGroupMessageReceivedEvent(
+    private static RealtimeEvent CreateGroupMessageAggregatedEvent(
         RealtimeEvent template,
         RealtimeMessageRecord message,
-        long targetUserId)
+        IReadOnlyList<long> targetUserIds)
     {
         return new RealtimeEvent
         {
-            EventId = RealtimeEventContracts.CreateMessageReceivedEventId(
+            EventId = RealtimeEventContracts.CreateGroupMessageReceivedEventId(
                 message.SenderUserId,
                 message.ClientMessageId,
-                targetUserId),
+                message.ConversationId!),
             Type = RealtimeEventType.MessageReceived,
-            TargetUserId = targetUserId,
+            TargetUserId = message.SenderUserId,
             ActorUserId = message.SenderUserId,
             MessageId = message.MessageId,
             SessionId = message.SenderSessionId,
             PayloadJson = template.PayloadJson,
             OccurredAtMs = template.OccurredAtMs,
             TraceParent = template.TraceParent,
-            TraceState = template.TraceState
+            TraceState = template.TraceState,
+            TargetUserIds = targetUserIds.ToArray()
         };
     }
 
@@ -755,7 +767,9 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             ReplyToPreview = payload.ReplyToPreview,
             ForwardedFromMessageId = payload.ForwardedFromMessageId,
             ForwardedFromSenderUserId = payload.ForwardedFromSenderUserId,
-            ForwardedFromPreview = payload.ForwardedFromPreview
+            ForwardedFromPreview = payload.ForwardedFromPreview,
+            MentionedUserIds = payload.MentionedUserIds,
+            MentionedRoles = payload.MentionedRoles
         };
 
         return new RealtimeEvent
@@ -798,13 +812,17 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         {
             var evt = events[i];
             values.Add(
-                $"(@event_id_{i}, @payload_json_{i}, @target_user_id_{i}, @event_type_{i}, @status, @created_at_ms, @next_attempt_at_ms, 0)");
+                $"(@event_id_{i}, @payload_json_{i}, @target_user_id_{i}, @event_type_{i}, @status, @created_at_ms, @next_attempt_at_ms, 0, @target_user_ids_{i})");
             command.Parameters.AddWithValue($"event_id_{i}", evt.EventId);
             command.Parameters.AddWithValue(
                 $"payload_json_{i}",
                 JsonSerializer.Serialize(evt, RealtimeJsonSerializerContext.Default.RealtimeEvent));
             command.Parameters.AddWithValue($"target_user_id_{i}", evt.TargetUserId);
             command.Parameters.AddWithValue($"event_type_{i}", (short)evt.Type);
+            var targetUserIdsParam = command.Parameters.Add(
+                $"target_user_ids_{i}",
+                NpgsqlTypes.NpgsqlDbType.Array | NpgsqlTypes.NpgsqlDbType.Bigint);
+            targetUserIdsParam.Value = (object?)evt.TargetUserIds ?? DBNull.Value;
         }
 
         command.Parameters.AddWithValue("status", (short)RealtimeOutboxStatus.Pending);
@@ -814,7 +832,7 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             $"""
              INSERT INTO {_databaseSchema.OutboxTableSql} (
                  event_id, payload_json, target_user_id, event_type, status,
-                 created_at_ms, next_attempt_at_ms, attempt_count
+                 created_at_ms, next_attempt_at_ms, attempt_count, target_user_ids
              ) VALUES
                  {string.Join(",\n                 ", values)}
              ON CONFLICT (event_id) DO NOTHING;

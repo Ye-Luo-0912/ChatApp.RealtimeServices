@@ -5,12 +5,14 @@ using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Queueing;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Infrastructure.Nats.Configuration;
 using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Nats.JetStream;
 using ChatApp.Realtime.Infrastructure.Nats.Queueing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 
 namespace ChatApp.Realtime.Infrastructure.Nats.DependencyInjection;
 
@@ -28,6 +30,7 @@ public static class RealtimeNatsRegistration
         }
         services.TryAddSingleton(_ => new NatsTransportMetrics(
             RealtimeNatsTelemetry.MeterName));
+        services.TryAddSingleton<RoutingMetrics>();
         services.AddSingleton<NatsConnectionClient>();
         services.RemoveAll<IMessageHistoryQueryConsumer>();
         services.AddSingleton<IMessageHistoryQueryConsumer, NatsMessageHistoryQueryConsumer>();
@@ -51,10 +54,30 @@ public static class RealtimeNatsRegistration
         if (IsJetStream(queueOptions))
         {
             services.AddSingleton(jetStreamOptions ?? new JetStreamOptions());
-            services.AddSingleton<JetStreamContextManager>();
+            services.TryAddSingleton<IGatewayDirectory, NullGatewayDirectory>();
+            services.TryAddSingleton<IWatcherGatewayDirectory, NullWatcherGatewayDirectory>();
+            services.AddSingleton<JetStreamContextManager>(static sp =>
+            {
+                var shardPattern = sp.GetRequiredService<RealtimeQueueOptions>()
+                    .RealtimeEventsShardSubjectPattern;
+                return new JetStreamContextManager(
+                    sp.GetRequiredService<NatsConnectionClient>(),
+                    sp.GetRequiredService<RealtimeQueueOptions>(),
+                    sp.GetRequiredService<JetStreamOptions>(),
+                    sp.GetRequiredService<ILogger<JetStreamContextManager>>(),
+                    shardPattern);
+            });
 
             services.RemoveAll<IRealtimeEventPublisher>();
-            services.AddSingleton<IRealtimeEventPublisher, JetStreamRealtimeEventPublisher>();
+            services.AddSingleton<IRealtimeEventPublisher>(static sp =>
+            {
+                var queueOptions = sp.GetRequiredService<RealtimeQueueOptions>();
+                return new JetStreamRealtimeEventPublisher(
+                    sp.GetRequiredService<JetStreamContextManager>(),
+                    sp.GetService<IGatewayDirectory>(),
+                    queueOptions.RealtimeEventsShardSubjectPattern,
+                    sp.GetService<RoutingMetrics>());
+            });
             services.RemoveAll<IRealtimeEventConsumer>();
             services.AddSingleton<IRealtimeEventConsumer, JetStreamRealtimeEventConsumer>();
             services.RemoveAll<IIncomingMessageConsumer>();
@@ -66,8 +89,20 @@ public static class RealtimeNatsRegistration
         }
         else
         {
+            services.TryAddSingleton<IGatewayDirectory, NullGatewayDirectory>();
+            services.TryAddSingleton<IWatcherGatewayDirectory, NullWatcherGatewayDirectory>();
             services.RemoveAll<IRealtimeEventPublisher>();
-            services.AddSingleton<IRealtimeEventPublisher, NatsRealtimeEventPublisher>();
+            services.AddSingleton<IRealtimeEventPublisher>(static sp =>
+            {
+                var queueOptions = sp.GetRequiredService<RealtimeQueueOptions>();
+                return new NatsRealtimeEventPublisher(
+                    queueOptions,
+                    sp.GetRequiredService<NatsConnectionClient>(),
+                    sp.GetRequiredService<ILogger<NatsRealtimeEventPublisher>>(),
+                    sp.GetService<IGatewayDirectory>(),
+                    queueOptions.RealtimeEventsShardSubjectPattern,
+                    sp.GetService<RoutingMetrics>());
+            });
             services.RemoveAll<IRealtimeEventConsumer>();
             services.AddSingleton<IRealtimeEventConsumer, NatsRealtimeEventConsumer>();
             services.RemoveAll<IIncomingMessageConsumer>();

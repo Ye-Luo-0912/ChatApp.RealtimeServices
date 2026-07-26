@@ -4,8 +4,8 @@ using Npgsql;
 namespace ChatApp.Realtime.Infrastructure.Postgres.Migrations;
 
 /// <summary>
-/// Outbox 增加 typed <c>target_user_id</c> / <c>event_type</c>，并�?payload JSON 回填�?
-/// 以便用户清理按精确列匹配，而不再依�?JSON LIKE�?
+/// Outbox 增加 typed <c>target_user_id</c> / <c>event_type</c>，并�?payload JSON 回填�?
+/// 以便用户清理按精确列匹配，而不再依�?JSON LIKE�?
 /// </summary>
 public sealed class Migration002_OutboxTypedTargetColumns : IRealtimeSchemaMigration
 {
@@ -24,7 +24,7 @@ public sealed class Migration002_OutboxTypedTargetColumns : IRealtimeSchemaMigra
         {
             $"ALTER TABLE {outbox} ADD COLUMN IF NOT EXISTS \"target_user_id\" bigint NULL;",
             $"ALTER TABLE {outbox} ADD COLUMN IF NOT EXISTS \"event_type\" smallint NULL;",
-            // jsonb 解析对空白与属性顺序不敏感，避免旧 LIKE 前缀误伤（如 user 12 误删 123）�?
+            // jsonb 解析对空白与属性顺序不敏感，避免旧 LIKE 前缀误伤（如 user 12 误删 123）�?
             $"""
              UPDATE {outbox}
              SET
@@ -36,7 +36,7 @@ public sealed class Migration002_OutboxTypedTargetColumns : IRealtimeSchemaMigra
                      NULLIF(BTRIM("payload_json"::jsonb ->> 'Type'), '')::smallint)
              WHERE "target_user_id" IS NULL OR "event_type" IS NULL;
              """,
-            // 无法�?payload 解析的历史脏行：落到 0，保证后�?NOT NULL；userId>0 的清理不会误删�?
+            // 无法�?payload 解析的历史脏行：落到 0，保证后�?NOT NULL；userId>0 的清理不会误删�?
             $"""
              UPDATE {outbox}
              SET

@@ -102,7 +102,9 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
             ReplyToPreview = message.ReplyToPreview,
             ForwardedFromMessageId = message.ForwardedFromMessageId,
             ForwardedFromSenderUserId = message.ForwardedFromSenderUserId,
-            ForwardedFromPreview = message.ForwardedFromPreview
+            ForwardedFromPreview = message.ForwardedFromPreview,
+            MentionedUserIds = message.MentionedUserIds,
+            MentionedRoles = message.MentionedRoles
         });
         dbContext.Outbox.Add(CreateOutboxEntity(eventToPublish, message.MessageId));
 

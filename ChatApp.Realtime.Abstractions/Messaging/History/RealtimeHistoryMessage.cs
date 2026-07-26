@@ -23,6 +23,12 @@ public sealed class RealtimeHistoryMessage
     public long? ForwardedFromSenderUserId { get; init; }
     public string? ForwardedFromPreview { get; init; }
 
+    /// <summary>@提到的用户 Id 列表（群聊场景下使用）。</summary>
+    public IReadOnlyList<long>? MentionedUserIds { get; init; }
+
+    /// <summary>@提到的角色（如 "all"、"admin"）；目前仅供展示，无强校验。</summary>
+    public IReadOnlyList<string>? MentionedRoles { get; init; }
+
     /// <summary>非空表示已撤回。</summary>
     public long? RecalledAtMs { get; init; }
 

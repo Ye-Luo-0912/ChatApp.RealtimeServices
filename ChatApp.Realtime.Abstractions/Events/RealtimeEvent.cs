@@ -27,4 +27,10 @@ public sealed class RealtimeEvent
     public string? TraceState { get; init; }
 
     public long OccurredAtMs { get; init; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+    /// <summary>
+    /// 多目标投递列表（群聊聚合事件使用）。非空时按此列表遍历本机会话投递；
+    /// 为空时回退到 <see cref="TargetUserId"/> 单目标路径。
+    /// </summary>
+    public long[]? TargetUserIds { get; init; }
 }

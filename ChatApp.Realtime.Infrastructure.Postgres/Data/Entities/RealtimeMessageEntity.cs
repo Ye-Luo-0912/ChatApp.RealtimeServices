@@ -19,6 +19,8 @@ public sealed class RealtimeMessageEntity
     public string? ForwardedFromMessageId { get; init; }
     public long? ForwardedFromSenderUserId { get; init; }
     public string? ForwardedFromPreview { get; init; }
+    public IReadOnlyList<long>? MentionedUserIds { get; init; }
+    public IReadOnlyList<string>? MentionedRoles { get; init; }
     public long? RecalledAtMs { get; set; }
     public int EditVersion { get; set; } = 1;
     public long? EditedAtMs { get; set; }

@@ -24,4 +24,6 @@ public sealed class NoopRealtimeEventPublisher : IRealtimeEventPublisher
 
         return Task.CompletedTask;
     }
+
+    public Task PublishToManyAsync(RealtimeEvent evt, CancellationToken ct = default) => Task.CompletedTask;
 }

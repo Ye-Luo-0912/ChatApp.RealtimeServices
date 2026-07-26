@@ -11,10 +11,12 @@ namespace ChatApp.RealtimeServices.Workers;
 /// <summary>
 /// Batched age-based hard-delete of messages older than the retention horizon.
 /// Silent GC (no ConversationChanged). Disabled when Enabled=false or effective horizon is 0.
+/// After purge, notifies outbox when AttachmentBlobsPurge events were enqueued.
 /// </summary>
 public sealed class MessageRetentionWorker : BackgroundService
 {
     private readonly IRealtimeMessageRetentionStore _store;
+    private readonly IRealtimeOutboxSignal _outboxSignal;
     private readonly RealtimeMetrics _metrics;
     private readonly MessageRetentionOptions _options;
     private readonly SyncBootstrapOptions _syncBootstrap;
@@ -23,12 +25,14 @@ public sealed class MessageRetentionWorker : BackgroundService
 
     public MessageRetentionWorker(
         IRealtimeMessageRetentionStore store,
+        IRealtimeOutboxSignal outboxSignal,
         RealtimeMetrics metrics,
         IOptions<MessageRetentionOptions> options,
         SyncBootstrapOptions syncBootstrap,
         ILogger<MessageRetentionWorker> logger)
     {
         _store = store;
+        _outboxSignal = outboxSignal;
         _metrics = metrics;
         _options = options.Value;
         _syncBootstrap = syncBootstrap;
@@ -70,6 +74,8 @@ public sealed class MessageRetentionWorker : BackgroundService
             return;
 
         var totalDeleted = 0;
+        var totalAbandoned = 0;
+        var totalPurgeEvents = 0;
         var batches = 0;
         var maxBatches = _options.MaxBatchesPerCycle <= 0
             ? int.MaxValue
@@ -93,6 +99,10 @@ public sealed class MessageRetentionWorker : BackgroundService
                 break;
 
             totalDeleted += result.DeletedCount;
+            totalAbandoned += result.AttachmentsAbandoned;
+            totalPurgeEvents += result.AttachmentPurgeEventsEnqueued;
+            if (result.AttachmentPurgeEventsEnqueued > 0)
+                _outboxSignal.Notify();
             _metrics.RecordMessageRetentionDeleted(result.DeletedCount);
             batches++;
 
@@ -117,9 +127,12 @@ public sealed class MessageRetentionWorker : BackgroundService
         if (totalDeleted > 0)
         {
             _logger.LogInformation(
-                "Message retention GC deleted rows. Deleted={Deleted}; Batches={Batches}; HorizonMs={HorizonMs}; Cutoff={Cutoff}",
+                "Message retention GC deleted rows. Deleted={Deleted}; Batches={Batches}; " +
+                "AttachmentsAbandoned={Abandoned}; PurgeEvents={PurgeEvents}; HorizonMs={HorizonMs}; Cutoff={Cutoff}",
                 totalDeleted,
                 batches,
+                totalAbandoned,
+                totalPurgeEvents,
                 horizonMs,
                 cutoff);
         }
