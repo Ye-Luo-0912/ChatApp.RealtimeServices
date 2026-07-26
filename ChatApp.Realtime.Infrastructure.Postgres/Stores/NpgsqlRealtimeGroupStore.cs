@@ -940,7 +940,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
 
         return new RealtimeEvent
         {
-            EventId = RealtimeEventContracts.CreateConversationCreatedAggregatedEventId(
+            EventId = ConversationEventIdFactory.CreateConversationCreatedAggregatedEventId(
                 conversationId,
                 causeToken,
                 occurredAtMs),
@@ -982,7 +982,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
 
         return new RealtimeEvent
         {
-            EventId = RealtimeEventContracts.CreateMembersAddedEventId(
+            EventId = GroupEventIdFactory.CreateMembersAddedEventId(
                 conversationId,
                 addedUserIds,
                 occurredAtMs),
@@ -1010,7 +1010,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         string? traceState) =>
         new()
         {
-            EventId = RealtimeEventContracts.CreateMemberLeftAggregatedEventId(
+            EventId = GroupEventIdFactory.CreateMemberLeftAggregatedEventId(
                 conversationId,
                 leftUserId,
                 occurredAtMs),
@@ -1043,7 +1043,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         string? traceState) =>
         new()
         {
-            EventId = RealtimeEventContracts.CreateMemberRemovedAggregatedEventId(
+            EventId = GroupEventIdFactory.CreateMemberRemovedAggregatedEventId(
                 conversationId,
                 removedUserId,
                 occurredAtMs),
@@ -1079,7 +1079,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         string? traceState) =>
         new()
         {
-            EventId = RealtimeEventContracts.CreateRoleChangedAggregatedEventId(
+            EventId = GroupEventIdFactory.CreateRoleChangedAggregatedEventId(
                 conversationId,
                 userId,
                 newRole,

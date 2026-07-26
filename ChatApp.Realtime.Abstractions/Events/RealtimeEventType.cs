@@ -2,7 +2,7 @@ namespace ChatApp.Realtime.Abstractions.Events;
 
 /// <summary>
 /// 枚举类型，表示实时事件的种类。每个枚举值对应一种特定类型的实时事件。
-/// 业务别名与 EventId 规则见 <see cref="RealtimeEventContracts"/>。
+/// 业务别名见 <see cref="RealtimeEventNames"/>，EventId 规则见各 EventIdFactory 类型。
 /// </summary>
 public enum RealtimeEventType : byte
 {

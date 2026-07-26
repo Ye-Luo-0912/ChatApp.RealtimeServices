@@ -225,7 +225,7 @@ public sealed class GroupChatTests : IAsyncLifetime
         };
         var template = new RealtimeEvent
         {
-            EventId = RealtimeEventContracts.CreateMessageReceivedEventId(1, "g-client-1", 1),
+            EventId = MessageEventIdFactory.CreateMessageReceivedEventId(1, "g-client-1", 1),
             Type = RealtimeEventType.MessageReceived,
             TargetUserId = 1,
             ActorUserId = 1,

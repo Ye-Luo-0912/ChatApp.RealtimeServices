@@ -86,7 +86,7 @@ internal static class RealtimeMessageEventFactory
     {
         return new RealtimeEvent
         {
-            EventId = RealtimeEventContracts.CreateGroupMessageReceivedEventId(
+            EventId = MessageEventIdFactory.CreateGroupMessageReceivedEventId(
                 message.SenderUserId,
                 message.ClientMessageId,
                 message.ConversationId!),
@@ -111,7 +111,7 @@ internal static class RealtimeMessageEventFactory
         var messageId = receiverEvent.MessageId ?? string.Empty;
         return new RealtimeEvent
         {
-            EventId = RealtimeEventContracts.CreateSenderEchoEventId(messageId, senderUserId),
+            EventId = MessageEventIdFactory.CreateSenderEchoEventId(messageId, senderUserId),
             Type = RealtimeEventType.MessageReceived,
             TargetUserId = senderUserId,
             ActorUserId = receiverEvent.ActorUserId,

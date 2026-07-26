@@ -1,6 +1,4 @@
 using System.Diagnostics;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
 using ChatApp.Realtime.Abstractions.Messaging;
@@ -10,6 +8,7 @@ using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Nats.Configuration;
 using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
 using ChatApp.RealtimeServices.Options;
+using ChatApp.RealtimeServices.Workers.Reliability;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -56,117 +55,18 @@ public sealed class IncomingMessageWorker : BackgroundService
             _processor.GetType().Name,
             _options.ProcessingConcurrency,
             _options.ProcessingQueueCapacity);
-        _readinessState.MarkStarted(WorkerName);
-        using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-        var heartbeatTask = RunHeartbeatAsync(heartbeatCts.Token);
-
-        var channels = CreatePartitionChannels();
-        var processors = channels
-            .Select((channel, index) => ProcessPartitionAsync(index, channel.Reader, stoppingToken))
-            .ToArray();
-
-        try
-        {
-            await ProduceAsync(channels, stoppingToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-        {
-            _logger.LogInformation("入站消息工作器正在停止。");
-        }
-        catch (Exception ex)
-        {
-            _readinessState.MarkFaulted(WorkerName, ex);
-            _logger.LogError(ex, "入站消息生产循环异常退出。");
-            throw;
-        }
-        finally
-        {
-            foreach (var channel in channels)
-                channel.Writer.TryComplete();
-
-            try
-            {
-                await Task.WhenAll(processors).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-            }
-            finally
-            {
-                heartbeatCts.Cancel();
-                await SuppressCancellationAsync(heartbeatTask).ConfigureAwait(false);
-                _readinessState.MarkStopped(WorkerName);
-                _logger.LogInformation("入站消息工作器已停止。");
-            }
-        }
-    }
-
-    private async Task RunHeartbeatAsync(CancellationToken ct)
-    {
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
-        while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
-            _readinessState.MarkHeartbeat(WorkerName);
-    }
-
-    private static async Task SuppressCancellationAsync(Task task)
-    {
-        try
-        {
-            await task.ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-        }
-    }
-
-    private Channel<IncomingMessageEnvelope>[] CreatePartitionChannels()
-    {
-        var capacity = Math.Max(1, _options.ProcessingQueueCapacity / _options.ProcessingConcurrency);
-        return Enumerable.Range(0, _options.ProcessingConcurrency)
-            .Select(_ => Channel.CreateBounded<IncomingMessageEnvelope>(new BoundedChannelOptions(capacity)
-            {
-                SingleReader = true,
-                SingleWriter = true,
-                FullMode = BoundedChannelFullMode.Wait,
-                AllowSynchronousContinuations = false
-            }))
-            .ToArray();
-    }
-
-    private async Task ProduceAsync(
-        IReadOnlyList<Channel<IncomingMessageEnvelope>> channels,
-        CancellationToken ct)
-    {
-        var retryAttempt = 0;
-        while (!ct.IsCancellationRequested)
-        {
-            try
-            {
-                await foreach (var envelope in _consumer.ConsumeAsync(ct).ConfigureAwait(false))
-                {
-                    retryAttempt = 0;
-                    _readinessState.MarkHeartbeat(WorkerName);
-                    var partition = GetPartition(envelope.Command, channels.Count);
-                    await channels[partition].Writer.WriteAsync(envelope, ct).ConfigureAwait(false);
-                }
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                retryAttempt++;
-                var delay = TimeSpan.FromMilliseconds(
-                    Math.Min(30_000, 500 * Math.Pow(2, Math.Min(retryAttempt, 6)))
-                    + Random.Shared.Next(0, 500));
-                _logger.LogWarning(ex, "入站订阅中断，将重新订阅。延迟={Delay}", delay);
-                await Task.Delay(delay, ct).ConfigureAwait(false);
-            }
-
-            _readinessState.MarkHeartbeat(WorkerName);
-            await Task.Delay(_options.WorkerIntervalMs, ct).ConfigureAwait(false);
-        }
+        var runtime = new PartitionedConsumerRuntime<IncomingMessageEnvelope>(
+            WorkerName,
+            _options.ProcessingConcurrency,
+            _options.ProcessingQueueCapacity,
+            _options.WorkerIntervalMs,
+            _readinessState,
+            _logger);
+        await runtime.RunAsync(
+            consume: ct => _consumer.ConsumeAsync(ct),
+            getPartition: env => GetPartition(env.Command, _options.ProcessingConcurrency),
+            processPartition: (partition, reader, ct) => ProcessPartitionAsync(partition, reader, ct),
+            stoppingToken).ConfigureAwait(false);
     }
 
     private async Task ProcessPartitionAsync(
@@ -279,7 +179,7 @@ public sealed class IncomingMessageWorker : BackgroundService
         await _deadLetterPublisher.PublishAsync(
             new DeadLetterMessage
             {
-                DeadLetterId = CreateDeadLetterId(envelope.Command.CommandId, reasonCode),
+                DeadLetterId = DeadLetterIds.Create(envelope.Command.CommandId, reasonCode),
                 CommandId = envelope.Command.CommandId,
                 SourceSubject = "chat.incoming-messages",
                 ReasonCode = reasonCode,
@@ -332,11 +232,5 @@ public sealed class IncomingMessageWorker : BackgroundService
         var second = Math.Max(command.SenderUserId, command.ReceiverUserId);
         var hash = unchecked((ulong)first * 397UL ^ (ulong)second);
         return (int)(hash % (ulong)partitionCount);
-    }
-
-    private static string CreateDeadLetterId(string commandId, string reasonCode)
-    {
-        var bytes = Encoding.UTF8.GetBytes($"{commandId}:{reasonCode}");
-        return Convert.ToHexStringLower(SHA256.HashData(bytes));
     }
 }

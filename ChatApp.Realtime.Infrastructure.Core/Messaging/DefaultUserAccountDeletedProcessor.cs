@@ -45,7 +45,7 @@ public sealed class DefaultUserAccountDeletedProcessor(
                     await messageStore.EnqueueEventAsync(
                         new RealtimeEvent
                         {
-                            EventId = RealtimeEventContracts.CreateAttachmentBlobsPurgeEventId(
+                            EventId = AttachmentEventIdFactory.CreateAttachmentBlobsPurgeEventId(
                                 evt.EventId,
                                 i),
                             Type = RealtimeEventType.AttachmentBlobsPurge,

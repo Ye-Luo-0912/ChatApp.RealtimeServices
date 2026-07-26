@@ -345,7 +345,7 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
         var messageId = receiverEvent.MessageId ?? string.Empty;
         return new RealtimeEvent
         {
-            EventId = RealtimeEventContracts.CreateSenderEchoEventId(messageId, senderUserId),
+            EventId = MessageEventIdFactory.CreateSenderEchoEventId(messageId, senderUserId),
             Type = RealtimeEventType.MessageReceived,
             TargetUserId = senderUserId,
             ActorUserId = receiverEvent.ActorUserId,

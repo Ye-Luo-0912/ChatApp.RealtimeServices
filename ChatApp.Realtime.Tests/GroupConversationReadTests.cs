@@ -276,7 +276,7 @@ public sealed class GroupConversationReadTests : IAsyncLifetime
         long receivedAtMs) =>
         new()
         {
-            EventId = RealtimeEventContracts.CreateMessageReceivedEventId(sender, $"client-{messageId}", sender),
+            EventId = MessageEventIdFactory.CreateMessageReceivedEventId(sender, $"client-{messageId}", sender),
             Type = RealtimeEventType.MessageReceived,
             TargetUserId = sender,
             ActorUserId = sender,
@@ -326,7 +326,7 @@ public sealed class GroupConversationReadTests : IAsyncLifetime
         long receivedAtMs) =>
         new()
         {
-            EventId = RealtimeEventContracts.CreateMessageReceivedEventId(sender, $"client-{messageId}"),
+            EventId = MessageEventIdFactory.CreateMessageReceivedEventId(sender, $"client-{messageId}"),
             Type = RealtimeEventType.MessageReceived,
             TargetUserId = receiver,
             ActorUserId = sender,

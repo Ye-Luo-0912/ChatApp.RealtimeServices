@@ -657,7 +657,7 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             {
                 events.Add(new RealtimeEvent
                 {
-                    EventId = RealtimeEventContracts.CreateMessageRecalledEventId(messageId, targetUserId),
+                    EventId = MessageEventIdFactory.CreateMessageRecalledEventId(messageId, targetUserId),
                     Type = RealtimeEventType.MessageRecalled,
                     TargetUserId = targetUserId,
                     ActorUserId = senderUserId,
@@ -694,7 +694,7 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         {
             events.Add(new RealtimeEvent
             {
-                EventId = RealtimeEventContracts.CreateMessageRecalledEventId(messageId, target.ReceiverUserId),
+                EventId = MessageEventIdFactory.CreateMessageRecalledEventId(messageId, target.ReceiverUserId),
                 Type = RealtimeEventType.MessageRecalled,
                 TargetUserId = target.ReceiverUserId,
                 ActorUserId = senderUserId,
@@ -709,7 +709,7 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             {
                 events.Add(new RealtimeEvent
                 {
-                    EventId = RealtimeEventContracts.CreateMessageRecalledEventId(messageId, senderUserId),
+                    EventId = MessageEventIdFactory.CreateMessageRecalledEventId(messageId, senderUserId),
                     Type = RealtimeEventType.MessageRecalled,
                     TargetUserId = senderUserId,
                     ActorUserId = senderUserId,
@@ -1019,7 +1019,7 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             {
                 events.Add(new RealtimeEvent
                 {
-                    EventId = RealtimeEventContracts.CreateMessageEditedEventId(
+                    EventId = MessageEventIdFactory.CreateMessageEditedEventId(
                         messageId,
                         targetUserId,
                         nextVersion),
@@ -1059,7 +1059,7 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         {
             events.Add(new RealtimeEvent
             {
-                EventId = RealtimeEventContracts.CreateMessageEditedEventId(
+                EventId = MessageEventIdFactory.CreateMessageEditedEventId(
                     messageId,
                     target.ReceiverUserId,
                     nextVersion),
@@ -1077,7 +1077,7 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             {
                 events.Add(new RealtimeEvent
                 {
-                    EventId = RealtimeEventContracts.CreateMessageEditedEventId(
+                    EventId = MessageEventIdFactory.CreateMessageEditedEventId(
                         messageId,
                         senderUserId,
                         nextVersion),

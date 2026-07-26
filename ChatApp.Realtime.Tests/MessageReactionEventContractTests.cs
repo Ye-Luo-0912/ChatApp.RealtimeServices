@@ -5,23 +5,23 @@ namespace ChatApp.Realtime.Tests;
 public sealed class MessageReactionEventContractTests
 {
     [Theory]
-    [InlineData(RealtimeEventContracts.ReactionAdded, RealtimeEventType.ReactionAdded)]
-    [InlineData(RealtimeEventContracts.ReactionRemoved, RealtimeEventType.ReactionRemoved)]
+    [InlineData(RealtimeEventNames.ReactionAdded, RealtimeEventType.ReactionAdded)]
+    [InlineData(RealtimeEventNames.ReactionRemoved, RealtimeEventType.ReactionRemoved)]
     public void BusinessName_MapsToStableWireType(string businessName, RealtimeEventType expected)
     {
-        Assert.Equal(expected, RealtimeEventContracts.ToWireType(businessName));
+        Assert.Equal(expected, RealtimeEventTypeMapper.ToWireType(businessName));
     }
 
     [Fact]
     public void ReactionEventIds_IncludeOccurredAtSoTogglesAreNotDeduped()
     {
-        var first = RealtimeEventContracts.CreateReactionAddedEventId(
+        var first = MessageEventIdFactory.CreateReactionAddedEventId(
             "msg-1",
             targetUserId: 2,
             reactorUserId: 1,
             emoji: "👍",
             occurredAtMs: 100);
-        var second = RealtimeEventContracts.CreateReactionAddedEventId(
+        var second = MessageEventIdFactory.CreateReactionAddedEventId(
             "msg-1",
             targetUserId: 2,
             reactorUserId: 1,
@@ -32,7 +32,7 @@ public sealed class MessageReactionEventContractTests
         Assert.NotEqual(first, second);
         Assert.Equal(
             first,
-            RealtimeEventContracts.CreateReactionAddedEventId(
+            MessageEventIdFactory.CreateReactionAddedEventId(
                 "msg-1",
                 2,
                 1,

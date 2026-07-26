@@ -59,12 +59,12 @@ public sealed class SyncCatchUpMutationCursorTests
     [Fact]
     public void MessageEditedEventIds_IncludeVersion()
     {
-        var v2 = RealtimeEventContracts.CreateMessageEditedEventId("msg-1", 2, 2);
-        var v3 = RealtimeEventContracts.CreateMessageEditedEventId("msg-1", 2, 3);
+        var v2 = MessageEventIdFactory.CreateMessageEditedEventId("msg-1", 2, 2);
+        var v3 = MessageEventIdFactory.CreateMessageEditedEventId("msg-1", 2, 3);
         Assert.NotEqual(v2, v3);
         Assert.Equal(
             v2,
-            RealtimeEventContracts.CreateMessageEditedEventId("msg-1", 2, 2));
+            MessageEventIdFactory.CreateMessageEditedEventId("msg-1", 2, 2));
     }
 
     [Fact]
@@ -72,6 +72,6 @@ public sealed class SyncCatchUpMutationCursorTests
     {
         Assert.Equal(
             RealtimeEventType.MessageEdited,
-            RealtimeEventContracts.ToWireType(RealtimeEventContracts.MessageEdited));
+            RealtimeEventTypeMapper.ToWireType(RealtimeEventNames.MessageEdited));
     }
 }

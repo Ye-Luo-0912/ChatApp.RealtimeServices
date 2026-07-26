@@ -270,7 +270,7 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
                 var cleanupEventId = $"msgret:{batchToken}:{group.Key}";
                 events.Add(new RealtimeEvent
                 {
-                    EventId = RealtimeEventContracts.CreateAttachmentBlobsPurgeEventId(
+                    EventId = AttachmentEventIdFactory.CreateAttachmentBlobsPurgeEventId(
                         cleanupEventId,
                         i),
                     Type = RealtimeEventType.AttachmentBlobsPurge,

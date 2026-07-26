@@ -125,7 +125,7 @@ public sealed class DefaultMessageReceiptProcessor : IMessageReceiptProcessor
     }
 
     private static string CreateEventId(MessageReceiptCommand command) =>
-        RealtimeEventContracts.CreateMessageReceiptUpdatedEventId(
+        MessageEventIdFactory.CreateMessageReceiptUpdatedEventId(
             command.MessageId,
             command.ReceiverUserId,
             command.ReceiptType);

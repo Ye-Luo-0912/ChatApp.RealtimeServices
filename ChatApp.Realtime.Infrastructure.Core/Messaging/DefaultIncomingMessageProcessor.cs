@@ -113,11 +113,11 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
         var evt = new RealtimeEvent
         {
             EventId = ConversationId.IsGroup(conversationId)
-                ? RealtimeEventContracts.CreateMessageReceivedEventId(
+                ? MessageEventIdFactory.CreateMessageReceivedEventId(
                     command.SenderUserId,
                     command.ClientMessageId,
                     command.SenderUserId)
-                : RealtimeEventContracts.CreateMessageReceivedEventId(
+                : MessageEventIdFactory.CreateMessageReceivedEventId(
                     command.SenderUserId,
                     command.ClientMessageId),
             Type = RealtimeEventType.MessageReceived,

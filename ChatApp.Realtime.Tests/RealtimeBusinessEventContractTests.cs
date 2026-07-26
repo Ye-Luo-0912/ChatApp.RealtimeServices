@@ -8,46 +8,46 @@ namespace ChatApp.Realtime.Tests;
 public sealed class RealtimeBusinessEventContractTests
 {
     [Theory]
-    [InlineData(RealtimeEventContracts.ConversationChanged, RealtimeEventType.ConversationListChanged)]
-    [InlineData(RealtimeEventContracts.UnreadCountChanged, RealtimeEventType.UnreadCountChanged)]
-    [InlineData(RealtimeEventContracts.MessageReceived, RealtimeEventType.MessageReceived)]
-    [InlineData(RealtimeEventContracts.MessageReceiptUpdated, RealtimeEventType.MessageReceiptUpdated)]
-    [InlineData(RealtimeEventContracts.SessionInvalidated, RealtimeEventType.SessionRevoked)]
-    [InlineData(RealtimeEventContracts.MessageRecalled, RealtimeEventType.MessageRecalled)]
-    [InlineData(RealtimeEventContracts.MessageEdited, RealtimeEventType.MessageEdited)]
-    [InlineData(RealtimeEventContracts.ReactionAdded, RealtimeEventType.ReactionAdded)]
-    [InlineData(RealtimeEventContracts.ReactionRemoved, RealtimeEventType.ReactionRemoved)]
-    [InlineData(RealtimeEventContracts.ConversationRead, RealtimeEventType.ConversationRead)]
+    [InlineData(RealtimeEventNames.ConversationChanged, RealtimeEventType.ConversationListChanged)]
+    [InlineData(RealtimeEventNames.UnreadCountChanged, RealtimeEventType.UnreadCountChanged)]
+    [InlineData(RealtimeEventNames.MessageReceived, RealtimeEventType.MessageReceived)]
+    [InlineData(RealtimeEventNames.MessageReceiptUpdated, RealtimeEventType.MessageReceiptUpdated)]
+    [InlineData(RealtimeEventNames.SessionInvalidated, RealtimeEventType.SessionRevoked)]
+    [InlineData(RealtimeEventNames.MessageRecalled, RealtimeEventType.MessageRecalled)]
+    [InlineData(RealtimeEventNames.MessageEdited, RealtimeEventType.MessageEdited)]
+    [InlineData(RealtimeEventNames.ReactionAdded, RealtimeEventType.ReactionAdded)]
+    [InlineData(RealtimeEventNames.ReactionRemoved, RealtimeEventType.ReactionRemoved)]
+    [InlineData(RealtimeEventNames.ConversationRead, RealtimeEventType.ConversationRead)]
     public void BusinessName_MapsToStableWireType(string businessName, RealtimeEventType expected)
     {
-        Assert.Equal(expected, RealtimeEventContracts.ToWireType(businessName));
+        Assert.Equal(expected, RealtimeEventTypeMapper.ToWireType(businessName));
     }
 
     [Fact]
     public void EventIds_AreDeterministicAndStableLength()
     {
-        var messageId = RealtimeEventContracts.CreateMessageReceivedEventId(1001, "client-1");
-        var echoId = RealtimeEventContracts.CreateSenderEchoEventId("msg-1", 1001);
-        var convId = RealtimeEventContracts.CreateConversationChangedEventId("dm:1:2", "msg-1", 1);
-        var unreadId = RealtimeEventContracts.CreateUnreadCountChangedEventId(
+        var messageId = MessageEventIdFactory.CreateMessageReceivedEventId(1001, "client-1");
+        var echoId = MessageEventIdFactory.CreateSenderEchoEventId("msg-1", 1001);
+        var convId = ConversationEventIdFactory.CreateConversationChangedEventId("dm:1:2", "msg-1", 1);
+        var unreadId = ConversationEventIdFactory.CreateUnreadCountChangedEventId(
             "dm:1:2",
             1,
             3,
             "msg-1",
             10,
             "cause-1");
-        var receiptId = RealtimeEventContracts.CreateMessageReceiptUpdatedEventId(
+        var receiptId = MessageEventIdFactory.CreateMessageReceiptUpdatedEventId(
             "msg-1",
             2,
             MessageReceiptType.Read);
 
         Assert.Equal(64, messageId.Length);
-        Assert.Equal(messageId, RealtimeEventContracts.CreateMessageReceivedEventId(1001, "client-1"));
-        Assert.Equal(echoId, RealtimeEventContracts.CreateSenderEchoEventId("msg-1", 1001));
-        Assert.Equal(convId, RealtimeEventContracts.CreateConversationChangedEventId("dm:1:2", "msg-1", 1));
+        Assert.Equal(messageId, MessageEventIdFactory.CreateMessageReceivedEventId(1001, "client-1"));
+        Assert.Equal(echoId, MessageEventIdFactory.CreateSenderEchoEventId("msg-1", 1001));
+        Assert.Equal(convId, ConversationEventIdFactory.CreateConversationChangedEventId("dm:1:2", "msg-1", 1));
         Assert.Equal(
             unreadId,
-            RealtimeEventContracts.CreateUnreadCountChangedEventId(
+            ConversationEventIdFactory.CreateUnreadCountChangedEventId(
                 "dm:1:2",
                 1,
                 3,
@@ -56,7 +56,7 @@ public sealed class RealtimeBusinessEventContractTests
                 "cause-1"));
         Assert.NotEqual(
             unreadId,
-            RealtimeEventContracts.CreateUnreadCountChangedEventId(
+            ConversationEventIdFactory.CreateUnreadCountChangedEventId(
                 "dm:1:2",
                 1,
                 3,
@@ -64,33 +64,33 @@ public sealed class RealtimeBusinessEventContractTests
                 10,
                 "cause-2"));
         Assert.NotEqual(
-            RealtimeEventContracts.CreateUnreadCountChangedEventId(
+            ConversationEventIdFactory.CreateUnreadCountChangedEventId(
                 "dm:1:2",
                 1,
                 1,
                 null,
                 null,
                 "msg-a"),
-            RealtimeEventContracts.CreateUnreadCountChangedEventId(
+            ConversationEventIdFactory.CreateUnreadCountChangedEventId(
                 "dm:1:2",
                 1,
                 1,
                 null,
                 null,
                 "msg-b"));
-        var revokeId = RealtimeEventContracts.CreateSessionRevokedEventId(1, "sess-1", 99);
+        var revokeId = SessionEventIdFactory.CreateSessionRevokedEventId(1, "sess-1", 99);
         Assert.Equal(
             revokeId,
-            RealtimeEventContracts.CreateSessionRevokedEventId(1, "sess-1", 99));
+            SessionEventIdFactory.CreateSessionRevokedEventId(1, "sess-1", 99));
         Assert.NotEqual(
             revokeId,
-            RealtimeEventContracts.CreateSessionRevokedEventId(1, "sess-2", 99));
+            SessionEventIdFactory.CreateSessionRevokedEventId(1, "sess-2", 99));
         Assert.Equal(
             receiptId,
-            RealtimeEventContracts.CreateMessageReceiptUpdatedEventId("msg-1", 2, MessageReceiptType.Read));
+            MessageEventIdFactory.CreateMessageReceiptUpdatedEventId("msg-1", 2, MessageReceiptType.Read));
         Assert.NotEqual(messageId, echoId);
 
-        var conversationReadId = RealtimeEventContracts.CreateConversationReadEventId(
+        var conversationReadId = ConversationEventIdFactory.CreateConversationReadEventId(
             "grp:abc",
             2,
             "msg-1",
@@ -98,10 +98,10 @@ public sealed class RealtimeBusinessEventContractTests
             1);
         Assert.Equal(
             conversationReadId,
-            RealtimeEventContracts.CreateConversationReadEventId("grp:abc", 2, "msg-1", 10, 1));
+            ConversationEventIdFactory.CreateConversationReadEventId("grp:abc", 2, "msg-1", 10, 1));
         Assert.NotEqual(
             conversationReadId,
-            RealtimeEventContracts.CreateConversationReadEventId("grp:abc", 2, "msg-1", 10, 3));
+            ConversationEventIdFactory.CreateConversationReadEventId("grp:abc", 2, "msg-1", 10, 3));
     }
 
     [Fact]

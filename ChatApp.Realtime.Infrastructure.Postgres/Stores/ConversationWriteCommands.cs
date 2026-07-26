@@ -394,7 +394,7 @@ internal static class ConversationWriteCommands
 
         return new RealtimeEvent
         {
-            EventId = RealtimeEventContracts.CreateUnreadCountChangedEventId(
+            EventId = ConversationEventIdFactory.CreateUnreadCountChangedEventId(
                 conversationId,
                 targetUserId,
                 unreadCount,
@@ -420,7 +420,7 @@ internal static class ConversationWriteCommands
         string? lastReadMessageId,
         long? lastReadAtMs,
         string causeMessageId) =>
-        RealtimeEventContracts.CreateUnreadCountChangedEventId(
+        ConversationEventIdFactory.CreateUnreadCountChangedEventId(
             conversationId,
             targetUserId,
             unreadCount,
@@ -448,7 +448,7 @@ internal static class ConversationWriteCommands
 
         return new RealtimeEvent
         {
-            EventId = RealtimeEventContracts.CreateConversationReadEventId(
+            EventId = ConversationEventIdFactory.CreateConversationReadEventId(
                 conversationId,
                 readerUserId,
                 lastReadMessageId,
@@ -569,7 +569,7 @@ internal static class ConversationWriteCommands
         string messageId,
         long targetUserId,
         string? causeToken = null) =>
-        RealtimeEventContracts.CreateConversationChangedEventId(
+        ConversationEventIdFactory.CreateConversationChangedEventId(
             conversationId,
             messageId,
             targetUserId,
@@ -582,7 +582,7 @@ internal static class ConversationWriteCommands
         long? pinnedAtMs,
         bool isMuted,
         long? mutedUntilMs) =>
-        RealtimeEventContracts.CreateConversationPrefsChangedEventId(
+        ConversationEventIdFactory.CreateConversationPrefsChangedEventId(
             conversationId,
             targetUserId,
             isPinned,

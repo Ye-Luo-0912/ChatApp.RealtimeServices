@@ -655,13 +655,13 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         foreach (var targetUserId in targets)
         {
             var eventId = added
-                ? RealtimeEventContracts.CreateReactionAddedEventId(
+                ? MessageEventIdFactory.CreateReactionAddedEventId(
                     messageId,
                     targetUserId,
                     reactorUserId,
                     emoji,
                     occurredAtMs)
-                : RealtimeEventContracts.CreateReactionRemovedEventId(
+                : MessageEventIdFactory.CreateReactionRemovedEventId(
                     messageId,
                     targetUserId,
                     reactorUserId,
