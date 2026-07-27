@@ -53,16 +53,19 @@ public sealed class JetStreamIncomingMessageConsumer : IIncomingMessageConsumer
 
         var consumeOptions = new NatsJSConsumeOpts
         {
+            // Reliability-4：预取上限使用 PrefetchMaxMsgs 而非 MaxAckPending。
+            // MaxAckPending（默认 256）是 consumer 在途上限，允许重投缓冲；
+            // 但单次拉取不应超过处理并发数倍，否则消息在本地 Channel 中排队消耗 AckWait 预算。
             MaxMsgs = Math.Max(
                 1,
-                _jetStreamOptions.Consumer.MaxAckPending),
+                _jetStreamOptions.Consumer.PrefetchMaxMsgs),
             Expires = TimeSpan.FromSeconds(Math.Max(
                 5,
                 _jetStreamOptions.Consumer.AckWaitSeconds)),
             IdleHeartbeat = TimeSpan.FromSeconds(10),
             ThresholdMsgs = Math.Max(
                 1,
-                _jetStreamOptions.Consumer.MaxAckPending / 2)
+                _jetStreamOptions.Consumer.PrefetchMaxMsgs / 2)
         };
 
         while (!ct.IsCancellationRequested)
@@ -129,7 +132,9 @@ public sealed class JetStreamIncomingMessageConsumer : IIncomingMessageConsumer
                         rawPayload: msg.Data,
                         parentContext: NatsTraceContext.ExtractParentContext(msg.Headers),
                         trustedUserId: trustedUserId,
-                        trustedSessionId: trustedSessionId);
+                        trustedSessionId: trustedSessionId,
+                        progressAck: progressCt => JetStreamMetricAck.ProgressAckAsync(
+                            jsMsg, _metrics, observation, progressCt));
                 }
                 else
                 {

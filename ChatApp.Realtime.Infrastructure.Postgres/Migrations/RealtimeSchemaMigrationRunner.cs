@@ -57,7 +57,8 @@ public sealed class RealtimeSchemaMigrationRunner
         new Migration026_UserDeletionTombstoneAndIdempotencyLedger(),
         new Migration027_UserLifecycleState(),
         new Migration028_GroupOperationAudit(),
-        new Migration029_LeaveGroupHistoryPolicy()
+        new Migration029_LeaveGroupHistoryPolicy(),
+        new Migration030_DeviceSyncCursorChangedAtColumn()
     ];
 
     public async Task MigrateAsync(

@@ -3,6 +3,7 @@ using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
+using ChatApp.Realtime.Infrastructure.Nats.Configuration;
 using Microsoft.Extensions.Logging;
 using NATS.Client.JetStream;
 
@@ -15,15 +16,18 @@ public sealed class JetStreamRealtimeEventConsumer : IRealtimeEventConsumer
 {
     private readonly RealtimeQueueOptions _options;
     private readonly JetStreamContextManager _contextManager;
+    private readonly JetStreamOptions _jetStreamOptions;
     private readonly ILogger<JetStreamRealtimeEventConsumer> _logger;
 
     public JetStreamRealtimeEventConsumer(
         RealtimeQueueOptions options,
         JetStreamContextManager contextManager,
+        JetStreamOptions jetStreamOptions,
         ILogger<JetStreamRealtimeEventConsumer> logger)
     {
         _options = options;
         _contextManager = contextManager;
+        _jetStreamOptions = jetStreamOptions;
         _logger = logger;
     }
 
@@ -40,7 +44,21 @@ public sealed class JetStreamRealtimeEventConsumer : IRealtimeEventConsumer
             durable,
             _options.Topics.AccountCleanup);
 
-        await foreach (var msg in consumer.ConsumeAsync<string>(cancellationToken: ct))
+        // Reliability-4：使用 PrefetchMaxMsgs 而非默认 MaxAckPending，避免本地队列堆积消耗 AckWait。
+        var consumeOptions = new NatsJSConsumeOpts
+        {
+            MaxMsgs = Math.Max(1, _jetStreamOptions.Consumer.PrefetchMaxMsgs),
+            Expires = TimeSpan.FromSeconds(
+                Math.Max(5, _jetStreamOptions.Consumer.AckWaitSeconds)),
+            IdleHeartbeat = TimeSpan.FromSeconds(10),
+            ThresholdMsgs = Math.Max(
+                1,
+                _jetStreamOptions.Consumer.PrefetchMaxMsgs / 2)
+        };
+
+        await foreach (var msg in consumer.ConsumeAsync<string>(
+                           opts: consumeOptions,
+                           cancellationToken: ct))
         {
             RealtimeEvent? evt = null;
             try

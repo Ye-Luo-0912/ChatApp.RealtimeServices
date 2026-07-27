@@ -9,12 +9,12 @@ public sealed class SyncCursorResetRequired
     public required SyncCursorResetReason Reason { get; init; }
 
     /// <summary>Server tip when known; null when conversation has no tip or membership is lost.</summary>
-    public long? TipReceivedAtMs { get; init; }
+    public long? TipChangedAtMs { get; init; }
 
     public string? TipMessageId { get; init; }
 
     /// <summary>Client-supplied (or device-stored) watermark that was rejected.</summary>
-    public long? ClientAfterReceivedAtMs { get; init; }
+    public long? ClientAfterChangedAtMs { get; init; }
 
     public string? ClientAfterMessageId { get; init; }
 }

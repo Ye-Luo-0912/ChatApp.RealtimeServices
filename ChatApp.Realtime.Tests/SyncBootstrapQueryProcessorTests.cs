@@ -134,7 +134,7 @@ public sealed class SyncBootstrapQueryProcessorTests
                 new ConversationSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = 100,
+                    AfterChangedAtMs = 100,
                     AfterMessageId = "msg-1"
                 }
             ]
@@ -145,7 +145,7 @@ public sealed class SyncBootstrapQueryProcessorTests
         Assert.Single(catchUp.Items);
         Assert.Equal("msg-2", catchUp.Items[0].MessageId);
         Assert.True(historyStore.AfterQueryCalled);
-        Assert.Equal(100, historyStore.AfterReceivedAtMs);
+        Assert.Equal(100, historyStore.AfterChangedAtMs);
         Assert.Equal("msg-1", historyStore.AfterMessageId);
     }
 
@@ -196,7 +196,7 @@ public sealed class SyncBootstrapQueryProcessorTests
                 new ConversationSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = 9_999_999,
+                    AfterChangedAtMs = 9_999_999,
                     AfterMessageId = "future-msg"
                 }
             ]
@@ -257,7 +257,7 @@ public sealed class SyncBootstrapQueryProcessorTests
                 new ConversationSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = 50,
+                    AfterChangedAtMs = 50,
                     AfterMessageId = "does-not-exist"
                 }
             ]
@@ -269,7 +269,7 @@ public sealed class SyncBootstrapQueryProcessorTests
         Assert.Equal(conversationId, reset.ConversationId);
         Assert.Equal(SyncCursorResetReason.MessageNotFound, reset.Reason);
         Assert.Equal("msg-2", reset.TipMessageId);
-        Assert.Equal(200, reset.TipReceivedAtMs);
+        Assert.Equal(200, reset.TipChangedAtMs);
     }
 
     [Fact]
@@ -306,7 +306,7 @@ public sealed class SyncBootstrapQueryProcessorTests
                 new ConversationSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = 100,
+                    AfterChangedAtMs = 100,
                     AfterMessageId = "ghost"
                 }
             ]
@@ -316,7 +316,7 @@ public sealed class SyncBootstrapQueryProcessorTests
         var reset = Assert.Single(page.ResetsRequired);
         Assert.Equal(SyncCursorResetReason.MessageNotFound, reset.Reason);
         Assert.Null(reset.TipMessageId);
-        Assert.Null(reset.TipReceivedAtMs);
+        Assert.Null(reset.TipChangedAtMs);
         Assert.Empty(deviceStore.Upserted);
     }
 
@@ -379,13 +379,13 @@ public sealed class SyncBootstrapQueryProcessorTests
                 new ConversationSyncWatermark
                 {
                     ConversationId = memberId,
-                    AfterReceivedAtMs = 100,
+                    AfterChangedAtMs = 100,
                     AfterMessageId = "msg-1"
                 },
                 new ConversationSyncWatermark
                 {
                     ConversationId = foreignId,
-                    AfterReceivedAtMs = 50,
+                    AfterChangedAtMs = 50,
                     AfterMessageId = "secret-1"
                 }
             ]
@@ -447,7 +447,7 @@ public sealed class SyncBootstrapQueryProcessorTests
             new DeviceSyncCursor
             {
                 ConversationId = conversationId,
-                AfterReceivedAtMs = 100,
+                AfterChangedAtMs = 100,
                 AfterMessageId = "msg-1"
             }
         ]);
@@ -468,13 +468,13 @@ public sealed class SyncBootstrapQueryProcessorTests
 
         Assert.True(page.Succeeded);
         Assert.True(historyStore.AfterQueryCalled);
-        Assert.Equal(100, historyStore.AfterReceivedAtMs);
+        Assert.Equal(100, historyStore.AfterChangedAtMs);
         Assert.Equal("msg-1", historyStore.AfterMessageId);
         var catchUp = Assert.Single(page.CatchUps);
         Assert.Equal("msg-2", Assert.Single(catchUp.Items).MessageId);
         var persisted = Assert.Single(deviceStore.Upserted);
         Assert.Equal("msg-2", persisted.AfterMessageId);
-        Assert.Equal(200, persisted.AfterReceivedAtMs);
+        Assert.Equal(200, persisted.AfterChangedAtMs);
     }
 
     [Fact]
@@ -526,7 +526,7 @@ public sealed class SyncBootstrapQueryProcessorTests
                 new ConversationSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = 999,
+                    AfterChangedAtMs = 999,
                     AfterMessageId = "msg-future"
                 }
             ]
@@ -538,7 +538,7 @@ public sealed class SyncBootstrapQueryProcessorTests
         var reset = Assert.Single(page.ResetsRequired);
         Assert.Equal(conversationId, reset.ConversationId);
         Assert.Equal(SyncCursorResetReason.MessageNotFound, reset.Reason);
-        Assert.Equal(200, reset.TipReceivedAtMs);
+        Assert.Equal(200, reset.TipChangedAtMs);
         Assert.Equal("msg-2", reset.TipMessageId);
         Assert.False(historyStore.AfterQueryCalled);
     }
@@ -585,7 +585,7 @@ public sealed class SyncBootstrapQueryProcessorTests
                 new ConversationSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = 150,
+                    AfterChangedAtMs = 150,
                     AfterMessageId = "msg-deleted"
                 }
             ]
@@ -651,7 +651,7 @@ public sealed class SyncBootstrapQueryProcessorTests
                 new ConversationSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = 100,
+                    AfterChangedAtMs = 100,
                     AfterMessageId = "msg-1"
                 }
             ]
@@ -660,7 +660,7 @@ public sealed class SyncBootstrapQueryProcessorTests
         Assert.True(page.Succeeded);
         var persisted = Assert.Single(deviceStore.Upserted);
         Assert.Equal("msg-2", persisted.AfterMessageId);
-        Assert.Equal(200, persisted.AfterReceivedAtMs);
+        Assert.Equal(200, persisted.AfterChangedAtMs);
         Assert.NotEqual("msg-1", persisted.AfterMessageId);
     }
 
@@ -716,7 +716,7 @@ public sealed class SyncBootstrapQueryProcessorTests
                 new ConversationSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = 200,
+                    AfterChangedAtMs = 200,
                     AfterMessageId = "msg-2"
                 }
             ]
@@ -728,7 +728,7 @@ public sealed class SyncBootstrapQueryProcessorTests
         Assert.Equal(conversationId, reset.ConversationId);
         Assert.Equal(SyncCursorResetReason.AheadOfTip, reset.Reason);
         Assert.Equal("msg-1", reset.TipMessageId);
-        Assert.Equal(100, reset.TipReceivedAtMs);
+        Assert.Equal(100, reset.TipChangedAtMs);
         Assert.Empty(deviceStore.Upserted);
     }
 
@@ -788,7 +788,7 @@ public sealed class SyncBootstrapQueryProcessorTests
                 new ConversationSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = 100,
+                    AfterChangedAtMs = 100,
                     AfterMessageId = "msg-1"
                 }
             ]
@@ -799,7 +799,7 @@ public sealed class SyncBootstrapQueryProcessorTests
         var reset = Assert.Single(page.ResetsRequired);
         Assert.Equal(SyncCursorResetReason.GapTooLarge, reset.Reason);
         Assert.Equal("msg-2", reset.TipMessageId);
-        Assert.Equal(10_000, reset.TipReceivedAtMs);
+        Assert.Equal(10_000, reset.TipChangedAtMs);
         Assert.Empty(deviceStore.Upserted);
     }
 
@@ -859,7 +859,7 @@ public sealed class SyncBootstrapQueryProcessorTests
                 new ConversationSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = 100,
+                    AfterChangedAtMs = 100,
                     AfterMessageId = "msg-1"
                 }
             ]
@@ -870,8 +870,8 @@ public sealed class SyncBootstrapQueryProcessorTests
         var reset = Assert.Single(page.ResetsRequired);
         Assert.Equal(SyncCursorResetReason.BeyondRetention, reset.Reason);
         Assert.Equal("msg-2", reset.TipMessageId);
-        Assert.Equal(10_000, reset.TipReceivedAtMs);
-        Assert.Equal(100, reset.ClientAfterReceivedAtMs);
+        Assert.Equal(10_000, reset.TipChangedAtMs);
+        Assert.Equal(100, reset.ClientAfterChangedAtMs);
         Assert.Equal("msg-1", reset.ClientAfterMessageId);
         Assert.Empty(deviceStore.Upserted);
         Assert.Contains(conversationId, deviceStore.Deleted);
@@ -933,7 +933,7 @@ public sealed class SyncBootstrapQueryProcessorTests
                 new ConversationSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = 100,
+                    AfterChangedAtMs = 100,
                     AfterMessageId = "msg-1"
                 }
             ]
@@ -942,7 +942,7 @@ public sealed class SyncBootstrapQueryProcessorTests
         Assert.True(page.Succeeded);
         Assert.Empty(page.ResetsRequired);
         Assert.True(historyStore.AfterQueryCalled);
-        Assert.Equal(100, historyStore.AfterReceivedAtMs);
+        Assert.Equal(100, historyStore.AfterChangedAtMs);
         Assert.Equal("msg-1", historyStore.AfterMessageId);
         var catchUp = Assert.Single(page.CatchUps);
         Assert.Equal("msg-2", Assert.Single(catchUp.Items).MessageId);
@@ -997,7 +997,7 @@ public sealed class SyncBootstrapQueryProcessorTests
                 new ConversationSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = 100,
+                    AfterChangedAtMs = 100,
                     AfterMessageId = "msg-purged"
                 }
             ]
@@ -1008,8 +1008,8 @@ public sealed class SyncBootstrapQueryProcessorTests
         var reset = Assert.Single(page.ResetsRequired);
         Assert.Equal(SyncCursorResetReason.BeyondRetention, reset.Reason);
         Assert.Equal("msg-2", reset.TipMessageId);
-        Assert.Equal(10_000, reset.TipReceivedAtMs);
-        Assert.Equal(100, reset.ClientAfterReceivedAtMs);
+        Assert.Equal(10_000, reset.TipChangedAtMs);
+        Assert.Equal(100, reset.ClientAfterChangedAtMs);
         Assert.Equal("msg-purged", reset.ClientAfterMessageId);
         Assert.Empty(deviceStore.Upserted);
         Assert.Contains(conversationId, deviceStore.Deleted);
@@ -1075,7 +1075,7 @@ public sealed class SyncBootstrapQueryProcessorTests
                 new ConversationSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = 100,
+                    AfterChangedAtMs = 100,
                     AfterMessageId = "msg-1"
                 }
             ]
@@ -1139,7 +1139,7 @@ public sealed class SyncBootstrapQueryProcessorTests
                 new ConversationSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = 100,
+                    AfterChangedAtMs = 100,
                     AfterMessageId = "msg-1"
                 }
             ]
@@ -1148,7 +1148,7 @@ public sealed class SyncBootstrapQueryProcessorTests
         Assert.True(page.Succeeded);
         Assert.Empty(page.ResetsRequired);
         Assert.True(historyStore.AfterQueryCalled);
-        Assert.Equal(100, historyStore.AfterReceivedAtMs);
+        Assert.Equal(100, historyStore.AfterChangedAtMs);
         Assert.Equal("msg-1", historyStore.AfterMessageId);
         var catchUp = Assert.Single(page.CatchUps);
         Assert.Equal("msg-2", Assert.Single(catchUp.Items).MessageId);
@@ -1328,7 +1328,7 @@ public sealed class SyncBootstrapQueryProcessorTests
 
         public bool ConversationQueryCalled { get; private set; }
         public bool AfterQueryCalled { get; private set; }
-        public long AfterReceivedAtMs { get; private set; }
+        public long AfterChangedAtMs { get; private set; }
         public string? AfterMessageId { get; private set; }
         public HashSet<string> MemberConversationIds { get; init; } = new(StringComparer.Ordinal);
         public List<string> FilteredConversationIds { get; } = [];
@@ -1370,7 +1370,7 @@ public sealed class SyncBootstrapQueryProcessorTests
             CancellationToken ct = default)
         {
             AfterQueryCalled = true;
-            AfterReceivedAtMs = afterReceivedAtMs;
+            AfterChangedAtMs = afterReceivedAtMs;
             AfterMessageId = afterMessageId;
             QueriedConversationIds.Add(conversationId);
             if (MemberConversationIds.Count > 0 && !MemberConversationIds.Contains(conversationId))
@@ -1420,7 +1420,7 @@ public sealed class SyncBootstrapQueryProcessorTests
             foreach (var query in queries)
             {
                 ConversationMessageHistoryResult result;
-                if (query.AfterReceivedAtMs is long afterAt
+                if (query.AfterChangedAtMs is long afterAt
                     && !string.IsNullOrWhiteSpace(query.AfterMessageId))
                 {
                     result = await QueryByConversationAfterAsync(
@@ -1466,12 +1466,12 @@ public sealed class SyncBootstrapQueryProcessorTests
             {
                 if (string.IsNullOrWhiteSpace(item.ConversationId)
                     || string.IsNullOrWhiteSpace(item.AfterMessageId)
-                    || item.AfterReceivedAtMs <= 0)
+                    || item.AfterChangedAtMs <= 0)
                 {
                     continue;
                 }
 
-                var tipAt = item.TipReceivedAtMs;
+                var tipAt = item.TipChangedAtMs;
                 var tipId = item.TipMessageId;
                 if (tipAt is not > 0 || string.IsNullOrWhiteSpace(tipId))
                 {
@@ -1485,13 +1485,13 @@ public sealed class SyncBootstrapQueryProcessorTests
                         map[item.ConversationId] = new ResolvedSyncWatermark
                         {
                             ConversationId = item.ConversationId,
-                            AfterReceivedAtMs = 0,
+                            AfterChangedAtMs = 0,
                             AfterMessageId = string.Empty,
                             IsValid = false,
                             InvalidationKind = SyncWatermarkInvalidationKind.MessageNotFound,
-                            TipReceivedAtMs = null,
+                            TipChangedAtMs = null,
                             TipMessageId = null,
-                            ClientAfterReceivedAtMs = item.AfterReceivedAtMs,
+                            ClientAfterChangedAtMs = item.AfterChangedAtMs,
                             ClientAfterMessageId = item.AfterMessageId
                         };
                         continue;
@@ -1514,12 +1514,12 @@ public sealed class SyncBootstrapQueryProcessorTests
                     map[item.ConversationId] = new ResolvedSyncWatermark
                     {
                         ConversationId = item.ConversationId,
-                        AfterReceivedAtMs = matched.ReceivedAtMs,
+                        AfterChangedAtMs = matched.ReceivedAtMs,
                         AfterMessageId = matched.MessageId,
                         IsValid = true,
-                        TipReceivedAtMs = tipAt,
+                        TipChangedAtMs = tipAt,
                         TipMessageId = tipId,
-                        ClientAfterReceivedAtMs = item.AfterReceivedAtMs,
+                        ClientAfterChangedAtMs = item.AfterChangedAtMs,
                         ClientAfterMessageId = item.AfterMessageId
                     };
                 }
@@ -1528,13 +1528,13 @@ public sealed class SyncBootstrapQueryProcessorTests
                     map[item.ConversationId] = new ResolvedSyncWatermark
                     {
                         ConversationId = item.ConversationId,
-                        AfterReceivedAtMs = tipAt.Value,
+                        AfterChangedAtMs = tipAt.Value,
                         AfterMessageId = tipId!,
                         IsValid = false,
                         InvalidationKind = SyncWatermarkInvalidationKind.AheadOfTip,
-                        TipReceivedAtMs = tipAt,
+                        TipChangedAtMs = tipAt,
                         TipMessageId = tipId,
-                        ClientAfterReceivedAtMs = item.AfterReceivedAtMs,
+                        ClientAfterChangedAtMs = item.AfterChangedAtMs,
                         ClientAfterMessageId = item.AfterMessageId
                     };
                 }
@@ -1543,13 +1543,13 @@ public sealed class SyncBootstrapQueryProcessorTests
                     map[item.ConversationId] = new ResolvedSyncWatermark
                     {
                         ConversationId = item.ConversationId,
-                        AfterReceivedAtMs = tipAt.Value,
+                        AfterChangedAtMs = tipAt.Value,
                         AfterMessageId = tipId!,
                         IsValid = false,
                         InvalidationKind = SyncWatermarkInvalidationKind.MessageNotFound,
-                        TipReceivedAtMs = tipAt,
+                        TipChangedAtMs = tipAt,
                         TipMessageId = tipId,
-                        ClientAfterReceivedAtMs = item.AfterReceivedAtMs,
+                        ClientAfterChangedAtMs = item.AfterChangedAtMs,
                         ClientAfterMessageId = item.AfterMessageId
                     };
                 }

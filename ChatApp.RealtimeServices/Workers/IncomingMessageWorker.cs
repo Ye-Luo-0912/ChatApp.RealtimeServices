@@ -27,6 +27,7 @@ public sealed class IncomingMessageWorker : BackgroundService
     private readonly RealtimeOptions _options;
     private readonly RealtimeNatsTrustSettings _trust;
     private readonly IMessagePartitionKeySelector _partitionKeySelector;
+    private readonly TimeSpan _ackWait;
     private readonly ILogger<IncomingMessageWorker> _logger;
 
     public IncomingMessageWorker(
@@ -38,6 +39,7 @@ public sealed class IncomingMessageWorker : BackgroundService
         IOptions<RealtimeOptions> options,
         RealtimeNatsTrustSettings trust,
         IMessagePartitionKeySelector partitionKeySelector,
+        JetStreamOptions? jetStreamOptions,
         ILogger<IncomingMessageWorker> logger)
     {
         _consumer = consumer;
@@ -48,6 +50,9 @@ public sealed class IncomingMessageWorker : BackgroundService
         _options = options.Value;
         _trust = trust;
         _partitionKeySelector = partitionKeySelector;
+        _ackWait = jetStreamOptions is not null
+            ? TimeSpan.FromSeconds(Math.Max(1, jetStreamOptions.Consumer.AckWaitSeconds))
+            : TimeSpan.Zero;
         _logger = logger;
     }
 
@@ -182,6 +187,13 @@ public sealed class IncomingMessageWorker : BackgroundService
             return;
         }
 
+        // Reliability-4：长时处理期间定期发送 In-Progress ACK，重置 JetStream AckWait 计时器。
+        // 防止 队列等待 + 数据库处理 > AckWait 时合法消息被重投。
+        await using var progressGuard = ProgressAckGuard.Start(
+            envelope.ProgressAckAsync,
+            _ackWait,
+            ct,
+            _logger);
         var result = await _processor.ProcessAsync(envelope.Command, ct).ConfigureAwait(false);
         if (result.Succeeded)
         {

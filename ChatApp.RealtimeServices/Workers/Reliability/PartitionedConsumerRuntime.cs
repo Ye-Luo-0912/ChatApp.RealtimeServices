@@ -75,10 +75,17 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
 
         // P0-6：不再使用 ByteReleasingChannelReader。lease 在 processor finally 块释放，
         // 预算覆盖 queued + processing，避免正在执行的大消息不计入预算。
+        // Reliability-3：使用一个 runtime 级 reporter 定期刷新所有分区深度，
+        // 避免每分区各建一个 Timer 并重复 O(P) 扫描（总计 O(P²)）。
         var processors = channels
-            .Select((channel, index) => processPartition(index, channel.Reader, faultToken))
+            .Select((channel, index) =>
+                processPartition(index, channel.Reader, faultToken))
             .ToArray();
         var processorsAggregate = Task.WhenAll(processors);
+        var queueDepthTask = ReportQueueDepthUntilCompletedAsync(
+            processorsAggregate,
+            channels,
+            faultToken);
 
         try
         {
@@ -130,6 +137,10 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
             {
                 // P0-6：释放 ByteBudget 持有的 SemaphoreSlim 资源
                 byteBudget?.Dispose();
+                faultCts.Cancel();
+                await WorkerHeartbeat
+                    .SuppressCancellationAsync(queueDepthTask)
+                    .ConfigureAwait(false);
                 heartbeatCts.Cancel();
                 await WorkerHeartbeat.SuppressCancellationAsync(heartbeatTask).ConfigureAwait(false);
                 _readinessState.MarkStopped(_workerName);
@@ -148,16 +159,20 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
         var retryAttempt = 0;
         while (!ct.IsCancellationRequested)
         {
-            // Reliability-2：订阅尝试开始时标记连接状态。
-            _readinessState.MarkSubscriptionConnected(_workerName, connected: false);
             try
             {
+                // IAsyncEnumerable 消费接口没有独立的“订阅已建立”回调。
+                // 进入 ConsumeAsync 枚举即表示消费循环已激活；真正的连接故障会进入
+                // catch 并置 false，同时依赖健康检查会独立验证 NATS。
+                // 不能在等待首条消息时保持 false，否则空队列会永远无法 Ready。
+                _readinessState.MarkSubscriptionConnected(
+                    _workerName,
+                    connected: true);
                 await foreach (var envelope in consume(ct).ConfigureAwait(false))
                 {
                     retryAttempt = 0;
                     // Reliability-2：用 RecordMessageConsumed 替代 MarkHeartbeat，使 readiness 反映真实消费进展。
                     _readinessState.RecordMessageConsumed(_workerName);
-                    _readinessState.MarkSubscriptionConnected(_workerName, connected: true);
                     var partition = getPartition(envelope);
 
                     // P0-6：入队前按 payload 字节长度计费，返回 lease。
@@ -222,5 +237,34 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
             }
         }
         _readinessState.RecordQueueDepth(_workerName, totalDepth, _queueCapacity);
+    }
+
+    /// <summary>
+    /// Reliability-3：单个 runtime 级 reporter 定期刷新所有分区的 QueueDepth。
+    /// 队列排空后即使没有新入队，也能清除 stale QueueFullSince。
+    /// </summary>
+    private async Task ReportQueueDepthUntilCompletedAsync(
+        Task processorsAggregate,
+        IReadOnlyList<Channel<LeasedEnvelope<TEnvelope>>> channels,
+        CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+        try
+        {
+            while (!processorsAggregate.IsCompleted &&
+                   await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+            {
+                ReportQueueDepth(channels);
+            }
+        }
+        catch (OperationCanceledException)
+            when (ct.IsCancellationRequested)
+        {
+            // Worker 正常停止或任一 produce/processor 失败。
+        }
+        finally
+        {
+            ReportQueueDepth(channels);
+        }
     }
 }

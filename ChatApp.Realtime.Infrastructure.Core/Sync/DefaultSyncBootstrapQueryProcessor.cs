@@ -112,7 +112,7 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                     .Select(static cursor => new ConversationSyncWatermark
                     {
                         ConversationId = cursor.ConversationId,
-                        AfterReceivedAtMs = cursor.AfterReceivedAtMs,
+                        AfterChangedAtMs = cursor.AfterChangedAtMs,
                         AfterMessageId = cursor.AfterMessageId
                     })
                     .ToArray();
@@ -162,7 +162,7 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                             return new HistoryCatchUpQuery
                             {
                                 ConversationId = conversationId,
-                                AfterReceivedAtMs = watermark.AfterReceivedAtMs,
+                                AfterChangedAtMs = watermark.AfterChangedAtMs,
                                 AfterMessageId = watermark.AfterMessageId,
                                 Take = historyLimit + 1
                             };
@@ -408,7 +408,7 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
             map[catchUp.ConversationId] = new DeviceSyncCursor
             {
                 ConversationId = catchUp.ConversationId,
-                AfterReceivedAtMs = last.ReceivedAtMs,
+                AfterChangedAtMs = last.ChangedAtMs > 0 ? last.ChangedAtMs : last.ReceivedAtMs,
                 AfterMessageId = last.MessageId
             };
         }
@@ -433,7 +433,7 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
         {
             if (string.IsNullOrWhiteSpace(item.ConversationId)
                 || string.IsNullOrWhiteSpace(item.AfterMessageId)
-                || item.AfterReceivedAtMs <= 0)
+                || item.AfterChangedAtMs <= 0)
             {
                 continue;
             }
@@ -469,8 +469,8 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                     ConversationId = conversationId,
                     Reason = SyncCursorResetReason.MembershipLost,
                     TipMessageId = null,
-                    TipReceivedAtMs = null,
-                    ClientAfterReceivedAtMs = watermark.AfterReceivedAtMs,
+                    TipChangedAtMs = null,
+                    ClientAfterChangedAtMs = watermark.AfterChangedAtMs,
                     ClientAfterMessageId = watermark.AfterMessageId
                 };
                 continue;
@@ -480,9 +480,9 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
             resolveInputs.Add(new ConversationSyncWatermarkInput
             {
                 ConversationId = conversationId,
-                AfterReceivedAtMs = watermark.AfterReceivedAtMs,
+                AfterChangedAtMs = watermark.AfterChangedAtMs,
                 AfterMessageId = watermark.AfterMessageId,
-                TipReceivedAtMs = listItem?.LastMessageAtMs,
+                TipChangedAtMs = listItem?.LastMessageAtMs,
                 TipMessageId = listItem?.LastMessageId
             });
         }
@@ -508,11 +508,11 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                     // 随机/已删消息 vs 已过期历史：无效游标若明显早于 tip−retention，标为 BeyondRetention。
                     if (reason == SyncCursorResetReason.MessageNotFound
                         && retentionHorizonMs is long retentionForInvalid
-                        && (watermark.TipReceivedAtMs ?? tipByConversation.GetValueOrDefault(conversationId)?.LastMessageAtMs)
+                        && (watermark.TipChangedAtMs ?? tipByConversation.GetValueOrDefault(conversationId)?.LastMessageAtMs)
                             is long tipForInvalid
-                        && (watermark.ClientAfterReceivedAtMs > 0
-                            ? watermark.ClientAfterReceivedAtMs
-                            : watermark.AfterReceivedAtMs) is var clientForInvalid
+                        && (watermark.ClientAfterChangedAtMs > 0
+                            ? watermark.ClientAfterChangedAtMs
+                            : watermark.AfterChangedAtMs) is var clientForInvalid
                         && clientForInvalid > 0
                         && clientForInvalid < tipForInvalid - retentionForInvalid)
                     {
@@ -524,10 +524,10 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                 }
 
                 tipByConversation.TryGetValue(conversationId, out var listItem);
-                var tipAt = watermark.TipReceivedAtMs ?? listItem?.LastMessageAtMs;
-                var clientAfter = watermark.ClientAfterReceivedAtMs > 0
-                    ? watermark.ClientAfterReceivedAtMs
-                    : watermark.AfterReceivedAtMs;
+                var tipAt = watermark.TipChangedAtMs ?? listItem?.LastMessageAtMs;
+                var clientAfter = watermark.ClientAfterChangedAtMs > 0
+                    ? watermark.ClientAfterChangedAtMs
+                    : watermark.AfterChangedAtMs;
 
                 // Retention takes precedence over a plain gap: a cursor beyond the retention
                 // horizon can never be served incrementally regardless of gap policy.
@@ -540,8 +540,8 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                         ConversationId = conversationId,
                         Reason = SyncCursorResetReason.BeyondRetention,
                         TipMessageId = watermark.TipMessageId ?? listItem?.LastMessageId,
-                        TipReceivedAtMs = tipAt,
-                        ClientAfterReceivedAtMs = clientAfter,
+                        TipChangedAtMs = tipAt,
+                        ClientAfterChangedAtMs = clientAfter,
                         ClientAfterMessageId = string.IsNullOrWhiteSpace(watermark.ClientAfterMessageId)
                             ? null
                             : watermark.ClientAfterMessageId
@@ -558,8 +558,8 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                         ConversationId = conversationId,
                         Reason = SyncCursorResetReason.GapTooLarge,
                         TipMessageId = watermark.TipMessageId ?? listItem?.LastMessageId,
-                        TipReceivedAtMs = tipAt,
-                        ClientAfterReceivedAtMs = clientAfter,
+                        TipChangedAtMs = tipAt,
+                        ClientAfterChangedAtMs = clientAfter,
                         ClientAfterMessageId = string.IsNullOrWhiteSpace(watermark.ClientAfterMessageId)
                             ? null
                             : watermark.ClientAfterMessageId
@@ -592,16 +592,16 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
             : (string.IsNullOrWhiteSpace(watermark.AfterMessageId)
                 ? null
                 : watermark.AfterMessageId);
-        var tipAt = watermark.TipReceivedAtMs
-                    ?? (watermark.AfterReceivedAtMs > 0 ? watermark.AfterReceivedAtMs : null);
+        var tipAt = watermark.TipChangedAtMs
+                    ?? (watermark.AfterChangedAtMs > 0 ? watermark.AfterChangedAtMs : null);
         return new SyncCursorResetRequired
         {
             ConversationId = watermark.ConversationId,
             Reason = reason,
             TipMessageId = tipId,
-            TipReceivedAtMs = tipAt,
-            ClientAfterReceivedAtMs = watermark.ClientAfterReceivedAtMs > 0
-                ? watermark.ClientAfterReceivedAtMs
+            TipChangedAtMs = tipAt,
+            ClientAfterChangedAtMs = watermark.ClientAfterChangedAtMs > 0
+                ? watermark.ClientAfterChangedAtMs
                 : null,
             ClientAfterMessageId = string.IsNullOrWhiteSpace(watermark.ClientAfterMessageId)
                 ? null

@@ -31,7 +31,7 @@ public sealed class DeviceSyncCursorStoreTests : IAsyncLifetime
                 new DeviceSyncCursor
                 {
                     ConversationId = "dm:42:43",
-                    AfterReceivedAtMs = 100,
+                    AfterChangedAtMs = 100,
                     AfterMessageId = "msg-1"
                 }
             ]);
@@ -43,7 +43,7 @@ public sealed class DeviceSyncCursorStoreTests : IAsyncLifetime
                 new DeviceSyncCursor
                 {
                     ConversationId = "dm:42:43",
-                    AfterReceivedAtMs = 50,
+                    AfterChangedAtMs = 50,
                     AfterMessageId = "msg-0"
                 }
             ]);
@@ -55,14 +55,14 @@ public sealed class DeviceSyncCursorStoreTests : IAsyncLifetime
                 new DeviceSyncCursor
                 {
                     ConversationId = "dm:42:43",
-                    AfterReceivedAtMs = 200,
+                    AfterChangedAtMs = 200,
                     AfterMessageId = "msg-2"
                 }
             ]);
 
         var loaded = await store.LoadAsync(42, 7, take: 10);
         var cursor = Assert.Single(loaded);
-        Assert.Equal(200, cursor.AfterReceivedAtMs);
+        Assert.Equal(200, cursor.AfterChangedAtMs);
         Assert.Equal("msg-2", cursor.AfterMessageId);
 
         var otherDevice = await store.LoadAsync(42, 8, take: 10);

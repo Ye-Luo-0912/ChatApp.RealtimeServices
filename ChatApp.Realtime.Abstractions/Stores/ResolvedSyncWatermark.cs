@@ -11,7 +11,7 @@ public sealed class ResolvedSyncWatermark
     /// Query watermark when <see cref="IsValid"/>; otherwise typically the tip (hint only — do not
     /// treat as a successful incremental catch-up cursor).
     /// </summary>
-    public required long AfterReceivedAtMs { get; init; }
+    public required long AfterChangedAtMs { get; init; }
 
     public required string AfterMessageId { get; init; }
 
@@ -21,11 +21,11 @@ public sealed class ResolvedSyncWatermark
     /// <summary>Set when <see cref="IsValid"/> is false (message missing or ahead of tip).</summary>
     public SyncWatermarkInvalidationKind? InvalidationKind { get; init; }
 
-    public long? TipReceivedAtMs { get; init; }
+    public long? TipChangedAtMs { get; init; }
 
     public string? TipMessageId { get; init; }
 
-    public long ClientAfterReceivedAtMs { get; init; }
+    public long ClientAfterChangedAtMs { get; init; }
 
     public string ClientAfterMessageId { get; init; } = string.Empty;
 }

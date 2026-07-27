@@ -25,6 +25,10 @@ public static class RealtimeNatsRegistration
         JetStreamOptions? jetStreamOptions = null)
     {
         services.AddSingleton(queueOptions);
+        // Reliability-4：始终注册 JetStreamOptions（即使 Noop 模式），
+        // 使 Worker 能注入并读取 AckWait 配置以驱动 In-Progress ACK 守卫。
+        // Noop 模式下 AckWait=0，ProgressAckGuard.Start 返回 null（空操作）。
+        services.TryAddSingleton(jetStreamOptions ?? new JetStreamOptions());
         if (!ShouldUseNatsQueue(queueOptions))
         {
             return services;
@@ -54,7 +58,7 @@ public static class RealtimeNatsRegistration
 
         if (IsJetStream(queueOptions))
         {
-            services.AddSingleton(jetStreamOptions ?? new JetStreamOptions());
+            // Reliability-4：已在上方 TryAddSingleton 注册，此处不再重复。
             // Null* 仅暴露私有构造函数 + 静态 Instance（单例），不能用 TryAddSingleton<TImpl>
             // 让 DI 容器构造；直接注册实例，避免 ValidateOnBuild 失败。
             services.TryAddSingleton<IGatewayDirectory>(NullGatewayDirectory.Instance);

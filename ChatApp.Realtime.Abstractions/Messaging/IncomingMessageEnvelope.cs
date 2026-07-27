@@ -15,6 +15,7 @@ public sealed class IncomingMessageEnvelope
 
     private readonly Func<CancellationToken, ValueTask>? _ack;
     private readonly Func<TimeSpan?, CancellationToken, ValueTask>? _nak;
+    private readonly Func<CancellationToken, ValueTask>? _progressAck;
 
     [SetsRequiredMembers]
     public IncomingMessageEnvelope(IncomingMessageCommand command)
@@ -31,7 +32,8 @@ public sealed class IncomingMessageEnvelope
         string? rawPayload = null,
         ActivityContext parentContext = default,
         long? trustedUserId = null,
-        string? trustedSessionId = null)
+        string? trustedSessionId = null,
+        Func<CancellationToken, ValueTask>? progressAck = null)
     {
         Command = command;
         _ack = ack;
@@ -41,11 +43,21 @@ public sealed class IncomingMessageEnvelope
         ParentContext = parentContext;
         TrustedUserId = trustedUserId;
         TrustedSessionId = trustedSessionId;
+        _progressAck = progressAck;
     }
 
     public ValueTask AckAsync(CancellationToken ct = default)
     {
         return _ack is not null ? _ack(ct) : ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// Reliability-4：In-Progress ACK（JetStream WPI）。重置 AckWait 计时器，
+    /// 防止长时处理消息在完成前被 JetStream 重投。无回调时为空操作。
+    /// </summary>
+    public ValueTask ProgressAckAsync(CancellationToken ct = default)
+    {
+        return _progressAck is not null ? _progressAck(ct) : ValueTask.CompletedTask;
     }
 
     public string? RawPayload { get; set; }

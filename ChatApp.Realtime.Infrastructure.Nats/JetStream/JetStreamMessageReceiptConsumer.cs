@@ -52,13 +52,14 @@ public sealed class JetStreamMessageReceiptConsumer : IMessageReceiptConsumer
 
         var consumeOptions = new NatsJSConsumeOpts
         {
-            MaxMsgs = Math.Max(1, _jetStreamOptions.Consumer.MaxAckPending),
+            // Reliability-4：预取上限使用 PrefetchMaxMsgs 而非 MaxAckPending。
+            MaxMsgs = Math.Max(1, _jetStreamOptions.Consumer.PrefetchMaxMsgs),
             Expires = TimeSpan.FromSeconds(
                 Math.Max(5, _jetStreamOptions.Consumer.AckWaitSeconds)),
             IdleHeartbeat = TimeSpan.FromSeconds(10),
             ThresholdMsgs = Math.Max(
                 1,
-                _jetStreamOptions.Consumer.MaxAckPending / 2)
+                _jetStreamOptions.Consumer.PrefetchMaxMsgs / 2)
         };
 
         while (!ct.IsCancellationRequested)
@@ -134,7 +135,9 @@ public sealed class JetStreamMessageReceiptConsumer : IMessageReceiptConsumer
                     deliveryCount: msg.Metadata?.NumDelivered,
                     rawPayload: msg.Data,
                     parentContext: NatsTraceContext.ExtractParentContext(msg.Headers),
-                    trustedUserId: trustedUserId);
+                    trustedUserId: trustedUserId,
+                    progressAck: progressCt => JetStreamMetricAck.ProgressAckAsync(
+                        jsMsg, _metrics, observation, progressCt));
             }
 
             await Task.Delay(TimeSpan.FromMilliseconds(100), ct)

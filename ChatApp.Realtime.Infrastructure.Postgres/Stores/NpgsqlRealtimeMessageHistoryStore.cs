@@ -457,7 +457,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                 continue;
             }
 
-            long? afterAt = query.AfterReceivedAtMs;
+            long? afterAt = query.AfterChangedAtMs;
             string? afterId = string.IsNullOrWhiteSpace(query.AfterMessageId)
                 ? null
                 : query.AfterMessageId.Trim();
@@ -769,7 +769,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
         {
             if (string.IsNullOrWhiteSpace(item.ConversationId)
                 || string.IsNullOrWhiteSpace(item.AfterMessageId)
-                || item.AfterReceivedAtMs <= 0)
+                || item.AfterChangedAtMs <= 0)
             {
                 continue;
             }
@@ -781,9 +781,9 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
             normalized.Add(new ConversationSyncWatermarkInput
             {
                 ConversationId = conversationId,
-                AfterReceivedAtMs = item.AfterReceivedAtMs,
+                AfterChangedAtMs = item.AfterChangedAtMs,
                 AfterMessageId = item.AfterMessageId.Trim(),
-                TipReceivedAtMs = item.TipReceivedAtMs,
+                TipChangedAtMs = item.TipChangedAtMs,
                 TipMessageId = string.IsNullOrWhiteSpace(item.TipMessageId)
                     ? null
                     : item.TipMessageId.Trim()
@@ -803,13 +803,13 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
         {
             var item = normalized[i];
             conversationIds[i] = item.ConversationId;
-            afterAts[i] = item.AfterReceivedAtMs;
+            afterAts[i] = item.AfterChangedAtMs;
             afterIds[i] = item.AfterMessageId;
-            if (item.TipReceivedAtMs is > 0
+            if (item.TipChangedAtMs is > 0
                 && !string.IsNullOrWhiteSpace(item.TipMessageId))
             {
                 hasTipHints[i] = true;
-                tipAts[i] = item.TipReceivedAtMs.Value;
+                tipAts[i] = item.TipChangedAtMs.Value;
                 tipIds[i] = item.TipMessageId!;
             }
         }
@@ -903,34 +903,43 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                 result[conversationId] = new ResolvedSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = 0,
+                    AfterChangedAtMs = 0,
                     AfterMessageId = string.Empty,
                     IsValid = false,
                     InvalidationKind = SyncWatermarkInvalidationKind.MessageNotFound,
-                    TipReceivedAtMs = tipAt,
+                    TipChangedAtMs = tipAt,
                     TipMessageId = tipId,
-                    ClientAfterReceivedAtMs = clientAfterAt,
+                    ClientAfterChangedAtMs = clientAfterAt,
                     ClientAfterMessageId = clientAfterId
                 };
                 continue;
             }
 
-            if (!reader.IsDBNull(5) && !reader.IsDBNull(6))
+            // SequentialAccess 要求列只能按 ordinal 单调前进。先完成第 5 列的
+            // null/value 读取，再访问第 6 列，不能 IsDBNull(6) 后回读 GetInt64(5)。
+            long? messageAt = reader.IsDBNull(5)
+                ? null
+                : reader.GetInt64(5);
+            string? messageId = reader.IsDBNull(6)
+                ? null
+                : reader.GetString(6);
+            if (messageAt.HasValue &&
+                !string.IsNullOrWhiteSpace(messageId))
             {
-                var msgAt = reader.GetInt64(5);
-                var msgId = reader.GetString(6);
+                var msgAt = messageAt.Value;
+                var msgId = messageId;
                 if (IsAfter(msgAt, msgId, tipAt.Value, tipId))
                 {
                     result[conversationId] = new ResolvedSyncWatermark
                     {
                         ConversationId = conversationId,
-                        AfterReceivedAtMs = tipAt.Value,
+                        AfterChangedAtMs = tipAt.Value,
                         AfterMessageId = tipId,
                         IsValid = false,
                         InvalidationKind = SyncWatermarkInvalidationKind.AheadOfTip,
-                        TipReceivedAtMs = tipAt,
+                        TipChangedAtMs = tipAt,
                         TipMessageId = tipId,
-                        ClientAfterReceivedAtMs = clientAfterAt,
+                        ClientAfterChangedAtMs = clientAfterAt,
                         ClientAfterMessageId = clientAfterId
                     };
                     continue;
@@ -939,12 +948,12 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                 result[conversationId] = new ResolvedSyncWatermark
                 {
                     ConversationId = conversationId,
-                    AfterReceivedAtMs = msgAt,
+                    AfterChangedAtMs = msgAt,
                     AfterMessageId = msgId,
                     IsValid = true,
-                    TipReceivedAtMs = tipAt,
+                    TipChangedAtMs = tipAt,
                     TipMessageId = tipId,
-                    ClientAfterReceivedAtMs = clientAfterAt,
+                    ClientAfterChangedAtMs = clientAfterAt,
                     ClientAfterMessageId = clientAfterId
                 };
                 continue;
@@ -953,13 +962,13 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
             result[conversationId] = new ResolvedSyncWatermark
             {
                 ConversationId = conversationId,
-                AfterReceivedAtMs = tipAt.Value,
+                AfterChangedAtMs = tipAt.Value,
                 AfterMessageId = tipId,
                 IsValid = false,
                 InvalidationKind = SyncWatermarkInvalidationKind.MessageNotFound,
-                TipReceivedAtMs = tipAt,
+                TipChangedAtMs = tipAt,
                 TipMessageId = tipId,
-                ClientAfterReceivedAtMs = clientAfterAt,
+                ClientAfterChangedAtMs = clientAfterAt,
                 ClientAfterMessageId = clientAfterId
             };
         }

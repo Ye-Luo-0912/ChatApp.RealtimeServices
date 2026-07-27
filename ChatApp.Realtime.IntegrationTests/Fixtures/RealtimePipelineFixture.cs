@@ -142,6 +142,7 @@ public sealed class RealtimePipelineFixture : IAsyncLifetime
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(90));
         Exception? last = null;
+        string? lastReadyResponse = null;
         while (!timeout.IsCancellationRequested)
         {
             try
@@ -151,17 +152,37 @@ public sealed class RealtimePipelineFixture : IAsyncLifetime
                 using var ready = await _http.GetAsync("/ready", timeout.Token).ConfigureAwait(false);
                 if (ready.IsSuccessStatusCode)
                     return;
+
+                lastReadyResponse = await ready.Content
+                    .ReadAsStringAsync(timeout.Token)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+                when (timeout.IsCancellationRequested)
+            {
+                break;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 last = ex;
             }
 
-            await Task.Delay(500, timeout.Token).ConfigureAwait(false);
+            try
+            {
+                await Task.Delay(500, timeout.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+                when (timeout.IsCancellationRequested)
+            {
+                break;
+            }
         }
 
         throw new TimeoutException(
-            "RealtimeServices host did not become ready in time.",
+            "RealtimeServices host did not become ready in time. Last /ready response: " +
+            (string.IsNullOrWhiteSpace(lastReadyResponse)
+                ? "<none>"
+                : lastReadyResponse[..Math.Min(lastReadyResponse.Length, 4096)]),
             last);
     }
 

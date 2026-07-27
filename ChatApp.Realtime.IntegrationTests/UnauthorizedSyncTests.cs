@@ -83,7 +83,7 @@ public sealed class UnauthorizedSyncTests
                     new ConversationSyncWatermark
                     {
                         ConversationId = privateConversation,
-                        AfterReceivedAtMs = receivedAtMs - 1,
+                        AfterChangedAtMs = receivedAtMs - 1,
                         AfterMessageId = "0"
                     }
                 ]

@@ -112,4 +112,13 @@ public sealed class JetStreamConsumerOptions
     public int MaxDeliver { get; init; } = 10;
     public int MaxAckPending { get; init; } = 256;
     public int[] BackoffSeconds { get; init; } = [1, 5, 30, 120, 300];
+
+    /// <summary>
+    /// Reliability-4：单次 consume 拉取的最大消息数（预取上限）。
+    /// 默认 16，与 ProcessingConcurrency（默认 4）的 4 倍匹配，确保有少量缓冲但不堆积。
+    /// 旧实现使用 MaxAckPending（默认 256）作为 MaxMsgs，导致大量消息进入本地 Channel
+    /// 后在队列中等待，消耗 AckWait 预算，最终被 JetStream 重投甚至累计到毒丸阈值。
+    /// MaxAckPending 仍是 consumer 的在途上限（允许重投缓冲），但单次拉取应受此值约束。
+    /// </summary>
+    public int PrefetchMaxMsgs { get; init; } = 16;
 }

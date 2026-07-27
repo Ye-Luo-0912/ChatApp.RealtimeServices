@@ -96,4 +96,30 @@ internal static class JetStreamMetricAck
                 succeeded);
         }
     }
+
+    /// <summary>
+    /// Reliability-4：In-Progress ACK（JetStream WPI）。
+    /// 重置 AckWait 计时器但不消费消息，防止长时处理消息在完成前被 JetStream 重投。
+    /// </summary>
+    public static async ValueTask ProgressAckAsync<T>(
+        INatsJSMsg<T> message,
+        NatsTransportMetrics metrics,
+        JetStreamDeliveryObservation observation,
+        CancellationToken ct)
+    {
+        var succeeded = false;
+        try
+        {
+            await message.AckProgressAsync(cancellationToken: ct).ConfigureAwait(false);
+            succeeded = true;
+        }
+        finally
+        {
+            metrics.RecordJetStreamAcknowledgement(
+                observation.Consumer,
+                "progress",
+                Stopwatch.GetElapsedTime(observation.StartedTimestamp),
+                succeeded);
+        }
+    }
 }

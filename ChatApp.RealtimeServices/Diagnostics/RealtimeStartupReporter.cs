@@ -37,6 +37,18 @@ public sealed class RealtimeStartupReporter : IHostedService
         "ConversationSyncBootstrapWorker"
     ];
 
+    /// <summary>
+    /// Reliability-3：非关键（清理类）Worker 列表。这些 Worker 的健康状态会上报但不会阻断就绪判定。
+    /// </summary>
+    internal static readonly string[] NonCriticalWorkerNames =
+    [
+        "AccountCleanupWorker",
+        "OutboxCleanupWorker",
+        "MessageRetentionWorker",
+        "OutboxMetricsCollector",
+        "IdempotencyGCWorker"
+    ];
+
     private readonly IHostEnvironment _environment;
     private readonly IOptions<RealtimeOptions> _realtimeOptions;
     private readonly IOptions<NatsOptions> _natsOptions;
@@ -82,6 +94,10 @@ public sealed class RealtimeStartupReporter : IHostedService
         // Reliability-2：注册必需 Worker，使 GetSnapshot 能验证它们是否全部启动。
         foreach (var name in RequiredWorkerNames)
             _readinessState.RegisterRequiredWorker(name);
+
+        // Reliability-3：注册非关键 Worker，状态上报但不阻断就绪。
+        foreach (var name in NonCriticalWorkerNames)
+            _readinessState.RegisterNonCriticalWorker(name);
 
         var realtime = _realtimeOptions.Value;
         var nats = _natsOptions.Value;
