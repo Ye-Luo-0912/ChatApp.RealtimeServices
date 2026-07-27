@@ -26,6 +26,7 @@ public sealed class DefaultMessageHistoryQueryProcessorTests
         {
             RequestId = "request-1",
             UserId = 42,
+            ConversationId = "dm:42:43",
             Limit = 500
         });
 
@@ -36,6 +37,26 @@ public sealed class DefaultMessageHistoryQueryProcessorTests
         Assert.Equal(page.Items[^1].MessageId, page.NextCursor.MessageId);
         Assert.Equal(101, store.Take);
         Assert.Equal(42, store.UserId);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_RejectsGlobalHistory_AfterP0_3()
+    {
+        // P0-3：废弃用户级全量历史，所有列表查询必须带 ConversationId。
+        var store = new CapturingHistoryStore(CreateMessages(5, "hello"));
+        var processor = CreateProcessor(store);
+
+        var page = await processor.ProcessAsync(new MessageHistoryQuery
+        {
+            RequestId = "request-global",
+            UserId = 42,
+            Limit = 20
+        });
+
+        Assert.False(page.Succeeded);
+        Assert.Equal("conversation_id_required", page.ErrorCode);
+        Assert.False(store.Called);
+        Assert.False(store.ConversationQueryCalled);
     }
 
     [Fact]
@@ -69,6 +90,7 @@ public sealed class DefaultMessageHistoryQueryProcessorTests
         {
             RequestId = "request-3",
             UserId = 42,
+            ConversationId = "dm:42:43",
             Limit = 3
         });
 
@@ -94,6 +116,7 @@ public sealed class DefaultMessageHistoryQueryProcessorTests
         {
             RequestId = "request-3b",
             UserId = 42,
+            ConversationId = "dm:42:43",
             Limit = 1
         });
 

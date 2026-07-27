@@ -4,13 +4,16 @@ using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Stores;
+using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Attachments;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Conversations;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using ChatApp.Realtime.Infrastructure.Postgres.Messages;
+using ChatApp.Realtime.Infrastructure.Postgres.Messaging;
 using ChatApp.Realtime.Infrastructure.Postgres.Outbox;
+using ChatApp.Realtime.Infrastructure.Postgres.Projections;
 using ChatApp.Realtime.Infrastructure.Postgres.Transactions;
 using Microsoft.Extensions.Logging;
 using Npgsql;
@@ -33,16 +36,21 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
     private readonly RealtimeWriteSessionFactory _sessionFactory;
     private readonly RealtimeDatabaseClient _databaseClient;
     private readonly RealtimeDatabaseSchema _databaseSchema;
+    private readonly IConversationMessageMutationPolicy _mutationPolicy;
     private readonly ILogger<NpgsqlRealtimeMessageStore> _logger;
 
     public NpgsqlRealtimeMessageStore(
         RealtimeDatabaseClient databaseClient,
         RealtimeDatabaseSchema databaseSchema,
-        ILogger<NpgsqlRealtimeMessageStore> logger)
+        IConversationMessageMutationPolicy mutationPolicy,
+        ILogger<NpgsqlRealtimeMessageStore> logger,
+        RealtimeMetrics? metrics = null)
     {
         _databaseClient = databaseClient;
         _databaseSchema = databaseSchema;
-        _sessionFactory = new RealtimeWriteSessionFactory(databaseClient, databaseSchema);
+        _mutationPolicy = mutationPolicy;
+        // Reliability-4：传入 RealtimeMetrics，由 session 在事务提交成功后记录 outbox 入队行数。
+        _sessionFactory = new RealtimeWriteSessionFactory(databaseClient, databaseSchema, metrics);
         _logger = logger;
     }
 
@@ -142,7 +150,6 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         var createdEvent = RealtimeMessageEventFactory.EnrichChatMessagePayload(
             RealtimeMessageEventFactory.CopyWithMessageId(eventToPublish, message.MessageId),
             boundAttachmentRefs);
-        var outboxEvents = new List<RealtimeEvent>(8);
 
         var isGroup = !string.IsNullOrWhiteSpace(message.ConversationId)
                       && ConversationId.IsGroup(message.ConversationId);
@@ -164,24 +171,26 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 return RealtimeMessagePersistResult.NotAllowed(message.MessageId);
             }
 
-            outboxEvents.Add(RealtimeMessageEventFactory.CreateGroupMessageAggregatedEvent(
+            // Perf-9：群消息走统一 GroupProjectionDelta 协议，广播事件聚合为单行 Outbox。
+            var delta = new GroupProjectionDelta(message.ConversationId!, memberIds);
+            delta.AddBroadcast(RealtimeMessageEventFactory.CreateGroupMessageAggregatedEvent(
                 createdEvent,
                 message,
                 memberIds));
 
             await AdvanceGroupConversationAndEnqueueAsync(
-                    session,
                     conversationWriter,
                     message,
-                    memberIds,
+                    delta,
                     createdEvent.TraceParent,
-                    createdEvent.TraceState,
-                    outboxEvents)
+                    createdEvent.TraceState)
                 .ConfigureAwait(false);
+
+            await outboxWriter.InsertManyAsync(delta.Build()).ConfigureAwait(false);
         }
         else
         {
-            outboxEvents.Add(createdEvent);
+            var outboxEvents = new List<RealtimeEvent>(8) { createdEvent };
 
             // 发送方其他在线设备回声：同事务写入；Gateway 会跳过来源 SessionId。
             if (message.SenderUserId != message.ReceiverUserId)
@@ -197,9 +206,9 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                         outboxEvents)
                     .ConfigureAwait(false);
             }
-        }
 
-        await outboxWriter.InsertManyAsync(outboxEvents).ConfigureAwait(false);
+            await outboxWriter.InsertManyAsync(outboxEvents).ConfigureAwait(false);
+        }
         await session.CommitAsync().ConfigureAwait(false);
 
         _logger.LogDebug(
@@ -211,13 +220,11 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
     }
 
     private static async Task AdvanceGroupConversationAndEnqueueAsync(
-        RealtimeWriteSession session,
         ConversationProjectionWriter conversationWriter,
         RealtimeMessageRecord message,
-        IReadOnlyList<long> memberIds,
+        GroupProjectionDelta delta,
         string? traceParent,
-        string? traceState,
-        List<RealtimeEvent> outboxEvents)
+        string? traceState)
     {
         var conversationId = message.ConversationId!;
         var preview = ConversationId.CreatePreview(message.Content);
@@ -233,25 +240,23 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
 
         if (advanced)
         {
-            foreach (var memberId in memberIds)
-            {
-                outboxEvents.Add(ConversationWriteCommands.CreateConversationChangedEvent(
-                    conversationId,
-                    memberId,
-                    peerUserId: null,
-                    message.MessageId,
-                    preview,
-                    message.ReceivedAtMs,
-                    message.SenderUserId,
-                    traceParent,
-                    traceState,
-                    type: ConversationType.Group));
-            }
+            // Perf-9：ConversationChanged 聚合为 1 行广播事件（原来按成员 N 行）。
+            delta.AddBroadcast(GroupProjectionEventFactory.CreateGroupConversationChangedBroadcast(
+                conversationId,
+                message.MessageId,
+                preview,
+                message.ReceivedAtMs,
+                message.SenderUserId,
+                causeToken: null,
+                traceParent,
+                traceState));
         }
 
+        // UnreadCountChanged 保持逐用户：每个成员的绝对未读数不同，无法聚合为同一 payload。
+        // 如需聚合需要演进 RealtimeUnreadCountChangedPayload 为 delta 语义（Perf-9 后续工作）。
         foreach (var (userId, unreadCount) in unreads)
         {
-            outboxEvents.Add(ConversationWriteCommands.CreateUnreadCountChangedEvent(
+            delta.AddPerUser(ConversationWriteCommands.CreateUnreadCountChangedEvent(
                 conversationId,
                 userId,
                 unreadCount,
@@ -543,6 +548,44 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 target.ConversationId);
         }
 
+        // P0-8：群消息撤回还需验证操作者仍是当前群成员，防止离群后修改旧消息。
+        var recallAuth = await _mutationPolicy
+            .AuthorizeMutationAsync(
+                session.Connection,
+                session.Transaction,
+                session.Schema,
+                new MessageMutationContext(
+                    target.ConversationId,
+                    target.SenderUserId,
+                    target.ReceiverUserId,
+                    senderUserId,
+                    MessageMutationOperation.Recall),
+                ct)
+            .ConfigureAwait(false);
+        if (!recallAuth.Allowed)
+        {
+            await mutationWriter.InsertMutationRequestAsync(
+                    senderUserId,
+                    requestId,
+                    operation: 2,
+                    messageId,
+                    payloadFingerprint,
+                    succeeded: false,
+                    errorCode: "recall_not_allowed",
+                    target.ConversationId,
+                    content: null,
+                    editVersion: null,
+                    editedAtMs: null,
+                    recalledAtMs: null)
+                .ConfigureAwait(false);
+            await session.CommitAsync().ConfigureAwait(false);
+            return new MessageRecallPersistResult(
+                MessageRecallPersistStatus.NotAllowed,
+                messageId,
+                target.ReceiverUserId,
+                target.ConversationId);
+        }
+
         if (target.RecalledAtMs is long already)
         {
             await mutationWriter.InsertMutationRequestAsync(
@@ -631,67 +674,59 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 .ConfigureAwait(false);
         }
 
-        var payloadJson = JsonSerializer.Serialize(
-            new RealtimeMessageRecalledPayload
-            {
-                MessageId = messageId,
-                ConversationId = target.ConversationId,
-                SenderUserId = senderUserId,
-                ReceiverUserId = target.ReceiverUserId,
-                RecalledAtMs = recalledAtMs
-            },
-            RealtimeJsonSerializerContext.Default.RealtimeMessageRecalledPayload);
-
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
-        var events = new List<RealtimeEvent>(8);
         var isGroup = !string.IsNullOrWhiteSpace(target.ConversationId)
                       && ConversationId.IsGroup(target.ConversationId);
 
         if (isGroup)
         {
+            // Perf-9：群撤回走统一 GroupProjectionDelta 协议，广播事件聚合为单行 Outbox。
             var memberIds = await conversationWriter
                 .ListActiveMemberUserIdsAsync(target.ConversationId!)
                 .ConfigureAwait(false);
-            foreach (var targetUserId in memberIds)
-            {
-                events.Add(new RealtimeEvent
-                {
-                    EventId = MessageEventIdFactory.CreateMessageRecalledEventId(messageId, targetUserId),
-                    Type = RealtimeEventType.MessageRecalled,
-                    TargetUserId = targetUserId,
-                    ActorUserId = senderUserId,
-                    MessageId = messageId,
-                    SessionId = senderSessionId,
-                    PayloadJson = payloadJson,
-                    OccurredAtMs = recalledAtMs,
-                    TraceParent = traceParent,
-                    TraceState = traceState
-                });
-            }
+            var delta = new GroupProjectionDelta(target.ConversationId!, memberIds);
+
+            delta.AddBroadcast(GroupProjectionEventFactory.CreateGroupMessageRecalledBroadcast(
+                messageId,
+                target.ConversationId!,
+                senderUserId,
+                target.ReceiverUserId,
+                senderSessionId,
+                recalledAtMs,
+                traceParent,
+                traceState));
 
             if (tipPreviewUpdated)
             {
                 var cause = $"recall:{recalledAtMs}";
-                foreach (var targetUserId in memberIds)
-                {
-                    events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
-                        target.ConversationId!,
-                        targetUserId,
-                        peerUserId: null,
-                        messageId,
-                        "消息已撤回",
-                        target.ReceivedAtMs,
-                        senderUserId,
-                        traceParent,
-                        traceState,
-                        cause,
-                        ConversationType.Group));
-                }
+                delta.AddBroadcast(GroupProjectionEventFactory.CreateGroupConversationChangedBroadcast(
+                    target.ConversationId!,
+                    messageId,
+                    "消息已撤回",
+                    target.ReceivedAtMs,
+                    senderUserId,
+                    cause,
+                    traceParent,
+                    traceState));
             }
+
+            await outboxWriter.InsertManyAsync(delta.Build()).ConfigureAwait(false);
         }
         else
         {
+            var payloadJson = JsonSerializer.Serialize(
+                new RealtimeMessageRecalledPayload
+                {
+                    MessageId = messageId,
+                    ConversationId = target.ConversationId,
+                    SenderUserId = senderUserId,
+                    ReceiverUserId = target.ReceiverUserId,
+                    RecalledAtMs = recalledAtMs
+                },
+                RealtimeJsonSerializerContext.Default.RealtimeMessageRecalledPayload);
+
+            var events = new List<RealtimeEvent>(8);
             events.Add(new RealtimeEvent
             {
                 EventId = MessageEventIdFactory.CreateMessageRecalledEventId(messageId, target.ReceiverUserId),
@@ -748,9 +783,9 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                     traceState,
                     cause));
             }
-        }
 
-        await outboxWriter.InsertManyAsync(events).ConfigureAwait(false);
+            await outboxWriter.InsertManyAsync(events).ConfigureAwait(false);
+        }
         await mutationWriter.InsertMutationRequestAsync(
                 senderUserId,
                 requestId,
@@ -853,6 +888,44 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         }
 
         if (target.SenderUserId != senderUserId)
+        {
+            await mutationWriter.InsertMutationRequestAsync(
+                    senderUserId,
+                    requestId,
+                    operation: 1,
+                    messageId,
+                    payloadFingerprint,
+                    succeeded: false,
+                    errorCode: "edit_not_allowed",
+                    target.ConversationId,
+                    content: null,
+                    editVersion: null,
+                    editedAtMs: null,
+                    recalledAtMs: null)
+                .ConfigureAwait(false);
+            await session.CommitAsync().ConfigureAwait(false);
+            return new MessageEditPersistResult(
+                MessageEditPersistStatus.NotAllowed,
+                messageId,
+                target.ReceiverUserId,
+                target.ConversationId);
+        }
+
+        // P0-8：群消息编辑还需验证操作者仍是当前群成员，防止离群后修改旧消息。
+        var editAuth = await _mutationPolicy
+            .AuthorizeMutationAsync(
+                session.Connection,
+                session.Transaction,
+                session.Schema,
+                new MessageMutationContext(
+                    target.ConversationId,
+                    target.SenderUserId,
+                    target.ReceiverUserId,
+                    senderUserId,
+                    MessageMutationOperation.Edit),
+                ct)
+            .ConfigureAwait(false);
+        if (!editAuth.Allowed)
         {
             await mutationWriter.InsertMutationRequestAsync(
                     senderUserId,
@@ -991,72 +1064,63 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 .ConfigureAwait(false);
         }
 
-        var payloadJson = JsonSerializer.Serialize(
-            new RealtimeMessageEditedPayload
-            {
-                MessageId = messageId,
-                ConversationId = target.ConversationId,
-                SenderUserId = senderUserId,
-                ReceiverUserId = target.ReceiverUserId,
-                Content = content,
-                EditVersion = nextVersion,
-                EditedAtMs = editedAtMs
-            },
-            RealtimeJsonSerializerContext.Default.RealtimeMessageEditedPayload);
-
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
-        var events = new List<RealtimeEvent>(8);
         var isGroup = !string.IsNullOrWhiteSpace(target.ConversationId)
                       && ConversationId.IsGroup(target.ConversationId);
 
         if (isGroup)
         {
+            // Perf-9：群编辑走统一 GroupProjectionDelta 协议，广播事件聚合为单行 Outbox。
             var memberIds = await conversationWriter
                 .ListActiveMemberUserIdsAsync(target.ConversationId!)
                 .ConfigureAwait(false);
-            foreach (var targetUserId in memberIds)
-            {
-                events.Add(new RealtimeEvent
-                {
-                    EventId = MessageEventIdFactory.CreateMessageEditedEventId(
-                        messageId,
-                        targetUserId,
-                        nextVersion),
-                    Type = RealtimeEventType.MessageEdited,
-                    TargetUserId = targetUserId,
-                    ActorUserId = senderUserId,
-                    MessageId = messageId,
-                    SessionId = senderSessionId,
-                    PayloadJson = payloadJson,
-                    OccurredAtMs = editedAtMs,
-                    TraceParent = traceParent,
-                    TraceState = traceState
-                });
-            }
+            var delta = new GroupProjectionDelta(target.ConversationId!, memberIds);
+
+            delta.AddBroadcast(GroupProjectionEventFactory.CreateGroupMessageEditedBroadcast(
+                messageId,
+                target.ConversationId!,
+                senderUserId,
+                target.ReceiverUserId,
+                senderSessionId,
+                content,
+                nextVersion,
+                editedAtMs,
+                traceParent,
+                traceState));
 
             if (tipPreviewUpdated)
             {
                 var cause = $"edit:{nextVersion}";
-                foreach (var targetUserId in memberIds)
-                {
-                    events.Add(ConversationWriteCommands.CreateConversationChangedEvent(
-                        target.ConversationId!,
-                        targetUserId,
-                        peerUserId: null,
-                        messageId,
-                        tipPreview,
-                        target.ReceivedAtMs,
-                        senderUserId,
-                        traceParent,
-                        traceState,
-                        cause,
-                        ConversationType.Group));
-                }
+                delta.AddBroadcast(GroupProjectionEventFactory.CreateGroupConversationChangedBroadcast(
+                    target.ConversationId!,
+                    messageId,
+                    tipPreview,
+                    target.ReceivedAtMs,
+                    senderUserId,
+                    cause,
+                    traceParent,
+                    traceState));
             }
+
+            await outboxWriter.InsertManyAsync(delta.Build()).ConfigureAwait(false);
         }
         else
         {
+            var payloadJson = JsonSerializer.Serialize(
+                new RealtimeMessageEditedPayload
+                {
+                    MessageId = messageId,
+                    ConversationId = target.ConversationId,
+                    SenderUserId = senderUserId,
+                    ReceiverUserId = target.ReceiverUserId,
+                    Content = content,
+                    EditVersion = nextVersion,
+                    EditedAtMs = editedAtMs
+                },
+                RealtimeJsonSerializerContext.Default.RealtimeMessageEditedPayload);
+
+            var events = new List<RealtimeEvent>(8);
             events.Add(new RealtimeEvent
             {
                 EventId = MessageEventIdFactory.CreateMessageEditedEventId(
@@ -1119,9 +1183,9 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                     traceState,
                     cause));
             }
-        }
 
-        await outboxWriter.InsertManyAsync(events).ConfigureAwait(false);
+            await outboxWriter.InsertManyAsync(events).ConfigureAwait(false);
+        }
         await mutationWriter.InsertMutationRequestAsync(
                 senderUserId,
                 requestId,
@@ -1183,31 +1247,61 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         await DeleteConversationDataForUserIfPresentAsync(connection, userId, ct)
             .ConfigureAwait(false);
 
-        await using (var outboxCmd = new NpgsqlCommand(
+        var outboxDeleted = 0;
+        await using (var outboxDeleteCmd = new NpgsqlCommand(
             $"""
              DELETE FROM {_databaseSchema.OutboxTableSql}
              WHERE target_user_id = @user_id
+               AND (target_user_ids IS NULL OR cardinality(target_user_ids) = 0)
                AND event_type <> ALL(@keep_types);
              """,
             connection))
         {
-            outboxCmd.Parameters.AddWithValue("user_id", userId);
-            outboxCmd.Parameters.AddWithValue(
+            outboxDeleteCmd.Parameters.AddWithValue("user_id", userId);
+            outboxDeleteCmd.Parameters.AddWithValue(
                 "keep_types",
                 new short[]
                 {
                     (short)RealtimeEventType.AccountCleanupCompleted,
                     (short)RealtimeEventType.AttachmentBlobsPurge
                 });
-            var outboxDeleted = await outboxCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-            if (total > 0 || outboxDeleted > 0)
-            {
-                _logger.LogInformation(
-                    "已清理用户消息与 Outbox。用户={UserId}；删除消息={Deleted}；删除Outbox={OutboxDeleted}",
-                    userId,
-                    total,
-                    outboxDeleted);
-            }
+            outboxDeleted = await outboxDeleteCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+
+        // P0-6：聚合事件（target_user_ids 非空）不应整行删除，否则会误伤同数组中的其他用户。
+        // 仅对 Pending/Dead 的聚合事件做 array_remove，Published 已投递等 TTL 清理即可。
+        await using (var outboxUpdateCmd = new NpgsqlCommand(
+            $"""
+             UPDATE {_databaseSchema.OutboxTableSql}
+             SET target_user_ids = array_remove(target_user_ids, @user_id)
+             WHERE @user_id = ANY(target_user_ids)
+               AND status <> @published_status
+               AND event_type <> ALL(@keep_types);
+             """,
+            connection))
+        {
+            outboxUpdateCmd.Parameters.AddWithValue("user_id", userId);
+            outboxUpdateCmd.Parameters.AddWithValue(
+                "published_status",
+                (short)RealtimeOutboxStatus.Published);
+            outboxUpdateCmd.Parameters.AddWithValue(
+                "keep_types",
+                new short[]
+                {
+                    (short)RealtimeEventType.AccountCleanupCompleted,
+                    (short)RealtimeEventType.AttachmentBlobsPurge
+                });
+            var outboxUpdated = await outboxUpdateCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            outboxDeleted += outboxUpdated;
+        }
+
+        if (total > 0 || outboxDeleted > 0)
+        {
+            _logger.LogInformation(
+                "已清理用户消息与 Outbox。用户={UserId}；删除消息={Deleted}；删除Outbox={OutboxDeleted}",
+                userId,
+                total,
+                outboxDeleted);
         }
 
         return total;
@@ -1261,6 +1355,8 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             await directCleanup.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
 
+        var affectedConversationIds = new HashSet<string>(StringComparer.Ordinal);
+
         await using (var tombstone = new NpgsqlCommand(
                            $"""
                             WITH removed AS (
@@ -1268,41 +1364,42 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                                 WHERE user_id = @user_id
                                 RETURNING conversation_id
                             ),
-                            clear_tip AS (
-                                UPDATE {_databaseSchema.ConversationsTableSql} AS c
-                                SET last_message_id = NULL,
-                                    last_message_preview = NULL,
-                                    last_message_at_ms = NULL,
-                                    last_sender_user_id = NULL,
-                                    updated_at_ms = @now
-                                FROM removed r
-                                WHERE c.conversation_id = r.conversation_id
-                                  AND c.last_sender_user_id = @user_id
-                                RETURNING c.conversation_id
-                            ),
                             fix_peer AS (
                                 UPDATE {_databaseSchema.ConversationMembersTableSql} AS m
-                                SET peer_user_id = CASE WHEN m.peer_user_id = @user_id THEN NULL ELSE m.peer_user_id END,
-                                    unread_count = 0,
-                                    last_read_message_id = NULL,
-                                    last_read_at_ms = NULL
+                                SET peer_user_id = CASE WHEN m.peer_user_id = @user_id THEN NULL ELSE m.peer_user_id END
                                 FROM removed r
                                 WHERE m.conversation_id = r.conversation_id
                                   AND m.user_id <> @user_id
-                                RETURNING m.user_id
+                                RETURNING m.conversation_id
                             )
-                            SELECT
-                                (SELECT COUNT(*) FROM removed) AS removed_members,
-                                (SELECT COUNT(*) FROM clear_tip) AS cleared_tips,
-                                (SELECT COUNT(*) FROM fix_peer) AS fixed_peers;
+                            SELECT conversation_id FROM removed
+                            UNION
+                            SELECT conversation_id FROM fix_peer;
                             """,
                            connection))
         {
             tombstone.Parameters.AddWithValue("user_id", userId);
-            tombstone.Parameters.AddWithValue(
-                "now",
-                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-            await tombstone.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            await using var reader = await tombstone.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            {
+                var conversationId = reader.GetString(0);
+                if (!string.IsNullOrWhiteSpace(conversationId))
+                    affectedConversationIds.Add(conversationId);
+            }
+        }
+
+        // P0-5：使用统一的 ConversationProjectionRepair 修复 tip 和未读数，
+        // 而非粗暴地将 unread_count 归零、清空 last_read 和 tip。
+        // 修复逻辑与 Retention 完全一致：DISTINCT ON 找剩余最新消息，
+        // 依据成员原 last_read 水位重新计算 unread_count。
+        if (affectedConversationIds.Count > 0)
+        {
+            await ConversationProjectionRepair.RepairConversationTipsAsync(
+                connection, transaction: null, _databaseSchema, affectedConversationIds, ct)
+                .ConfigureAwait(false);
+            await ConversationProjectionRepair.RepairUnreadCountsAsync(
+                connection, transaction: null, _databaseSchema, affectedConversationIds, ct)
+                .ConfigureAwait(false);
         }
 
         await using (var orphanConversationsCmd = new NpgsqlCommand(

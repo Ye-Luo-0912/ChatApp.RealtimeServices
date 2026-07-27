@@ -33,7 +33,7 @@ public sealed class NoopRealtimeMessageHistoryStore : IRealtimeMessageHistorySto
     public Task<ConversationMessageHistoryResult> QueryByConversationAfterAsync(
         long userId,
         string conversationId,
-        long afterReceivedAtMs,
+        long afterChangedAtMs,
         string afterMessageId,
         int take,
         CancellationToken ct = default)

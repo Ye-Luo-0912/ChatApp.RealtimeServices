@@ -13,12 +13,14 @@ public sealed class DefaultMessageRecallProcessor : IMessageRecallProcessor
     private readonly MessageRecallOptions _options;
     private readonly RealtimeMetrics _metrics;
     private readonly ILogger<DefaultMessageRecallProcessor> _logger;
+    private readonly IUserDeletionTombstoneStore _tombstoneStore;
 
     public DefaultMessageRecallProcessor(
         IRealtimeMessageStore messageStore,
         IRealtimeOutboxSignal outboxSignal,
         RealtimeMetrics metrics,
         ILogger<DefaultMessageRecallProcessor> logger,
+        IUserDeletionTombstoneStore tombstoneStore,
         MessageRecallOptions? options = null)
     {
         _messageStore = messageStore;
@@ -26,6 +28,7 @@ public sealed class DefaultMessageRecallProcessor : IMessageRecallProcessor
         _options = options ?? new MessageRecallOptions();
         _metrics = metrics;
         _logger = logger;
+        _tombstoneStore = tombstoneStore;
     }
 
     public async Task<MessageRecallResult> ProcessAsync(
@@ -43,6 +46,11 @@ public sealed class DefaultMessageRecallProcessor : IMessageRecallProcessor
                 command.RequestId,
                 "recall_disabled",
                 "消息撤回已关闭。");
+        }
+
+        if (await _tombstoneStore.IsUserDeletedAsync(command.SenderUserId, ct).ConfigureAwait(false))
+        {
+            return MessageRecallResult.Failed(command.RequestId, "user_deleted", "用户已注销，操作被拒绝。");
         }
 
         var result = await _messageStore

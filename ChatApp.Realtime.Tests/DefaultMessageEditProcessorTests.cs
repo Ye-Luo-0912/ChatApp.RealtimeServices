@@ -107,6 +107,7 @@ public sealed class DefaultMessageEditProcessorTests
             signal,
             metrics,
             NullLogger<DefaultMessageEditProcessor>.Instance,
+            NoopTombstoneAndLedger.Tombstone,
             new MessageEditOptions { MaxAgeMinutes = maxAgeMinutes });
 
     private static MessageEditCommand ValidCommand() =>

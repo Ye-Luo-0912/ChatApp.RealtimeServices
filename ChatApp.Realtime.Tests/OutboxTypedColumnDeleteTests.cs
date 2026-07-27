@@ -70,6 +70,7 @@ public sealed class OutboxTypedColumnDeleteTests : IAsyncLifetime
         var store = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
 
         await store.DeleteByUserAsync(12);
@@ -103,6 +104,7 @@ public sealed class OutboxTypedColumnDeleteTests : IAsyncLifetime
         var store = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
 
         await store.EnqueueEventAsync(new RealtimeEvent

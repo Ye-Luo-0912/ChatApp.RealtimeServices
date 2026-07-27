@@ -40,6 +40,54 @@ public static class MessageEventIdFactory
         return Convert.ToHexStringLower(SHA256.HashData(input));
     }
 
+    /// <summary>
+    /// Perf-9：群聊消息撤回聚合事件的幂等键。按 (messageId, conversationId) 派生，
+    /// 不纳入 target，避免同一撤回操作为每个成员生成不同 EventId 而被拆成多行 Outbox。
+    /// </summary>
+    public static string CreateGroupMessageRecalledEventId(string messageId, string conversationId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(messageId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(conversationId);
+        var input = Encoding.UTF8.GetBytes($"grprecall:{messageId}:{conversationId}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
+    /// <summary>
+    /// Perf-9：群聊消息编辑聚合事件的幂等键。按 (messageId, conversationId, editVersion) 派生，
+    /// 不纳入 target。必须纳入 editVersion，否则连续编辑会被 Outbox 冲突吞掉。
+    /// </summary>
+    public static string CreateGroupMessageEditedEventId(
+        string messageId,
+        string conversationId,
+        int editVersion)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(messageId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(conversationId);
+        var input = Encoding.UTF8.GetBytes($"grpedit:{messageId}:{conversationId}:{editVersion}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
+    /// <summary>
+    /// Perf-9：群聊反应聚合事件的幂等键。按 (messageId, conversationId, reactorUserId, emoji, occurredAtMs) 派生，
+    /// 不纳入 target。同一反应操作只产生一个 EventId。
+    /// </summary>
+    public static string CreateGroupReactionEventId(
+        string messageId,
+        string conversationId,
+        long reactorUserId,
+        string emoji,
+        long occurredAtMs,
+        bool added)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(messageId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(conversationId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(emoji);
+        var prefix = added ? "grpreactadd" : "grpreactrm";
+        var input = Encoding.UTF8.GetBytes(
+            $"{prefix}:{messageId}:{conversationId}:{reactorUserId}:{emoji}:{occurredAtMs}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
     public static string CreateSenderEchoEventId(string messageId, long senderUserId)
     {
         var input = Encoding.UTF8.GetBytes($"msgecho:{messageId}:{senderUserId}");

@@ -1,4 +1,6 @@
+using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Routing;
+using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Health;
 using ChatApp.Realtime.Infrastructure.Nats.Configuration;
 using ChatApp.Realtime.Infrastructure.Nats.JetStream;
@@ -13,11 +15,34 @@ namespace ChatApp.RealtimeServices.Diagnostics;
 
 public sealed class RealtimeStartupReporter : IHostedService
 {
+    /// <summary>
+    /// Reliability-2：必需 Worker 列表。这些 Worker 必须全部启动并处于 Running 状态，
+    /// <see cref="RealtimeReadinessState.GetSnapshot"/> 才会返回 IsReady=true。
+    /// 清理类 Worker（AccountCleanup / OutboxCleanup / MessageRetention）不阻断就绪。
+    /// </summary>
+    internal static readonly string[] RequiredWorkerNames =
+    [
+        "IncomingMessageWorker",
+        "MessageReceiptWorker",
+        "OutboxPublisherWorker",
+        "RealtimeEventWorker",
+        "MessageHistoryQueryWorker",
+        "ConversationListQueryWorker",
+        "ConversationMarkReadWorker",
+        "ConversationSetPrefsWorker",
+        "GroupConversationWorker",
+        "MessageRecallWorker",
+        "MessageEditWorker",
+        "MessageReactionWorker",
+        "ConversationSyncBootstrapWorker"
+    ];
+
     private readonly IHostEnvironment _environment;
     private readonly IOptions<RealtimeOptions> _realtimeOptions;
     private readonly IOptions<NatsOptions> _natsOptions;
     private readonly IOptions<RealtimeDatabaseOptions> _databaseOptions;
     private readonly IOptions<RealtimeConnectionOptions> _connectionOptions;
+    private readonly IOptions<IdempotencyOptions> _idempotencyOptions;
     private readonly RealtimeConfigurationWarnings _warnings;
     private readonly RealtimeReadinessState _readinessState;
     private readonly IServiceProvider _services;
@@ -29,6 +54,7 @@ public sealed class RealtimeStartupReporter : IHostedService
         IOptions<NatsOptions> natsOptions,
         IOptions<RealtimeDatabaseOptions> databaseOptions,
         IOptions<RealtimeConnectionOptions> connectionOptions,
+        IOptions<IdempotencyOptions> idempotencyOptions,
         RealtimeConfigurationWarnings warnings,
         RealtimeReadinessState readinessState,
         IServiceProvider services,
@@ -39,6 +65,7 @@ public sealed class RealtimeStartupReporter : IHostedService
         _natsOptions = natsOptions;
         _databaseOptions = databaseOptions;
         _connectionOptions = connectionOptions;
+        _idempotencyOptions = idempotencyOptions;
         _warnings = warnings;
         _readinessState = readinessState;
         _services = services;
@@ -52,6 +79,10 @@ public sealed class RealtimeStartupReporter : IHostedService
     /// <returns>返回一个表示异步操作的任务。</returns>
     public async Task StartAsync(CancellationToken cancellationToken)
     {
+        // Reliability-2：注册必需 Worker，使 GetSnapshot 能验证它们是否全部启动。
+        foreach (var name in RequiredWorkerNames)
+            _readinessState.RegisterRequiredWorker(name);
+
         var realtime = _realtimeOptions.Value;
         var nats = _natsOptions.Value;
 
@@ -114,6 +145,28 @@ public sealed class RealtimeStartupReporter : IHostedService
                 $"Nats:Routing:Mode=Sharded 但路由目录为 Null（gateway={gatewayDirType}, watcher={watcherDirType}）。" +
                 "请配置 ConnectionStrings:Garnet 以注册 RedisGatewayDirectory / RedisWatcherGatewayDirectory。");
         }
+
+        // LongTerm-1：校验幂等账本保留期 >= JetStream MaxAge。
+        // JetStream durable 重建后会以 DeliverPolicy.All 回放旧命令；若账本保留期短于 MaxAge，
+        // 则旧命令在账本清理后会被当作新消息重新写入（"复活"）。
+        var jetStreamMaxAgeHours = nats.JetStream?.MaxAgeHours ?? 168;
+        var jetStreamMaxAgeMs = jetStreamMaxAgeHours * 3_600_000L;
+        var idempotencyHorizonMs = _idempotencyOptions.Value
+            .ResolveEffectiveHorizonMs(jetStreamMaxAgeMs);
+        if (idempotencyHorizonMs < jetStreamMaxAgeMs)
+        {
+            throw new InvalidOperationException(
+                $"Idempotency 保留期（{idempotencyHorizonMs} ms）小于 JetStream MaxAge" +
+                $"（{jetStreamMaxAgeMs} ms = {jetStreamMaxAgeHours} h）。" +
+                "请增大 Idempotency:RetentionDays / RetentionHorizonMs，" +
+                "确保账本保留期不少于 JetStream 最大回放周期，防止旧命令在账本清理后\"复活\"。");
+        }
+
+        _logger.LogInformation(
+            "幂等账本保留配置。保留窗口毫秒={HorizonMs}；JetStream MaxAge 毫秒={JetStreamMaxAgeMs}；启用={Enabled}",
+            idempotencyHorizonMs,
+            jetStreamMaxAgeMs,
+            _idempotencyOptions.Value.Enabled);
 
         var snapshot = _readinessState.GetSnapshot();
         _logger.LogInformation(

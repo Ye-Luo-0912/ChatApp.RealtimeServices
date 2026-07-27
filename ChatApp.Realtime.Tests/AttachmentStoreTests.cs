@@ -158,7 +158,7 @@ public sealed class AttachmentStoreTests : IAsyncLifetime
     private static NpgsqlRealtimeMessageStore CreateMessageStore(
         RealtimeDatabaseClient client,
         RealtimeDatabaseSchema schema) =>
-        new(client, schema, NullLogger<NpgsqlRealtimeMessageStore>.Instance);
+        new(client, schema, TestMutationPolicy.Instance, NullLogger<NpgsqlRealtimeMessageStore>.Instance);
 
     private static RealtimeAttachmentRecord Confirmed(
         string id,

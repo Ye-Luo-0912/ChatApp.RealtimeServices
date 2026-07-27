@@ -299,96 +299,8 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
         NpgsqlTransaction transaction,
         IReadOnlyCollection<string> conversationIds,
         CancellationToken ct)
-    {
-        // P1-2：集合 SQL 修复，替代按会话逐条 N+1。
-        // 一次 DISTINCT ON 取所有受影响会话的最新消息，一次 UPDATE conversations，
-        // 一次 UPDATE conversation_members，持锁时间与受影响会话数解耦。
-        // LEFT(content, 256) 复现 ConversationId.CreatePreview 的截断语义（PreviewMaxChars=256）；
-        // 当会话所有消息都被清理时，通过 target LEFT JOIN latest 将 tip 置 NULL。
-        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var ids = conversationIds.ToArray();
-
-        var repaired = 0;
-        await using (var updateConv = new NpgsqlCommand(
-                         $"""
-                          WITH target AS (
-                              SELECT UNNEST(@conversation_ids) AS conversation_id
-                          ),
-                          latest AS (
-                              SELECT DISTINCT ON (conversation_id)
-                                  conversation_id, message_id, content, received_at_ms, sender_user_id,
-                                  recalled_at_ms IS NOT NULL AS is_recalled
-                              FROM {databaseSchema.MessagesTableSql}
-                              WHERE conversation_id = ANY(@conversation_ids)
-                              ORDER BY conversation_id, received_at_ms DESC, message_id DESC
-                          ),
-                          computed AS (
-                              SELECT
-                                  t.conversation_id,
-                                  l.message_id,
-                                  CASE WHEN l.is_recalled THEN '消息已撤回'
-                                       WHEN l.content IS NULL THEN NULL
-                                       ELSE LEFT(l.content, 256) END AS preview,
-                                  l.received_at_ms,
-                                  l.sender_user_id
-                              FROM target t
-                              LEFT JOIN latest l USING (conversation_id)
-                          )
-                          UPDATE {databaseSchema.ConversationsTableSql} AS c
-                          SET last_message_id = comp.message_id,
-                              last_message_preview = comp.preview,
-                              last_message_at_ms = comp.received_at_ms,
-                              last_sender_user_id = comp.sender_user_id,
-                              updated_at_ms = @now
-                          FROM computed comp
-                          WHERE c.conversation_id = comp.conversation_id
-                            AND (
-                                 c.last_message_id IS DISTINCT FROM comp.message_id
-                              OR c.last_message_at_ms IS DISTINCT FROM comp.received_at_ms
-                              OR c.last_message_preview IS DISTINCT FROM comp.preview
-                              OR c.last_sender_user_id IS DISTINCT FROM comp.sender_user_id
-                            );
-                          """,
-                         connection,
-                         transaction))
-        {
-            updateConv.Parameters.AddWithValue("conversation_ids", ids);
-            updateConv.Parameters.AddWithValue("now", now);
-            repaired = await updateConv.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-        }
-
-        await using (var updateMembers = new NpgsqlCommand(
-                         $"""
-                          WITH target AS (
-                              SELECT UNNEST(@conversation_ids) AS conversation_id
-                          ),
-                          latest AS (
-                              SELECT DISTINCT ON (conversation_id)
-                                  conversation_id, received_at_ms
-                              FROM {databaseSchema.MessagesTableSql}
-                              WHERE conversation_id = ANY(@conversation_ids)
-                              ORDER BY conversation_id, received_at_ms DESC, message_id DESC
-                          ),
-                          computed AS (
-                              SELECT t.conversation_id, l.received_at_ms
-                              FROM target t
-                              LEFT JOIN latest l USING (conversation_id)
-                          )
-                          UPDATE {databaseSchema.ConversationMembersTableSql} AS m
-                          SET last_message_at_ms = comp.received_at_ms
-                          FROM computed comp
-                          WHERE m.conversation_id = comp.conversation_id
-                            AND m.last_message_at_ms IS DISTINCT FROM comp.received_at_ms;
-                          """,
-                         connection,
-                         transaction))
-        {
-            updateMembers.Parameters.AddWithValue("conversation_ids", ids);
-            await updateMembers.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-        }
-
-        return repaired;
-    }
+        => await ConversationProjectionRepair.RepairConversationTipsAsync(
+            connection, transaction, databaseSchema, conversationIds, ct).ConfigureAwait(false);
 
     /// <summary>
     /// Recounts <c>unread_count</c> from messages still present after the member's last-read
@@ -399,52 +311,8 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
         NpgsqlTransaction transaction,
         IReadOnlyCollection<string> conversationIds,
         CancellationToken ct)
-    {
-        await using var command = new NpgsqlCommand(
-            $"""
-             UPDATE {databaseSchema.ConversationMembersTableSql} AS m
-             SET unread_count = repaired.new_unread
-             FROM (
-                 SELECT
-                     cm.conversation_id,
-                     cm.user_id,
-                     LEAST(
-                         (
-                             SELECT COUNT(*)::int
-                             FROM (
-                                 SELECT 1
-                                 FROM {databaseSchema.MessagesTableSql} msg
-                                 WHERE msg.conversation_id = cm.conversation_id
-                                   AND msg.sender_user_id <> cm.user_id
-                                   AND (
-                                        cm.last_read_at_ms IS NULL
-                                        OR msg.received_at_ms > cm.last_read_at_ms
-                                        OR (
-                                            msg.received_at_ms = cm.last_read_at_ms
-                                            AND (
-                                                cm.last_read_message_id IS NULL
-                                                OR msg.message_id > cm.last_read_message_id
-                                            )
-                                        )
-                                   )
-                                 LIMIT @max_unread
-                             ) AS bounded
-                         ),
-                         @max_unread
-                     ) AS new_unread
-                 FROM {databaseSchema.ConversationMembersTableSql} cm
-                 WHERE cm.conversation_id = ANY(@conversation_ids)
-             ) AS repaired
-             WHERE m.conversation_id = repaired.conversation_id
-               AND m.user_id = repaired.user_id
-               AND m.unread_count IS DISTINCT FROM repaired.new_unread;
-             """,
-            connection,
-            transaction);
-        command.Parameters.AddWithValue("conversation_ids", conversationIds.ToArray());
-        command.Parameters.AddWithValue("max_unread", ConversationWriteCommands.MaxTrackedUnreadCount);
-        return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-    }
+        => await ConversationProjectionRepair.RepairUnreadCountsAsync(
+            connection, transaction, databaseSchema, conversationIds, ct).ConfigureAwait(false);
 
     private async Task InsertOutboxManyAsync(
         NpgsqlConnection connection,

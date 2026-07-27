@@ -82,4 +82,37 @@ public static class ConversationEventIdFactory
             $"convchgagg:{conversationId}:{causeToken}:{occurredAtMs}");
         return Convert.ToHexStringLower(SHA256.HashData(input));
     }
+
+    /// <summary>
+    /// Perf-9：群聊 tip 变更聚合事件的幂等键。按 (conversationId, lastMessageId, causeToken) 派生，
+    /// 不纳入 target。用于群消息/编辑/撤回时推进会话 tip 的广播。
+    /// </summary>
+    public static string CreateConversationChangedAggregatedEventId(
+        string conversationId,
+        string lastMessageId,
+        string? causeToken = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(lastMessageId);
+        var input = Encoding.UTF8.GetBytes(
+            string.IsNullOrEmpty(causeToken)
+                ? $"convchgagg:{conversationId}:{lastMessageId}"
+                : $"convchgagg:{conversationId}:{lastMessageId}:{causeToken}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
+
+    /// <summary>
+    /// Perf-9：群聊已读广播聚合事件的幂等键。按 (conversationId, readerUserId, lastReadMessageId, lastReadAtMs) 派生，
+    /// 不纳入 target。用于通知群内其他成员某用户已读到某水位。
+    /// </summary>
+    public static string CreateConversationReadAggregatedEventId(
+        string conversationId,
+        long readerUserId,
+        string lastReadMessageId,
+        long lastReadAtMs)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(lastReadMessageId);
+        var input = Encoding.UTF8.GetBytes(
+            $"convreadagg:{conversationId}:{readerUserId}:{lastReadMessageId}:{lastReadAtMs}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
 }

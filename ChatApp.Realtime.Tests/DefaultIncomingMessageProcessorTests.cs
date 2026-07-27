@@ -20,9 +20,10 @@ public sealed class DefaultIncomingMessageProcessorTests
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             store,
-            new AlwaysMemberGroupStore(),
             signal,
             metrics,
+            NoopTombstoneAndLedger.Tombstone,
+            NoopTombstoneAndLedger.Ledger,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
         var command = ValidCommand();
 
@@ -56,9 +57,10 @@ public sealed class DefaultIncomingMessageProcessorTests
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             store,
-            new AlwaysMemberGroupStore(),
             new RecordingRealtimeOutboxSignal(),
             metrics,
+            NoopTombstoneAndLedger.Tombstone,
+            NoopTombstoneAndLedger.Ledger,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         await processor.ProcessAsync(ValidCommand());
@@ -78,15 +80,17 @@ public sealed class DefaultIncomingMessageProcessorTests
 
         await new DefaultIncomingMessageProcessor(
             firstStore,
-            new AlwaysMemberGroupStore(),
             new RecordingRealtimeOutboxSignal(),
             firstMetrics,
+            NoopTombstoneAndLedger.Tombstone,
+            NoopTombstoneAndLedger.Ledger,
             NullLogger<DefaultIncomingMessageProcessor>.Instance).ProcessAsync(command);
         await new DefaultIncomingMessageProcessor(
             secondStore,
-            new AlwaysMemberGroupStore(),
             new RecordingRealtimeOutboxSignal(),
             secondMetrics,
+            NoopTombstoneAndLedger.Tombstone,
+            NoopTombstoneAndLedger.Ledger,
             NullLogger<DefaultIncomingMessageProcessor>.Instance).ProcessAsync(command);
 
         Assert.Equal(firstStore.Event!.EventId, secondStore.Event!.EventId);
@@ -101,9 +105,10 @@ public sealed class DefaultIncomingMessageProcessorTests
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             store,
-            new AlwaysMemberGroupStore(),
             signal,
             metrics,
+            NoopTombstoneAndLedger.Tombstone,
+            NoopTombstoneAndLedger.Ledger,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var result = await processor.ProcessAsync(ValidCommand());
@@ -120,9 +125,10 @@ public sealed class DefaultIncomingMessageProcessorTests
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             store,
-            new AlwaysMemberGroupStore(),
             signal,
             metrics,
+            NoopTombstoneAndLedger.Tombstone,
+            NoopTombstoneAndLedger.Ledger,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
         var command = ValidCommand() with { Content = " " };
 
@@ -143,9 +149,10 @@ public sealed class DefaultIncomingMessageProcessorTests
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             store,
-            new AlwaysMemberGroupStore(),
             signal,
             metrics,
+            NoopTombstoneAndLedger.Tombstone,
+            NoopTombstoneAndLedger.Ledger,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var result = await processor.ProcessAsync(ValidCommand());
@@ -164,9 +171,10 @@ public sealed class DefaultIncomingMessageProcessorTests
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             store,
-            new AlwaysMemberGroupStore(),
             signal,
             metrics,
+            NoopTombstoneAndLedger.Tombstone,
+            NoopTombstoneAndLedger.Ledger,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
         var command = ValidCommand() with { ReceiverUserId = 1001 };
 
@@ -253,6 +261,7 @@ public sealed class DefaultIncomingMessageProcessorTests
     private sealed class AlwaysMemberGroupStore : IRealtimeGroupStore
     {
         public Task<GroupCreatePersistResult> CreateGroupAsync(
+            string requestId,
             long creatorUserId,
             string conversationId,
             string title,
@@ -263,6 +272,7 @@ public sealed class DefaultIncomingMessageProcessorTests
             throw new NotSupportedException();
 
         public Task<GroupMutatePersistResult> AddMembersAsync(
+            string requestId,
             long actorUserId,
             string conversationId,
             IReadOnlyList<long> memberUserIds,
@@ -272,6 +282,7 @@ public sealed class DefaultIncomingMessageProcessorTests
             throw new NotSupportedException();
 
         public Task<GroupMutatePersistResult> RemoveMemberAsync(
+            string requestId,
             long actorUserId,
             string conversationId,
             long targetUserId,
@@ -281,6 +292,7 @@ public sealed class DefaultIncomingMessageProcessorTests
             throw new NotSupportedException();
 
         public Task<GroupMutatePersistResult> LeaveAsync(
+            string requestId,
             long actorUserId,
             string conversationId,
             string? actorSessionId,
@@ -289,10 +301,20 @@ public sealed class DefaultIncomingMessageProcessorTests
             throw new NotSupportedException();
 
         public Task<GroupMutatePersistResult> ChangeRoleAsync(
+            string requestId,
             long actorUserId,
             string conversationId,
             long targetUserId,
             ConversationMemberRole newRole,
+            string? actorSessionId,
+            long occurredAtMs,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<GroupMutatePersistResult> DissolveAsync(
+            string requestId,
+            long actorUserId,
+            string conversationId,
             string? actorSessionId,
             long occurredAtMs,
             CancellationToken ct = default) =>

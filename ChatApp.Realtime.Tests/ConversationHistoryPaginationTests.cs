@@ -67,15 +67,15 @@ public sealed class ConversationHistoryPaginationTests : IAsyncLifetime
         Assert.Equal(10, seen.Count);
         Assert.Equal(4, pages);
 
-        // 用户级历史仍可用，且不应包含其他会话消息过滤逻辑错误。
+        // P0-3：用户级全量历史已废弃，不带 ConversationId 的查询必须被拒绝。
         var global = await processor.ProcessAsync(new MessageHistoryQuery
         {
             RequestId = "global",
             UserId = 1001,
             Limit = 50
         });
-        Assert.True(global.Succeeded);
-        Assert.True(global.Items.Count >= 10);
+        Assert.False(global.Succeeded);
+        Assert.Equal("conversation_id_required", global.ErrorCode);
 
         _ = messageStore;
     }
@@ -130,6 +130,7 @@ public sealed class ConversationHistoryPaginationTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var historyStore = new NpgsqlRealtimeMessageHistoryStore(client, schema);
         var conversationId = ConversationId.CreateDirect(1001, 1002);
@@ -169,6 +170,7 @@ public sealed class ConversationHistoryPaginationTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var historyStore = new NpgsqlRealtimeMessageHistoryStore(client, schema);
         var conversationId = ConversationId.CreateDirect(7, 8);

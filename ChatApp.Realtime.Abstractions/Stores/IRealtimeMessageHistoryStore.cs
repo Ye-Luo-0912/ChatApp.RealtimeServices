@@ -25,11 +25,12 @@ public interface IRealtimeMessageHistoryStore
 
     /// <summary>
     /// 按会话向前（更新）keyset 查询；同一 SQL 内校验成员身份。用于重连补偿。
+    /// <para>P0-2：按 changed_at_ms 过滤和排序，参数为变更水位而非接收时间。</para>
     /// </summary>
     Task<ConversationMessageHistoryResult> QueryByConversationAfterAsync(
         long userId,
         string conversationId,
-        long afterReceivedAtMs,
+        long afterChangedAtMs,
         string afterMessageId,
         int take,
         CancellationToken ct = default);

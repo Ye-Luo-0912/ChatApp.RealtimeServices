@@ -41,4 +41,10 @@ public sealed class NoopRealtimeDeviceSyncCursorStore : IRealtimeDeviceSyncCurso
         ct.ThrowIfCancellationRequested();
         return Task.FromResult(0L);
     }
+
+    public Task<long> DeleteInactiveAsync(long inactiveBeforeMs, int batchSize, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(0L);
+    }
 }

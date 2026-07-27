@@ -205,6 +205,96 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
         return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Perf-8：列出早于 cutoff 的 Dead 行，按 created_at_ms 升序、LIMIT 限定。
+    /// 用于归档接收器落盘后再调用 <see cref="DeleteDeadBatchAsync"/> 物理删除。
+    /// </summary>
+    public async Task<IReadOnlyList<DeadOutboxRow>> ListDeadAsync(
+        long createdBeforeMs,
+        int limit,
+        CancellationToken ct = default)
+    {
+        limit = Math.Clamp(limit, 1, 10_000);
+        await using var connection = await _databaseClient.GetDataSource()
+            .OpenConnectionAsync(ct).ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT
+                 event_id,
+                 event_type,
+                 target_user_id,
+                 target_user_ids,
+                 attempt_count,
+                 created_at_ms,
+                 next_attempt_at_ms,
+                 last_error,
+                 payload_json
+             FROM {_databaseSchema.OutboxTableSql}
+             WHERE status = {(short)RealtimeOutboxStatus.Dead}
+               AND created_at_ms < @cutoff
+             ORDER BY created_at_ms
+             LIMIT @limit;
+             """,
+            connection);
+        command.Parameters.AddWithValue("cutoff", createdBeforeMs);
+        command.Parameters.AddWithValue("limit", limit);
+
+        var rows = new List<DeadOutboxRow>(limit);
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            rows.Add(new DeadOutboxRow(
+                reader.GetString(0),
+                reader.GetInt16(1),
+                reader.GetInt64(2),
+                reader.IsDBNull(3) ? null : reader.GetFieldValue<long[]>(3),
+                reader.GetInt32(4),
+                reader.GetInt64(5),
+                reader.GetInt64(6),
+                reader.IsDBNull(7) ? null : reader.GetString(7),
+                reader.GetString(8)));
+        }
+
+        return rows;
+    }
+
+    /// <summary>
+    /// Perf-8：按 event_id 批量删除 Dead 行。仅当归档成功（或选择跳过归档）后调用。
+    /// 使用 <c>ctid IN</c> 子查询限定批次大小，避免全表锁。
+    /// </summary>
+    public async Task<int> DeleteDeadBatchAsync(
+        IReadOnlyList<string> eventIds,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(eventIds);
+        if (eventIds.Count == 0)
+            return 0;
+
+        var normalized = eventIds
+            .Where(static id => !string.IsNullOrWhiteSpace(id))
+            .Select(static id => id.Trim())
+            .Distinct(StringComparer.Ordinal)
+            .Take(10_000)
+            .ToArray();
+        if (normalized.Length == 0)
+            return 0;
+
+        await using var connection = await _databaseClient.GetDataSource()
+            .OpenConnectionAsync(ct).ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            $"""
+             DELETE FROM {_databaseSchema.OutboxTableSql}
+             WHERE event_id = ANY(@event_ids)
+               AND status = {(short)RealtimeOutboxStatus.Dead};
+             """,
+            connection);
+        var idsParam = command.Parameters.Add(
+            "event_ids",
+            NpgsqlTypes.NpgsqlDbType.Array | NpgsqlTypes.NpgsqlDbType.Text);
+        idsParam.Value = normalized;
+        return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
     public async Task<RealtimeOutboxStats> GetStatsAsync(CancellationToken ct = default)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -265,6 +355,7 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
                  status,
                  event_type,
                  target_user_id,
+                 target_user_ids,
                  attempt_count,
                  created_at_ms,
                  next_attempt_at_ms,
@@ -274,7 +365,7 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
                  last_error
              FROM {_databaseSchema.OutboxTableSql}
              WHERE (@status IS NULL OR status = @status)
-               AND (@target_user_id IS NULL OR target_user_id = @target_user_id)
+               AND (@target_user_id IS NULL OR target_user_id = @target_user_id OR @target_user_id = ANY(target_user_ids))
              ORDER BY created_at_ms DESC
              OFFSET @offset
              LIMIT @limit;
@@ -296,13 +387,14 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
                 (RealtimeOutboxStatus)reader.GetInt16(1),
                 reader.GetInt16(2),
                 reader.GetInt64(3),
-                reader.GetInt32(4),
-                reader.GetInt64(5),
+                reader.IsDBNull(4) ? null : reader.GetFieldValue<long[]>(4),
+                reader.GetInt32(5),
                 reader.GetInt64(6),
-                reader.IsDBNull(7) ? null : reader.GetInt64(7),
-                reader.IsDBNull(8) ? null : reader.GetString(8),
-                reader.IsDBNull(9) ? null : reader.GetInt64(9),
-                reader.IsDBNull(10) ? null : reader.GetString(10)));
+                reader.GetInt64(7),
+                reader.IsDBNull(8) ? null : reader.GetInt64(8),
+                reader.IsDBNull(9) ? null : reader.GetString(9),
+                reader.IsDBNull(10) ? null : reader.GetInt64(10),
+                reader.IsDBNull(11) ? null : reader.GetString(11)));
         }
 
         return items;
@@ -320,6 +412,7 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
                  status,
                  event_type,
                  target_user_id,
+                 target_user_ids,
                  attempt_count,
                  created_at_ms,
                  next_attempt_at_ms,
@@ -343,13 +436,14 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
             (RealtimeOutboxStatus)reader.GetInt16(1),
             reader.GetInt16(2),
             reader.GetInt64(3),
-            reader.GetInt32(4),
-            reader.GetInt64(5),
+            reader.IsDBNull(4) ? null : reader.GetFieldValue<long[]>(4),
+            reader.GetInt32(5),
             reader.GetInt64(6),
-            reader.IsDBNull(7) ? null : reader.GetInt64(7),
-            reader.IsDBNull(8) ? null : reader.GetString(8),
-            reader.IsDBNull(9) ? null : reader.GetInt64(9),
-            reader.IsDBNull(10) ? null : reader.GetString(10));
+            reader.GetInt64(7),
+            reader.IsDBNull(8) ? null : reader.GetInt64(8),
+            reader.IsDBNull(9) ? null : reader.GetString(9),
+            reader.IsDBNull(10) ? null : reader.GetInt64(10),
+            reader.IsDBNull(11) ? null : reader.GetString(11));
     }
 
     public Task MarkPublishedBatchAsync(

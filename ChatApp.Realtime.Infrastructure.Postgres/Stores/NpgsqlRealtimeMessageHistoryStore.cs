@@ -250,7 +250,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
     public async Task<ConversationMessageHistoryResult> QueryByConversationAfterAsync(
         long userId,
         string conversationId,
-        long afterReceivedAtMs,
+        long afterChangedAtMs,
         string afterMessageId,
         int take,
         CancellationToken ct = default)
@@ -258,7 +258,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(userId);
         ArgumentException.ThrowIfNullOrWhiteSpace(conversationId);
         ArgumentException.ThrowIfNullOrWhiteSpace(afterMessageId);
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(afterReceivedAtMs);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(afterChangedAtMs);
         if (take is <= 0 or > 101)
             throw new ArgumentOutOfRangeException(nameof(take));
 
@@ -327,9 +327,9 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  WHERE conversation_id = @conversation_id
                    AND membership.is_member
                    AND (
-                        changed_at_ms > @after_received_at_ms
+                        changed_at_ms > @after_changed_at_ms
                         OR (
-                            changed_at_ms = @after_received_at_ms
+                            changed_at_ms = @after_changed_at_ms
                             AND message_id > @after_message_id
                         )
                    )
@@ -340,7 +340,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
             connection);
         command.Parameters.AddWithValue("user_id", userId);
         command.Parameters.AddWithValue("conversation_id", conversationId.Trim());
-        command.Parameters.AddWithValue("after_received_at_ms", afterReceivedAtMs);
+        command.Parameters.AddWithValue("after_changed_at_ms", afterChangedAtMs);
         command.Parameters.AddWithValue("after_message_id", afterMessageId.Trim());
         command.Parameters.AddWithValue("take", take);
 

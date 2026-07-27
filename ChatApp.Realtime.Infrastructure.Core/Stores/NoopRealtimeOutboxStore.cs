@@ -90,6 +90,24 @@ public sealed class NoopRealtimeOutboxStore : IRealtimeOutboxStore
         return Task.FromResult(0);
     }
 
+    public Task<IReadOnlyList<DeadOutboxRow>> ListDeadAsync(
+        long createdBeforeMs,
+        int limit,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult<IReadOnlyList<DeadOutboxRow>>([]);
+    }
+
+    public Task<int> DeleteDeadBatchAsync(
+        IReadOnlyList<string> eventIds,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(eventIds);
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(0);
+    }
+
     public Task<RealtimeOutboxStats> GetStatsAsync(CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();

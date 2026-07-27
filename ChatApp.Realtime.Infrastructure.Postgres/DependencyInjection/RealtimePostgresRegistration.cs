@@ -1,7 +1,9 @@
 using ChatApp.Realtime.Abstractions.Stores;
+using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using ChatApp.Realtime.Infrastructure.Postgres.Initialization;
+using ChatApp.Realtime.Infrastructure.Postgres.Messaging;
 using ChatApp.Realtime.Infrastructure.Postgres.Stores;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -26,6 +28,10 @@ public static class RealtimePostgresRegistration
         services.RemoveAll<IRealtimeOpsQueryStore>();
         services.AddSingleton<IRealtimeOpsQueryStore, NpgsqlRealtimeOpsQueryStore>();
 
+        // P0-8：消息变更（撤回 / 编辑 / Reaction）统一权限策略，防止离群用户修改旧群消息。
+        services.RemoveAll<IConversationMessageMutationPolicy>();
+        services.AddSingleton<IConversationMessageMutationPolicy, PostgresConversationMessageMutationPolicy>();
+
         if (ShouldUseEfCoreMessageStore(connectionString, messageStoreProvider))
         {
             RealtimeDbContext.ConfigureSchema(schema);
@@ -40,7 +46,12 @@ public static class RealtimePostgresRegistration
         else if (ShouldUseNpgsqlMessageStore(connectionString, messageStoreProvider))
         {
             services.RemoveAll<IRealtimeMessageStore>();
-            services.AddSingleton<IRealtimeMessageStore, NpgsqlRealtimeMessageStore>();
+            services.AddSingleton<IRealtimeMessageStore>(sp => new NpgsqlRealtimeMessageStore(
+                sp.GetRequiredService<RealtimeDatabaseClient>(),
+                sp.GetRequiredService<RealtimeDatabaseSchema>(),
+                sp.GetRequiredService<IConversationMessageMutationPolicy>(),
+                sp.GetRequiredService<ILogger<NpgsqlRealtimeMessageStore>>(),
+                sp.GetService<RealtimeMetrics>()));
         }
 
         if (!string.IsNullOrWhiteSpace(connectionString)
@@ -63,6 +74,14 @@ public static class RealtimePostgresRegistration
             services.AddSingleton<IRealtimeReactionStore, NpgsqlRealtimeReactionStore>();
             services.RemoveAll<IRealtimeMessageRetentionStore>();
             services.AddSingleton<IRealtimeMessageRetentionStore, NpgsqlRealtimeMessageRetentionStore>();
+            // LongTerm-1：用户删除 tombstone + 独立命令幂等账本。
+            services.RemoveAll<IUserDeletionTombstoneStore>();
+            services.AddSingleton<IUserDeletionTombstoneStore, NpgsqlUserDeletionTombstoneStore>();
+            services.RemoveAll<ICommandIdempotencyLedger>();
+            services.AddSingleton<ICommandIdempotencyLedger, NpgsqlCommandIdempotencyLedger>();
+            // Feature 2：群操作审计。
+            services.RemoveAll<IGroupOperationAuditStore>();
+            services.AddSingleton<IGroupOperationAuditStore, NpgsqlGroupOperationAuditStore>();
         }
 
         return services;

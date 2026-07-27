@@ -7,13 +7,19 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
 {
     private readonly IRealtimeGroupStore _store;
     private readonly IRealtimeOutboxSignal _outboxSignal;
+    private readonly IUserDeletionTombstoneStore _tombstoneStore;
+    private readonly IGroupOperationAuditStore _auditStore;
 
     public DefaultGroupConversationProcessor(
         IRealtimeGroupStore store,
-        IRealtimeOutboxSignal outboxSignal)
+        IRealtimeOutboxSignal outboxSignal,
+        IUserDeletionTombstoneStore tombstoneStore,
+        IGroupOperationAuditStore auditStore)
     {
         _store = store;
         _outboxSignal = outboxSignal;
+        _tombstoneStore = tombstoneStore;
+        _auditStore = auditStore;
     }
 
     public async Task<GroupConversationResult> ProcessAsync(
@@ -24,6 +30,15 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
         if (validationError is not null)
             return validationError;
 
+        // Feature 1：拒绝已注销用户的群操作。
+        if (await _tombstoneStore.IsUserDeletedAsync(command.ActorUserId, ct).ConfigureAwait(false))
+        {
+            return GroupConversationResult.Failed(
+                command.RequestId,
+                "user_deleted",
+                "用户已注销，操作被拒绝。");
+        }
+
         var occurredAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         switch (command.Operation)
         {
@@ -32,6 +47,7 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                 var conversationId = ConversationId.CreateGroup();
                 var title = command.Title!.Trim();
                 var result = await _store.CreateGroupAsync(
+                        command.RequestId,
                         command.ActorUserId,
                         conversationId,
                         title,
@@ -40,6 +56,8 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                         occurredAtMs,
                         ct)
                     .ConfigureAwait(false);
+                await RecordAuditAsync(command, result.Succeeded, result.ErrorCode,
+                    result.ConversationId ?? conversationId, null, null, occurredAtMs, ct);
                 if (!result.Succeeded)
                     return GroupConversationResult.Failed(
                         command.RequestId,
@@ -55,6 +73,7 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
             case GroupConversationOperation.AddMembers:
             {
                 var result = await _store.AddMembersAsync(
+                        command.RequestId,
                         command.ActorUserId,
                         command.ConversationId!.Trim(),
                         command.MemberUserIds ?? Array.Empty<long>(),
@@ -62,6 +81,8 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                         occurredAtMs,
                         ct)
                     .ConfigureAwait(false);
+                await RecordAuditAsync(command, result.Succeeded, result.ErrorCode,
+                    result.ConversationId, null, null, occurredAtMs, ct);
                 if (!result.Succeeded)
                     return GroupConversationResult.Failed(
                         command.RequestId,
@@ -78,6 +99,7 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
             case GroupConversationOperation.RemoveMember:
             {
                 var result = await _store.RemoveMemberAsync(
+                        command.RequestId,
                         command.ActorUserId,
                         command.ConversationId!.Trim(),
                         command.TargetUserId!.Value,
@@ -85,6 +107,8 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                         occurredAtMs,
                         ct)
                     .ConfigureAwait(false);
+                await RecordAuditAsync(command, result.Succeeded, result.ErrorCode,
+                    result.ConversationId, null, null, occurredAtMs, ct);
                 if (!result.Succeeded)
                     return GroupConversationResult.Failed(
                         command.RequestId,
@@ -99,12 +123,15 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
             case GroupConversationOperation.Leave:
             {
                 var result = await _store.LeaveAsync(
+                        command.RequestId,
                         command.ActorUserId,
                         command.ConversationId!.Trim(),
                         command.ActorSessionId,
                         occurredAtMs,
                         ct)
                     .ConfigureAwait(false);
+                await RecordAuditAsync(command, result.Succeeded, result.ErrorCode,
+                    result.ConversationId, null, null, occurredAtMs, ct);
                 if (!result.Succeeded)
                     return GroupConversationResult.Failed(
                         command.RequestId,
@@ -119,6 +146,7 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
             case GroupConversationOperation.ChangeRole:
             {
                 var result = await _store.ChangeRoleAsync(
+                        command.RequestId,
                         command.ActorUserId,
                         command.ConversationId!.Trim(),
                         command.TargetUserId!.Value,
@@ -127,6 +155,8 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                         occurredAtMs,
                         ct)
                     .ConfigureAwait(false);
+                await RecordAuditAsync(command, result.Succeeded, result.ErrorCode,
+                    result.ConversationId, result.PreviousRole, result.NewRole, occurredAtMs, ct);
                 if (!result.Succeeded)
                     return GroupConversationResult.Failed(
                         command.RequestId,
@@ -166,12 +196,63 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                     command.ConversationId.Trim(),
                     members: members);
             }
+            case GroupConversationOperation.Dissolve:
+            {
+                var result = await _store.DissolveAsync(
+                        command.RequestId,
+                        command.ActorUserId,
+                        command.ConversationId!.Trim(),
+                        command.ActorSessionId,
+                        occurredAtMs,
+                        ct)
+                    .ConfigureAwait(false);
+                await RecordAuditAsync(command, result.Succeeded, result.ErrorCode,
+                    result.ConversationId, null, null, occurredAtMs, ct);
+                if (!result.Succeeded)
+                    return GroupConversationResult.Failed(
+                        command.RequestId,
+                        result.ErrorCode!,
+                        result.ErrorMessage!);
+                _outboxSignal.Notify();
+                return GroupConversationResult.Success(
+                    command.RequestId,
+                    result.ConversationId!,
+                    result.Title);
+            }
             default:
                 return GroupConversationResult.Failed(
                     command.RequestId,
                     "invalid_operation",
                     "不支持的群操作。");
         }
+    }
+
+    /// <summary>Feature 2：记录群操作审计（best-effort，不阻断主流程）。</summary>
+    private async Task RecordAuditAsync(
+        GroupConversationCommand command,
+        bool succeeded,
+        string? errorCode,
+        string? conversationId,
+        ConversationMemberRole? previousRole,
+        ConversationMemberRole? newRole,
+        long occurredAtMs,
+        CancellationToken ct)
+    {
+        var entry = new GroupOperationAuditEntry
+        {
+            ActorUserId = command.ActorUserId,
+            ConversationId = conversationId,
+            Operation = command.Operation,
+            TargetUserId = command.TargetUserId,
+            PreviousRole = previousRole,
+            NewRole = newRole ?? command.NewRole,
+            RequestId = command.RequestId,
+            ActorSessionId = command.ActorSessionId,
+            Succeeded = succeeded,
+            ErrorCode = errorCode,
+            OccurredAtMs = occurredAtMs
+        };
+        await _auditStore.RecordAsync(entry, ct).ConfigureAwait(false);
     }
 
     private static GroupConversationResult? Validate(GroupConversationCommand command)
@@ -205,6 +286,7 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
             case GroupConversationOperation.Leave:
             case GroupConversationOperation.ChangeRole:
             case GroupConversationOperation.ListMembers:
+            case GroupConversationOperation.Dissolve:
                 if (string.IsNullOrWhiteSpace(command.ConversationId)
                     || !ConversationId.IsGroup(command.ConversationId.Trim()))
                 {

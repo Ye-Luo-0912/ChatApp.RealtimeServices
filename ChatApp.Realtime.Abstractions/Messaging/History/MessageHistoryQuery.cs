@@ -9,14 +9,17 @@ public sealed class MessageHistoryQuery
     public int Limit { get; init; } = 50;
 
     /// <summary>
-    /// 非空时按会话查询；空则保持用户级全量历史（兼容旧客户端）。
+    /// 非空时按会话查询。
+    /// <para>P0-3：不再支持空 ConversationId 的用户级全量历史（群消息 receiver_user_id=0
+    /// 导致全局查询遗漏群消息）。所有列表查询必须带 ConversationId。</para>
     /// </summary>
     public string? ConversationId { get; init; }
 
     /// <summary>
-    /// 向前（更新）翻页起点，与 Before* 互斥；仅会话历史支持。
+    /// 向前（更新）翻页起点（变更水位），与 Before* 互斥；仅会话历史支持。
+    /// <para>P0-2：After 模式按 changed_at_ms 过滤和排序，因此游标携带的是变更水位而非接收时间。</para>
     /// </summary>
-    public long? AfterReceivedAtMs { get; init; }
+    public long? AfterChangedAtMs { get; init; }
 
     public string? AfterMessageId { get; init; }
 

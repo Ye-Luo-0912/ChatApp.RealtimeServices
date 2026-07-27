@@ -79,7 +79,9 @@ dotnet run --project .\ChatApp.RealtimeServices\ChatApp.RealtimeServices.csproj 
 }
 ```
 
-开发模式允许 `InitializeSchemaOnStart=true`（`appsettings.Development.json`；走版本化 `schema_migrations` + `RealtimeSchemaMigrationRunner`）。容器/生产环境必须关闭运行时迁移（`appsettings.json` 默认 `false`，非 Development 启动校验会拒绝 `true`），改由独立迁移 Job/CLI 执行 runner（009/010 支持检查点续跑与 `CREATE INDEX CONCURRENTLY`）。`scripts/realtime-schema.sql` 仅适合空库引导 DDL，不替代数据回填。
+开发模式允许 `InitializeSchemaOnStart=true`（`appsettings.Development.json`；走版本化 `schema_migrations` + `RealtimeSchemaMigrationRunner`）。容器/生产环境必须关闭运行时迁移（`appsettings.json` 默认 `false`，非 Development 启动校验会拒绝 `true`），改由独立迁移 Job 执行 runner（009/010 支持检查点续跑与 `CREATE INDEX CONCURRENTLY`）。
+
+P0-1：C# migrations 是唯一事实来源。容器 Compose 的 `realtime_migrations` 服务直接运行 `dotnet ChatApp.RealtimeServices.dll --migrate`，该命令读取 `ConnectionStrings__RealtimeDatabase` 和 `RealtimeDatabase__Schema`，执行全部 23 个版本化迁移后退出。不再维护手写 SQL 脚本。
 
 ## 健康与指标
 

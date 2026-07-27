@@ -31,6 +31,7 @@ public sealed class P1PerfStabilityTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var historyStore = new NpgsqlRealtimeMessageHistoryStore(client, schema);
 
@@ -65,6 +66,7 @@ public sealed class P1PerfStabilityTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
 
         var conversationId = ConversationId.CreateDirect(501, 502);
@@ -133,6 +135,7 @@ public sealed class P1PerfStabilityTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var outboxStore = new NpgsqlRealtimeOutboxStore(client, schema);
 
@@ -195,6 +198,7 @@ public sealed class P1PerfStabilityTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationStore = new NpgsqlRealtimeConversationStore(client, schema);
 

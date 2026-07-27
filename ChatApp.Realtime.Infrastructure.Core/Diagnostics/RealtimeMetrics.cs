@@ -28,6 +28,8 @@ public sealed class RealtimeMetrics : IDisposable
     private readonly ObservableGauge<long> _outboxDeadGauge;
     private readonly Counter<long> _outboxDeadLetterCounter;
     private readonly Counter<long> _outboxCleanupCounter;
+    private readonly Counter<long> _outboxDeadCleanupCounter;
+    private readonly Counter<long> _outboxDeadArchiveCounter;
     private readonly Counter<long> _outboxStatsFailureCounter;
     private readonly Counter<long> _idempotencyConflictCounter;
     private readonly Counter<long> _messageRetentionDeletedCounter;
@@ -35,6 +37,7 @@ public sealed class RealtimeMetrics : IDisposable
     private readonly ObservableGauge<double> _messageRetentionLagGauge;
     private readonly Histogram<double> _processingDuration;
     private readonly Histogram<double> _historyQueryDuration;
+    private readonly Counter<long> _overloadReplyCounter;
 
     private long _persisted;
     private long _duplicates;
@@ -94,6 +97,10 @@ public sealed class RealtimeMetrics : IDisposable
             "realtime.outbox.dead_letters");
         _outboxCleanupCounter = _meter.CreateCounter<long>(
             "realtime.outbox.cleanup.deleted");
+        _outboxDeadCleanupCounter = _meter.CreateCounter<long>(
+            "realtime.outbox.cleanup.dead.deleted");
+        _outboxDeadArchiveCounter = _meter.CreateCounter<long>(
+            "realtime.outbox.cleanup.dead.archived");
         _outboxStatsFailureCounter = _meter.CreateCounter<long>(
             "realtime.outbox.stats.failures");
         _idempotencyConflictCounter = _meter.CreateCounter<long>(
@@ -108,6 +115,7 @@ public sealed class RealtimeMetrics : IDisposable
             "s");
         _processingDuration = _meter.CreateHistogram<double>("realtime.messages.processing.duration", "ms");
         _historyQueryDuration = _meter.CreateHistogram<double>("realtime.history.duration", "ms");
+        _overloadReplyCounter = _meter.CreateCounter<long>("realtime.overload.replies");
     }
 
     public void RecordPersisted()
@@ -187,6 +195,22 @@ public sealed class RealtimeMetrics : IDisposable
 
     public void RecordOutboxCleanup(int deleted) =>
         _outboxCleanupCounter.Add(deleted);
+
+    /// <summary>Perf-8：物理删除 Dead 行的累计计数。</summary>
+    public void RecordOutboxDeadCleanup(int deleted)
+    {
+        if (deleted <= 0)
+            return;
+        _outboxDeadCleanupCounter.Add(deleted);
+        AdjustOutboxDead(-deleted);
+    }
+
+    /// <summary>Perf-8：归档 Dead 行到外部接收器的累计计数。</summary>
+    public void RecordOutboxDeadArchive(int archived)
+    {
+        if (archived > 0)
+            _outboxDeadArchiveCounter.Add(archived);
+    }
 
     public void RecordMessageRetentionDeleted(int deleted)
     {
@@ -299,6 +323,17 @@ public sealed class RealtimeMetrics : IDisposable
             new KeyValuePair<string, object?>(
                 "reason",
                 reason ?? "unknown"));
+    }
+
+    /// <summary>
+    /// 过载协议：记录一次 <c>server_busy</c> 快速失败回复。
+    /// </summary>
+    public void RecordOverloadReply(string queueKind, string source)
+    {
+        _overloadReplyCounter.Add(
+            1,
+            new KeyValuePair<string, object?>("queue_kind", queueKind),
+            new KeyValuePair<string, object?>("source", source));
     }
 
     public RealtimeMetricsSnapshot GetSnapshot() => new(

@@ -2,6 +2,7 @@ using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
+using ChatApp.Realtime.Abstractions.Protocol;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.Ephemeral;
@@ -278,12 +279,46 @@ internal sealed class RealtimeRequestClient
                 .ConfigureAwait(false);
             response.EnsureSuccess();
 
-            return string.IsNullOrWhiteSpace(response.Data) ? null : response.Data;
+            var data = string.IsNullOrWhiteSpace(response.Data) ? null : response.Data;
+            ThrowIfServerBusy(data);
+            return data;
         }
         catch (Exception ex)
         {
             RealtimeIntegrationTelemetry.RecordException(activity, ex);
             throw;
+        }
+    }
+
+    /// <summary>
+    /// 过载协议：检测响应体中的 <c>server_busy</c> 错误码并抛出
+    /// <see cref="RealtimeServerBusyException"/>，携带 <c>retry_after_ms</c> 和 <c>queue_kind</c>。
+    /// </summary>
+    private static void ThrowIfServerBusy(string? data)
+    {
+        if (string.IsNullOrEmpty(data) || !data.Contains("server_busy", StringComparison.Ordinal))
+            return;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(data);
+            if (!doc.RootElement.TryGetProperty("errorCode", out var codeEl) ||
+                codeEl.GetString() != "server_busy")
+                return;
+
+            var retryAfterMs = doc.RootElement.TryGetProperty("retryAfterMs", out var retryEl) &&
+                               retryEl.ValueKind == JsonValueKind.Number
+                ? retryEl.GetInt32()
+                : 500;
+            var queueKind = doc.RootElement.TryGetProperty("queueKind", out var kindEl)
+                ? kindEl.GetString() ?? "unknown"
+                : "unknown";
+
+            throw new RealtimeServerBusyException(retryAfterMs, queueKind);
+        }
+        catch (JsonException)
+        {
+            // 响应体不是合法 JSON，交给调用方的反序列化逻辑处理。
         }
     }
 }

@@ -11,6 +11,7 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="Npgsql" Version="10.0.2" />
     <PackageReference Include="Testcontainers.PostgreSql" Version="4.7.0" />
+    <PackageReference Include="Testcontainers.Redis" Version="4.7.0" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5">
       <PrivateAssets>all</PrivateAssets>
@@ -23,6 +24,7 @@
     <ProjectReference Include="..\ChatApp.Realtime.Infrastructure.Core\ChatApp.Realtime.Infrastructure.Core.csproj" />
     <ProjectReference Include="..\ChatApp.Realtime.Infrastructure.Nats\ChatApp.Realtime.Infrastructure.Nats.csproj" />
     <ProjectReference Include="..\ChatApp.Realtime.Infrastructure.Postgres\ChatApp.Realtime.Infrastructure.Postgres.csproj" />
+    <ProjectReference Include="..\ChatApp.Realtime.Infrastructure.Redis\ChatApp.Realtime.Infrastructure.Redis.csproj" />
     <ProjectReference Include="..\ChatApp.Realtime.Integration\ChatApp.Realtime.Integration.csproj" />
   </ItemGroup>
 </Project>

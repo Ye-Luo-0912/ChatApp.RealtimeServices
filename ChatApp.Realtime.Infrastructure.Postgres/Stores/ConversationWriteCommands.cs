@@ -230,6 +230,7 @@ internal static class ConversationWriteCommands
              SELECT user_id
              FROM {schema.ConversationMembersTableSql}
              WHERE conversation_id = @conversation_id
+               AND left_at_ms IS NULL
              ORDER BY user_id;
              """,
             connection,

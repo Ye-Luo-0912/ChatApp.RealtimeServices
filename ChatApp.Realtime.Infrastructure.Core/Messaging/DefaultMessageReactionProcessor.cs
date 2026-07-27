@@ -13,12 +13,14 @@ public sealed class DefaultMessageReactionProcessor : IMessageReactionProcessor
     private readonly MessageReactionOptions _options;
     private readonly RealtimeMetrics _metrics;
     private readonly ILogger<DefaultMessageReactionProcessor> _logger;
+    private readonly IUserDeletionTombstoneStore _tombstoneStore;
 
     public DefaultMessageReactionProcessor(
         IRealtimeReactionStore reactionStore,
         IRealtimeOutboxSignal outboxSignal,
         RealtimeMetrics metrics,
         ILogger<DefaultMessageReactionProcessor> logger,
+        IUserDeletionTombstoneStore tombstoneStore,
         MessageReactionOptions? options = null)
     {
         _reactionStore = reactionStore;
@@ -26,6 +28,7 @@ public sealed class DefaultMessageReactionProcessor : IMessageReactionProcessor
         _options = options ?? new MessageReactionOptions();
         _metrics = metrics;
         _logger = logger;
+        _tombstoneStore = tombstoneStore;
     }
 
     public async Task<MessageReactionResult> ProcessAsync(
@@ -35,6 +38,11 @@ public sealed class DefaultMessageReactionProcessor : IMessageReactionProcessor
         var validationError = Validate(command);
         if (validationError is not null)
             return validationError;
+
+        if (await _tombstoneStore.IsUserDeletedAsync(command.ActorUserId, ct).ConfigureAwait(false))
+        {
+            return MessageReactionResult.Failed(command.RequestId, "user_deleted", "用户已注销，操作被拒绝。");
+        }
 
         var emoji = command.Emoji.Trim();
         var messageId = command.MessageId.Trim();

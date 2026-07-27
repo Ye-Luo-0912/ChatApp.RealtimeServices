@@ -124,7 +124,7 @@ public sealed class MessageReactionStoreTests : IAsyncLifetime
         var catchUp = await historyStore.QueryByConversationAfterAsync(
             userId: 1001,
             conversationId,
-            afterReceivedAtMs: 1_000,
+            afterChangedAtMs: 1_000,
             afterMessageId: messageId,
             take: 10);
         Assert.True(catchUp.IsMember);
@@ -168,8 +168,9 @@ public sealed class MessageReactionStoreTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
-        var reactionStore = new NpgsqlRealtimeReactionStore(client, schema);
+        var reactionStore = new NpgsqlRealtimeReactionStore(client, schema, TestMutationPolicy.Instance);
         var historyStore = new NpgsqlRealtimeMessageHistoryStore(client, schema);
         var conversationId = ConversationId.CreateDirect(1001, 1002);
         const string messageId = "msg-react-1";

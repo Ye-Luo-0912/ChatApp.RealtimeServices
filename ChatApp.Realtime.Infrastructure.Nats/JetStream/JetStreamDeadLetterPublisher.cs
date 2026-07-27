@@ -13,9 +13,13 @@ public sealed class JetStreamDeadLetterPublisher : IDeadLetterPublisher
         _contextManager = contextManager;
     }
 
-    public Task PublishAsync(DeadLetterMessage message, CancellationToken ct = default) =>
-        _contextManager.PublishDeadLetterAsync(
-            message.DeadLetterId,
-            JsonSerializer.Serialize(message, RealtimeJsonSerializerContext.Default.DeadLetterMessage),
+    public Task PublishAsync(DeadLetterMessage message, CancellationToken ct = default)
+    {
+        // Reliability-5：截断 payload 以适应 JetStream 1 MiB 单消息上限，记录 SHA-256 与原长度。
+        var bounded = message.WithBoundedPayload();
+        return _contextManager.PublishDeadLetterAsync(
+            bounded.DeadLetterId,
+            JsonSerializer.Serialize(bounded, RealtimeJsonSerializerContext.Default.DeadLetterMessage),
             ct);
+    }
 }

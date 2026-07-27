@@ -29,6 +29,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
     }
 
     public async Task<GroupCreatePersistResult> CreateGroupAsync(
+        string requestId,
         long creatorUserId,
         string conversationId,
         string title,
@@ -37,6 +38,10 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         long occurredAtMs,
         CancellationToken ct = default)
     {
+        var fingerprint = ComputeGroupFingerprint(
+            1,
+            $"{title}\n{string.Join(',', memberUserIds)}");
+
         var members = NormalizeCreateMembers(creatorUserId, memberUserIds);
         if (members.Count > MaxMembersPerGroup)
         {
@@ -58,6 +63,23 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         await using var transaction = await connection
             .BeginTransactionAsync(ct)
             .ConfigureAwait(false);
+
+        var existing = await TryReadGroupMutationRequestAsync(
+                connection,
+                transaction,
+                creatorUserId,
+                requestId,
+                ct)
+            .ConfigureAwait(false);
+        if (existing is not null)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            if (existing.Fingerprint != fingerprint)
+                return GroupCreatePersistResult.Fail(
+                    "request_conflict",
+                    "请求编号已用于不同操作。");
+            return GroupCreatePersistResult.Ok(existing.ConversationId!, null, null);
+        }
 
         await using (var insertConv = new NpgsqlCommand(
                          $"""
@@ -151,11 +173,24 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         }
 
         await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
+        await InsertGroupMutationRequestAsync(
+                connection,
+                transaction,
+                creatorUserId,
+                requestId,
+                operation: 1,
+                fingerprint,
+                conversationId,
+                succeeded: true,
+                errorCode: null,
+                ct)
+            .ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return GroupCreatePersistResult.Ok(conversationId, title, memberItems);
     }
 
     public async Task<GroupMutatePersistResult> AddMembersAsync(
+        string requestId,
         long actorUserId,
         string conversationId,
         IReadOnlyList<long> memberUserIds,
@@ -163,6 +198,10 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         long occurredAtMs,
         CancellationToken ct = default)
     {
+        var fingerprint = ComputeGroupFingerprint(
+            2,
+            $"{conversationId}\n{string.Join(',', memberUserIds)}");
+
         var toAdd = NormalizeDistinctPositive(memberUserIds);
         if (toAdd.Count == 0)
             return GroupMutatePersistResult.Fail("invalid_members", "至少需要一名有效成员。");
@@ -186,6 +225,23 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         await using var transaction = await connection
             .BeginTransactionAsync(ct)
             .ConfigureAwait(false);
+
+        var existing = await TryReadGroupMutationRequestAsync(
+                connection,
+                transaction,
+                actorUserId,
+                requestId,
+                ct)
+            .ConfigureAwait(false);
+        if (existing is not null)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            if (existing.Fingerprint != fingerprint)
+                return GroupMutatePersistResult.Fail(
+                    "request_conflict",
+                    "请求编号已用于不同操作。");
+            return GroupMutatePersistResult.Ok(existing.ConversationId!, null, null);
+        }
 
         var (title, actorRole, existingCount) = await LoadGroupContextAsync(
                 connection,
@@ -279,11 +335,24 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             causeToken: $"join-batch:{occurredAtMs}"));
 
         await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
+        await InsertGroupMutationRequestAsync(
+                connection,
+                transaction,
+                actorUserId,
+                requestId,
+                operation: 2,
+                fingerprint,
+                conversationId,
+                succeeded: true,
+                errorCode: null,
+                ct)
+            .ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return GroupMutatePersistResult.Ok(conversationId, title, allMembers);
     }
 
     public async Task<GroupMutatePersistResult> RemoveMemberAsync(
+        string requestId,
         long actorUserId,
         string conversationId,
         long targetUserId,
@@ -296,6 +365,8 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         if (targetUserId == actorUserId)
             return GroupMutatePersistResult.Fail("invalid_target", "不能移除自己，请使用退群。");
 
+        var fingerprint = ComputeGroupFingerprint(3, $"{conversationId}\n{targetUserId}");
+
         await using var connection = await _databaseClient
             .GetDataSource()
             .OpenConnectionAsync(ct)
@@ -303,6 +374,23 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         await using var transaction = await connection
             .BeginTransactionAsync(ct)
             .ConfigureAwait(false);
+
+        var existing = await TryReadGroupMutationRequestAsync(
+                connection,
+                transaction,
+                actorUserId,
+                requestId,
+                ct)
+            .ConfigureAwait(false);
+        if (existing is not null)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            if (existing.Fingerprint != fingerprint)
+                return GroupMutatePersistResult.Fail(
+                    "request_conflict",
+                    "请求编号已用于不同操作。");
+            return GroupMutatePersistResult.Ok(existing.ConversationId!, null, null);
+        }
 
         var (title, actorRole, _) = await LoadGroupContextAsync(
                 connection,
@@ -354,17 +442,21 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 $"群成员数超过单事件目标上限 {RealtimeWireLimits.MaxTargetUserIdsPerEvent}。");
         }
 
-        await using (var delete = new NpgsqlCommand(
+        await using (var softDelete = new NpgsqlCommand(
                          $"""
-                          DELETE FROM {_databaseSchema.ConversationMembersTableSql}
-                          WHERE conversation_id = @conversation_id AND user_id = @user_id;
+                          UPDATE {_databaseSchema.ConversationMembersTableSql}
+                          SET left_at_ms = @occurred_at_ms
+                          WHERE conversation_id = @conversation_id
+                            AND user_id = @user_id
+                            AND left_at_ms IS NULL;
                           """,
                          connection,
                          transaction))
         {
-            delete.Parameters.AddWithValue("conversation_id", conversationId);
-            delete.Parameters.AddWithValue("user_id", targetUserId);
-            await delete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            softDelete.Parameters.AddWithValue("conversation_id", conversationId);
+            softDelete.Parameters.AddWithValue("user_id", targetUserId);
+            softDelete.Parameters.AddWithValue("occurred_at_ms", occurredAtMs);
+            await softDelete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
 
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
@@ -380,17 +472,32 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             traceState);
 
         await InsertOutboxManyAsync(connection, transaction, [evt], ct).ConfigureAwait(false);
+        await InsertGroupMutationRequestAsync(
+                connection,
+                transaction,
+                actorUserId,
+                requestId,
+                operation: 3,
+                fingerprint,
+                conversationId,
+                succeeded: true,
+                errorCode: null,
+                ct)
+            .ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return GroupMutatePersistResult.Ok(conversationId, title);
     }
 
     public async Task<GroupMutatePersistResult> LeaveAsync(
+        string requestId,
         long actorUserId,
         string conversationId,
         string? actorSessionId,
         long occurredAtMs,
         CancellationToken ct = default)
     {
+        var fingerprint = ComputeGroupFingerprint(4, $"{conversationId}");
+
         await using var connection = await _databaseClient
             .GetDataSource()
             .OpenConnectionAsync(ct)
@@ -398,6 +505,23 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         await using var transaction = await connection
             .BeginTransactionAsync(ct)
             .ConfigureAwait(false);
+
+        var existing = await TryReadGroupMutationRequestAsync(
+                connection,
+                transaction,
+                actorUserId,
+                requestId,
+                ct)
+            .ConfigureAwait(false);
+        if (existing is not null)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            if (existing.Fingerprint != fingerprint)
+                return GroupMutatePersistResult.Fail(
+                    "request_conflict",
+                    "请求编号已用于不同操作。");
+            return GroupMutatePersistResult.Ok(existing.ConversationId!, null, null);
+        }
 
         var (title, actorRole, _) = await LoadGroupContextAsync(
                 connection,
@@ -440,17 +564,21 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 $"群成员数超过单事件目标上限 {RealtimeWireLimits.MaxTargetUserIdsPerEvent}。");
         }
 
-        await using (var delete = new NpgsqlCommand(
+        await using (var softDelete = new NpgsqlCommand(
                          $"""
-                          DELETE FROM {_databaseSchema.ConversationMembersTableSql}
-                          WHERE conversation_id = @conversation_id AND user_id = @user_id;
+                          UPDATE {_databaseSchema.ConversationMembersTableSql}
+                          SET left_at_ms = @occurred_at_ms
+                          WHERE conversation_id = @conversation_id
+                            AND user_id = @user_id
+                            AND left_at_ms IS NULL;
                           """,
                          connection,
                          transaction))
         {
-            delete.Parameters.AddWithValue("conversation_id", conversationId);
-            delete.Parameters.AddWithValue("user_id", actorUserId);
-            await delete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            softDelete.Parameters.AddWithValue("conversation_id", conversationId);
+            softDelete.Parameters.AddWithValue("user_id", actorUserId);
+            softDelete.Parameters.AddWithValue("occurred_at_ms", occurredAtMs);
+            await softDelete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
 
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
@@ -465,11 +593,24 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             traceState);
 
         await InsertOutboxManyAsync(connection, transaction, [evt], ct).ConfigureAwait(false);
+        await InsertGroupMutationRequestAsync(
+                connection,
+                transaction,
+                actorUserId,
+                requestId,
+                operation: 4,
+                fingerprint,
+                conversationId,
+                succeeded: true,
+                errorCode: null,
+                ct)
+            .ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return GroupMutatePersistResult.Ok(conversationId, title);
     }
 
     public async Task<GroupMutatePersistResult> ChangeRoleAsync(
+        string requestId,
         long actorUserId,
         string conversationId,
         long targetUserId,
@@ -487,6 +628,10 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             return GroupMutatePersistResult.Fail("invalid_role", "角色无效。");
         }
 
+        var fingerprint = ComputeGroupFingerprint(
+            5,
+            $"{conversationId}\n{targetUserId}\n{(short)newRole}");
+
         await using var connection = await _databaseClient
             .GetDataSource()
             .OpenConnectionAsync(ct)
@@ -494,6 +639,23 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         await using var transaction = await connection
             .BeginTransactionAsync(ct)
             .ConfigureAwait(false);
+
+        var existing = await TryReadGroupMutationRequestAsync(
+                connection,
+                transaction,
+                actorUserId,
+                requestId,
+                ct)
+            .ConfigureAwait(false);
+        if (existing is not null)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            if (existing.Fingerprint != fingerprint)
+                return GroupMutatePersistResult.Fail(
+                    "request_conflict",
+                    "请求编号已用于不同操作。");
+            return GroupMutatePersistResult.Ok(existing.ConversationId!, null, null);
+        }
 
         var (title, actorRole, _) = await LoadGroupContextAsync(
                 connection,
@@ -524,8 +686,21 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
 
         if (previousRole == newRole)
         {
+            await InsertGroupMutationRequestAsync(
+                    connection,
+                    transaction,
+                    actorUserId,
+                    requestId,
+                    operation: 5,
+                    fingerprint,
+                    conversationId,
+                    succeeded: true,
+                    errorCode: null,
+                    ct)
+                .ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
-            return GroupMutatePersistResult.Ok(conversationId, title);
+            return GroupMutatePersistResult.Ok(conversationId, title)
+                with { PreviousRole = previousRole, NewRole = newRole };
         }
 
         if (newRole == ConversationMemberRole.Owner)
@@ -617,6 +792,141 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         }
 
         await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
+        await InsertGroupMutationRequestAsync(
+                connection,
+                transaction,
+                actorUserId,
+                requestId,
+                operation: 5,
+                fingerprint,
+                conversationId,
+                succeeded: true,
+                errorCode: null,
+                ct)
+            .ConfigureAwait(false);
+        await transaction.CommitAsync(ct).ConfigureAwait(false);
+        return GroupMutatePersistResult.Ok(conversationId, title)
+            with { PreviousRole = previousRole, NewRole = newRole };
+    }
+
+    public async Task<GroupMutatePersistResult> DissolveAsync(
+        string requestId,
+        long actorUserId,
+        string conversationId,
+        string? actorSessionId,
+        long occurredAtMs,
+        CancellationToken ct = default)
+    {
+        var fingerprint = ComputeGroupFingerprint(7, $"{conversationId}");
+
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+        await using var transaction = await connection
+            .BeginTransactionAsync(ct)
+            .ConfigureAwait(false);
+
+        var existing = await TryReadGroupMutationRequestAsync(
+                connection,
+                transaction,
+                actorUserId,
+                requestId,
+                ct)
+            .ConfigureAwait(false);
+        if (existing is not null)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            if (existing.Fingerprint != fingerprint)
+                return GroupMutatePersistResult.Fail(
+                    "request_conflict",
+                    "请求编号已用于不同操作。");
+            return GroupMutatePersistResult.Ok(existing.ConversationId!, null, null);
+        }
+
+        var (title, actorRole, _) = await LoadGroupContextAsync(
+                connection,
+                transaction,
+                conversationId,
+                actorUserId,
+                ct)
+            .ConfigureAwait(false);
+        if (title is null || actorRole is null)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupMutatePersistResult.Fail("not_found", "群不存在或当前用户不是成员。");
+        }
+
+        if (actorRole != ConversationMemberRole.Owner)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupMutatePersistResult.Fail("forbidden", "仅 Owner 可解散群。");
+        }
+
+        var notifyTargets = await ListMemberUserIdsInTxAsync(connection, transaction, conversationId, ct)
+            .ConfigureAwait(false);
+        if (notifyTargets.Count > RealtimeWireLimits.MaxTargetUserIdsPerEvent)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupMutatePersistResult.Fail(
+                "too_many_members",
+                $"群成员数超过单事件目标上限 {RealtimeWireLimits.MaxTargetUserIdsPerEvent}。");
+        }
+
+        await using (var dissolveMembers = new NpgsqlCommand(
+                         $"""
+                          UPDATE {_databaseSchema.ConversationMembersTableSql}
+                          SET left_at_ms = @occurred_at_ms
+                          WHERE conversation_id = @conversation_id AND left_at_ms IS NULL;
+                          """,
+                         connection,
+                         transaction))
+        {
+            dissolveMembers.Parameters.AddWithValue("conversation_id", conversationId);
+            dissolveMembers.Parameters.AddWithValue("occurred_at_ms", occurredAtMs);
+            await dissolveMembers.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+
+        await using (var dissolveConv = new NpgsqlCommand(
+                         $"""
+                          UPDATE {_databaseSchema.ConversationsTableSql}
+                          SET dissolved_at_ms = @occurred_at_ms
+                          WHERE conversation_id = @conversation_id AND dissolved_at_ms IS NULL;
+                          """,
+                         connection,
+                         transaction))
+        {
+            dissolveConv.Parameters.AddWithValue("conversation_id", conversationId);
+            dissolveConv.Parameters.AddWithValue("occurred_at_ms", occurredAtMs);
+            await dissolveConv.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+
+        var traceParent = RealtimeTraceContext.CaptureTraceParent();
+        var traceState = RealtimeTraceContext.CaptureTraceState();
+        var evt = CreateConversationCreatedAggregatedEvent(
+            conversationId,
+            title,
+            actorUserId,
+            notifyTargets.ToArray(),
+            occurredAtMs,
+            actorSessionId,
+            traceParent,
+            traceState,
+            causeToken: $"group-dissolved:{occurredAtMs}");
+
+        await InsertOutboxManyAsync(connection, transaction, [evt], ct).ConfigureAwait(false);
+        await InsertGroupMutationRequestAsync(
+                connection,
+                transaction,
+                actorUserId,
+                requestId,
+                operation: 7,
+                fingerprint,
+                conversationId,
+                succeeded: true,
+                errorCode: null,
+                ct)
+            .ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return GroupMutatePersistResult.Ok(conversationId, title);
     }
@@ -626,17 +936,43 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         string conversationId,
         CancellationToken ct = default)
     {
+        // LongTerm-2：合并成员资格校验与成员读取为单条 SQL，避免打开两次连接，
+        // 同时消除“校验通过 / 读取之前”的 TOCTOU 窗口。EXISTS 子查询保证 actor 仍是当前成员。
         await using var connection = await _databaseClient
             .GetDataSource()
             .OpenConnectionAsync(ct)
             .ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT members.user_id, members.role, members.joined_at_ms
+             FROM {_databaseSchema.ConversationMembersTableSql} AS members
+             WHERE members.conversation_id = @conversation_id
+               AND EXISTS (
+                   SELECT 1
+                   FROM {_databaseSchema.ConversationMembersTableSql} AS actor
+                   WHERE actor.conversation_id = @conversation_id
+                     AND actor.user_id = @actor_user_id
+                     AND actor.left_at_ms IS NULL
+               )
+             ORDER BY members.role ASC, members.joined_at_ms ASC, members.user_id ASC;
+             """,
+            connection);
+        command.Parameters.AddWithValue("conversation_id", conversationId);
+        command.Parameters.AddWithValue("actor_user_id", actorUserId);
 
-        var isMember = await IsActiveMemberAsync(conversationId, actorUserId, ct).ConfigureAwait(false);
-        if (!isMember)
-            return Array.Empty<ConversationMemberItem>();
+        var items = new List<ConversationMemberItem>();
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            items.Add(new ConversationMemberItem
+            {
+                UserId = reader.GetInt64(0),
+                Role = (ConversationMemberRole)reader.GetInt16(1),
+                JoinedAtMs = reader.GetInt64(2)
+            });
+        }
 
-        return await ListMembersInTxAsync(connection, transaction: null, conversationId, ct)
-            .ConfigureAwait(false);
+        return items;
     }
 
     public async Task<IReadOnlyList<long>> ListActiveMemberUserIdsAsync(
@@ -664,7 +1000,9 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             $"""
              SELECT 1
              FROM {_databaseSchema.ConversationMembersTableSql}
-             WHERE conversation_id = @conversation_id AND user_id = @user_id
+             WHERE conversation_id = @conversation_id
+               AND user_id = @user_id
+               AND left_at_ms IS NULL
              LIMIT 1;
              """,
             connection);
@@ -685,10 +1023,11 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             $"""
              SELECT c.title, m.role,
                     (SELECT COUNT(*)::int FROM {_databaseSchema.ConversationMembersTableSql} AS x
-                     WHERE x.conversation_id = c.conversation_id) AS member_count
+                     WHERE x.conversation_id = c.conversation_id AND x.left_at_ms IS NULL) AS member_count
              FROM {_databaseSchema.ConversationsTableSql} AS c
              INNER JOIN {_databaseSchema.ConversationMembersTableSql} AS m
                  ON m.conversation_id = c.conversation_id AND m.user_id = @actor_user_id
+                   AND m.left_at_ms IS NULL
              WHERE c.conversation_id = @conversation_id
                AND c.type = @group_type
              FOR UPDATE OF m;
@@ -770,7 +1109,13 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
              )
              SELECT @conversation_id, t.user_id, NULL, @joined_at_ms, @role, @joined_at_ms
              FROM UNNEST(@user_ids) AS t(user_id)
-             ON CONFLICT (conversation_id, user_id) DO NOTHING
+             ON CONFLICT (conversation_id, user_id) DO UPDATE
+                 SET role = EXCLUDED.role,
+                     joined_at_ms = EXCLUDED.joined_at_ms,
+                     left_at_ms = NULL,
+                     last_message_at_ms = EXCLUDED.last_message_at_ms,
+                     unread_count = 0
+             WHERE conversation_members.left_at_ms IS NOT NULL
              RETURNING user_id;
              """,
             connection,
@@ -825,7 +1170,8 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
              FROM {_databaseSchema.ConversationMembersTableSql}
              WHERE conversation_id = @conversation_id
                AND role = @owner_role
-               AND user_id <> @exclude_user_id;
+               AND user_id <> @exclude_user_id
+               AND left_at_ms IS NULL;
              """,
             connection,
             transaction);
@@ -1176,4 +1522,81 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
     }
+
+    private async Task<GroupMutationRequestRow?> TryReadGroupMutationRequestAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        long actorUserId,
+        string requestId,
+        CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT operation, request_fingerprint, conversation_id, succeeded, error_code
+             FROM {_databaseSchema.GroupMutationRequestsTableSql}
+             WHERE actor_user_id = @actor_user_id
+               AND request_id = @request_id
+             FOR UPDATE
+             """,
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("actor_user_id", actorUserId);
+        command.Parameters.AddWithValue("request_id", requestId);
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+            return null;
+        return new GroupMutationRequestRow(
+            reader.GetInt16(0),
+            reader.GetString(1),
+            reader.IsDBNull(2) ? null : reader.GetString(2),
+            reader.GetBoolean(3),
+            reader.IsDBNull(4) ? null : reader.GetString(4));
+    }
+
+    private async Task InsertGroupMutationRequestAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        long actorUserId,
+        string requestId,
+        short operation,
+        string fingerprint,
+        string? conversationId,
+        bool succeeded,
+        string? errorCode,
+        CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand(
+            $"""
+             INSERT INTO {_databaseSchema.GroupMutationRequestsTableSql} (
+                 actor_user_id, request_id, operation, request_fingerprint,
+                 conversation_id, succeeded, error_code, created_at_ms
+             ) VALUES (
+                 @actor_user_id, @request_id, @operation, @request_fingerprint,
+                 @conversation_id, @succeeded, @error_code, @created_at_ms
+             )
+             ON CONFLICT (actor_user_id, request_id) DO NOTHING
+             """,
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("actor_user_id", actorUserId);
+        command.Parameters.AddWithValue("request_id", requestId);
+        command.Parameters.AddWithValue("operation", operation);
+        command.Parameters.AddWithValue("request_fingerprint", fingerprint);
+        command.Parameters.AddWithValue("conversation_id", (object?)conversationId ?? DBNull.Value);
+        command.Parameters.AddWithValue("succeeded", succeeded);
+        command.Parameters.AddWithValue("error_code", (object?)errorCode ?? DBNull.Value);
+        command.Parameters.AddWithValue("created_at_ms", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
+    private static string ComputeGroupFingerprint(short operation, string keyData) =>
+        Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes($"{operation}\n{keyData}")));
+
+    private sealed record GroupMutationRequestRow(
+        short Operation,
+        string Fingerprint,
+        string? ConversationId,
+        bool Succeeded,
+        string? ErrorCode);
 }

@@ -1,7 +1,10 @@
+using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Messaging.History;
+using ChatApp.Realtime.Abstractions.Protocol;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Abstractions.Sync;
+using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Core.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Sync;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -1153,6 +1156,113 @@ public sealed class SyncBootstrapQueryProcessorTests
         Assert.Equal("msg-2", persisted.AfterMessageId);
     }
 
+    /// <summary>
+    /// Perf-5 属性测试：任意合法输入生成的 SyncBootstrapPage 序列化后不得超过 MaximumResponseBytes。
+    /// 覆盖：含大量引号/反斜杠/控制字符的 Content（JSON 转义后会明显膨胀）、
+    /// 含 Reply/Forward preview、MentionedUserIds、Reactions、Title 等估算易漏字段、
+    /// 单条消息接近 64KiB 的极端场景。
+    /// </summary>
+    [Theory]
+    [InlineData(42)]
+    [InlineData(7)]
+    [InlineData(12345)]
+    public async Task ProcessAsync_FinalResponseNeverExceedsMaximumResponseBytes(int seed)
+    {
+        var rng = new Random(seed);
+        var conversationCount = rng.Next(5, 15);
+        var conversations = new List<ConversationListItem>(conversationCount);
+        for (var i = 0; i < conversationCount; i++)
+        {
+            conversations.Add(new ConversationListItem
+            {
+                ConversationId = $"dm:42:{100 + i}",
+                Type = i % 3 == 0 ? ConversationType.Group : ConversationType.Direct,
+                PeerUserId = 100 + i,
+                Title = i % 3 == 0 ? BuildEscapedString(rng, rng.Next(20, 80)) : null,
+                LastMessageId = $"msg-{i}-last",
+                LastMessagePreview = BuildEscapedString(rng, rng.Next(10, 120)),
+                LastMessageAtMs = 1000L + i,
+                LastSenderUserId = 100 + i,
+                UnreadCount = rng.Next(0, 50),
+                LastReadMessageId = i % 2 == 0 ? $"msg-{i}-read" : null,
+                LastReadAtMs = i % 2 == 0 ? 900L + i : null,
+                IsPinned = i % 4 == 0,
+                PinnedAtMs = i % 4 == 0 ? 2000L + i : null,
+                IsMuted = i % 5 == 0,
+                MutedUntilMs = i % 5 == 0 ? 3000L + i : null
+            });
+        }
+
+        var conversationId = conversations[0].ConversationId;
+        var messageCount = rng.Next(20, 60);
+        var messages = new List<RealtimeHistoryMessage>(messageCount);
+        for (var i = 0; i < messageCount; i++)
+        {
+            messages.Add(new RealtimeHistoryMessage
+            {
+                MessageId = $"msg-{i}",
+                ClientMessageId = $"client-{i}",
+                SenderUserId = 100,
+                ReceiverUserId = 42,
+                ConversationId = conversationId,
+                Content = BuildEscapedString(rng, rng.Next(50, 4000)),
+                ReceivedAtMs = 100L + i,
+                DeliveredAtMs = 101L + i,
+                ReadAtMs = i % 2 == 0 ? 102L + i : null,
+                ReplyToMessageId = i % 4 == 0 ? $"reply-{i}" : null,
+                ReplyToSenderUserId = i % 4 == 0 ? 200 : null,
+                ReplyToPreview = i % 4 == 0 ? BuildEscapedString(rng, rng.Next(20, 200)) : null,
+                ForwardedFromMessageId = i % 6 == 0 ? $"fwd-{i}" : null,
+                ForwardedFromSenderUserId = i % 6 == 0 ? 300 : null,
+                ForwardedFromPreview = i % 6 == 0 ? BuildEscapedString(rng, rng.Next(20, 200)) : null,
+                MentionedUserIds = i % 3 == 0 ? new long[] { 1, 2, 3 } : null,
+                MentionedRoles = i % 3 == 0 ? new[] { "all", "admin" } : null,
+                RecalledAtMs = i % 10 == 0 ? 200L + i : null,
+                EditVersion = i % 5 == 0 ? 2 : 1,
+                EditedAtMs = i % 5 == 0 ? 150L + i : null,
+                ChangedAtMs = 100L + i,
+                Reactions = i % 7 == 0
+                    ? new[]
+                    {
+                        new MessageReactionSummary { Emoji = "👍", Count = 3, ReactedByMe = true },
+                        new MessageReactionSummary { Emoji = "🎉", Count = 1, ReactedByMe = false }
+                    }
+                    : null
+            });
+        }
+
+        var conversationStore = new CapturingConversationStore(conversations);
+        var historyStore = new CapturingHistoryStore(conversationId, messages);
+        var processor = CreateProcessor(conversationStore, historyStore, new NoopDeviceCursorStore());
+
+        var page = await processor.ProcessAsync(new SyncBootstrapQuery
+        {
+            RequestId = "sync-perf5",
+            UserId = 42,
+            ListLimit = 100,
+            HistoryLimitPerConversation = 50,
+            MaxConversationsWithHistory = 20
+        });
+
+        Assert.True(page.Succeeded);
+
+        var json = JsonSerializer.Serialize(page, RealtimeJsonSerializerContext.Default.SyncBootstrapPage);
+        var byteCount = System.Text.Encoding.UTF8.GetByteCount(json);
+        Assert.True(
+            byteCount <= DefaultSyncBootstrapQueryProcessor.MaximumResponseBytes,
+            $"序列化后字节数 {byteCount} 超过硬上限 {DefaultSyncBootstrapQueryProcessor.MaximumResponseBytes}（seed={seed}）");
+    }
+
+    private static string BuildEscapedString(Random rng, int length)
+    {
+        // 包含大量引号、反斜杠、控制字符——JSON 转义后字节数会明显大于原字符串。
+        var chars = new char[length];
+        const string escapePool = "\"\\\n\r\t\b\f你好世界👋";
+        for (var i = 0; i < length; i++)
+            chars[i] = escapePool[rng.Next(escapePool.Length)];
+        return new string(chars);
+    }
+
     private static DefaultSyncBootstrapQueryProcessor CreateProcessor(
         CapturingConversationStore conversationStore,
         CapturingHistoryStore historyStore,
@@ -1474,6 +1584,9 @@ public sealed class SyncBootstrapQueryProcessorTests
 
         public Task<long> DeleteByUserAsync(long userId, CancellationToken ct = default) =>
             Task.FromResult(0L);
+
+        public Task<long> DeleteInactiveAsync(long inactiveBeforeMs, int batchSize, CancellationToken ct = default) =>
+            Task.FromResult(0L);
     }
 
     private sealed class CapturingDeviceCursorStore : IRealtimeDeviceSyncCursorStore
@@ -1516,6 +1629,9 @@ public sealed class SyncBootstrapQueryProcessorTests
         }
 
         public Task<long> DeleteByUserAsync(long userId, CancellationToken ct = default) =>
+            Task.FromResult(0L);
+
+        public Task<long> DeleteInactiveAsync(long inactiveBeforeMs, int batchSize, CancellationToken ct = default) =>
             Task.FromResult(0L);
     }
 }

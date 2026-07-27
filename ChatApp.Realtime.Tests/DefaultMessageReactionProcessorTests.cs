@@ -169,6 +169,7 @@ public sealed class DefaultMessageReactionProcessorTests
             signal,
             metrics,
             NullLogger<DefaultMessageReactionProcessor>.Instance,
+            NoopTombstoneAndLedger.Tombstone,
             new MessageReactionOptions());
 
     private static MessageReactionCommand ValidAddCommand() =>

@@ -35,9 +35,14 @@ public sealed class MessageReceiptEnvelope
 
     public required MessageReceiptCommand Command { get; init; }
     public ulong? DeliveryCount { get; init; }
-    public string? RawPayload { get; init; }
+    public string? RawPayload { get; set; }
     public ActivityContext ParentContext { get; init; }
     public long? TrustedUserId { get; init; }
+
+    /// <summary>
+    /// Perf-6：成功解析并处理后清除原始 payload，避免在队列中长期保留完整 RawPayload。
+    /// </summary>
+    public void ClearRawPayload() => RawPayload = null;
 
     public ValueTask AckAsync(CancellationToken ct = default) =>
         _ack is not null ? _ack(ct) : ValueTask.CompletedTask;

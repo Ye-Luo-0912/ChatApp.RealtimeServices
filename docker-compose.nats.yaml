@@ -24,22 +24,21 @@ services:
 
   realtime_migrations:
     profiles: ["container-service"]
-    image: postgres:16-alpine
+    build:
+      context: .
+      dockerfile: ChatApp.RealtimeServices/Dockerfile
+      args:
+        FINAL_BASE_IMAGE: mcr.microsoft.com/dotnet/aspnet:10.0
     restart: "no"
     depends_on:
       postgres_db:
         condition: service_started
     environment:
-      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
-    volumes:
-      - ./scripts/realtime-schema.sql:/migrations/realtime-schema.sql:ro
-    command:
-      - psql
-      - --host=postgres_db
-      - --username=postgres
-      - --dbname=ChatAppDatabase
-      - --set=ON_ERROR_STOP=1
-      - --file=/migrations/realtime-schema.sql
+      # P0-1：C# migrations 是唯一事实来源，不再使用手写 SQL 脚本。
+      # --migrate 命令读取连接字符串并运行 RealtimeSchemaMigrationRunner。
+      ConnectionStrings__RealtimeDatabase: Host=postgres_db;Port=5432;Database=ChatAppDatabase;Username=postgres;Password=${POSTGRES_PASSWORD};Pooling=true;Minimum Pool Size=0;Maximum Pool Size=100;Connection Idle Lifetime=300;Timeout=5;Command Timeout=5;
+      RealtimeDatabase__Schema: realtime
+    command: ["dotnet", "ChatApp.RealtimeServices.dll", "--migrate"]
 
   realtime_services:
     profiles: ["container-service"]

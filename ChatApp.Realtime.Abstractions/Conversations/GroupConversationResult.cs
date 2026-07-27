@@ -6,6 +6,8 @@ public sealed class GroupConversationResult
     public required bool Succeeded { get; init; }
     public string? ErrorCode { get; init; }
     public string? ErrorMessage { get; init; }
+    public int? RetryAfterMs { get; init; }
+    public string? QueueKind { get; init; }
     public string? ConversationId { get; init; }
     public string? Title { get; init; }
     public ConversationType Type { get; init; } = ConversationType.Group;
@@ -35,5 +37,19 @@ public sealed class GroupConversationResult
             Succeeded = false,
             ErrorCode = errorCode,
             ErrorMessage = errorMessage
+        };
+
+    public static GroupConversationResult ServerBusy(
+        string requestId,
+        int retryAfterMs,
+        string queueKind) =>
+        new()
+        {
+            RequestId = requestId,
+            Succeeded = false,
+            ErrorCode = "server_busy",
+            ErrorMessage = "服务繁忙，请稍后重试。",
+            RetryAfterMs = retryAfterMs,
+            QueueKind = queueKind
         };
 }

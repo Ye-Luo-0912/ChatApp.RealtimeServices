@@ -143,46 +143,24 @@ public sealed class Migration010_ConversationListMemberIndex : IRealtimeSchemaMi
         if (!await IsPhaseCompleteAsync(connection, checkpoints, IndexPhase, cancellationToken)
                 .ConfigureAwait(false))
         {
-            await using (var drop = new NpgsqlCommand(
-                               $"""
-                                DROP INDEX CONCURRENTLY IF EXISTS {quotedSchema}."ix_conversation_members_user_pinned_list";
-                                """,
-                               connection))
-            {
-                await drop.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-            }
-
-            await using var create = new NpgsqlCommand(
-                $"""
-                 CREATE INDEX CONCURRENTLY IF NOT EXISTS "ix_conversation_members_user_pinned_list"
-                     ON {members} (
-                         "user_id",
-                         "is_pinned" DESC,
-                         "pinned_at_ms" DESC NULLS LAST,
-                         "last_message_at_ms" DESC NULLS LAST,
-                         "conversation_id" DESC
-                     );
-                 """,
-                connection);
-            await create.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-
-            await using var validate = new NpgsqlCommand(
-                $"""
-                 SELECT i.indisvalid
-                 FROM pg_class c
-                 JOIN pg_index i ON i.indexrelid = c.oid
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = @schema
-                   AND c.relname = 'ix_conversation_members_user_pinned_list';
-                 """,
-                connection);
-            validate.Parameters.AddWithValue("schema", schema.Schema);
-            var valid = await validate.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-            if (valid is false)
-            {
-                throw new InvalidOperationException(
-                    "ix_conversation_members_user_pinned_list 为 INVALID，请 DROP INDEX CONCURRENTLY 后重跑 Migration010。");
-            }
+            // LongTerm-3：通过 ConcurrentIndexHelper 检查 indisvalid，INVALID 时自动 DROP 后重建。
+            await ConcurrentIndexHelper.EnsureValidAsync(
+                    connection,
+                    quotedSchema,
+                    schema.Schema,
+                    "ix_conversation_members_user_pinned_list",
+                    $"""
+                     CREATE INDEX CONCURRENTLY "ix_conversation_members_user_pinned_list"
+                         ON {members} (
+                             "user_id",
+                             "is_pinned" DESC,
+                             "pinned_at_ms" DESC NULLS LAST,
+                             "last_message_at_ms" DESC NULLS LAST,
+                             "conversation_id" DESC
+                         );
+                     """,
+                    cancellationToken)
+                .ConfigureAwait(false);
 
             await MarkPhaseCompleteAsync(connection, checkpoints, IndexPhase, cancellationToken)
                 .ConfigureAwait(false);

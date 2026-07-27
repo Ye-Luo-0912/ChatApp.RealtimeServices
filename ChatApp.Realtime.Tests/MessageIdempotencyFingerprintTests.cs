@@ -28,6 +28,7 @@ public sealed class MessageIdempotencyFingerprintTests : IAsyncLifetime
         var store = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
 
         var first = await store.SaveAsync(CreateMessage("m1", receiver: 2, content: "hello"), CreateEvent("m1"));
@@ -45,6 +46,7 @@ public sealed class MessageIdempotencyFingerprintTests : IAsyncLifetime
         var store = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
 
         var first = await store.SaveAsync(CreateMessage("m1", receiver: 2, content: "hello"), CreateEvent("m1"));
@@ -66,6 +68,7 @@ public sealed class MessageIdempotencyFingerprintTests : IAsyncLifetime
         var store = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
 
         await attachments.InsertConfirmedAsync(Confirmed("att-a", uploader: 1));
@@ -94,6 +97,7 @@ public sealed class MessageIdempotencyFingerprintTests : IAsyncLifetime
         var store = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
 
         await attachments.InsertConfirmedAsync(Confirmed("att-1", uploader: 1));

@@ -21,5 +21,19 @@ public sealed class RealtimeQueryConcurrencyGate
 
     public Task WaitAsync(CancellationToken ct) => _semaphore.WaitAsync(ct);
 
+    /// <summary>
+    /// 过载协议：尝试在 <paramref name="timeoutMs"/> 内获取信号量。
+    /// 成功返回 true；超时返回 false（调用方应回复 <c>server_busy</c>）。
+    /// </summary>
+    public async Task<bool> WaitAsync(int timeoutMs, CancellationToken ct)
+    {
+        if (timeoutMs <= 0)
+        {
+            await _semaphore.WaitAsync(ct).ConfigureAwait(false);
+            return true;
+        }
+        return await _semaphore.WaitAsync(timeoutMs, ct).ConfigureAwait(false);
+    }
+
     public void Release() => _semaphore.Release();
 }

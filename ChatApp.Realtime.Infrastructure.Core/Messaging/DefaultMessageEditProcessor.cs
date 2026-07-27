@@ -13,12 +13,14 @@ public sealed class DefaultMessageEditProcessor : IMessageEditProcessor
     private readonly MessageEditOptions _options;
     private readonly RealtimeMetrics _metrics;
     private readonly ILogger<DefaultMessageEditProcessor> _logger;
+    private readonly IUserDeletionTombstoneStore _tombstoneStore;
 
     public DefaultMessageEditProcessor(
         IRealtimeMessageStore messageStore,
         IRealtimeOutboxSignal outboxSignal,
         RealtimeMetrics metrics,
         ILogger<DefaultMessageEditProcessor> logger,
+        IUserDeletionTombstoneStore tombstoneStore,
         MessageEditOptions? options = null)
     {
         _messageStore = messageStore;
@@ -26,6 +28,7 @@ public sealed class DefaultMessageEditProcessor : IMessageEditProcessor
         _options = options ?? new MessageEditOptions();
         _metrics = metrics;
         _logger = logger;
+        _tombstoneStore = tombstoneStore;
     }
 
     public async Task<MessageEditResult> ProcessAsync(
@@ -43,6 +46,11 @@ public sealed class DefaultMessageEditProcessor : IMessageEditProcessor
                 command.RequestId,
                 "edit_disabled",
                 "消息编辑已关闭。");
+        }
+
+        if (await _tombstoneStore.IsUserDeletedAsync(command.SenderUserId, ct).ConfigureAwait(false))
+        {
+            return MessageEditResult.Failed(command.RequestId, "user_deleted", "用户已注销，操作被拒绝。");
         }
 
         var result = await _messageStore

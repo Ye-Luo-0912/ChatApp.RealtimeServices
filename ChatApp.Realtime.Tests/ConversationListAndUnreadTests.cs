@@ -31,6 +31,7 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationStore = new NpgsqlRealtimeConversationStore(client, schema);
         var listProcessor = new DefaultConversationListQueryProcessor(conversationStore);
@@ -98,6 +99,7 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationStore = new NpgsqlRealtimeConversationStore(client, schema);
         var listProcessor = new DefaultConversationListQueryProcessor(conversationStore);
@@ -127,6 +129,7 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationStore = new NpgsqlRealtimeConversationStore(client, schema);
         var listProcessor = new DefaultConversationListQueryProcessor(conversationStore);
@@ -191,6 +194,7 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationStore = new NpgsqlRealtimeConversationStore(client, schema);
         var outboxSignal = new RecordingRealtimeOutboxSignal();
@@ -266,6 +270,7 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationStore = new NpgsqlRealtimeConversationStore(client, schema);
         var listProcessor = new DefaultConversationListQueryProcessor(conversationStore);
@@ -341,6 +346,7 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationStore = new NpgsqlRealtimeConversationStore(client, schema);
         var listProcessor = new DefaultConversationListQueryProcessor(conversationStore);
@@ -462,6 +468,7 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationStore = new NpgsqlRealtimeConversationStore(client, schema);
         var listProcessor = new DefaultConversationListQueryProcessor(conversationStore);
@@ -579,6 +586,7 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationStore = new NpgsqlRealtimeConversationStore(client, schema);
         var markReadProcessor = new DefaultConversationMarkReadProcessor(
@@ -640,6 +648,7 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationStore = new NpgsqlRealtimeConversationStore(client, schema);
         var listProcessor = new DefaultConversationListQueryProcessor(conversationStore);

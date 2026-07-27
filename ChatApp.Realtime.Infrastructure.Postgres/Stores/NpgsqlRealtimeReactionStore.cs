@@ -4,9 +4,13 @@ using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Stores;
+using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
+using ChatApp.Realtime.Infrastructure.Postgres.Messaging;
+using ChatApp.Realtime.Infrastructure.Postgres.Outbox;
+using ChatApp.Realtime.Infrastructure.Postgres.Projections;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -16,13 +20,16 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
 {
     private readonly RealtimeDatabaseClient _databaseClient;
     private readonly RealtimeDatabaseSchema _databaseSchema;
+    private readonly IConversationMessageMutationPolicy _mutationPolicy;
 
     public NpgsqlRealtimeReactionStore(
         RealtimeDatabaseClient databaseClient,
-        RealtimeDatabaseSchema databaseSchema)
+        RealtimeDatabaseSchema databaseSchema,
+        IConversationMessageMutationPolicy mutationPolicy)
     {
         _databaseClient = databaseClient;
         _databaseSchema = databaseSchema;
+        _mutationPolicy = mutationPolicy;
     }
 
     public async Task<MessageReactionPersistResult> AddAsync(
@@ -53,7 +60,6 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 connection,
                 transaction,
                 messageId,
-                actorUserId,
                 ct)
             .ConfigureAwait(false);
         if (access is null)
@@ -74,7 +80,21 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 emoji);
         }
 
-        if (!access.IsAllowed)
+        // P0-8：群消息 Reaction 需验证操作者仍是当前群成员，防离群后修改旧消息。
+        var addAuth = await _mutationPolicy
+            .AuthorizeMutationAsync(
+                connection,
+                transaction,
+                _databaseSchema,
+                new MessageMutationContext(
+                    access.ConversationId,
+                    access.SenderUserId,
+                    access.ReceiverUserId,
+                    actorUserId,
+                    MessageMutationOperation.Reaction),
+                ct)
+            .ConfigureAwait(false);
+        if (!addAuth.Allowed)
         {
             await transaction.CommitAsync(ct).ConfigureAwait(false);
             return new MessageReactionPersistResult(
@@ -240,7 +260,6 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 connection,
                 transaction,
                 messageId,
-                actorUserId,
                 ct)
             .ConfigureAwait(false);
         if (access is null)
@@ -261,7 +280,21 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 emoji);
         }
 
-        if (!access.IsAllowed)
+        // P0-8：群消息 Reaction 移除同样需验证操作者仍是当前群成员。
+        var removeAuth = await _mutationPolicy
+            .AuthorizeMutationAsync(
+                connection,
+                transaction,
+                _databaseSchema,
+                new MessageMutationContext(
+                    access.ConversationId,
+                    access.SenderUserId,
+                    access.ReceiverUserId,
+                    actorUserId,
+                    MessageMutationOperation.Reaction),
+                ct)
+            .ConfigureAwait(false);
+        if (!removeAuth.Allowed)
         {
             await transaction.CommitAsync(ct).ConfigureAwait(false);
             return new MessageReactionPersistResult(
@@ -392,7 +425,6 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
         string messageId,
-        long actorUserId,
         CancellationToken ct)
     {
         long senderUserId;
@@ -421,32 +453,11 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
             recalledAtMs = reader.IsDBNull(3) ? null : reader.GetInt64(3);
         }
 
-        var isParticipant = actorUserId == senderUserId || actorUserId == receiverUserId;
-        var isMember = isParticipant;
-        if (!isMember && !string.IsNullOrWhiteSpace(conversationId))
-        {
-            await using var memberCmd = new NpgsqlCommand(
-                $"""
-                 SELECT 1
-                 FROM {_databaseSchema.ConversationMembersTableSql}
-                 WHERE conversation_id = @conversation_id
-                   AND user_id = @user_id
-                 LIMIT 1;
-                 """,
-                connection,
-                transaction);
-            memberCmd.Parameters.AddWithValue("conversation_id", conversationId);
-            memberCmd.Parameters.AddWithValue("user_id", actorUserId);
-            var scalar = await memberCmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
-            isMember = scalar is not null;
-        }
-
         return new MessageAccess(
             senderUserId,
             receiverUserId,
             conversationId,
-            recalledAtMs,
-            isMember);
+            recalledAtMs);
     }
 
     private async Task<bool> ReactionExistsAsync(
@@ -596,6 +607,48 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         long occurredAtMs,
         CancellationToken ct)
     {
+        var traceParent = RealtimeTraceContext.CaptureTraceParent();
+        var traceState = RealtimeTraceContext.CaptureTraceState();
+
+        // Perf-9：群反应走统一 GroupProjectionDelta 协议，广播事件聚合为单行 Outbox。
+        if (!string.IsNullOrWhiteSpace(conversationId)
+            && ConversationId.IsGroup(conversationId))
+        {
+            var memberIds = await ConversationWriteCommands.ListActiveMemberUserIdsAsync(
+                    connection,
+                    transaction,
+                    _databaseSchema,
+                    conversationId,
+                    ct)
+                .ConfigureAwait(false);
+
+            var delta = new GroupProjectionDelta(conversationId, memberIds);
+            delta.AddBroadcast(GroupProjectionEventFactory.CreateGroupReactionBroadcast(
+                added,
+                messageId,
+                conversationId,
+                reactorUserId,
+                reactorSessionId,
+                messageSenderUserId,
+                messageReceiverUserId,
+                emoji,
+                emojiCount,
+                occurredAtMs,
+                traceParent,
+                traceState));
+
+            await OutboxInsertHelper.InsertManyAsync(
+                    connection,
+                    transaction,
+                    _databaseSchema,
+                    delta.Build(),
+                    ct)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        // 单聊路径：保持 per-target 事件（发送方 + 接收方），各产生独立 Outbox 行。
+        var directTargets = new HashSet<long> { messageSenderUserId, messageReceiverUserId };
         string payloadJson;
         RealtimeEventType eventType;
         if (added)
@@ -633,26 +686,8 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 RealtimeJsonSerializerContext.Default.RealtimeReactionRemovedPayload);
         }
 
-        var traceParent = RealtimeTraceContext.CaptureTraceParent();
-        var traceState = RealtimeTraceContext.CaptureTraceState();
-        var targets = new HashSet<long> { messageSenderUserId, messageReceiverUserId };
-        if (!string.IsNullOrWhiteSpace(conversationId)
-            && ConversationId.IsGroup(conversationId))
-        {
-            var memberIds = await ConversationWriteCommands.ListActiveMemberUserIdsAsync(
-                    connection,
-                    transaction,
-                    _databaseSchema,
-                    conversationId,
-                    ct)
-                .ConfigureAwait(false);
-            targets.Clear();
-            foreach (var id in memberIds)
-                targets.Add(id);
-        }
-
-        var events = new List<RealtimeEvent>(targets.Count);
-        foreach (var targetUserId in targets)
+        var events = new List<RealtimeEvent>(directTargets.Count);
+        foreach (var targetUserId in directTargets)
         {
             var eventId = added
                 ? MessageEventIdFactory.CreateReactionAddedEventId(
@@ -683,53 +718,18 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
             });
         }
 
-        await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
-    }
-
-    private async Task InsertOutboxManyAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        IReadOnlyList<RealtimeEvent> events,
-        CancellationToken ct)
-    {
-        if (events.Count == 0)
-            return;
-
-        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        await using var command = new NpgsqlCommand { Connection = connection, Transaction = transaction };
-        var values = new List<string>(events.Count);
-        for (var i = 0; i < events.Count; i++)
-        {
-            var evt = events[i];
-            values.Add(
-                $"(@event_id_{i}, @payload_json_{i}, @target_user_id_{i}, @event_type_{i}, @status, @created_at_ms, @next_attempt_at_ms, 0)");
-            command.Parameters.AddWithValue($"event_id_{i}", evt.EventId);
-            command.Parameters.AddWithValue(
-                $"payload_json_{i}",
-                JsonSerializer.Serialize(evt, RealtimeJsonSerializerContext.Default.RealtimeEvent));
-            command.Parameters.AddWithValue($"target_user_id_{i}", evt.TargetUserId);
-            command.Parameters.AddWithValue($"event_type_{i}", (short)evt.Type);
-        }
-
-        command.Parameters.AddWithValue("status", (short)RealtimeOutboxStatus.Pending);
-        command.Parameters.AddWithValue("created_at_ms", now);
-        command.Parameters.AddWithValue("next_attempt_at_ms", now);
-        command.CommandText =
-            $"""
-             INSERT INTO {_databaseSchema.OutboxTableSql} (
-                 event_id, payload_json, target_user_id, event_type, status,
-                 created_at_ms, next_attempt_at_ms, attempt_count
-             ) VALUES
-                 {string.Join(",\n                 ", values)}
-             ON CONFLICT (event_id) DO NOTHING;
-             """;
-        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        await OutboxInsertHelper.InsertManyAsync(
+                connection,
+                transaction,
+                _databaseSchema,
+                events,
+                ct)
+            .ConfigureAwait(false);
     }
 
     private sealed record MessageAccess(
         long SenderUserId,
         long ReceiverUserId,
         string? ConversationId,
-        long? RecalledAtMs,
-        bool IsAllowed);
+        long? RecalledAtMs);
 }

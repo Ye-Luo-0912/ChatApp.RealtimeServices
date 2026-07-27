@@ -35,6 +35,7 @@ public sealed class GroupConversationReadTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationStore = new NpgsqlRealtimeConversationStore(client, schema);
         var listProcessor = new DefaultConversationListQueryProcessor(conversationStore);
@@ -45,6 +46,7 @@ public sealed class GroupConversationReadTests : IAsyncLifetime
 
         var conversationId = ConversationId.CreateGroup();
         await groupStore.CreateGroupAsync(
+            "req-read-create",
             501,
             conversationId,
             "Reads",
@@ -106,21 +108,24 @@ public sealed class GroupConversationReadTests : IAsyncLifetime
         unreadCmd.Parameters.AddWithValue("type", (short)RealtimeEventType.UnreadCountChanged);
         Assert.True(Convert.ToInt32(await unreadCmd.ExecuteScalarAsync()) >= 1);
 
+        // Perf-9：群已读走 GroupProjectionDelta 协议，ConversationRead 广播聚合为单行 Outbox，
+        // 携带 target_user_ids 数组 [501, 503]（排除读者 502）。
         await using var readCmd = new NpgsqlCommand(
             $"""
-             SELECT target_user_id, payload_json
+             SELECT target_user_id, target_user_ids, payload_json
              FROM {schema.OutboxTableSql}
              WHERE event_type = @type
-             ORDER BY target_user_id
              """,
             connection);
         readCmd.Parameters.AddWithValue("type", (short)RealtimeEventType.ConversationRead);
-        var readTargets = new List<long>();
+        var readRows = new List<(long PrimaryTarget, long[]? AllTargets)>();
         await using var readReader = await readCmd.ExecuteReaderAsync();
         while (await readReader.ReadAsync())
         {
-            readTargets.Add(readReader.GetInt64(0));
-            var evt = RealtimeWireSerializer.DeserializeEvent(readReader.GetString(1));
+            var primaryTarget = readReader.GetInt64(0);
+            long[]? allTargets = readReader.IsDBNull(1) ? null : (long[])readReader.GetValue(1);
+            readRows.Add((primaryTarget, allTargets));
+            var evt = RealtimeWireSerializer.DeserializeEvent(readReader.GetString(2));
             Assert.NotNull(evt);
             var payload = RealtimeWireSerializer.DeserializeConversationRead(evt.PayloadJson!);
             Assert.NotNull(payload);
@@ -130,8 +135,11 @@ public sealed class GroupConversationReadTests : IAsyncLifetime
             Assert.Equal(1_700_000_000_100, payload.LastReadAtMs);
         }
 
-        Assert.Equal([501L, 503L], readTargets);
-        Assert.DoesNotContain(502L, readTargets);
+        // 单行广播事件：target_user_ids = [501, 503]，读者 502 不在目标列表中。
+        var broadcastRow = Assert.Single(readRows);
+        Assert.NotNull(broadcastRow.AllTargets);
+        Assert.Equal([501L, 503L], broadcastRow.AllTargets);
+        Assert.DoesNotContain(502L, broadcastRow.AllTargets);
     }
 
     [Fact]
@@ -146,6 +154,7 @@ public sealed class GroupConversationReadTests : IAsyncLifetime
 
         var conversationId = ConversationId.CreateGroup();
         await groupStore.CreateGroupAsync(
+            "req-gate-create",
             601,
             conversationId,
             "Gate",
@@ -172,6 +181,7 @@ public sealed class GroupConversationReadTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationStore = new NpgsqlRealtimeConversationStore(client, schema);
         var markReadProcessor = new DefaultConversationMarkReadProcessor(

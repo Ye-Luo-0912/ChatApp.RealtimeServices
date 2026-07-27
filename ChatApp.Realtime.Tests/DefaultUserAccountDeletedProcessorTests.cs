@@ -20,6 +20,7 @@ public sealed class DefaultUserAccountDeletedProcessorTests
             store,
             attachments,
             cursors ?? new NoopRealtimeDeviceSyncCursorStore(),
+            NoopTombstoneAndLedger.Tombstone,
             signal,
             NullLogger<DefaultUserAccountDeletedProcessor>.Instance);
 
@@ -193,6 +194,9 @@ public sealed class DefaultUserAccountDeletedProcessorTests
             LastDeletedUserId = userId;
             return Task.FromResult(3L);
         }
+
+        public Task<long> DeleteInactiveAsync(long inactiveBeforeMs, int batchSize, CancellationToken ct = default) =>
+            Task.FromResult(0L);
     }
 
     private sealed class InMemoryAttachmentStore : IRealtimeAttachmentStore

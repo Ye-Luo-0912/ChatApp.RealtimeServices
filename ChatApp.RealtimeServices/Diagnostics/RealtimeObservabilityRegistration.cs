@@ -1,3 +1,4 @@
+using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
 using ChatApp.RealtimeServices.Options;
@@ -46,6 +47,7 @@ public static class RealtimeObservabilityRegistration
                 metrics.AddMeter(
                     RealtimeMetrics.MeterName,
                     RealtimeNatsTelemetry.MeterName,
+                    RoutingMetrics.DefaultMeterName,
                     "System.Runtime",
                     "Microsoft.AspNetCore.Hosting",
                     "Microsoft.AspNetCore.Server.Kestrel",

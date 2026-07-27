@@ -17,6 +17,8 @@ public sealed class SyncBootstrapPage
     public required bool Succeeded { get; init; }
     public string? ErrorCode { get; init; }
     public string? ErrorMessage { get; init; }
+    public int? RetryAfterMs { get; init; }
+    public string? QueueKind { get; init; }
     public long ServerTimeMs { get; init; }
     public IReadOnlyList<ConversationListItem> Conversations { get; init; } = [];
     public ConversationListCursor? ConversationsNextCursor { get; init; }
@@ -59,6 +61,21 @@ public sealed class SyncBootstrapPage
             Succeeded = false,
             ErrorCode = errorCode,
             ErrorMessage = errorMessage,
+            ServerTimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+        };
+
+    public static SyncBootstrapPage ServerBusy(
+        string requestId,
+        int retryAfterMs,
+        string queueKind) =>
+        new()
+        {
+            RequestId = requestId,
+            Succeeded = false,
+            ErrorCode = "server_busy",
+            ErrorMessage = "服务繁忙，请稍后重试。",
+            RetryAfterMs = retryAfterMs,
+            QueueKind = queueKind,
             ServerTimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         };
 }

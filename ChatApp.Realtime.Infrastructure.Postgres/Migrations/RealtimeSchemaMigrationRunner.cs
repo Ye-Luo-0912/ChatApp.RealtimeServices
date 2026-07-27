@@ -51,7 +51,13 @@ public sealed class RealtimeSchemaMigrationRunner
         new Migration020_MessageRetentionAgeIndex(),
         new Migration021_MessageMentions(),
         new Migration022_OutboxTargetUserIdsColumn(),
-        new Migration023_OutboxClaimTokenColumn()
+        new Migration023_OutboxClaimTokenColumn(),
+        new Migration024_GroupMutationRequests(),
+        new Migration025_DeviceSyncCursorRetention(),
+        new Migration026_UserDeletionTombstoneAndIdempotencyLedger(),
+        new Migration027_UserLifecycleState(),
+        new Migration028_GroupOperationAudit(),
+        new Migration029_LeaveGroupHistoryPolicy()
     ];
 
     public async Task MigrateAsync(

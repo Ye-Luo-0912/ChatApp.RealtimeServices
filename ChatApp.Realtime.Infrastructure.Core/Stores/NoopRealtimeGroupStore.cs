@@ -6,6 +6,7 @@ namespace ChatApp.Realtime.Infrastructure.Core.Stores;
 public sealed class NoopRealtimeGroupStore : IRealtimeGroupStore
 {
     public Task<GroupCreatePersistResult> CreateGroupAsync(
+        string requestId,
         long creatorUserId,
         string conversationId,
         string title,
@@ -19,6 +20,7 @@ public sealed class NoopRealtimeGroupStore : IRealtimeGroupStore
     }
 
     public Task<GroupMutatePersistResult> AddMembersAsync(
+        string requestId,
         long actorUserId,
         string conversationId,
         IReadOnlyList<long> memberUserIds,
@@ -31,6 +33,7 @@ public sealed class NoopRealtimeGroupStore : IRealtimeGroupStore
     }
 
     public Task<GroupMutatePersistResult> RemoveMemberAsync(
+        string requestId,
         long actorUserId,
         string conversationId,
         long targetUserId,
@@ -43,6 +46,7 @@ public sealed class NoopRealtimeGroupStore : IRealtimeGroupStore
     }
 
     public Task<GroupMutatePersistResult> LeaveAsync(
+        string requestId,
         long actorUserId,
         string conversationId,
         string? actorSessionId,
@@ -54,10 +58,23 @@ public sealed class NoopRealtimeGroupStore : IRealtimeGroupStore
     }
 
     public Task<GroupMutatePersistResult> ChangeRoleAsync(
+        string requestId,
         long actorUserId,
         string conversationId,
         long targetUserId,
         ConversationMemberRole newRole,
+        string? actorSessionId,
+        long occurredAtMs,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        throw new InvalidOperationException("未配置真实群会话存储。");
+    }
+
+    public Task<GroupMutatePersistResult> DissolveAsync(
+        string requestId,
+        long actorUserId,
+        string conversationId,
         string? actorSessionId,
         long occurredAtMs,
         CancellationToken ct = default)

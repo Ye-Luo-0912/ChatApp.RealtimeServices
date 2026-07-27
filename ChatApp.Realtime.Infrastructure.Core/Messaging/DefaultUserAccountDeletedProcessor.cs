@@ -11,6 +11,7 @@ public sealed class DefaultUserAccountDeletedProcessor(
     IRealtimeMessageStore messageStore,
     IRealtimeAttachmentStore attachmentStore,
     IRealtimeDeviceSyncCursorStore deviceSyncCursorStore,
+    IUserDeletionTombstoneStore tombstoneStore,
     IRealtimeOutboxSignal outboxSignal,
     ILogger<DefaultUserAccountDeletedProcessor> logger) : IUserAccountDeletedProcessor
 {
@@ -26,6 +27,16 @@ public sealed class DefaultUserAccountDeletedProcessor(
 
         try
         {
+            // LongTerm-1：在账号删除清理开始前先写入 tombstone（幂等，PK=user_id）。
+            // 确保清理过程中 Incoming Processor 能立即拒绝该用户的旧命令回放，
+            // 防止 retention GC 删除消息行后 JetStream replay 将旧命令当作新消息重新写入。
+            var deletedAtMs = evt.OccurredAtMs > 0
+                ? evt.OccurredAtMs
+                : DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            await tombstoneStore
+                .RecordDeletionAsync(evt.TargetUserId, evt.EventId, deletedAtMs, ct)
+                .ConfigureAwait(false);
+
             // 先列出 object_key 并写入 purge Outbox，再删元数据。
             // 若在「删元数据」与「写 Outbox」之间崩溃，重试时键已丢失 → Blob 永久泄漏。
             var objectKeys = await attachmentStore
@@ -105,6 +116,12 @@ public sealed class DefaultUserAccountDeletedProcessor(
                 },
                 ct).ConfigureAwait(false);
             outboxSignal.Notify();
+
+            // Feature 1：清理完成后将 tombstone 升级为 Deleted，
+            // 使观测层能区分"清理中"与"已删除"。
+            await tombstoneStore
+                .RecordDeletionCompletedAsync(evt.TargetUserId, ct)
+                .ConfigureAwait(false);
 
             return MessageProcessResult.Success(evt.EventId);
         }

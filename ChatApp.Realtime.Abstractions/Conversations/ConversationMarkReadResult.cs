@@ -6,6 +6,8 @@ public sealed class ConversationMarkReadResult
     public required bool Succeeded { get; init; }
     public string? ErrorCode { get; init; }
     public string? ErrorMessage { get; init; }
+    public int? RetryAfterMs { get; init; }
+    public string? QueueKind { get; init; }
     public string? ConversationId { get; init; }
     public int UnreadCount { get; init; }
     public string? LastReadMessageId { get; init; }
@@ -40,5 +42,19 @@ public sealed class ConversationMarkReadResult
             Succeeded = false,
             ErrorCode = errorCode,
             ErrorMessage = errorMessage
+        };
+
+    public static ConversationMarkReadResult ServerBusy(
+        string requestId,
+        int retryAfterMs,
+        string queueKind) =>
+        new()
+        {
+            RequestId = requestId,
+            Succeeded = false,
+            ErrorCode = "server_busy",
+            ErrorMessage = "服务繁忙，请稍后重试。",
+            RetryAfterMs = retryAfterMs,
+            QueueKind = queueKind
         };
 }

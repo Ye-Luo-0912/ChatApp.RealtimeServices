@@ -30,4 +30,10 @@ public interface IRealtimeDeviceSyncCursorStore
 
     /// <summary>账号删除时清理该用户全部设备游标。</summary>
     Task<long> DeleteByUserAsync(long userId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Perf-3：清理长期未活跃的设备游标。<paramref name="inactiveBeforeMs"/> 之前最后活跃的设备游标将被删除。
+    /// 返回删除行数。调用方应节流（例如每日一次）。
+    /// </summary>
+    Task<long> DeleteInactiveAsync(long inactiveBeforeMs, int batchSize, CancellationToken ct = default);
 }

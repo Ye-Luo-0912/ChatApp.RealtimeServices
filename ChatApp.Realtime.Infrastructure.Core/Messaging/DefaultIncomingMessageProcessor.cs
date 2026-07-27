@@ -11,22 +11,25 @@ namespace ChatApp.Realtime.Infrastructure.Core.Messaging;
 public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
 {
     private readonly IRealtimeMessageStore _messageStore;
-    private readonly IRealtimeGroupStore _groupStore;
     private readonly IRealtimeOutboxSignal _outboxSignal;
     private readonly RealtimeMetrics _metrics;
+    private readonly IUserDeletionTombstoneStore _tombstoneStore;
+    private readonly ICommandIdempotencyLedger _idempotencyLedger;
     private readonly ILogger<DefaultIncomingMessageProcessor> _logger;
 
     public DefaultIncomingMessageProcessor(
         IRealtimeMessageStore messageStore,
-        IRealtimeGroupStore groupStore,
         IRealtimeOutboxSignal outboxSignal,
         RealtimeMetrics metrics,
+        IUserDeletionTombstoneStore tombstoneStore,
+        ICommandIdempotencyLedger idempotencyLedger,
         ILogger<DefaultIncomingMessageProcessor> logger)
     {
         _messageStore = messageStore;
-        _groupStore = groupStore;
         _outboxSignal = outboxSignal;
         _metrics = metrics;
+        _tombstoneStore = tombstoneStore;
+        _idempotencyLedger = idempotencyLedger;
         _logger = logger;
     }
 
@@ -41,6 +44,21 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             return validationError;
         }
 
+        // LongTerm-1：账号已注销用户的旧命令回放必须直接拒绝，防止 retention GC
+        // 清理消息行后 JetStream replay 将旧命令当作新消息重新写入。
+        if (await _tombstoneStore.IsUserDeletedAsync(command.SenderUserId, ct).ConfigureAwait(false))
+        {
+            _metrics.RecordProcessingFailure("user_deleted");
+            _logger.LogWarning(
+                "入站消息被拒绝：发送用户已注销。发送用户={SenderUserId}；命令编号={CommandId}",
+                command.SenderUserId,
+                command.CommandId);
+            return MessageProcessResult.Failed(
+                "user_deleted",
+                "发送用户已注销，旧命令不再处理。",
+                MessageFailureKind.Permanent);
+        }
+
         string conversationId;
         long receiverUserId;
         var explicitConversationId = string.IsNullOrWhiteSpace(command.ConversationId)
@@ -51,17 +69,10 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
         {
             conversationId = explicitConversationId;
             receiverUserId = 0;
-            var isMember = await _groupStore
-                .IsActiveMemberAsync(conversationId, command.SenderUserId, ct)
-                .ConfigureAwait(false);
-            if (!isMember)
-            {
-                _metrics.RecordProcessingFailure("not_member");
-                return MessageProcessResult.Failed(
-                    "forbidden",
-                    "无权在该群发送消息。",
-                    MessageFailureKind.Permanent);
-            }
+            // Perf-2：删除 Processor 的群成员预检查。该查询不具备事务权威性
+            // （查询成功后用户仍可能立即被移除），且每条群消息多一次数据库往返。
+            // 由 NpgsqlRealtimeMessageStore.SaveAsync 在写事务内加载成员并验证，
+            // 失败时返回 IsNotAllowed，由下方分支统一处理。
         }
         else
         {
@@ -85,6 +96,46 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                 command.SenderUserId,
                 command.ReceiverUserId);
             receiverUserId = command.ReceiverUserId;
+        }
+
+        // LongTerm-1：独立幂等账本检查。解耦幂等性依据与 messages 行生命周期：
+        // 消息行被 retention GC 或账号删除清理后，账本仍保留命令处理结果，
+        // 防止 JetStream replay 将旧命令当作新消息重新写入。
+        var fingerprint = RealtimeMessageFingerprint.Compute(
+            receiverUserId,
+            command.Content,
+            command.AttachmentIds);
+
+        var ledgerEntry = await _idempotencyLedger
+            .FindAsync(command.SenderUserId, command.ClientMessageId, ct)
+            .ConfigureAwait(false);
+        if (ledgerEntry is not null)
+        {
+            if (string.Equals(ledgerEntry.ContentFingerprint, fingerprint, StringComparison.Ordinal))
+            {
+                // 幂等重放：内容指纹匹配，返回已有消息编号，不调用 Store。
+                _metrics.RecordDuplicate();
+                _outboxSignal.Notify();
+                _logger.LogDebug(
+                    "幂等账本命中（重放）。发送用户={SenderUserId}；客户端消息编号={ClientMessageId}；已有消息={MessageId}",
+                    command.SenderUserId,
+                    command.ClientMessageId,
+                    ledgerEntry.MessageId);
+                return MessageProcessResult.Success(ledgerEntry.MessageId ?? command.CommandId);
+            }
+
+            // 内容冲突：相同 (sender, client_message_id) 但指纹不一致。
+            _metrics.RecordIdempotencyConflict();
+            _metrics.RecordProcessingFailure("idempotency_conflict");
+            _logger.LogWarning(
+                "幂等账本命中（冲突）。发送用户={SenderUserId}；客户端消息编号={ClientMessageId}；已有消息={MessageId}",
+                command.SenderUserId,
+                command.ClientMessageId,
+                ledgerEntry.MessageId);
+            return MessageProcessResult.Failed(
+                "idempotency_conflict",
+                "相同客户端消息编号已存在但内容不一致。",
+                MessageFailureKind.Permanent);
         }
 
         var record = new RealtimeMessageRecord
@@ -162,6 +213,16 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                 record.ClientMessageId,
                 record.SenderUserId,
                 persisted.MessageId);
+            // LongTerm-1：回填账本（messages 表冲突但账本未命中，说明是迁移前数据）。
+            await RecordLedgerBestEffortAsync(
+                command.CommandId,
+                command.SenderUserId,
+                command.ClientMessageId,
+                fingerprint,
+                IdempotencyLedgerResultKind.Conflict,
+                persisted.MessageId,
+                command.ReceivedAtMs,
+                ct).ConfigureAwait(false);
             return MessageProcessResult.Failed(
                 "idempotency_conflict",
                 "相同客户端消息编号已存在但内容不一致。",
@@ -176,6 +237,7 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                 record.ClientMessageId,
                 record.SenderUserId,
                 persisted.MessageId);
+            // 附件绑定失败不记录账本：重试可能成功（附件状态可能变化）。
             return MessageProcessResult.Failed(
                 "attachment_bind_failed",
                 "附件不存在、未确认或不属于发送方，消息未写入。",
@@ -185,6 +247,7 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
         if (persisted.IsNotAllowed)
         {
             _metrics.RecordProcessingFailure("not_member");
+            // 权限失败不记录账本：重试可能成功（成员关系可能变化）。
             return MessageProcessResult.Failed(
                 "forbidden",
                 "无权在该会话发送消息。",
@@ -202,10 +265,30 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                 record.ReceiverUserId);
 
             _metrics.RecordDuplicate();
+            // LongTerm-1：回填账本（messages 表命中但账本未命中，说明是迁移前数据）。
+            await RecordLedgerBestEffortAsync(
+                command.CommandId,
+                command.SenderUserId,
+                command.ClientMessageId,
+                fingerprint,
+                IdempotencyLedgerResultKind.Duplicate,
+                persisted.MessageId,
+                command.ReceivedAtMs,
+                ct).ConfigureAwait(false);
             return MessageProcessResult.Success(persisted.MessageId);
         }
 
         _metrics.RecordPersisted();
+        // LongTerm-1：记录 Created 结果到独立账本，解耦幂等性与 messages 行生命周期。
+        await RecordLedgerBestEffortAsync(
+            command.CommandId,
+            command.SenderUserId,
+            command.ClientMessageId,
+            fingerprint,
+            IdempotencyLedgerResultKind.Created,
+            persisted.MessageId,
+            command.ReceivedAtMs,
+            ct).ConfigureAwait(false);
 
         _logger.LogDebug(
             "入站消息已处理。消息编号={MessageId}；发送用户={SenderUserId}；接收用户={ReceiverUserId}",
@@ -214,6 +297,38 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             record.ReceiverUserId);
 
         return MessageProcessResult.Success(record.MessageId);
+    }
+
+    /// <summary>
+    /// LongTerm-1：best-effort 记录幂等账本。写入失败不阻断主流程（消息已持久化）。
+    /// 失败时仅记录日志：retention GC 后旧命令可能"复活"，但 tombstone 检查会拒绝已注销用户，
+    /// 且 retention GC 周期远大于此 crash 窗口。
+    /// </summary>
+    private async Task RecordLedgerBestEffortAsync(
+        string commandId,
+        long senderUserId,
+        string clientMessageId,
+        string fingerprint,
+        IdempotencyLedgerResultKind kind,
+        string? messageId,
+        long receivedAtMs,
+        CancellationToken ct)
+    {
+        try
+        {
+            await _idempotencyLedger
+                .RecordAsync(commandId, senderUserId, clientMessageId,
+                    fingerprint, kind, messageId, receivedAtMs, ct)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(
+                ex,
+                "幂等账本写入失败（不阻断主流程）。发送用户={SenderUserId}；客户端消息编号={ClientMessageId}",
+                senderUserId,
+                clientMessageId);
+        }
     }
 
     private static MessageProcessResult? Validate(IncomingMessageCommand command)

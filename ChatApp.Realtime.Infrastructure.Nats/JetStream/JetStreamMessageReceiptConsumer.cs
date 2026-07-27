@@ -109,8 +109,14 @@ public sealed class JetStreamMessageReceiptConsumer : IMessageReceiptConsumer
 
                 if (command is null)
                 {
-                    await JetStreamMetricAck.NakAsync(
-                        msg, _metrics, observation, null, ct).ConfigureAwait(false);
+                    // P0-9：合法 JSON null 反序列化为 null，视为协议毒丸，
+                    // 进入 DLQ 并 Terminate，不再 NAK 导致无限重投。
+                    await DeadLetterAndTerminateAsync(
+                        msg,
+                        "null_receipt_payload",
+                        "JetStream 消息回执反序列化结果为 null（合法 JSON null 或缺少必要字段）。",
+                        observation,
+                        ct).ConfigureAwait(false);
                     continue;
                 }
 

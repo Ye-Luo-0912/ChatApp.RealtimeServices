@@ -1,13 +1,21 @@
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
+using ChatApp.Realtime.Infrastructure.Postgres.Clients;
+using ChatApp.Realtime.Infrastructure.Postgres.Configuration;
+using ChatApp.Realtime.Infrastructure.Postgres.Data;
+using ChatApp.Realtime.Infrastructure.Postgres.Migrations;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.RealtimeServices.DependencyInjection;
 using ChatApp.RealtimeServices.Diagnostics;
 using ChatApp.RealtimeServices.Options;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Options;
 using OpenTelemetry.Metrics;
 
 if (args.Length > 0 && args[0].Equals("--health-check", StringComparison.OrdinalIgnoreCase))
     return await RunHealthCheckCommandAsync(args).ConfigureAwait(false);
+
+if (args.Length > 0 && args[0].Equals("--migrate", StringComparison.OrdinalIgnoreCase))
+    return await RunMigrateCommandAsync().ConfigureAwait(false);
 
 try
 {
@@ -202,6 +210,88 @@ static async Task<int> RunHealthCheckCommandAsync(string[] commandArgs)
     catch
     {
         return 1;
+    }
+}
+
+static async Task<int> RunMigrateCommandAsync()
+{
+    // P0-1：C# migrations 是唯一事实来源。独立迁移命令供 Compose migration Job
+    // 或 CI 调用，不在运行时迁移路径之外维护第二套手写 SQL。
+    var configuration = new ConfigurationBuilder()
+        .SetBasePath(Directory.GetCurrentDirectory())
+        .AddJsonFile("appsettings.json", optional: false)
+        .AddJsonFile(
+            Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".chatapp",
+                "realtime.user.json"),
+            optional: true,
+            reloadOnChange: false)
+        .AddEnvironmentVariables()
+        .Build();
+
+    var connectionString = configuration.GetConnectionString("RealtimeDatabase");
+    if (string.IsNullOrWhiteSpace(connectionString))
+    {
+        Console.Error.WriteLine("ConnectionStrings__RealtimeDatabase 未配置，无法执行迁移。");
+        return 1;
+    }
+
+    var schema = configuration.GetSection("RealtimeDatabase:Schema").Get<string>() ?? "realtime";
+
+    using var loggerFactory = LoggerFactory.Create(builder =>
+    {
+        builder.AddSimpleConsole(options =>
+        {
+            options.SingleLine = true;
+            options.TimestampFormat = "yyyy-MM-dd HH:mm:ss.fff ";
+        });
+        builder.SetMinimumLevel(LogLevel.Information);
+    });
+    var migrateLogger = loggerFactory.CreateLogger("RealtimeMigrations");
+    var clientLogger = loggerFactory.CreateLogger<RealtimeDatabaseClient>();
+
+    await using var databaseClient = new RealtimeDatabaseClient(connectionString, clientLogger);
+    var databaseSchema = new RealtimeDatabaseSchema(schema);
+    var runner = new RealtimeSchemaMigrationRunner(databaseSchema, migrateLogger);
+
+    migrateLogger.LogInformation("正在通过版本化迁移初始化实时数据库。数据库架构={Schema}", schema);
+
+    const int maxAttempts = 30;
+    for (var attempt = 1; ; attempt++)
+    {
+        try
+        {
+            await using var connection = await databaseClient
+                .GetDataSource()
+                .OpenConnectionAsync()
+                .ConfigureAwait(false);
+            await runner.MigrateAsync(connection).ConfigureAwait(false);
+            migrateLogger.LogInformation("实时数据库版本化迁移完成。数据库架构={Schema}", schema);
+            return 0;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            if (attempt >= maxAttempts)
+            {
+                migrateLogger.LogError(
+                    ex,
+                    "实时数据库迁移失败，已达到最大重试次数。尝试次数={Attempt}",
+                    attempt);
+                return 1;
+            }
+
+            migrateLogger.LogWarning(
+                ex,
+                "实时数据库迁移失败，将在短暂等待后重试。尝试次数={Attempt}/{MaxAttempts}",
+                attempt,
+                maxAttempts);
+            await Task.Delay(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+        }
     }
 }
 

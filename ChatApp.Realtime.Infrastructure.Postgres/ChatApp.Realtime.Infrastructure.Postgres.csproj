@@ -18,4 +18,8 @@
     <ProjectReference Include="..\ChatApp.Realtime.Infrastructure.Core\ChatApp.Realtime.Infrastructure.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="ChatApp.Realtime.Tests" />
+  </ItemGroup>
+
 </Project>

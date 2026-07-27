@@ -6,6 +6,7 @@ namespace ChatApp.Realtime.Abstractions.Stores;
 public interface IRealtimeGroupStore
 {
     Task<GroupCreatePersistResult> CreateGroupAsync(
+        string requestId,
         long creatorUserId,
         string conversationId,
         string title,
@@ -15,6 +16,7 @@ public interface IRealtimeGroupStore
         CancellationToken ct = default);
 
     Task<GroupMutatePersistResult> AddMembersAsync(
+        string requestId,
         long actorUserId,
         string conversationId,
         IReadOnlyList<long> memberUserIds,
@@ -23,6 +25,7 @@ public interface IRealtimeGroupStore
         CancellationToken ct = default);
 
     Task<GroupMutatePersistResult> RemoveMemberAsync(
+        string requestId,
         long actorUserId,
         string conversationId,
         long targetUserId,
@@ -31,6 +34,7 @@ public interface IRealtimeGroupStore
         CancellationToken ct = default);
 
     Task<GroupMutatePersistResult> LeaveAsync(
+        string requestId,
         long actorUserId,
         string conversationId,
         string? actorSessionId,
@@ -38,10 +42,20 @@ public interface IRealtimeGroupStore
         CancellationToken ct = default);
 
     Task<GroupMutatePersistResult> ChangeRoleAsync(
+        string requestId,
         long actorUserId,
         string conversationId,
         long targetUserId,
         ConversationMemberRole newRole,
+        string? actorSessionId,
+        long occurredAtMs,
+        CancellationToken ct = default);
+
+    /// <summary>解散群（仅 Owner）：全员标记 left_at_ms，会话标记 dissolved_at_ms，历史保留只读。</summary>
+    Task<GroupMutatePersistResult> DissolveAsync(
+        string requestId,
+        long actorUserId,
+        string conversationId,
         string? actorSessionId,
         long occurredAtMs,
         CancellationToken ct = default);
@@ -71,8 +85,8 @@ public readonly record struct GroupCreatePersistResult(
 {
     public static GroupCreatePersistResult Ok(
         string conversationId,
-        string title,
-        IReadOnlyList<ConversationMemberItem> members) =>
+        string? title = null,
+        IReadOnlyList<ConversationMemberItem>? members = null) =>
         new(true, null, null, conversationId, title, members);
 
     public static GroupCreatePersistResult Fail(string errorCode, string errorMessage) =>
@@ -87,6 +101,12 @@ public readonly record struct GroupMutatePersistResult(
     string? Title,
     IReadOnlyList<ConversationMemberItem>? Members)
 {
+    /// <summary>ChangeRole 操作的变更前角色（其他操作为 null）。</summary>
+    public ConversationMemberRole? PreviousRole { get; init; }
+
+    /// <summary>ChangeRole 操作的变更后角色（其他操作为 null）。</summary>
+    public ConversationMemberRole? NewRole { get; init; }
+
     public static GroupMutatePersistResult Ok(
         string conversationId,
         string? title = null,

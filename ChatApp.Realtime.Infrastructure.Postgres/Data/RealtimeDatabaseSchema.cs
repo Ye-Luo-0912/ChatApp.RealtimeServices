@@ -18,6 +18,10 @@ public sealed class RealtimeDatabaseSchema
     public string ConversationMembersTableSql => $"{QuotedSchema}.\"conversation_members\"";
     public string DeviceSyncCursorsTableSql => $"{QuotedSchema}.\"device_sync_cursors\"";
     public string MessageMutationRequestsTableSql => $"{QuotedSchema}.\"message_mutation_requests\"";
+    public string GroupMutationRequestsTableSql => $"{QuotedSchema}.\"group_mutation_requests\"";
+    public string UserDeletionTombstonesTableSql => $"{QuotedSchema}.\"user_deletion_tombstones\"";
+    public string CommandIdempotencyLedgerTableSql => $"{QuotedSchema}.\"command_idempotency_ledger\"";
+    public string GroupOperationAuditTableSql => $"{QuotedSchema}.\"group_operation_audit\"";
     public string OutboxTableSql => $"{QuotedSchema}.\"outbox\"";
     public string SchemaMigrationsTableSql => $"{QuotedSchema}.\"schema_migrations\"";
     public string SchemaMigrationCheckpointsTableSql =>

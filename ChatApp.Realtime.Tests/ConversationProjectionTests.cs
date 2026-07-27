@@ -29,6 +29,7 @@ public sealed class ConversationProjectionTests : IAsyncLifetime
         var store = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
 
         var conversationId = ConversationId.CreateDirect(1001, 1002);
@@ -97,6 +98,7 @@ public sealed class ConversationProjectionTests : IAsyncLifetime
         var store = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationId = ConversationId.CreateDirect(1, 2);
 
@@ -130,6 +132,7 @@ public sealed class ConversationProjectionTests : IAsyncLifetime
         var store = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationId = ConversationId.CreateDirect(3, 4);
 

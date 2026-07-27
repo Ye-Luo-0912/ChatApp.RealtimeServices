@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
 using ChatApp.Realtime.Abstractions.Messaging;
@@ -25,6 +26,7 @@ public sealed class IncomingMessageWorker : BackgroundService
     private readonly RealtimeMetrics _metrics;
     private readonly RealtimeOptions _options;
     private readonly RealtimeNatsTrustSettings _trust;
+    private readonly IMessagePartitionKeySelector _partitionKeySelector;
     private readonly ILogger<IncomingMessageWorker> _logger;
 
     public IncomingMessageWorker(
@@ -35,6 +37,7 @@ public sealed class IncomingMessageWorker : BackgroundService
         RealtimeMetrics metrics,
         IOptions<RealtimeOptions> options,
         RealtimeNatsTrustSettings trust,
+        IMessagePartitionKeySelector partitionKeySelector,
         ILogger<IncomingMessageWorker> logger)
     {
         _consumer = consumer;
@@ -44,29 +47,51 @@ public sealed class IncomingMessageWorker : BackgroundService
         _metrics = metrics;
         _options = options.Value;
         _trust = trust;
+        _partitionKeySelector = partitionKeySelector;
         _logger = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation(
-            "入站消息工作器已启动。消费者={Consumer}；处理器={Processor}；分区并发={Concurrency}；队列容量={Capacity}",
+            "入站消息工作器已启动。消费者={Consumer}；处理器={Processor}；分区并发={Concurrency}；队列容量={Capacity}；字节预算={ByteBudget}",
             _consumer.GetType().Name,
             _processor.GetType().Name,
             _options.ProcessingConcurrency,
-            _options.ProcessingQueueCapacity);
+            _options.ProcessingQueueCapacity,
+            _options.ProcessingQueueByteBudget);
         var runtime = new PartitionedConsumerRuntime<IncomingMessageEnvelope>(
             WorkerName,
             _options.ProcessingConcurrency,
             _options.ProcessingQueueCapacity,
             _options.WorkerIntervalMs,
             _readinessState,
-            _logger);
+            _logger,
+            byteSizer: EnvelopeByteSizer,
+            maxQueueBytes: _options.ProcessingQueueByteBudget);
         await runtime.RunAsync(
             consume: ct => _consumer.ConsumeAsync(ct),
             getPartition: env => GetPartition(env.Command, _options.ProcessingConcurrency),
             processPartition: (partition, reader, ct) => ProcessPartitionAsync(partition, reader, ct),
             stoppingToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Perf-6：按 RawPayload 的 UTF-8 字节长度计费。RawPayload 为 null 时回退到 Content 长度估算。
+    /// </summary>
+    private static long EnvelopeByteSizer(IncomingMessageEnvelope envelope)
+    {
+        if (envelope.RawPayload is { Length: > 0 } raw)
+            return Encoding.UTF8.GetByteCount(raw);
+        // 回退：Content 字符数 × 4（UTF-8 最坏情况）+ 结构开销
+        return (envelope.Command.Content?.Length ?? 0) * 4L + 512;
+    }
+
+    private int GetPartition(IncomingMessageCommand command, int partitionCount)
+    {
+        // Perf-1：群聊按 ConversationId 分区，单聊按双方用户组合分区。
+        var key = _partitionKeySelector.GetPartitionKey(command);
+        return (int)(key % (ulong)partitionCount);
     }
 
     private async Task ProcessPartitionAsync(
@@ -112,6 +137,18 @@ public sealed class IncomingMessageWorker : BackgroundService
 
     private async Task ProcessOneAsync(IncomingMessageEnvelope envelope, CancellationToken ct)
     {
+        // Perf-6：超大合法消息提前拒绝，避免单条消息占满字节预算。
+        var payloadBytes = EnvelopeByteSizer(envelope);
+        if (payloadBytes > _options.MaxSinglePayloadBytes)
+        {
+            await DeadLetterAndAckAsync(
+                envelope,
+                "payload_too_large",
+                $"消息 payload 字节数 {payloadBytes} 超过单条上限 {_options.MaxSinglePayloadBytes}。",
+                ct).ConfigureAwait(false);
+            return;
+        }
+
         if (envelope.DeliveryCount is not null
             && envelope.DeliveryCount >= (ulong)_options.PoisonDeliveryThreshold)
         {
@@ -142,6 +179,8 @@ public sealed class IncomingMessageWorker : BackgroundService
         var result = await _processor.ProcessAsync(envelope.Command, ct).ConfigureAwait(false);
         if (result.Succeeded)
         {
+            // Perf-6：成功解析后不长期保留完整 RawPayload，释放内存。
+            envelope.ClearRawPayload();
             await TryAckAsync(envelope, ct).ConfigureAwait(false);
             _logger.LogDebug(
                 "入站消息处理成功。命令编号={CommandId}；消息编号={MessageId}",
@@ -224,13 +263,5 @@ public sealed class IncomingMessageWorker : BackgroundService
             _metrics.RecordProcessingFailure("nak");
             _logger.LogError(ex, "NAK 失败，等待 AckWait 触发重投。命令编号={CommandId}", envelope.Command.CommandId);
         }
-    }
-
-    private static int GetPartition(IncomingMessageCommand command, int partitionCount)
-    {
-        var first = Math.Min(command.SenderUserId, command.ReceiverUserId);
-        var second = Math.Max(command.SenderUserId, command.ReceiverUserId);
-        var hash = unchecked((ulong)first * 397UL ^ (ulong)second);
-        return (int)(hash % (ulong)partitionCount);
     }
 }

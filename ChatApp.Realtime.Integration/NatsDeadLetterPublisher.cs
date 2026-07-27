@@ -26,6 +26,8 @@ internal sealed class NatsDeadLetterPublisher
     /// </summary>
     public async Task PublishDeadLetterAsync(DeadLetterMessage message, CancellationToken ct)
     {
+        // Reliability-5：截断 payload 以适应 JetStream 1 MiB 单消息上限，记录 SHA-256 与原长度。
+        var bounded = message.WithBoundedPayload();
         await _topology.EnsureStreamAsync(
             _options.DeadLettersStream,
             _options.DeadLettersSubject,
@@ -33,8 +35,8 @@ internal sealed class NatsDeadLetterPublisher
             ct).ConfigureAwait(false);
         await _topology.Context.PublishAsync(
             _options.DeadLettersSubject,
-            RealtimeWireSerializer.Serialize(message),
-            opts: JetStreamTopologyManager.BuildPublishOptions(message.DeadLetterId),
+            RealtimeWireSerializer.Serialize(bounded),
+            opts: JetStreamTopologyManager.BuildPublishOptions(bounded.DeadLetterId),
             cancellationToken: ct).ConfigureAwait(false);
     }
 }

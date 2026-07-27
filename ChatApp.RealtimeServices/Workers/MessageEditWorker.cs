@@ -118,15 +118,39 @@ public sealed class MessageEditWorker : BackgroundService
                     retryAttempt = 0;
                     _readinessState.MarkHeartbeat(WorkerName);
                     _metrics.HistoryQueryEnqueued();
-                    try
+                    if (_options.OverloadEnqueueTimeoutMs > 0)
                     {
-                        await writer.WriteAsync(envelope, ct)
-                            .ConfigureAwait(false);
+                        using var enqueueTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        enqueueTimeout.CancelAfter(TimeSpan.FromMilliseconds(_options.OverloadEnqueueTimeoutMs));
+                        try
+                        {
+                            await writer.WriteAsync(envelope, enqueueTimeout.Token)
+                                .ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                        {
+                            _metrics.RecordOverloadReply("message_edit", "enqueue");
+                            await envelope.ReplyAsync(
+                                MessageEditResult.ServerBusy(
+                                    envelope.Command.RequestId,
+                                    _options.OverloadRetryAfterMs,
+                                    "message_edit"),
+                                ct).ConfigureAwait(false);
+                            continue;
+                        }
                     }
-                    catch
+                    else
                     {
-                        _metrics.HistoryQueryEnqueueFailed();
-                        throw;
+                        try
+                        {
+                            await writer.WriteAsync(envelope, ct)
+                                .ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            _metrics.HistoryQueryEnqueueFailed();
+                            throw;
+                        }
                     }
                 }
             }
@@ -169,7 +193,32 @@ public sealed class MessageEditWorker : BackgroundService
             string? outcome = "cancelled";
             try
             {
-                await _queryGate.WaitAsync(ct).ConfigureAwait(false);
+                var gateAcquired = await _queryGate
+                    .WaitAsync(_options.OverloadGateTimeoutMs, ct)
+                    .ConfigureAwait(false);
+                if (!gateAcquired)
+                {
+                    _metrics.RecordOverloadReply("message_edit", "gate");
+                    outcome = "server_busy";
+                    try
+                    {
+                        await envelope.ReplyAsync(
+                            MessageEditResult.ServerBusy(
+                                envelope.Command.RequestId,
+                                _options.OverloadRetryAfterMs,
+                                "message_edit"),
+                            ct).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        outcome = "reply_failed";
+                        _logger.LogWarning(
+                            ex,
+                            "消息编辑过载响应发送失败。请求编号={RequestId}",
+                            envelope.Command.RequestId);
+                    }
+                    continue;
+                }
                 try
                 {
                     MessageEditResult result;

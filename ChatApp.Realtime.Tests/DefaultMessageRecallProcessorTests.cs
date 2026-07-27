@@ -78,6 +78,7 @@ public sealed class DefaultMessageRecallProcessorTests
             signal,
             metrics,
             NullLogger<DefaultMessageRecallProcessor>.Instance,
+            NoopTombstoneAndLedger.Tombstone,
             new MessageRecallOptions { MaxAgeMinutes = maxAgeMinutes });
 
     private static MessageRecallCommand ValidCommand() =>

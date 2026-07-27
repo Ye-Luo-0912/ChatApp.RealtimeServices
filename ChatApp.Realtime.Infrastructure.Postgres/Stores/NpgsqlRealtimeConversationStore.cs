@@ -1,11 +1,11 @@
-using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Stores;
-using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
+using ChatApp.Realtime.Infrastructure.Postgres.Outbox;
+using ChatApp.Realtime.Infrastructure.Postgres.Projections;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -263,9 +263,10 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
 
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
-        await InsertOutboxAsync(
+        await OutboxInsertHelper.InsertAsync(
                 connection,
                 transaction,
+                _databaseSchema,
                 ConversationWriteCommands.CreateConversationPrefsChangedEvent(
                     conversationId,
                     userId,
@@ -456,21 +457,17 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
 
-        await InsertOutboxAsync(
-                connection,
-                transaction,
-                ConversationWriteCommands.CreateUnreadCountChangedEvent(
-                    conversationId,
-                    userId,
-                    unread,
-                    targetMessageId,
-                    targetAtMs,
-                    causeMessageId: targetMessageId,
-                    now,
-                    traceParent,
-                    traceState),
-                ct)
-            .ConfigureAwait(false);
+        // 读者自身的未读变更事件：每个用户绝对未读数不同，必须逐用户。
+        var readerUnreadEvent = ConversationWriteCommands.CreateUnreadCountChangedEvent(
+            conversationId,
+            userId,
+            unread,
+            targetMessageId,
+            targetAtMs,
+            causeMessageId: targetMessageId,
+            now,
+            traceParent,
+            traceState);
 
         var memberIds = await ConversationWriteCommands.ListActiveMemberUserIdsAsync(
                 connection,
@@ -479,23 +476,68 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                 conversationId,
                 ct)
             .ConfigureAwait(false);
-        foreach (var memberId in memberIds)
-        {
-            if (memberId == userId)
-                continue;
 
-            await InsertOutboxAsync(
+        // Perf-9：群已读走统一 GroupProjectionDelta 协议，ConversationRead 广播聚合为单行 Outbox。
+        if (ConversationId.IsGroup(conversationId))
+        {
+            var delta = new GroupProjectionDelta(conversationId, memberIds);
+
+            // 排除读者本人：读者不需要再收到自己的已读水位通知。
+            var others = new List<long>(memberIds.Count);
+            foreach (var memberId in memberIds)
+            {
+                if (memberId != userId)
+                    others.Add(memberId);
+            }
+
+            // 通知群内其他成员某用户已读到某水位：单一 payload 适合广播。
+            delta.AddBroadcastTo(
+                GroupProjectionEventFactory.CreateGroupConversationReadBroadcast(
+                    conversationId,
+                    userId,
+                    targetMessageId,
+                    targetAtMs,
+                    now,
+                    traceParent,
+                    traceState),
+                others);
+
+            // 读者自身的未读数变更保持逐用户。
+            delta.AddPerUser(readerUnreadEvent);
+
+            await OutboxInsertHelper.InsertManyAsync(
                     connection,
                     transaction,
-                    ConversationWriteCommands.CreateConversationReadEvent(
-                        conversationId,
-                        memberId,
-                        userId,
-                        targetMessageId,
-                        targetAtMs,
-                        now,
-                        traceParent,
-                        traceState),
+                    _databaseSchema,
+                    delta.Build(),
+                    ct)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            // 单聊路径：保持 per-target ConversationRead 事件 + 读者未读变更。
+            var events = new List<RealtimeEvent>(memberIds.Count + 1) { readerUnreadEvent };
+            foreach (var memberId in memberIds)
+            {
+                if (memberId == userId)
+                    continue;
+
+                events.Add(ConversationWriteCommands.CreateConversationReadEvent(
+                    conversationId,
+                    memberId,
+                    userId,
+                    targetMessageId,
+                    targetAtMs,
+                    now,
+                    traceParent,
+                    traceState));
+            }
+
+            await OutboxInsertHelper.InsertManyAsync(
+                    connection,
+                    transaction,
+                    _databaseSchema,
+                    events,
                     ct)
                 .ConfigureAwait(false);
         }
@@ -577,37 +619,5 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
         command.Parameters.AddWithValue("max_unread", ConversationWriteCommands.MaxTrackedUnreadCount);
         var result = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
         return result is int count ? count : Convert.ToInt32(result);
-    }
-
-    private async Task InsertOutboxAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        RealtimeEvent evt,
-        CancellationToken ct)
-    {
-        await using var command = new NpgsqlCommand(
-            $"""
-             INSERT INTO {_databaseSchema.OutboxTableSql} (
-                 event_id, payload_json, target_user_id, event_type, status,
-                 created_at_ms, next_attempt_at_ms, attempt_count
-             ) VALUES (
-                 @event_id, @payload_json, @target_user_id, @event_type, @status,
-                 @created_at_ms, @next_attempt_at_ms, 0
-             )
-             ON CONFLICT (event_id) DO NOTHING;
-             """,
-            connection,
-            transaction);
-        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        command.Parameters.AddWithValue("event_id", evt.EventId);
-        command.Parameters.AddWithValue(
-            "payload_json",
-            JsonSerializer.Serialize(evt, RealtimeJsonSerializerContext.Default.RealtimeEvent));
-        command.Parameters.AddWithValue("target_user_id", evt.TargetUserId);
-        command.Parameters.AddWithValue("event_type", (short)evt.Type);
-        command.Parameters.AddWithValue("status", (short)RealtimeOutboxStatus.Pending);
-        command.Parameters.AddWithValue("created_at_ms", now);
-        command.Parameters.AddWithValue("next_attempt_at_ms", now);
-        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 }

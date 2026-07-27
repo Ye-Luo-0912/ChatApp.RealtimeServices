@@ -1,6 +1,7 @@
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Abstractions.Routing;
+using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Infrastructure.Core.DependencyInjection;
 using ChatApp.Realtime.Infrastructure.Nats.Configuration;
@@ -14,6 +15,7 @@ using ChatApp.RealtimeServices.Options;
 using ChatApp.RealtimeServices.Workers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 
 namespace ChatApp.RealtimeServices.DependencyInjection;
@@ -49,10 +51,19 @@ public static class RealtimeServicesRegistration
         var messageRetentionOptions = BindMessageRetentionOptions(configuration);
         services.AddSingleton(Microsoft.Extensions.Options.Options.Create(messageRetentionOptions));
         services.AddSingleton(messageRetentionOptions);
+        var idempotencyOptions = BindIdempotencyOptions(configuration);
+        services.AddSingleton(Microsoft.Extensions.Options.Options.Create(idempotencyOptions));
+        services.AddSingleton(idempotencyOptions);
         services.AddSingleton(trustSettings);
         services.AddSingleton(new RealtimeConfigurationWarnings(warnings));
         services.AddSingleton<RealtimeHealthService>();
         services.AddSingleton<RealtimeQueryConcurrencyGate>();
+        // Perf-1：群消息按 ConversationId 分区的策略。默认实现足够，注册为单例。
+        services.TryAddSingleton<IMessagePartitionKeySelector, DefaultMessagePartitionKeySelector>();
+
+        // Perf-8：Outbox Dead 行归档接收器。默认使用 NullDeadLetterArchiveSink（直接物理删除）。
+        // 业务方可注册自定义 IDeadLetterArchiveSink 覆盖，并在 OutboxOptions.DeadArchiveSink 指定名称。
+        services.TryAddSingleton<IDeadLetterArchiveSink, NullDeadLetterArchiveSink>();
 
         services.AddRealtimeInfrastructureCore();
         services.AddRealtimeInfrastructureRedis(connectionOptions.Garnet);
@@ -71,6 +82,7 @@ public static class RealtimeServicesRegistration
 
         services.AddHostedService<IncomingMessageWorker>();
         services.AddHostedService<AccountCleanupWorker>();
+        services.AddHostedService<RealtimeEventWorker>();
         services.AddHostedService<MessageReceiptWorker>();
         services.AddHostedService<MessageHistoryQueryWorker>();
         services.AddHostedService<ConversationListQueryWorker>();
@@ -84,6 +96,8 @@ public static class RealtimeServicesRegistration
         services.AddHostedService<OutboxPublisherWorker>();
         services.AddHostedService<OutboxCleanupWorker>();
         services.AddHostedService<MessageRetentionWorker>();
+        // LongTerm-1：独立幂等账本 + 用户删除 tombstone 的周期 GC（不阻断就绪）。
+        services.AddHostedService<IdempotencyGCWorker>();
 
         return services;
     }
@@ -218,6 +232,14 @@ public static class RealtimeServicesRegistration
             throw new InvalidOperationException("Outbox 配置值必须大于 0。");
         if (options.PublishedRetentionHours < 0)
             throw new InvalidOperationException("Outbox:PublishedRetentionHours 不能为负数。");
+        if (options.PublishedMaxBatchesPerCycle < 0)
+            throw new InvalidOperationException("Outbox:PublishedMaxBatchesPerCycle 不能为负数。");
+        if (options.PublishedBatchSleepMs < 0)
+            throw new InvalidOperationException("Outbox:PublishedBatchSleepMs 不能为负数。");
+        if (options.DeadRetentionDays < 0)
+            throw new InvalidOperationException("Outbox:DeadRetentionDays 不能为负数。");
+        if (options.DeadMaxRows < 0)
+            throw new InvalidOperationException("Outbox:DeadMaxRows 不能为负数。");
         return options;
     }
 
@@ -248,6 +270,25 @@ public static class RealtimeServicesRegistration
             throw new InvalidOperationException("MessageRetention:BatchSleepMs 不能为负数。");
         if (options.MaxBatchesPerCycle < 0)
             throw new InvalidOperationException("MessageRetention:MaxBatchesPerCycle 不能为负数。");
+        return options;
+    }
+
+    private static IdempotencyOptions BindIdempotencyOptions(IConfiguration configuration)
+    {
+        var options = configuration.GetSection(IdempotencyOptions.SectionName).Get<IdempotencyOptions>()
+            ?? new IdempotencyOptions();
+        if (options.RetentionHorizonMs < 0)
+            throw new InvalidOperationException("Idempotency:RetentionHorizonMs 不能为负数。");
+        if (options.RetentionDays < 0)
+            throw new InvalidOperationException("Idempotency:RetentionDays 不能为负数。");
+        if (options.BatchSize <= 0)
+            throw new InvalidOperationException("Idempotency:BatchSize 必须大于 0。");
+        if (options.IntervalMs <= 0)
+            throw new InvalidOperationException("Idempotency:IntervalMs 必须大于 0。");
+        if (options.BatchSleepMs < 0)
+            throw new InvalidOperationException("Idempotency:BatchSleepMs 不能为负数。");
+        if (options.MaxBatchesPerCycle < 0)
+            throw new InvalidOperationException("Idempotency:MaxBatchesPerCycle 不能为负数。");
         return options;
     }
 

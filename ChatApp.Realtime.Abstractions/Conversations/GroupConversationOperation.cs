@@ -8,5 +8,6 @@ public enum GroupConversationOperation : byte
     RemoveMember = 3,
     Leave = 4,
     ChangeRole = 5,
-    ListMembers = 6
+    ListMembers = 6,
+    Dissolve = 7
 }

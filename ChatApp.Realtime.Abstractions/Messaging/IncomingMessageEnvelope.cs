@@ -48,7 +48,13 @@ public sealed class IncomingMessageEnvelope
         return _ack is not null ? _ack(ct) : ValueTask.CompletedTask;
     }
 
-    public string? RawPayload { get; init; }
+    public string? RawPayload { get; set; }
+
+    /// <summary>
+    /// Perf-6：成功解析并处理后清除原始 payload，避免在队列中长期保留完整 RawPayload。
+    /// 死信路径会在需要时回退到 Command 重新序列化（截断）。
+    /// </summary>
+    public void ClearRawPayload() => RawPayload = null;
 
     public ValueTask NakAsync(TimeSpan? delay = null, CancellationToken ct = default)
     {

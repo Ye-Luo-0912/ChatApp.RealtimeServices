@@ -68,6 +68,22 @@ public interface IRealtimeOutboxStore
         CancellationToken ct = default);
 
     /// <summary>
+    /// Perf-8：列出早于 cutoff 的 Dead 行（用于归档），按 created_at_ms 升序、LIMIT 限定。
+    /// 返回的行包含完整 payload 与元数据，调用方归档成功后再调用 <see cref="DeleteDeadBatchAsync"/>。
+    /// </summary>
+    Task<IReadOnlyList<DeadOutboxRow>> ListDeadAsync(
+        long createdBeforeMs,
+        int limit,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Perf-8：按 event_id 批量删除 Dead 行。仅当归档成功（或选择跳过归档）后调用。
+    /// </summary>
+    Task<int> DeleteDeadBatchAsync(
+        IReadOnlyList<string> eventIds,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// 运维/低频对账用：仅聚合 Pending + Dead（走部分索引），不扫 Published 全表。
     /// 热路径指标应由进程内计数器维护，勿高频调用。
     /// </summary>
@@ -96,6 +112,7 @@ public sealed record RealtimeOutboxListItem(
     RealtimeOutboxStatus Status,
     short EventType,
     long TargetUserId,
+    long[]? TargetUserIds,
     int AttemptCount,
     long CreatedAtMs,
     long NextAttemptAtMs,
@@ -103,3 +120,17 @@ public sealed record RealtimeOutboxListItem(
     string? LockedBy,
     long? LockedUntilMs,
     string? LastError);
+
+/// <summary>
+/// Perf-8：Dead 行归档所需的最小字段集合。归档接收器据此写入对象存储/审计库。
+/// </summary>
+public sealed record DeadOutboxRow(
+    string EventId,
+    short EventType,
+    long TargetUserId,
+    long[]? TargetUserIds,
+    int AttemptCount,
+    long CreatedAtMs,
+    long NextAttemptAtMs,
+    string? LastError,
+    string PayloadJson);

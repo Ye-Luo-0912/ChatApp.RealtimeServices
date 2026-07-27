@@ -21,9 +21,10 @@ public sealed class MentionRoundTripTests
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             store,
-            new AlwaysMemberGroupStore(),
             signal,
             metrics,
+            NoopTombstoneAndLedger.Tombstone,
+            NoopTombstoneAndLedger.Ledger,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var command = ValidGroupCommand() with
@@ -57,9 +58,10 @@ public sealed class MentionRoundTripTests
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             store,
-            new AlwaysMemberGroupStore(),
             signal,
             metrics,
+            NoopTombstoneAndLedger.Tombstone,
+            NoopTombstoneAndLedger.Ledger,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var result = await processor.ProcessAsync(ValidGroupCommand());
@@ -82,9 +84,10 @@ public sealed class MentionRoundTripTests
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             store,
-            new AlwaysMemberGroupStore(),
             signal,
             metrics,
+            NoopTombstoneAndLedger.Tombstone,
+            NoopTombstoneAndLedger.Ledger,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         // 单聊场景下 mention 仍然透传（Gateway 侧已规整为 null，但 Realtime 侧不二次过滤）
@@ -189,6 +192,7 @@ public sealed class MentionRoundTripTests
     private sealed class AlwaysMemberGroupStore : IRealtimeGroupStore
     {
         public Task<GroupCreatePersistResult> CreateGroupAsync(
+            string requestId,
             long creatorUserId,
             string conversationId,
             string title,
@@ -199,6 +203,7 @@ public sealed class MentionRoundTripTests
             throw new NotSupportedException();
 
         public Task<GroupMutatePersistResult> AddMembersAsync(
+            string requestId,
             long actorUserId,
             string conversationId,
             IReadOnlyList<long> memberUserIds,
@@ -208,6 +213,7 @@ public sealed class MentionRoundTripTests
             throw new NotSupportedException();
 
         public Task<GroupMutatePersistResult> RemoveMemberAsync(
+            string requestId,
             long actorUserId,
             string conversationId,
             long targetUserId,
@@ -217,6 +223,7 @@ public sealed class MentionRoundTripTests
             throw new NotSupportedException();
 
         public Task<GroupMutatePersistResult> LeaveAsync(
+            string requestId,
             long actorUserId,
             string conversationId,
             string? actorSessionId,
@@ -225,10 +232,20 @@ public sealed class MentionRoundTripTests
             throw new NotSupportedException();
 
         public Task<GroupMutatePersistResult> ChangeRoleAsync(
+            string requestId,
             long actorUserId,
             string conversationId,
             long targetUserId,
             ConversationMemberRole newRole,
+            string? actorSessionId,
+            long occurredAtMs,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<GroupMutatePersistResult> DissolveAsync(
+            string requestId,
+            long actorUserId,
+            string conversationId,
             string? actorSessionId,
             long occurredAtMs,
             CancellationToken ct = default) =>

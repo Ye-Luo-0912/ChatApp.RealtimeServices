@@ -5,6 +5,7 @@ using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Conversations;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Messaging;
+using ChatApp.Realtime.Infrastructure.Core.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
@@ -46,6 +47,7 @@ public sealed class GroupChatTests : IAsyncLifetime
         var conversationId = ConversationId.CreateGroup();
 
         var result = await groupStore.CreateGroupAsync(
+            requestId: "req-create-squad",
             creatorUserId: 1001,
             conversationId,
             title: "Squad",
@@ -114,6 +116,7 @@ public sealed class GroupChatTests : IAsyncLifetime
 
         var memberIds = Enumerable.Range(2000, 49).Select(i => (long)i).ToArray();
         var result = await groupStore.CreateGroupAsync(
+            requestId: "req-create-big",
             creatorUserId: 1001,
             conversationId,
             title: "Big",
@@ -148,9 +151,11 @@ public sealed class GroupChatTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationId = ConversationId.CreateGroup();
         await groupStore.CreateGroupAsync(
+            "req-create-g",
             1001,
             conversationId,
             "G",
@@ -161,9 +166,10 @@ public sealed class GroupChatTests : IAsyncLifetime
         using var metrics = new RealtimeMetrics();
         var processor = new DefaultIncomingMessageProcessor(
             messageStore,
-            groupStore,
             new RecordingRealtimeOutboxSignal(),
             metrics,
+            NoopTombstoneAndLedger.Tombstone,
+            NoopTombstoneAndLedger.Ledger,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var rejected = await processor.ProcessAsync(new IncomingMessageCommand
@@ -202,9 +208,11 @@ public sealed class GroupChatTests : IAsyncLifetime
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
+            TestMutationPolicy.Instance,
             NullLogger<NpgsqlRealtimeMessageStore>.Instance);
         var conversationId = ConversationId.CreateGroup();
         await groupStore.CreateGroupAsync(
+            "req-create-fan",
             1,
             conversationId,
             "Fan",
@@ -282,9 +290,12 @@ public sealed class GroupChatTests : IAsyncLifetime
         var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
         var processor = new DefaultGroupConversationProcessor(
             groupStore,
-            new RecordingRealtimeOutboxSignal());
+            new RecordingRealtimeOutboxSignal(),
+            NoopTombstoneAndLedger.Tombstone,
+            new NoopGroupOperationAuditStore(NullLogger<NoopGroupOperationAuditStore>.Instance));
         var conversationId = ConversationId.CreateGroup();
         await groupStore.CreateGroupAsync(
+            "req-create-roles",
             10,
             conversationId,
             "Roles",
@@ -355,6 +366,131 @@ public sealed class GroupChatTests : IAsyncLifetime
         });
         Assert.True(leave.Succeeded);
         Assert.False(await groupStore.IsActiveMemberAsync(conversationId, 10));
+    }
+
+    [Fact]
+    public async Task RemovedMember_Cannot_Edit_Recall_Or_React_OldGroupMessage()
+    {
+        var (client, schema) = await CreateStoreAsync("realtime_group_p0_8_mutation_gate");
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var messageStore = new NpgsqlRealtimeMessageStore(
+            client,
+            schema,
+            TestMutationPolicy.Instance,
+            NullLogger<NpgsqlRealtimeMessageStore>.Instance);
+        var reactionStore = new NpgsqlRealtimeReactionStore(client, schema, TestMutationPolicy.Instance);
+        var conversationId = ConversationId.CreateGroup();
+
+        // 建群：用户 10 是 Owner，用户 20、30 是成员。
+        await groupStore.CreateGroupAsync(
+            "req-create-p08",
+            10,
+            conversationId,
+            "P0-8",
+            [20, 30],
+            "s10",
+            1_700_000_000_000);
+
+        // 用户 20 在群内时发送一条群消息。
+        const string messageId = "g-msg-p08";
+        var message = new RealtimeMessageRecord
+        {
+            MessageId = messageId,
+            ClientMessageId = "g-client-p08",
+            SenderUserId = 20,
+            SenderSessionId = "s20",
+            ReceiverUserId = 0,
+            ConversationId = conversationId,
+            Content = "original",
+            ReceivedAtMs = 1_700_000_000_500
+        };
+        var template = new RealtimeEvent
+        {
+            EventId = MessageEventIdFactory.CreateMessageReceivedEventId(20, "g-client-p08", 1),
+            Type = RealtimeEventType.MessageReceived,
+            TargetUserId = 20,
+            ActorUserId = 20,
+            MessageId = messageId,
+            SessionId = "s20",
+            PayloadJson = JsonSerializer.Serialize(
+                new RealtimeChatMessagePayload
+                {
+                    MessageId = messageId,
+                    ClientMessageId = "g-client-p08",
+                    SenderUserId = 20,
+                    SenderSessionId = "s20",
+                    ReceiverUserId = 0,
+                    ConversationId = conversationId,
+                    Content = "original",
+                    ReceivedAtMs = 1_700_000_000_500
+                },
+                RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload),
+            OccurredAtMs = 1_700_000_000_500
+        };
+        var persisted = await messageStore.SaveAsync(message, template);
+        Assert.Equal(RealtimeMessagePersistKind.Created, persisted.Kind);
+
+        // 用户 20 被移出群。
+        var remove = await groupStore.RemoveMemberAsync(
+            "req-remove-p08",
+            10,
+            conversationId,
+            targetUserId: 20,
+            "s10",
+            1_700_000_001_000);
+        Assert.True(remove.Succeeded);
+        Assert.False(await groupStore.IsActiveMemberAsync(conversationId, 20));
+
+        // 用户 20 尝试编辑旧消息 → 应被拒绝（仍是发送者，但已不是群成员）。
+        var edit = await messageStore.ApplyEditAsync(
+            requestId: "req-edit-p08",
+            messageId,
+            senderUserId: 20,
+            senderSessionId: "s20",
+            content: "edited after leave",
+            editedAtMs: 1_700_000_002_000,
+            maxAgeMs: 60_000);
+        Assert.Equal(MessageEditPersistStatus.NotAllowed, edit.Status);
+
+        // 用户 20 尝试撤回旧消息 → 应被拒绝。
+        var recall = await messageStore.ApplyRecallAsync(
+            requestId: "req-recall-p08",
+            messageId,
+            senderUserId: 20,
+            senderSessionId: "s20",
+            recalledAtMs: 1_700_000_003_000,
+            maxAgeMs: 60_000);
+        Assert.Equal(MessageRecallPersistStatus.NotAllowed, recall.Status);
+
+        // 用户 20 尝试添加 Reaction → 应被拒绝。
+        var reaction = await reactionStore.AddAsync(
+            messageId,
+            actorUserId: 20,
+            actorSessionId: "s20",
+            emoji: "👍",
+            occurredAtMs: 1_700_000_004_000,
+            new MessageReactionOptions());
+        Assert.Equal(MessageReactionPersistStatus.NotAllowed, reaction.Status);
+
+        // 用户 30 仍是群成员，可以添加 Reaction（验证策略不会误拒活跃成员）。
+        var memberReaction = await reactionStore.AddAsync(
+            messageId,
+            actorUserId: 30,
+            actorSessionId: "s30",
+            emoji: "🎉",
+            occurredAtMs: 1_700_000_005_000,
+            new MessageReactionOptions());
+        Assert.Equal(MessageReactionPersistStatus.Applied, memberReaction.Status);
+
+        // 用户 10（Owner）可以撤回他人消息吗？不能——不是原发送者。
+        var ownerRecall = await messageStore.ApplyRecallAsync(
+            requestId: "req-owner-recall-p08",
+            messageId,
+            senderUserId: 10,
+            senderSessionId: "s10",
+            recalledAtMs: 1_700_000_006_000,
+            maxAgeMs: 60_000);
+        Assert.Equal(MessageRecallPersistStatus.NotAllowed, ownerRecall.Status);
     }
 
     private async Task<(RealtimeDatabaseClient Client, RealtimeDatabaseSchema Schema)> CreateStoreAsync(

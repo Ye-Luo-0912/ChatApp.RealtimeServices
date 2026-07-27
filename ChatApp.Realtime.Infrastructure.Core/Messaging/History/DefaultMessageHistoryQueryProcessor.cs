@@ -78,49 +78,35 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
             1,
             MaximumPageSize);
 
-        var hasAfter = query.AfterReceivedAtMs.HasValue;
-        IReadOnlyList<RealtimeHistoryMessage> rows;
-        if (!string.IsNullOrWhiteSpace(query.ConversationId))
+        // P0-3：所有列表查询必须带 ConversationId。空 ConversationId 的用户级全量历史
+        // 已废弃（群消息 receiver_user_id=0 导致全局查询遗漏群消息）。
+        if (string.IsNullOrWhiteSpace(query.ConversationId))
         {
-            var conversationId = query.ConversationId.Trim();
-            ConversationMessageHistoryResult history;
-            if (hasAfter)
-            {
-                history = await _store.QueryByConversationAfterAsync(
-                        query.UserId,
-                        conversationId,
-                        query.AfterReceivedAtMs!.Value,
-                        query.AfterMessageId!.Trim(),
-                        pageSize + 1,
-                        ct)
-                    .ConfigureAwait(false);
-            }
-            else
-            {
-                history = await _store.QueryByConversationAsync(
-                        query.UserId,
-                        conversationId,
-                        query.BeforeReceivedAtMs,
-                        query.BeforeMessageId,
-                        pageSize + 1,
-                        ct)
-                    .ConfigureAwait(false);
-            }
+            return MessageHistoryPage.Failed(
+                query.RequestId,
+                "conversation_id_required",
+                "历史列表查询必须指定会话编号。");
+        }
 
-            if (!history.IsMember)
-            {
-                return MessageHistoryPage.Failed(
-                    query.RequestId,
-                    "forbidden",
-                    "无权查看该会话历史。");
-            }
-
-            rows = history.Messages;
+        var hasAfter = query.AfterChangedAtMs.HasValue;
+        var targetConversationId = query.ConversationId.Trim();
+        ConversationMessageHistoryResult history;
+        if (hasAfter)
+        {
+            history = await _store.QueryByConversationAfterAsync(
+                    query.UserId,
+                    targetConversationId,
+                    query.AfterChangedAtMs!.Value,
+                    query.AfterMessageId!.Trim(),
+                    pageSize + 1,
+                    ct)
+                .ConfigureAwait(false);
         }
         else
         {
-            rows = await _store.QueryAsync(
+            history = await _store.QueryByConversationAsync(
                     query.UserId,
+                    targetConversationId,
                     query.BeforeReceivedAtMs,
                     query.BeforeMessageId,
                     pageSize + 1,
@@ -128,6 +114,15 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
                 .ConfigureAwait(false);
         }
 
+        if (!history.IsMember)
+        {
+            return MessageHistoryPage.Failed(
+                query.RequestId,
+                "forbidden",
+                "无权查看该会话历史。");
+        }
+
+        var rows = history.Messages;
         rows = await RealtimeHistoryAttachmentEnricher
             .EnrichAsync(_attachmentStore, rows, ct)
             .ConfigureAwait(false);
@@ -135,7 +130,7 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
             .EnrichAsync(_reactionStore, rows, query.UserId, ct)
             .ConfigureAwait(false);
 
-        return PackByActualUtf8Json(query.RequestId, rows, pageSize);
+        return PackByActualUtf8Json(query.RequestId, rows, pageSize, hasAfter);
     }
 
     /// <summary>
@@ -143,54 +138,97 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
     /// 单条超过 <see cref="MaximumResponseBytes"/> → <c>message_too_large</c>；
     /// 单条超过 packing 余量但仍 ≤ 硬上限 → 单独返回该条并置 HasMore。
     /// </summary>
+    /// <remarks>
+    /// Perf-4：旧实现每加入一条消息就重新序列化整个 Page，导致 O(N²) 序列化开销。
+    /// 新实现先逐条序列化获取精确字节（O(N)），线性累加判断预算，最后仅做一次完整序列化验证。
+    /// </remarks>
     private static MessageHistoryPage PackByActualUtf8Json(
         string requestId,
         IReadOnlyList<RealtimeHistoryMessage> rows,
-        int pageSize)
+        int pageSize,
+        bool isAfterMode)
     {
+        // O(N)：逐条序列化获取精确字节大小。
+        var perItemBytes = new int[rows.Count];
+        for (var i = 0; i < rows.Count; i++)
+        {
+            perItemBytes[i] = MeasureSingleMessageUtf8Json(rows[i]);
+        }
+
+        // 页面 JSON 结构开销估算：
+        // {"requestId":"...","items":[...],"nextCursor":{...},"hasMore":true,"succeeded":true,...}
+        // 每条 item 在数组中额外 1 字节逗号分隔。nextCursor 约 200 字节。
+        const int pageWrapperOverhead = 256;
+        const int cursorOverhead = 200;
+        const int itemSeparatorOverhead = 1;
+
+        var budget = RealtimeWireLimits.PackingBudgetBytes - pageWrapperOverhead - cursorOverhead;
+
         var items = new List<RealtimeHistoryMessage>(Math.Min(pageSize, rows.Count));
-        foreach (var row in rows)
+        var accumulated = 0;
+        for (var i = 0; i < rows.Count; i++)
         {
             if (items.Count >= pageSize)
                 break;
 
-            items.Add(row);
-            var candidate = BuildPackedPage(requestId, items, rows.Count > items.Count);
-            var bytes = MeasureUtf8Json(candidate);
+            var itemSize = perItemBytes[i] + (items.Count > 0 ? itemSeparatorOverhead : 0);
 
-            if (bytes <= RealtimeWireLimits.PackingBudgetBytes)
-                continue;
-
-            if (items.Count == 1)
-            {
-                if (bytes > MaximumResponseBytes)
-                {
-                    return MessageHistoryPage.Failed(
-                        requestId,
-                        "message_too_large",
-                        "单条历史消息序列化后超过协议预算。");
-                }
-
+            if (items.Count > 0 && accumulated + itemSize > budget)
                 break;
-            }
 
-            items.RemoveAt(items.Count - 1);
-            break;
+            items.Add(rows[i]);
+            accumulated += itemSize;
         }
 
         var hasMore = rows.Count > items.Count;
-        return BuildPackedPage(requestId, items, hasMore);
+        var page = BuildPackedPage(requestId, items, hasMore, isAfterMode);
+
+        // 一次完整序列化验证：估算可能偏低（cursor 实际大小、JSON 转义差异），
+        // 超预算则移除最后一条并重新构建（最多重试一次，仍 O(N)）。
+        var finalBytes = MeasureUtf8Json(page);
+        if (finalBytes > RealtimeWireLimits.PackingBudgetBytes && items.Count > 1)
+        {
+            items.RemoveAt(items.Count - 1);
+            hasMore = rows.Count > items.Count;
+            page = BuildPackedPage(requestId, items, hasMore, isAfterMode);
+            finalBytes = MeasureUtf8Json(page);
+        }
+
+        if (items.Count == 1 && finalBytes > MaximumResponseBytes)
+        {
+            return MessageHistoryPage.Failed(
+                requestId,
+                "message_too_large",
+                "单条历史消息序列化后超过协议预算。");
+        }
+
+        return page;
+    }
+
+    private static int MeasureSingleMessageUtf8Json(RealtimeHistoryMessage message)
+    {
+        var json = JsonSerializer.Serialize(
+            message,
+            RealtimeJsonSerializerContext.Default.RealtimeHistoryMessage);
+        return Encoding.UTF8.GetByteCount(json);
     }
 
     private static MessageHistoryPage BuildPackedPage(
         string requestId,
         IReadOnlyList<RealtimeHistoryMessage> items,
-        bool hasMore)
+        bool hasMore,
+        bool isAfterMode)
     {
         var last = items.Count == 0 ? null : items[^1];
-        var nextCursor = hasMore && last is not null
-            ? new MessageHistoryCursor(last.ReceivedAtMs, last.MessageId)
-            : null;
+        MessageHistoryCursor? nextCursor = null;
+        if (hasMore && last is not null)
+        {
+            // P0-2：After 模式按 changed_at_ms 排序，游标必须携带变更水位；
+            // Before 模式按 received_at_ms 排序，游标携带接收时间。
+            nextCursor = isAfterMode
+                ? new MessageHistoryCursor(last.ReceivedAtMs, last.MessageId, last.ChangedAtMs)
+                : new MessageHistoryCursor(last.ReceivedAtMs, last.MessageId);
+        }
         return MessageHistoryPage.Success(requestId, items, nextCursor, hasMore);
     }
 
@@ -244,7 +282,7 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
                 "invalid_cursor",
                 "Before 游标时间和消息编号必须同时提供。");
 
-        var hasAfterTime = query.AfterReceivedAtMs.HasValue;
+        var hasAfterTime = query.AfterChangedAtMs.HasValue;
         var hasAfterMessage = !string.IsNullOrWhiteSpace(query.AfterMessageId);
         if (hasAfterTime != hasAfterMessage)
             return MessageHistoryPage.Failed(
@@ -269,7 +307,7 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
                 query.RequestId,
                 "invalid_cursor",
                 "历史消息游标无效。");
-        if (query.AfterReceivedAtMs is <= 0 || query.AfterMessageId?.Length > 64)
+        if (query.AfterChangedAtMs is <= 0 || query.AfterMessageId?.Length > 64)
             return MessageHistoryPage.Failed(
                 query.RequestId,
                 "invalid_cursor",
