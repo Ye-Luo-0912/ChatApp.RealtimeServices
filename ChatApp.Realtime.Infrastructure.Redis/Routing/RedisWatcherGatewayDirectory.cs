@@ -44,6 +44,16 @@ public sealed class RedisWatcherGatewayDirectory : IWatcherGatewayDirectory
     private const string KeySuffix = ":instances";
     private const char MemberSeparator = ':';
 
+    /// <summary>
+    /// P0-9：全局活跃 Gateway shard ZSET 的 key。
+    /// <para>
+    /// member = instanceId，score = 该实例最近一次 watcher 注册的租约到期 Unix 毫秒。
+    /// RegisterWatchersAsync 时同步 ZADD 此 key（续期），ListActiveShardsAsync 时按 score 过期过滤。
+    /// 租约机制保证 Gateway 崩溃后此 key 中的陈旧实例自动过期。
+    /// </para>
+    /// </summary>
+    private const string ActiveShardsKey = "watchers:__active_shards__";
+
     private readonly RealtimeGarnetClient _client;
     private readonly RoutingMetrics _metrics;
     private readonly ILogger<RedisWatcherGatewayDirectory> _logger;
@@ -176,14 +186,17 @@ public sealed class RedisWatcherGatewayDirectory : IWatcherGatewayDirectory
             var expiryMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + LeaseMs;
             var member = FormatMember(watcherUserId, instanceId);
 
+            // P0-9：批量写入时额外维护全局活跃 shard ZSET，使 LookupFailure 时可枚举所有活跃 Gateway 实例。
+            // 同一 instanceId 多次注册仅刷新 score（续期），不产生重复 member。
             var batch = db.CreateBatch();
-            var tasks = new Task[watchedUserIds.Count];
+            var tasks = new Task[watchedUserIds.Count + 1];
             for (var i = 0; i < watchedUserIds.Count; i++)
             {
                 var key = FormatKey(watchedUserIds[i]);
                 // ZADD 幂等：相同 member 仅刷新 score（续期），不产生重复计数。
                 tasks[i] = batch.SortedSetAddAsync(key, member, expiryMs);
             }
+            tasks[watchedUserIds.Count] = batch.SortedSetAddAsync(ActiveShardsKey, instanceId, expiryMs);
             batch.Execute();
             await Task.WhenAll(tasks).WaitAsync(cancellationToken).ConfigureAwait(false);
         }
@@ -200,6 +213,72 @@ public sealed class RedisWatcherGatewayDirectory : IWatcherGatewayDirectory
                 watcherUserId,
                 instanceId,
                 watchedUserIds.Count);
+        }
+    }
+
+    /// <summary>
+    /// P0-9：列出当前所有已知活跃的 Gateway shard ID。
+    /// <para>
+    /// 读取 <see cref="ActiveShardsKey"/> ZSET，清理过期成员后返回存活 instanceId 集合。
+    /// 查询失败时返回空集合（不抛异常），调用方据此再次回退到广播。
+    /// </para>
+    /// </summary>
+    public async Task<IReadOnlyList<string>> ListActiveShardsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var db = _client.GetDatabase();
+            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+            // 先清理过期成员，保持 ZSET 紧凑；失败不阻塞查询。
+            try
+            {
+                await db.SortedSetRemoveRangeByScoreAsync(ActiveShardsKey, start: -1, stop: nowMs)
+                    .WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                // 清理失败不影响读取。
+            }
+
+            var members = await db.SortedSetRangeByScoreAsync(
+                ActiveShardsKey,
+                start: nowMs + 1,
+                stop: double.PositiveInfinity)
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+
+            if (members.Length == 0)
+                return Array.Empty<string>();
+
+            var result = new List<string>(members.Length);
+            foreach (var member in members)
+            {
+                if (member.HasValue)
+                {
+                    var instanceId = (string?)member;
+                    if (!string.IsNullOrWhiteSpace(instanceId))
+                        result.Add(instanceId);
+                }
+            }
+
+            return result;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _metrics.RecordDirectoryLookupFailed("watcher", "list_active_shards");
+            _logger.LogWarning(
+                ex,
+                "Redis 活跃 shard 列表查询失败，回退到空集合。");
+            return Array.Empty<string>();
         }
     }
 

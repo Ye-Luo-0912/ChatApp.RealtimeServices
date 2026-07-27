@@ -19,6 +19,7 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
     private readonly ILogger _logger;
     private readonly Func<TEnvelope, long>? _byteSizer;
     private readonly long _maxQueueBytes;
+    private readonly long _maxSinglePayloadBytes;
 
     public PartitionedConsumerRuntime(
         string workerName,
@@ -28,7 +29,8 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
         RealtimeReadinessState readinessState,
         ILogger logger,
         Func<TEnvelope, long>? byteSizer = null,
-        long maxQueueBytes = 0)
+        long maxQueueBytes = 0,
+        long maxSinglePayloadBytes = 0)
     {
         _workerName = workerName;
         _partitionCount = partitionCount;
@@ -38,6 +40,7 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
         _logger = logger;
         _byteSizer = byteSizer;
         _maxQueueBytes = maxQueueBytes;
+        _maxSinglePayloadBytes = maxSinglePayloadBytes;
     }
 
     /// <summary>
@@ -45,10 +48,15 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
     /// 运行 produce 循环（含订阅重连退避）、协调 shutdown。
     /// 业务 Worker 提供 consume 委托和 processPartition 委托。
     /// </summary>
+    /// <remarks>
+    /// P0-6：channel 元素类型为 <see cref="LeasedEnvelope{TEnvelope}"/>，
+    /// 携带 <see cref="ByteBudgetLease"/>。processor 应在 finally 块 Dispose lease，
+    /// 使预算覆盖 queued + processing，而非在 dequeue 时释放。
+    /// </remarks>
     public async Task RunAsync(
         Func<CancellationToken, IAsyncEnumerable<TEnvelope>> consume,
         Func<TEnvelope, int> getPartition,
-        Func<int, ChannelReader<TEnvelope>, CancellationToken, Task> processPartition,
+        Func<int, ChannelReader<LeasedEnvelope<TEnvelope>>, CancellationToken, Task> processPartition,
         CancellationToken stoppingToken)
     {
         _readinessState.MarkStarted(_workerName);
@@ -60,21 +68,15 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
         var faultToken = faultCts.Token;
         var heartbeatTask = WorkerHeartbeat.RunAsync(_readinessState, _workerName, heartbeatCts.Token);
 
-        var channels = PartitionChannelPool<TEnvelope>.Create(_partitionCount, _queueCapacity);
+        var channels = PartitionChannelPool<LeasedEnvelope<TEnvelope>>.Create(_partitionCount, _queueCapacity);
         var byteBudget = _maxQueueBytes > 0 && _byteSizer is not null
-            ? new ByteBudget(_maxQueueBytes)
+            ? new ByteBudget(_maxQueueBytes, _maxSinglePayloadBytes)
             : null;
 
-        // Perf-6：如果配置了字节预算，用 ByteReleasingChannelReader 包装每个分区的 reader，
-        // 使处理完成后自动释放字节配额。
+        // P0-6：不再使用 ByteReleasingChannelReader。lease 在 processor finally 块释放，
+        // 预算覆盖 queued + processing，避免正在执行的大消息不计入预算。
         var processors = channels
-            .Select((channel, index) =>
-            {
-                var reader = byteBudget is not null && _byteSizer is not null
-                    ? new ByteReleasingChannelReader<TEnvelope>(channel.Reader, byteBudget, _byteSizer)
-                    : channel.Reader;
-                return processPartition(index, reader, faultToken);
-            })
+            .Select((channel, index) => processPartition(index, channel.Reader, faultToken))
             .ToArray();
         var processorsAggregate = Task.WhenAll(processors);
 
@@ -126,6 +128,8 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
                                                      || faultToken.IsCancellationRequested) { }
             finally
             {
+                // P0-6：释放 ByteBudget 持有的 SemaphoreSlim 资源
+                byteBudget?.Dispose();
                 heartbeatCts.Cancel();
                 await WorkerHeartbeat.SuppressCancellationAsync(heartbeatTask).ConfigureAwait(false);
                 _readinessState.MarkStopped(_workerName);
@@ -137,7 +141,7 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
     private async Task ProduceAsync(
         Func<CancellationToken, IAsyncEnumerable<TEnvelope>> consume,
         Func<TEnvelope, int> getPartition,
-        IReadOnlyList<Channel<TEnvelope>> channels,
+        IReadOnlyList<Channel<LeasedEnvelope<TEnvelope>>> channels,
         ByteBudget? byteBudget,
         CancellationToken ct)
     {
@@ -156,20 +160,27 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
                     _readinessState.MarkSubscriptionConnected(_workerName, connected: true);
                     var partition = getPartition(envelope);
 
-                    // Perf-6：入队前按 payload 字节长度计费。超预算时施加背压：
-                    // 等待已入队项被处理后再重试，而非立即入队。
+                    // P0-6：入队前按 payload 字节长度计费，返回 lease。
+                    // lease 在 processor finally 块 Dispose，预算覆盖 queued + processing。
+                    // 单条消息超过 MaxSinglePayloadBytes 时永久拒绝（不获取 lease，直接入队让 processor 死信）。
+                    ByteBudgetLease? lease = null;
                     if (byteBudget is not null && _byteSizer is not null)
                     {
                         var bytes = _byteSizer(envelope);
-                        while (!byteBudget.TryAcquire(bytes) && !ct.IsCancellationRequested)
+                        try
                         {
-                            await Task.Delay(Math.Max(10, _workerIntervalMs / 4), ct).ConfigureAwait(false);
+                            lease = await byteBudget.AcquireAsync(bytes, ct).ConfigureAwait(false);
                         }
-                        if (ct.IsCancellationRequested)
-                            return;
+                        catch (ByteBudgetOversizedException)
+                        {
+                            // 单条消息超过硬上限，不获取预算直接入队。
+                            // 处理器会在 ProcessOneAsync 中检测 MaxSinglePayloadBytes 并转入死信流。
+                            lease = null;
+                        }
                     }
 
-                    await channels[partition].Writer.WriteAsync(envelope, ct).ConfigureAwait(false);
+                    var leased = new LeasedEnvelope<TEnvelope>(envelope, lease);
+                    await channels[partition].Writer.WriteAsync(leased, ct).ConfigureAwait(false);
 
                     // Reliability-2：报告队列深度，满队列持续过久会被 GetSnapshot 判定为不就绪。
                     ReportQueueDepth(channels);
@@ -193,7 +204,7 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
         }
     }
 
-    private void ReportQueueDepth(IReadOnlyList<Channel<TEnvelope>> channels)
+    private void ReportQueueDepth(IReadOnlyList<Channel<LeasedEnvelope<TEnvelope>>> channels)
     {
         if (channels.Count == 0)
             return;

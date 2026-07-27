@@ -168,12 +168,15 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
         await using var command = new NpgsqlCommand(
             $"""
              WITH membership AS (
-                 SELECT EXISTS (
-                     SELECT 1
-                     FROM {_databaseSchema.ConversationMembersTableSql}
-                     WHERE conversation_id = @conversation_id
-                       AND user_id = @user_id
-                 ) AS is_member
+                 SELECT
+                     m.left_at_ms,
+                     c.dissolved_at_ms,
+                     (m.user_id IS NOT NULL) AS is_member
+                 FROM {_databaseSchema.ConversationMembersTableSql} AS m
+                 INNER JOIN {_databaseSchema.ConversationsTableSql} AS c
+                     ON c.conversation_id = m.conversation_id
+                 WHERE m.conversation_id = @conversation_id
+                   AND m.user_id = @user_id
              )
              SELECT
                  membership.is_member,
@@ -225,6 +228,8 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  FROM {_databaseSchema.MessagesTableSql}
                  WHERE conversation_id = @conversation_id
                    AND membership.is_member
+                   AND (membership.left_at_ms IS NULL OR received_at_ms <= membership.left_at_ms)
+                   AND (membership.dissolved_at_ms IS NULL OR received_at_ms <= membership.dissolved_at_ms)
                    AND (
                         @before_received_at_ms IS NULL
                         OR received_at_ms < @before_received_at_ms
@@ -269,12 +274,15 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
         await using var command = new NpgsqlCommand(
             $"""
              WITH membership AS (
-                 SELECT EXISTS (
-                     SELECT 1
-                     FROM {_databaseSchema.ConversationMembersTableSql}
-                     WHERE conversation_id = @conversation_id
-                       AND user_id = @user_id
-                 ) AS is_member
+                 SELECT
+                     m.left_at_ms,
+                     c.dissolved_at_ms,
+                     (m.user_id IS NOT NULL) AS is_member
+                 FROM {_databaseSchema.ConversationMembersTableSql} AS m
+                 INNER JOIN {_databaseSchema.ConversationsTableSql} AS c
+                     ON c.conversation_id = m.conversation_id
+                 WHERE m.conversation_id = @conversation_id
+                   AND m.user_id = @user_id
              )
              SELECT
                  membership.is_member,
@@ -326,6 +334,8 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  FROM {_databaseSchema.MessagesTableSql}
                  WHERE conversation_id = @conversation_id
                    AND membership.is_member
+                   AND (membership.left_at_ms IS NULL OR received_at_ms <= membership.left_at_ms)
+                   AND (membership.dissolved_at_ms IS NULL OR received_at_ms <= membership.dissolved_at_ms)
                    AND (
                         changed_at_ms > @after_changed_at_ms
                         OR (
@@ -365,6 +375,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
              FROM {_databaseSchema.ConversationMembersTableSql}
              WHERE conversation_id = @conversation_id
                AND user_id = @user_id
+               AND left_at_ms IS NULL
              LIMIT 1;
              """,
             connection);
@@ -400,6 +411,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
              SELECT conversation_id
              FROM {_databaseSchema.ConversationMembersTableSql}
              WHERE user_id = @user_id
+               AND left_at_ms IS NULL
                AND conversation_id = ANY(@conversation_ids);
              """,
             connection);
@@ -567,13 +579,14 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                      r.after_at,
                      r.after_id,
                      r.take,
-                     EXISTS (
-                         SELECT 1
-                         FROM {_databaseSchema.ConversationMembersTableSql} AS m
-                         WHERE m.conversation_id = r.conversation_id
-                           AND m.user_id = @user_id
-                     ) AS is_member
+                     m.left_at_ms,
+                     c.dissolved_at_ms,
+                     (m.user_id IS NOT NULL) AS is_member
                  FROM requests r
+                 LEFT JOIN {_databaseSchema.ConversationMembersTableSql} AS m
+                     ON m.conversation_id = r.conversation_id AND m.user_id = @user_id
+                 LEFT JOIN {_databaseSchema.ConversationsTableSql} AS c
+                     ON c.conversation_id = r.conversation_id
              )
              SELECT
                  membership.conversation_id,
@@ -626,6 +639,8 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  FROM {_databaseSchema.MessagesTableSql}
                  WHERE conversation_id = membership.conversation_id
                    AND membership.is_member
+                   AND (membership.left_at_ms IS NULL OR received_at_ms <= membership.left_at_ms)
+                   AND (membership.dissolved_at_ms IS NULL OR received_at_ms <= membership.dissolved_at_ms)
                    AND (
                         CASE
                             WHEN membership.has_after THEN

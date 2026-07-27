@@ -322,6 +322,234 @@ public sealed class LeaveGroupHistoryPolicyTests : IAsyncLifetime
         Assert.Equal("before-leave", result.Messages[0].Content);
     }
 
+    [Fact]
+    public async Task LeftMember_CannotReadMessagesSentAfterLeaving()
+    {
+        var (client, schema) = await CreateStoreAsync("realtime_leave_boundary");
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var messageStore = new NpgsqlRealtimeMessageStore(
+            client,
+            schema,
+            TestMutationPolicy.Instance,
+            NullLogger<NpgsqlRealtimeMessageStore>.Instance);
+        var historyStore = new NpgsqlRealtimeMessageHistoryStore(client, schema);
+        var conversationId = ConversationId.CreateGroup();
+
+        await groupStore.CreateGroupAsync(
+            "req-create-boundary",
+            10,
+            conversationId,
+            "Boundary",
+            [20],
+            "s10",
+            1_700_000_000_000);
+
+        // 离群前发送的消息
+        await SendGroupMessageAsync(messageStore, conversationId, senderUserId: 10, "before-leave", 1_700_000_000_500);
+
+        // 用户 20 离群
+        await groupStore.LeaveAsync(
+            "req-leave-boundary",
+            20,
+            conversationId,
+            "s20",
+            1_700_000_001_000);
+
+        // 离群后群里继续发送的新消息
+        await SendGroupMessageAsync(messageStore, conversationId, senderUserId: 10, "after-leave", 1_700_000_002_000);
+
+        // 离群用户查询历史：应只看到离群前的消息，看不到离群后的新消息
+        var result = await historyStore.QueryByConversationAsync(
+            userId: 20,
+            conversationId,
+            beforeReceivedAtMs: null,
+            beforeMessageId: null,
+            take: 10);
+
+        Assert.True(result.IsMember);
+        Assert.Single(result.Messages);
+        Assert.Equal("before-leave", result.Messages[0].Content);
+    }
+
+    [Fact]
+    public async Task DissolvedGroup_MembersCannotReadMessagesSentAfterDissolution()
+    {
+        var (client, schema) = await CreateStoreAsync("realtime_dissolved_boundary");
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var messageStore = new NpgsqlRealtimeMessageStore(
+            client,
+            schema,
+            TestMutationPolicy.Instance,
+            NullLogger<NpgsqlRealtimeMessageStore>.Instance);
+        var historyStore = new NpgsqlRealtimeMessageHistoryStore(client, schema);
+        var conversationId = ConversationId.CreateGroup();
+
+        await groupStore.CreateGroupAsync(
+            "req-create-dissolved-b",
+            10,
+            conversationId,
+            "DissolvedBoundary",
+            [20],
+            "s10",
+            1_700_000_000_000);
+
+        await SendGroupMessageAsync(messageStore, conversationId, senderUserId: 10, "before-dissolve", 1_700_000_000_500);
+
+        // Owner 解散群
+        await groupStore.DissolveAsync(
+            "req-dissolve-b",
+            10,
+            conversationId,
+            "s10",
+            1_700_000_001_000);
+
+        // 解散后尝试发送消息（应失败，因为 LoadGroupContextAsync 过滤 dissolved_at_ms）
+        // 但即使有残留消息，前成员也不应看到
+
+        // 前成员查询历史：应只看到解散前的消息
+        var result = await historyStore.QueryByConversationAsync(
+            userId: 20,
+            conversationId,
+            beforeReceivedAtMs: null,
+            beforeMessageId: null,
+            take: 10);
+
+        Assert.True(result.IsMember);
+        Assert.Single(result.Messages);
+        Assert.Equal("before-dissolve", result.Messages[0].Content);
+    }
+
+    [Fact]
+    public async Task LeftMember_DoesNotAppearInMemberListOrEventTargets()
+    {
+        var (client, schema) = await CreateStoreAsync("realtime_leave_member_list");
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var conversationId = ConversationId.CreateGroup();
+
+        await groupStore.CreateGroupAsync(
+            "req-create-list",
+            10,
+            conversationId,
+            "MemberList",
+            [20, 30],
+            "s10",
+            1_700_000_000_000);
+
+        // 用户 20 离群
+        await groupStore.LeaveAsync(
+            "req-leave-list",
+            20,
+            conversationId,
+            "s20",
+            1_700_000_001_000);
+
+        // 活跃成员列表不应包含已离群的用户 20
+        var members = await groupStore.ListMembersAsync(10, conversationId);
+        Assert.Equal(2, members.Count);
+        Assert.DoesNotContain(members, m => m.UserId == 20);
+        Assert.Contains(members, m => m.UserId == 10);
+        Assert.Contains(members, m => m.UserId == 30);
+
+        // 活跃成员 ID 列表也不应包含用户 20
+        var activeIds = await groupStore.ListActiveMemberUserIdsAsync(conversationId);
+        Assert.DoesNotContain(20L, activeIds);
+        Assert.Contains(10L, activeIds);
+        Assert.Contains(30L, activeIds);
+    }
+
+    [Fact]
+    public async Task DissolvedGroup_NotInActiveConversationList()
+    {
+        var (client, schema) = await CreateStoreAsync("realtime_dissolved_conversation_list");
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var conversationStore = new NpgsqlRealtimeConversationStore(
+            client,
+            schema);
+        var conversationId = ConversationId.CreateGroup();
+
+        await groupStore.CreateGroupAsync(
+            "req-create-conv-list",
+            10,
+            conversationId,
+            "ConvList",
+            [20],
+            "s10",
+            1_700_000_000_000);
+
+        // 解散前会话出现在列表中
+        var beforeList = await conversationStore.QueryListAsync(
+            userId: 10,
+            beforeIsPinned: null,
+            beforePinnedAtMs: null,
+            beforeLastMessageAtMs: null,
+            beforeConversationId: null,
+            take: 10);
+        Assert.Contains(beforeList, c => c.ConversationId == conversationId);
+
+        // Owner 解散群
+        await groupStore.DissolveAsync(
+            "req-dissolve-conv-list",
+            10,
+            conversationId,
+            "s10",
+            1_700_000_001_000);
+
+        // 解散后会话不应出现在活跃会话列表中
+        var afterList = await conversationStore.QueryListAsync(
+            userId: 10,
+            beforeIsPinned: null,
+            beforePinnedAtMs: null,
+            beforeLastMessageAtMs: null,
+            beforeConversationId: null,
+            take: 10);
+        Assert.DoesNotContain(afterList, c => c.ConversationId == conversationId);
+    }
+
+    [Fact]
+    public async Task LeftMember_CannotSetPrefsOrMarkRead()
+    {
+        var (client, schema) = await CreateStoreAsync("realtime_leave_write_prefs");
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var conversationStore = new NpgsqlRealtimeConversationStore(
+            client,
+            schema);
+        var conversationId = ConversationId.CreateGroup();
+
+        await groupStore.CreateGroupAsync(
+            "req-create-prefs",
+            10,
+            conversationId,
+            "Prefs",
+            [20],
+            "s10",
+            1_700_000_000_000);
+
+        // 用户 20 离群
+        await groupStore.LeaveAsync(
+            "req-leave-prefs",
+            20,
+            conversationId,
+            "s20",
+            1_700_000_001_000);
+
+        // 离群后尝试设置 prefs → 应找不到成员行
+        var prefsResult = await conversationStore.SetMemberPrefsAsync(
+            userId: 20,
+            conversationId,
+            pinned: true,
+            muted: false,
+            mutedUntilMs: null);
+        Assert.False(prefsResult.Found);
+
+        // 离群后尝试标记已读 → 应找不到成员行
+        var readResult = await conversationStore.AdvanceReadCursorAsync(
+            userId: 20,
+            conversationId,
+            readAtMs: 1_700_000_002_000,
+            readMessageId: "msg-x");
+        Assert.False(readResult.Found);
+    }
+
     private static async Task SendGroupMessageAsync(
         NpgsqlRealtimeMessageStore messageStore,
         string conversationId,

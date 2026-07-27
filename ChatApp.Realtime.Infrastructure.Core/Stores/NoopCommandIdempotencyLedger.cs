@@ -7,6 +7,10 @@ namespace ChatApp.Realtime.Infrastructure.Core.Stores;
 /// LongTerm-1：Noop 幂等账本。测试与未配置 PostgreSQL 时使用。
 /// FindAsync 始终返回 null（未处理），RecordAsync / PurgeOlderThanAsync 为空操作。
 /// 此时幂等性回退到 messages 表唯一索引（原有行为）。
+/// <para>
+/// P0-3：RecordAsync 签名不变（仍为 Task），Npgsql 实现内部已改为
+/// ON CONFLICT DO NOTHING 以保护 canonical 记录不被并发请求覆盖。
+/// </para>
 /// </summary>
 public sealed class NoopCommandIdempotencyLedger(ILogger<NoopCommandIdempotencyLedger> logger)
     : ICommandIdempotencyLedger

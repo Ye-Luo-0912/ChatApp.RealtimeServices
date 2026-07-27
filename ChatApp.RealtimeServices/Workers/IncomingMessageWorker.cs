@@ -68,7 +68,8 @@ public sealed class IncomingMessageWorker : BackgroundService
             _readinessState,
             _logger,
             byteSizer: EnvelopeByteSizer,
-            maxQueueBytes: _options.ProcessingQueueByteBudget);
+            maxQueueBytes: _options.ProcessingQueueByteBudget,
+            maxSinglePayloadBytes: _options.MaxSinglePayloadBytes);
         await runtime.RunAsync(
             consume: ct => _consumer.ConsumeAsync(ct),
             getPartition: env => GetPartition(env.Command, _options.ProcessingConcurrency),
@@ -96,11 +97,12 @@ public sealed class IncomingMessageWorker : BackgroundService
 
     private async Task ProcessPartitionAsync(
         int partition,
-        ChannelReader<IncomingMessageEnvelope> reader,
+        ChannelReader<LeasedEnvelope<IncomingMessageEnvelope>> reader,
         CancellationToken ct)
     {
-        await foreach (var envelope in reader.ReadAllAsync(ct).ConfigureAwait(false))
+        await foreach (var leased in reader.ReadAllAsync(ct).ConfigureAwait(false))
         {
+            var envelope = leased.Envelope;
             using var activity = RealtimeTelemetry.StartConsumer(
                 "incoming_message.process",
                 envelope.ParentContext);
@@ -129,6 +131,10 @@ public sealed class IncomingMessageWorker : BackgroundService
             }
             finally
             {
+                // P0-6：lease 在处理完成时释放，预算覆盖 queued + processing。
+                // 不再在 Channel dequeue 时释放，确保正在执行的大消息始终计入内存预算。
+                if (leased.Lease is not null)
+                    await leased.Lease.DisposeAsync().ConfigureAwait(false);
                 _readinessState.MarkHeartbeat(WorkerName);
                 _metrics.RecordProcessingDuration(Stopwatch.GetElapsedTime(started));
             }

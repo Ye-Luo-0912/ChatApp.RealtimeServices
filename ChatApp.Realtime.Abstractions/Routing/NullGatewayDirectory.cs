@@ -27,4 +27,29 @@ public sealed class NullGatewayDirectory : IGatewayDirectory
     {
         return Task.FromResult(EmptyDict);
     }
+
+    /// <summary>
+    /// P0-9：空实现返回 <see cref="GatewayLookupResultKind.LookupFailure"/>，
+    /// 使调用方回退到所有活跃 shards 投递路径（最终若活跃 shards 也为空则回退到广播）。
+    /// </summary>
+    public Task<GatewayLookupResult> GetOnlineGatewaysWithStatusAsync(
+        long userId,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(new GatewayLookupResult(
+            GatewayLookupResultKind.LookupFailure,
+            Empty));
+    }
+
+    /// <summary>
+    /// P0-9：空实现返回 <see cref="GatewayLookupResultKind.LookupFailure"/>。
+    /// </summary>
+    public Task<GatewayLookupManyResult> GetOnlineGatewaysManyWithStatusAsync(
+        IReadOnlyList<long> userIds,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult(new GatewayLookupManyResult(
+            GatewayLookupResultKind.LookupFailure,
+            EmptyDict));
+    }
 }

@@ -1,6 +1,7 @@
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
+using ChatApp.Realtime.Infrastructure.Postgres.Transactions;
 using Microsoft.Extensions.Logging;
 using Npgsql;
 
@@ -92,6 +93,17 @@ public sealed class NpgsqlUserDeletionTombstoneStore(
         await using var connection = await databaseClient.GetDataSource()
             .OpenConnectionAsync(ct)
             .ConfigureAwait(false);
+        await using var transaction = await connection
+            .BeginTransactionAsync(ct)
+            .ConfigureAwait(false);
+
+        // P0-2：获取排他 advisory lock，等待该用户所有进行中的消息/群写入事务提交或回滚。
+        // 排他锁释放（本事务提交）时 tombstone 已持久化，后续写入能读到 state=Deleting 并拒绝。
+        await UserLifecycleAdvisoryLock.AcquireExclusiveAsync(
+            connection,
+            transaction,
+            userId,
+            ct).ConfigureAwait(false);
 
         await using var command = new NpgsqlCommand(
             $"""
@@ -100,13 +112,16 @@ public sealed class NpgsqlUserDeletionTombstoneStore(
              VALUES (@user_id, @event_id, @deleted_at_ms, @state)
              ON CONFLICT (user_id) DO NOTHING;
              """,
-            connection);
+            connection,
+            transaction);
         command.Parameters.AddWithValue("user_id", userId);
         command.Parameters.AddWithValue("event_id", deletionEventId);
         command.Parameters.AddWithValue("deleted_at_ms", deletedAtMs);
         command.Parameters.AddWithValue("state", (byte)UserLifecycleState.Deleting);
 
         var affected = await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        await transaction.CommitAsync(ct).ConfigureAwait(false);
+
         if (affected > 0)
         {
             logger.LogInformation(
@@ -147,6 +162,9 @@ public sealed class NpgsqlUserDeletionTombstoneStore(
 
     public async Task<long> PurgeOlderThanAsync(long cutoffMs, int batchSize, CancellationToken ct = default)
     {
+        // P0-4: tombstone 永久保留策略——用户 ID 永不复用，轻量 tombstone 永久保留，
+        // 确保 Deleting/Deleted 状态不会被 GC 误删导致已注销用户重新开放写入。
+        // 仅清理 state=Deleted 且超期的记录（保留 Deleting 状态用于排查卡死的清理流程）。
         batchSize = Math.Clamp(batchSize, 1, 10_000);
         if (!databaseClient.IsConfigured)
             return 0;
@@ -162,6 +180,7 @@ public sealed class NpgsqlUserDeletionTombstoneStore(
                  SELECT user_id
                  FROM {databaseSchema.UserDeletionTombstonesTableSql}
                  WHERE deleted_at_ms < @cutoff
+                   AND state = @deleted_state
                  LIMIT @batch_size
                  FOR UPDATE SKIP LOCKED
              );
@@ -169,12 +188,13 @@ public sealed class NpgsqlUserDeletionTombstoneStore(
             connection);
         command.Parameters.AddWithValue("cutoff", cutoffMs);
         command.Parameters.AddWithValue("batch_size", batchSize);
+        command.Parameters.AddWithValue("deleted_state", (byte)UserLifecycleState.Deleted);
 
         var deleted = await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         if (deleted > 0)
         {
             logger.LogDebug(
-                "Tombstone GC 已清理 {Count} 条过期记录。cutoff={Cutoff}",
+                "Tombstone GC 已清理 {Count} 条已完成的过期记录。cutoff={Cutoff}",
                 deleted,
                 cutoffMs);
         }

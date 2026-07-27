@@ -59,12 +59,55 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         RealtimeEvent eventToPublish,
         CancellationToken ct = default)
     {
+        // P0-8：v3 指纹覆盖会话、回复、转发、@提及等字段
         var fingerprint = RealtimeMessageFingerprint.Compute(
             message.ReceiverUserId,
             message.Content,
-            message.AttachmentIds);
+            message.AttachmentIds,
+            message.ConversationId,
+            message.ReplyToMessageId,
+            message.ForwardedFromMessageId,
+            message.MentionedUserIds,
+            message.MentionedRoles);
 
         await using var session = await _sessionFactory.BeginAsync(ct).ConfigureAwait(false);
+
+        // P0-2：在事务内获取发送方 advisory lock（共享）并检查生命周期状态，
+        // 消除"processor 预检查 tombstone → 开消息事务 → 提交"之间的 TOCTOU 竞态。
+        // 单聊同时锁接收方，防止接收方正在被删除时写入孤儿消息。
+        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
+                session.Connection,
+                session.Transaction,
+                session.Schema,
+                message.SenderUserId,
+                ct).ConfigureAwait(false))
+        {
+            await session.RollbackAsync().ConfigureAwait(false);
+            _logger.LogWarning(
+                "入站消息被拒绝：发送用户已注销。发送用户={SenderUserId}；消息={MessageId}",
+                message.SenderUserId,
+                message.MessageId);
+            return RealtimeMessagePersistResult.UserDeleted(message.MessageId);
+        }
+
+        if (message.ReceiverUserId > 0)
+        {
+            if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
+                    session.Connection,
+                    session.Transaction,
+                    session.Schema,
+                    message.ReceiverUserId,
+                    ct).ConfigureAwait(false))
+            {
+                await session.RollbackAsync().ConfigureAwait(false);
+                _logger.LogWarning(
+                    "入站消息被拒绝：接收用户已注销。接收用户={ReceiverUserId}；消息={MessageId}",
+                    message.ReceiverUserId,
+                    message.MessageId);
+                return RealtimeMessagePersistResult.UserDeleted(message.MessageId);
+            }
+        }
+
         var messageWriter = new MessageWriter(session);
         var attachmentWriter = new AttachmentBindingWriter(session);
         var conversationWriter = new ConversationProjectionWriter(session);
@@ -86,7 +129,12 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                     existing.ReceiverUserId,
                     existing.Content,
                     existingAttachmentIds,
-                    fingerprint))
+                    fingerprint,
+                    existing.ConversationId,
+                    existing.ReplyToMessageId,
+                    existing.ForwardedFromMessageId,
+                    existing.MentionedUserIds,
+                    existing.MentionedRoles))
             {
                 await session.RollbackAsync().ConfigureAwait(false);
                 _logger.LogWarning(
@@ -334,6 +382,17 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         CancellationToken ct = default)
     {
         await using var session = await _sessionFactory.BeginAsync(ct).ConfigureAwait(false);
+
+        // P0-2：事务内检查接收方生命周期，防止已注销用户更新已读/已送达状态。
+        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
+                session.Connection, session.Transaction, session.Schema,
+                receipt.ReceiverUserId, ct).ConfigureAwait(false))
+        {
+            await session.RollbackAsync().ConfigureAwait(false);
+            return new MessageReceiptPersistResult(
+                MessageReceiptPersistStatus.Unchanged, receipt.MessageId);
+        }
+
         var outboxWriter = new PostgresOutboxWriter(session);
         var conversationWriter = new ConversationProjectionWriter(session);
 
@@ -472,6 +531,17 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             content: string.Empty);
 
         await using var session = await _sessionFactory.BeginAsync(ct).ConfigureAwait(false);
+
+        // P0-2：事务内检查发送方生命周期，防止已注销用户撤回消息。
+        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
+                session.Connection, session.Transaction, session.Schema,
+                senderUserId, ct).ConfigureAwait(false))
+        {
+            await session.RollbackAsync().ConfigureAwait(false);
+            return new MessageRecallPersistResult(
+                MessageRecallPersistStatus.NotAllowed, messageId);
+        }
+
         var mutationWriter = new MessageMutationWriter(session);
         var conversationWriter = new ConversationProjectionWriter(session);
         var outboxWriter = new PostgresOutboxWriter(session);
@@ -833,6 +903,17 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             content);
 
         await using var session = await _sessionFactory.BeginAsync(ct).ConfigureAwait(false);
+
+        // P0-2：事务内检查发送方生命周期，防止已注销用户编辑消息。
+        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
+                session.Connection, session.Transaction, session.Schema,
+                senderUserId, ct).ConfigureAwait(false))
+        {
+            await session.RollbackAsync().ConfigureAwait(false);
+            return new MessageEditPersistResult(
+                MessageEditPersistStatus.NotAllowed, messageId);
+        }
+
         var mutationWriter = new MessageMutationWriter(session);
         var conversationWriter = new ConversationProjectionWriter(session);
         var outboxWriter = new PostgresOutboxWriter(session);
@@ -1270,29 +1351,141 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
 
         // P0-6：聚合事件（target_user_ids 非空）不应整行删除，否则会误伤同数组中的其他用户。
         // 仅对 Pending/Dead 的聚合事件做 array_remove，Published 已投递等 TTL 清理即可。
-        await using (var outboxUpdateCmd = new NpgsqlCommand(
+        // P0-5：同时重写 payload_json 中的 TargetUserIds 字段，避免 Publisher 反序列化
+        // payload_json 路由到已删除用户。先 SELECT 命中行，应用层反序列化-修改-序列化后
+        // 逐行 UPDATE；payload_json 解析失败则保留原 payload，仅更新 target_user_ids 列。
+        var keepTypes = new short[]
+        {
+            (short)RealtimeEventType.AccountCleanupCompleted,
+            (short)RealtimeEventType.AttachmentBlobsPurge
+        };
+
+        // 第一阶段：SELECT 命中行的 event_id 与 payload_json。
+        List<(string EventId, string PayloadJson)> outboxRowsToUpdate;
+        await using (var outboxSelectCmd = new NpgsqlCommand(
             $"""
-             UPDATE {_databaseSchema.OutboxTableSql}
-             SET target_user_ids = array_remove(target_user_ids, @user_id)
+             SELECT event_id, payload_json
+             FROM {_databaseSchema.OutboxTableSql}
              WHERE @user_id = ANY(target_user_ids)
                AND status <> @published_status
                AND event_type <> ALL(@keep_types);
              """,
             connection))
         {
-            outboxUpdateCmd.Parameters.AddWithValue("user_id", userId);
-            outboxUpdateCmd.Parameters.AddWithValue(
+            outboxSelectCmd.Parameters.AddWithValue("user_id", userId);
+            outboxSelectCmd.Parameters.AddWithValue(
                 "published_status",
                 (short)RealtimeOutboxStatus.Published);
-            outboxUpdateCmd.Parameters.AddWithValue(
-                "keep_types",
-                new short[]
+            outboxSelectCmd.Parameters.AddWithValue("keep_types", keepTypes);
+
+            outboxRowsToUpdate = new List<(string, string)>();
+            await using var outboxReader = await outboxSelectCmd
+                .ExecuteReaderAsync(ct)
+                .ConfigureAwait(false);
+            while (await outboxReader.ReadAsync(ct).ConfigureAwait(false))
+            {
+                outboxRowsToUpdate.Add((outboxReader.GetString(0), outboxReader.GetString(1)));
+            }
+        }
+
+        // 第二阶段：对每行反序列化 payload_json，移除 TargetUserIds 中的 userId，重新序列化。
+        // 解析失败或无 TargetUserIds 字段则收集到 fallback 列表，仅更新 target_user_ids 列。
+        var fallbackEventIds = new List<string>();
+        foreach (var (eventId, payloadJson) in outboxRowsToUpdate)
+        {
+            try
+            {
+                var evt = JsonSerializer.Deserialize(
+                    payloadJson,
+                    RealtimeJsonSerializerContext.Default.RealtimeEvent);
+                if (evt is null
+                    || evt.TargetUserIds is null
+                    || evt.TargetUserIds.Length == 0)
                 {
-                    (short)RealtimeEventType.AccountCleanupCompleted,
-                    (short)RealtimeEventType.AttachmentBlobsPurge
-                });
-            var outboxUpdated = await outboxUpdateCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-            outboxDeleted += outboxUpdated;
+                    // payload_json 无 TargetUserIds 字段或为空：仅需更新 target_user_ids 列。
+                    fallbackEventIds.Add(eventId);
+                    continue;
+                }
+
+                var filtered = evt.TargetUserIds.Where(id => id != userId).ToArray();
+                var rewritten = new RealtimeEvent
+                {
+                    EventId = evt.EventId,
+                    Type = evt.Type,
+                    TargetUserId = evt.TargetUserId,
+                    ActorUserId = evt.ActorUserId,
+                    MessageId = evt.MessageId,
+                    SessionId = evt.SessionId,
+                    PayloadJson = evt.PayloadJson,
+                    TraceParent = evt.TraceParent,
+                    TraceState = evt.TraceState,
+                    OccurredAtMs = evt.OccurredAtMs,
+                    TargetUserIds = filtered.Length == 0 ? null : filtered
+                };
+                var newPayload = JsonSerializer.Serialize(
+                    rewritten,
+                    RealtimeJsonSerializerContext.Default.RealtimeEvent);
+
+                // 第三阶段：逐行 UPDATE 同时更新两列。WHERE 重新校验状态避免与并发 Publish 冲突。
+                await using var rewriteCmd = new NpgsqlCommand(
+                    $"""
+                     UPDATE {_databaseSchema.OutboxTableSql}
+                     SET target_user_ids = array_remove(target_user_ids, @user_id),
+                         payload_json = @new_payload
+                     WHERE event_id = @event_id
+                       AND @user_id = ANY(target_user_ids)
+                       AND status <> @published_status
+                       AND event_type <> ALL(@keep_types);
+                     """,
+                    connection);
+                rewriteCmd.Parameters.AddWithValue("user_id", userId);
+                rewriteCmd.Parameters.AddWithValue("new_payload", newPayload);
+                rewriteCmd.Parameters.AddWithValue("event_id", eventId);
+                rewriteCmd.Parameters.AddWithValue(
+                    "published_status",
+                    (short)RealtimeOutboxStatus.Published);
+                rewriteCmd.Parameters.AddWithValue("keep_types", keepTypes);
+                outboxDeleted += await rewriteCmd
+                    .ExecuteNonQueryAsync(ct)
+                    .ConfigureAwait(false);
+            }
+            catch (JsonException ex)
+            {
+                // payload_json 解析失败：保留原 payload，仅更新 target_user_ids 列。
+                _logger.LogWarning(
+                    ex,
+                    "Outbox payload_json 解析失败，仅更新 target_user_ids 列。事件={EventId}；用户={UserId}",
+                    eventId,
+                    userId);
+                fallbackEventIds.Add(eventId);
+            }
+        }
+
+        // 第四阶段：fallback 行（解析失败或无 TargetUserIds）仅更新 target_user_ids 列。
+        if (fallbackEventIds.Count > 0)
+        {
+            await using var fallbackCmd = new NpgsqlCommand(
+                $"""
+                 UPDATE {_databaseSchema.OutboxTableSql}
+                 SET target_user_ids = array_remove(target_user_ids, @user_id)
+                 WHERE event_id = ANY(@event_ids)
+                   AND @user_id = ANY(target_user_ids)
+                   AND status <> @published_status
+                   AND event_type <> ALL(@keep_types);
+                 """,
+                connection);
+            fallbackCmd.Parameters.AddWithValue("user_id", userId);
+            var fallbackIdsParam = fallbackCmd.Parameters.Add(
+                "event_ids",
+                NpgsqlTypes.NpgsqlDbType.Array | NpgsqlTypes.NpgsqlDbType.Text);
+            fallbackIdsParam.Value = fallbackEventIds.ToArray();
+            fallbackCmd.Parameters.AddWithValue(
+                "published_status",
+                (short)RealtimeOutboxStatus.Published);
+            fallbackCmd.Parameters.AddWithValue("keep_types", keepTypes);
+            outboxDeleted += await fallbackCmd
+                .ExecuteNonQueryAsync(ct)
+                .ConfigureAwait(false);
         }
 
         if (total > 0 || outboxDeleted > 0)

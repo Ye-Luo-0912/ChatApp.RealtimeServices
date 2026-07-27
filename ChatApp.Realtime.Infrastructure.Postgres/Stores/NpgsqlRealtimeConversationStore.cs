@@ -64,6 +64,8 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
              INNER JOIN {_databaseSchema.ConversationsTableSql} AS c
                  ON c.conversation_id = m.conversation_id
              WHERE m.user_id = @user_id
+               AND m.left_at_ms IS NULL
+               AND c.dissolved_at_ms IS NULL
                AND (
                     @before_id IS NULL
                     OR (
@@ -167,6 +169,7 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                                 ON c.conversation_id = m.conversation_id
                             WHERE m.conversation_id = @conversation_id
                               AND m.user_id = @user_id
+                              AND m.left_at_ms IS NULL
                             FOR UPDATE OF m;
                             """,
                            connection,
@@ -174,23 +177,26 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
         {
             load.Parameters.AddWithValue("conversation_id", conversationId);
             load.Parameters.AddWithValue("user_id", userId);
-            await using var reader = await load.ExecuteReaderAsync(ct).ConfigureAwait(false);
-            if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+            await using (var reader = await load.ExecuteReaderAsync(ct).ConfigureAwait(false))
             {
-                await transaction.RollbackAsync(ct).ConfigureAwait(false);
-                return new ConversationMemberPrefsResult(false, false, false, false, null);
-            }
+                if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+                {
+                    await reader.CloseAsync().ConfigureAwait(false);
+                    await transaction.RollbackAsync(ct).ConfigureAwait(false);
+                    return new ConversationMemberPrefsResult(false, false, false, false, null);
+                }
 
-            type = (ConversationType)reader.GetInt16(0);
-            peerUserId = reader.IsDBNull(1) ? null : reader.GetInt64(1);
-            lastMessageId = reader.IsDBNull(2) ? null : reader.GetString(2);
-            lastMessagePreview = reader.IsDBNull(3) ? null : reader.GetString(3);
-            lastMessageAtMs = reader.IsDBNull(4) ? null : reader.GetInt64(4);
-            lastSenderUserId = reader.IsDBNull(5) ? null : reader.GetInt64(5);
-            currentPinned = reader.GetBoolean(6);
-            currentPinnedAtMs = reader.IsDBNull(7) ? null : reader.GetInt64(7);
-            currentMuted = reader.GetBoolean(8);
-            currentMutedUntilMs = reader.IsDBNull(9) ? null : reader.GetInt64(9);
+                type = (ConversationType)reader.GetInt16(0);
+                peerUserId = reader.IsDBNull(1) ? null : reader.GetInt64(1);
+                lastMessageId = reader.IsDBNull(2) ? null : reader.GetString(2);
+                lastMessagePreview = reader.IsDBNull(3) ? null : reader.GetString(3);
+                lastMessageAtMs = reader.IsDBNull(4) ? null : reader.GetInt64(4);
+                lastSenderUserId = reader.IsDBNull(5) ? null : reader.GetInt64(5);
+                currentPinned = reader.GetBoolean(6);
+                currentPinnedAtMs = reader.IsDBNull(7) ? null : reader.GetInt64(7);
+                currentMuted = reader.GetBoolean(8);
+                currentMutedUntilMs = reader.IsDBNull(9) ? null : reader.GetInt64(9);
+            }
         }
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -329,6 +335,7 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                                 ON c.conversation_id = m.conversation_id
                             WHERE m.conversation_id = @conversation_id
                               AND m.user_id = @user_id
+                              AND m.left_at_ms IS NULL
                             FOR UPDATE OF m;
                             """,
                            connection,

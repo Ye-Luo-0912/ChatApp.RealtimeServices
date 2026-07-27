@@ -19,10 +19,13 @@ public sealed class RealtimeOptions
     public long ProcessingQueueByteBudget { get; init; } = 64 * 1024 * 1024; // 64 MB
 
     /// <summary>
-    /// Perf-6：单条消息 payload 的硬上限。超过该值的合法消息在入队前即被拒绝并进入死信，
+    /// P0-6：单条消息 payload 的硬上限。超过该值的合法消息在入队前即被拒绝并进入死信，
     /// 避免单条超大消息占满整个队列字节预算。
+    /// 该值同时作为 <see cref="Workers.Reliability.ByteBudget"/> 的 MaxSinglePayloadBytes：
+    /// 当单条消息字节数 ≤ 该值但 &gt; <see cref="ProcessingQueueByteBudget"/> 时，
+    /// 若队列空闲（无其他占用）则允许独占预算处理。
     /// </summary>
-    public int MaxSinglePayloadBytes { get; init; } = 128 * 1024; // 128 KB
+    public int MaxSinglePayloadBytes { get; init; } = 10 * 1024 * 1024; // 10 MB
 
     /// <summary>
     /// Perf-6：死信 payload 截断上限。死信流不需要保留完整原始 payload，

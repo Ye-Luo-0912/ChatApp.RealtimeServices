@@ -160,12 +160,20 @@ public static class RealtimeServicesRegistration
                 EnableDetailedErrors = options.EnableDetailedErrors,
                 ProcessingConcurrency = options.ProcessingConcurrency,
                 ProcessingQueueCapacity = options.ProcessingQueueCapacity,
+                // P0-6：补齐此前重建时遗漏的字段——字节预算与过载配置，
+                // 避免 InstanceId=auto 时这些配置被静默重置为默认值。
+                ProcessingQueueByteBudget = options.ProcessingQueueByteBudget,
+                MaxSinglePayloadBytes = options.MaxSinglePayloadBytes,
+                DeadLetterPayloadLimitBytes = options.DeadLetterPayloadLimitBytes,
                 HistoryQueryConcurrency = options.HistoryQueryConcurrency,
                 HistoryQueryQueueCapacity = options.HistoryQueryQueueCapacity,
                 HistoryQueryWorkerSlots = options.HistoryQueryWorkerSlots,
                 TransientRetryDelayMs = options.TransientRetryDelayMs,
                 PoisonDeliveryThreshold = options.PoisonDeliveryThreshold,
-                ReadinessHeartbeatTimeoutMs = options.ReadinessHeartbeatTimeoutMs
+                ReadinessHeartbeatTimeoutMs = options.ReadinessHeartbeatTimeoutMs,
+                OverloadEnqueueTimeoutMs = options.OverloadEnqueueTimeoutMs,
+                OverloadGateTimeoutMs = options.OverloadGateTimeoutMs,
+                OverloadRetryAfterMs = options.OverloadRetryAfterMs
             }
             : options;
     }

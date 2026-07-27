@@ -35,10 +35,16 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
         RealtimeEvent eventToPublish,
         CancellationToken ct = default)
     {
+        // P0-8：v3 指纹覆盖会话、回复、转发、@提及等字段
         var fingerprint = RealtimeMessageFingerprint.Compute(
             message.ReceiverUserId,
             message.Content,
-            message.AttachmentIds);
+            message.AttachmentIds,
+            message.ConversationId,
+            message.ReplyToMessageId,
+            message.ForwardedFromMessageId,
+            message.MentionedUserIds,
+            message.MentionedRoles);
 
         // P1-4：EfCore 路径不绑定附件，但仍需要把应用层传入的 Payload 对象物化为 PayloadJson，
         // 否则 Outbox 行会缺少 payload。附件参数为 null，保留原 payload 字段不变。
@@ -59,7 +65,12 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
                 m.MessageId,
                 m.ReceiverUserId,
                 m.Content,
-                m.ContentFingerprint
+                m.ContentFingerprint,
+                m.ConversationId,
+                m.ReplyToMessageId,
+                m.ForwardedFromMessageId,
+                m.MentionedUserIds,
+                m.MentionedRoles
             })
             .SingleOrDefaultAsync(ct)
             .ConfigureAwait(false);
@@ -72,7 +83,12 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
                     existing.ReceiverUserId,
                     existing.Content,
                     Array.Empty<string>(),
-                    fingerprint))
+                    fingerprint,
+                    existing.ConversationId,
+                    existing.ReplyToMessageId,
+                    existing.ForwardedFromMessageId,
+                    existing.MentionedUserIds,
+                    existing.MentionedRoles))
             {
                 await transaction.RollbackAsync(ct).ConfigureAwait(false);
                 _logger.LogWarning(
@@ -154,7 +170,12 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
                     m.MessageId,
                     m.ReceiverUserId,
                     m.Content,
-                    m.ContentFingerprint
+                    m.ContentFingerprint,
+                    m.ConversationId,
+                    m.ReplyToMessageId,
+                    m.ForwardedFromMessageId,
+                    m.MentionedUserIds,
+                    m.MentionedRoles
                 })
                 .SingleOrDefaultAsync(ct)
                 .ConfigureAwait(false);
@@ -167,7 +188,12 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
                     concurrent.ReceiverUserId,
                     concurrent.Content,
                     Array.Empty<string>(),
-                    fingerprint))
+                    fingerprint,
+                    concurrent.ConversationId,
+                    concurrent.ReplyToMessageId,
+                    concurrent.ForwardedFromMessageId,
+                    concurrent.MentionedUserIds,
+                    concurrent.MentionedRoles))
             {
                 _logger.LogWarning(
                     "入站消息幂等键内容冲突（并发写入检测）。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}",

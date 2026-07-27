@@ -17,5 +17,10 @@ public enum RealtimeMessagePersistKind : byte
     /// <summary>
     /// 发送方不是会话成员等权限拒绝。事务已回滚。
     /// </summary>
-    NotAllowed = 4
+    NotAllowed = 4,
+
+    /// <summary>
+    /// P0-2：发送方或接收方用户已注销（Deleting / Deleted）。事务已回滚。
+    /// </summary>
+    UserDeleted = 5
 }

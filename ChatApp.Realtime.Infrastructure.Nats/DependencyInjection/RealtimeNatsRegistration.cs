@@ -6,6 +6,7 @@ using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Abstractions.Routing;
+using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Nats.Configuration;
 using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Nats.JetStream;
@@ -78,7 +79,10 @@ public static class RealtimeNatsRegistration
                     sp.GetRequiredService<JetStreamContextManager>(),
                     sp.GetService<IGatewayDirectory>(),
                     queueOptions.RealtimeEventsShardSubjectPattern,
-                    sp.GetService<RoutingMetrics>());
+                    sp.GetService<RoutingMetrics>(),
+                    sp.GetService<IWatcherGatewayDirectory>(),
+                    sp.GetService<RealtimeMetrics>(),
+                    sp.GetService<ILogger<JetStreamRealtimeEventPublisher>>());
             });
             services.RemoveAll<IRealtimeEventConsumer>();
             services.AddSingleton<IRealtimeEventConsumer, JetStreamRealtimeEventConsumer>();
@@ -105,7 +109,9 @@ public static class RealtimeNatsRegistration
                     sp.GetRequiredService<ILogger<NatsRealtimeEventPublisher>>(),
                     sp.GetService<IGatewayDirectory>(),
                     queueOptions.RealtimeEventsShardSubjectPattern,
-                    sp.GetService<RoutingMetrics>());
+                    sp.GetService<RoutingMetrics>(),
+                    sp.GetService<IWatcherGatewayDirectory>(),
+                    sp.GetService<RealtimeMetrics>());
             });
             services.RemoveAll<IRealtimeEventConsumer>();
             services.AddSingleton<IRealtimeEventConsumer, NatsRealtimeEventConsumer>();

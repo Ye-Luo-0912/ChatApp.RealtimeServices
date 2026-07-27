@@ -73,13 +73,14 @@ public sealed class MessageReceiptWorker : BackgroundService
 
     private async Task ProcessPartitionAsync(
         int partition,
-        ChannelReader<MessageReceiptEnvelope> reader,
+        ChannelReader<LeasedEnvelope<MessageReceiptEnvelope>> reader,
         CancellationToken ct)
     {
-        await foreach (var envelope in reader
+        await foreach (var leased in reader
                            .ReadAllAsync(ct)
                            .ConfigureAwait(false))
         {
+            var envelope = leased.Envelope;
             using var activity = RealtimeTelemetry.StartConsumer(
                 "message_receipt.process",
                 envelope.ParentContext);
@@ -108,6 +109,9 @@ public sealed class MessageReceiptWorker : BackgroundService
             }
             finally
             {
+                // P0-6：lease 在处理完成时释放。MessageReceiptWorker 未启用字节预算，lease 始终为 null。
+                if (leased.Lease is not null)
+                    await leased.Lease.DisposeAsync().ConfigureAwait(false);
                 _readinessState.MarkHeartbeat(WorkerName);
                 _metrics.RecordProcessingDuration(
                     Stopwatch.GetElapsedTime(started));

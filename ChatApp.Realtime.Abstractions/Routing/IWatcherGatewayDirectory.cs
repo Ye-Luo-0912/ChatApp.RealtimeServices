@@ -68,4 +68,20 @@ public interface IWatcherGatewayDirectory
         IReadOnlyList<long> watchedUserIds,
         string instanceId,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 列出当前所有已知活跃的 Gateway shard ID（基于 watcher 注册关系维护的全局活跃集合）。
+    /// <para>
+    /// P0-9：用于 <see cref="IGatewayDirectory"/> 查询失败时枚举所有活跃 Gateway shards，
+    /// 分别发布到各自 shard subject，避免分片模式下广播 fallback 无人消费。
+    /// </para>
+    /// <para>
+    /// 实现应返回最近仍在注册（租约未过期）的 Gateway 实例 ID 集合。
+    /// 查询失败时返回空集合而非抛异常，调用方据此再次回退到广播。
+    /// </para>
+    /// </summary>
+    /// <param name="cancellationToken">取消令牌。</param>
+    /// <returns>活跃 Gateway 实例 ID 集合；无活跃实例或查询失败时返回空集合。</returns>
+    Task<IReadOnlyList<string>> ListActiveShardsAsync(
+        CancellationToken cancellationToken = default);
 }

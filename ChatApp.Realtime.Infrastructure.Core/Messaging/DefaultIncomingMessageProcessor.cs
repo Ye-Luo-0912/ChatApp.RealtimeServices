@@ -101,10 +101,16 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
         // LongTerm-1：独立幂等账本检查。解耦幂等性依据与 messages 行生命周期：
         // 消息行被 retention GC 或账号删除清理后，账本仍保留命令处理结果，
         // 防止 JetStream replay 将旧命令当作新消息重新写入。
+        // P0-8：v3 指纹覆盖会话、回复、转发、@提及等字段，区分真重放与内容冲突
         var fingerprint = RealtimeMessageFingerprint.Compute(
             receiverUserId,
             command.Content,
-            command.AttachmentIds);
+            command.AttachmentIds,
+            conversationId,
+            command.ReplyToMessageId,
+            command.ForwardedFromMessageId,
+            command.MentionedUserIds,
+            command.MentionedRoles);
 
         var ledgerEntry = await _idempotencyLedger
             .FindAsync(command.SenderUserId, command.ClientMessageId, ct)
@@ -254,6 +260,16 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                 MessageFailureKind.Permanent);
         }
 
+        if (persisted.IsUserDeleted)
+        {
+            _metrics.RecordProcessingFailure("user_deleted");
+            // P0-2：事务内 advisory lock 检测到用户正在删除/已删除，不记录账本。
+            return MessageProcessResult.Failed(
+                "user_deleted",
+                "用户已注销，消息未写入。",
+                MessageFailureKind.Permanent);
+        }
+
         _outboxSignal.Notify();
 
         if (!persisted.IsNew)
@@ -357,7 +373,8 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
         if (string.IsNullOrWhiteSpace(command.Content)
             && command.AttachmentIds is not { Count: > 0 })
             return MessageProcessResult.Failed("empty_content", "入站消息内容不能为空。");
-        if (command.Content.Length > 65_536)
+        // P0-8：修复 attachment-only 消息 Content=null 时访问 .Length 的 NRE
+        if ((command.Content?.Length ?? 0) > 65_536)
             return MessageProcessResult.Failed("content_too_large", "入站消息内容不能超过 65536 个字符。");
         if (command.AttachmentIds is { Count: > 0 })
         {
@@ -426,6 +443,41 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             return MessageProcessResult.Failed(
                 "invalid_forwarded_from",
                 "缺少转发原消息编号时不能携带转发元数据。");
+        }
+
+        // P0-8：@提及用户与角色校验
+        if (command.MentionedUserIds is { Count: > 0 })
+        {
+            if (command.MentionedUserIds.Count > 50)
+                return MessageProcessResult.Failed(
+                    "too_many_mentions",
+                    "单条消息 @提及用户数不能超过 50。");
+            // 去重校验：不允许重复的用户 Id
+            var seenMentionedUsers = new HashSet<long>();
+            foreach (var mentionedUserId in command.MentionedUserIds)
+            {
+                if (!seenMentionedUsers.Add(mentionedUserId))
+                    return MessageProcessResult.Failed(
+                        "duplicate_mentioned_user",
+                        "@提及用户列表不能包含重复的用户编号。");
+            }
+        }
+
+        if (command.MentionedRoles is { Count: > 0 })
+        {
+            if (command.MentionedRoles.Count > 5)
+                return MessageProcessResult.Failed(
+                    "too_many_mentioned_roles",
+                    "单条消息 @提及角色数不能超过 5。");
+            foreach (var role in command.MentionedRoles)
+            {
+                // 仅允许 "all" 和 "admin" 两个角色
+                if (!string.Equals(role, "all", StringComparison.Ordinal)
+                    && !string.Equals(role, "admin", StringComparison.Ordinal))
+                    return MessageProcessResult.Failed(
+                        "invalid_mentioned_role",
+                        "@提及角色仅允许 'all' 和 'admin'。");
+            }
         }
 
         return null;

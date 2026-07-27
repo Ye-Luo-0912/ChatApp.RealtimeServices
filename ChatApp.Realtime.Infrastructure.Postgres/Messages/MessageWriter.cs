@@ -130,7 +130,9 @@ internal sealed class MessageWriter
         var ct = _session.CancellationToken;
         await using var command = new NpgsqlCommand(
             $"""
-             SELECT message_id, receiver_user_id, content, content_fingerprint
+             SELECT message_id, receiver_user_id, content, content_fingerprint,
+                    conversation_id, reply_to_message_id, forwarded_from_message_id,
+                    mentioned_user_ids, mentioned_roles
              FROM {_session.Schema.MessagesTableSql}
              WHERE sender_user_id = @sender_user_id AND client_message_id = @client_message_id
              """,
@@ -142,11 +144,17 @@ internal sealed class MessageWriter
         if (!await reader.ReadAsync(ct).ConfigureAwait(false))
             throw new InvalidOperationException("检测到消息冲突，但无法读取已有消息编号。");
 
+        // P0-8：读取 v3 指纹覆盖字段，用于旧版本指纹的重算比对
         return new ExistingMessage(
             reader.GetString(0),
             reader.GetInt64(1),
             reader.GetString(2),
-            reader.IsDBNull(3) ? null : reader.GetString(3));
+            reader.IsDBNull(3) ? null : reader.GetString(3),
+            reader.IsDBNull(4) ? null : reader.GetString(4),
+            reader.IsDBNull(5) ? null : reader.GetString(5),
+            reader.IsDBNull(6) ? null : reader.GetString(6),
+            reader.IsDBNull(7) ? null : reader.GetFieldValue<long[]>(7),
+            reader.IsDBNull(8) ? null : reader.GetFieldValue<string[]>(8));
     }
 
     public async Task<IReadOnlyList<string>> ListAttachmentIdsAsync(string messageId)
@@ -173,5 +181,10 @@ internal sealed class MessageWriter
         string MessageId,
         long ReceiverUserId,
         string Content,
-        string? Fingerprint);
+        string? Fingerprint,
+        string? ConversationId,
+        string? ReplyToMessageId,
+        string? ForwardedFromMessageId,
+        long[]? MentionedUserIds,
+        string[]? MentionedRoles);
 }

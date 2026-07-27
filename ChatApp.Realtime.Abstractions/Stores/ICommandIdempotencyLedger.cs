@@ -22,7 +22,13 @@ public interface ICommandIdempotencyLedger
         CancellationToken ct = default);
 
     /// <summary>
-    /// 记录命令处理结果。幂等（PK 冲突时更新 result_kind / message_id）。
+    /// 记录命令处理结果。P0-3：使用 ON CONFLICT DO NOTHING 保护 canonical 记录。
+    /// <para>
+    /// 首次写入（PK 不冲突）记录 Created 并成为 canonical；后续重复投递不再覆盖
+    /// 已有 canonical 行——内部读取 canonical 的 content_fingerprint 判断是重放
+    /// （指纹匹配）还是冲突（指纹不一致），仅记录审计日志。旧实现使用
+    /// ON CONFLICT DO UPDATE 会被并发请求用不同内容覆盖原始 canonical 记录。
+    /// </para>
     /// </summary>
     Task RecordAsync(
         string commandId,

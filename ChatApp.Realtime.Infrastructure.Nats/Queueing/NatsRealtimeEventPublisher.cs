@@ -4,6 +4,7 @@ using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Abstractions.Routing;
+using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
 using Microsoft.Extensions.Logging;
@@ -15,9 +16,11 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
     private readonly RealtimeQueueOptions _options;
     private readonly NatsConnectionClient _connectionClient;
     private readonly IGatewayDirectory _gatewayDirectory;
+    private readonly IWatcherGatewayDirectory _watcherGatewayDirectory;
     private readonly string? _shardSubjectPattern;
     private readonly ILogger<NatsRealtimeEventPublisher> _logger;
     private readonly RoutingMetrics? _routingMetrics;
+    private readonly RealtimeMetrics? _realtimeMetrics;
 
     public NatsRealtimeEventPublisher(
         RealtimeQueueOptions options,
@@ -25,16 +28,20 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
         ILogger<NatsRealtimeEventPublisher> logger,
         IGatewayDirectory? gatewayDirectory = null,
         string? shardSubjectPattern = null,
-        RoutingMetrics? routingMetrics = null)
+        RoutingMetrics? routingMetrics = null,
+        IWatcherGatewayDirectory? watcherGatewayDirectory = null,
+        RealtimeMetrics? realtimeMetrics = null)
     {
         _options = options;
         _connectionClient = connectionClient;
         _logger = logger;
         _gatewayDirectory = gatewayDirectory ?? NullGatewayDirectory.Instance;
+        _watcherGatewayDirectory = watcherGatewayDirectory ?? NullWatcherGatewayDirectory.Instance;
         _shardSubjectPattern = string.IsNullOrWhiteSpace(shardSubjectPattern)
             ? null
             : shardSubjectPattern;
         _routingMetrics = routingMetrics;
+        _realtimeMetrics = realtimeMetrics;
     }
 
     public async Task PublishAsync(RealtimeEvent evt, CancellationToken ct = default)
@@ -67,15 +74,35 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
 
         // 分片模式：查询目标用户在线 Gateway 集合并定向发布。
         var sw = Stopwatch.StartNew();
-        var gateways = await _gatewayDirectory
-            .GetOnlineGatewaysAsync(evt.TargetUserId, ct)
+        var lookup = await _gatewayDirectory
+            .GetOnlineGatewaysWithStatusAsync(evt.TargetUserId, ct)
             .ConfigureAwait(false);
         sw.Stop();
-        _routingMetrics?.RecordDirectoryQuery("gateway", "single", sw.Elapsed, gateways.Count);
+        _routingMetrics?.RecordDirectoryQuery("gateway", "single", sw.Elapsed, lookup.Gateways.Count);
 
+        // P0-9：根据查询状态分类处理。
+        // - Success：定向发布到命中的 Gateway 实例。
+        // - UserOffline：查询成功但用户离线，正常不投递。
+        // - LookupFailure / PartialLookupFailure：枚举所有活跃 shards 分别发布，避免广播 fallback 无人消费。
+        if (lookup.Kind is GatewayLookupResultKind.LookupFailure
+            or GatewayLookupResultKind.PartialLookupFailure)
+        {
+            await PublishToAllShardsAsync(json, evt, "lookup_failure", ct)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        if (lookup.Kind == GatewayLookupResultKind.UserOffline)
+        {
+            // 查询成功但用户离线：正常不投递（避免无谓 fanout）。
+            _routingMetrics?.RecordBroadcastFallback("realtime", "user_offline");
+            return;
+        }
+
+        var gateways = lookup.Gateways;
         if (gateways.Count == 0)
         {
-            // 回退到广播。
+            // 兜底：理论上不应到达（UserOffline 已处理），保持原广播回退行为以容错。
             _routingMetrics?.RecordBroadcastFallback("realtime", "empty_directory");
             await PublishToSubjectAsync(_options.Topics.RealtimeEvents, json, evt, ct)
                 .ConfigureAwait(false);
@@ -119,13 +146,13 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
 
         // 分片模式：批量查询所有目标用户的在线 Gateway 集合，按实例聚合投递。
         var sw = Stopwatch.StartNew();
-        var gatewayMap = await _gatewayDirectory
-            .GetOnlineGatewaysManyAsync(evt.TargetUserIds, ct)
+        var lookup = await _gatewayDirectory
+            .GetOnlineGatewaysManyWithStatusAsync(evt.TargetUserIds, ct)
             .ConfigureAwait(false);
         sw.Stop();
 
         var instances = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var kvp in gatewayMap)
+        foreach (var kvp in lookup.GatewayMap)
         {
             foreach (var instanceId in kvp.Value)
             {
@@ -136,9 +163,18 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
 
         _routingMetrics?.RecordDirectoryQuery("gateway", "many", sw.Elapsed, instances.Count);
 
+        // P0-9：批量查询失败时枚举所有活跃 shards 分别发布。
+        if (lookup.Kind is GatewayLookupResultKind.LookupFailure
+            or GatewayLookupResultKind.PartialLookupFailure)
+        {
+            await PublishToAllShardsAsync(json, evt, "partial_lookup_failure", ct)
+                .ConfigureAwait(false);
+            return;
+        }
+
         if (instances.Count == 0)
         {
-            // 路由目录为空（所有目标离线或查询失败）：回退到广播，避免事件丢失。
+            // 路由目录为空（所有目标离线）：回退到广播，避免事件丢失。
             _routingMetrics?.RecordBroadcastFallback("realtime", "empty_directory");
             await PublishToSubjectAsync(_options.Topics.RealtimeEvents, json, evt, ct)
                 .ConfigureAwait(false);
@@ -154,6 +190,64 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
 
         _routingMetrics?.RecordShardPublish("realtime", "many", instances.Count);
         _routingMetrics?.RecordFanout(evt.TargetUserIds!.Length, instances.Count);
+    }
+
+    /// <summary>
+    /// P0-9：枚举所有已知活跃 Gateway shards，分别发布到各自 shard subject。
+    /// <para>
+    /// 用于 <see cref="GatewayLookupResultKind.LookupFailure"/> /
+    /// <see cref="GatewayLookupResultKind.PartialLookupFailure"/> 时避免分片模式下广播 fallback 无人消费。
+    /// 若活跃 shards 为空（目录查询也失败），最终回退到广播 subject 保证不丢事件。
+    /// </para>
+    /// </summary>
+    /// <param name="json">已序列化的事件载荷。</param>
+    /// <param name="evt">原始事件（用于日志/subject 计算）。</param>
+    /// <param name="reason">fallback 原因，用于指标标签。</param>
+    /// <param name="ct">取消令牌。</param>
+    private async Task PublishToAllShardsAsync(
+        string json,
+        RealtimeEvent evt,
+        string reason,
+        CancellationToken ct)
+    {
+        var shards = await _watcherGatewayDirectory
+            .ListActiveShardsAsync(ct)
+            .ConfigureAwait(false);
+
+        if (shards.Count == 0)
+        {
+            // 活跃 shards 也为空（双重故障）：最终回退到广播，至少尝试投递一次。
+            _routingMetrics?.RecordBroadcastFallback("realtime", "no_active_shards");
+            _realtimeMetrics?.RecordShardFallback(reason, 0);
+            _logger.LogWarning(
+                "分片 fallback 无活跃 shards，回退到广播。事件类型={Type}；事件编号={EventId}；原因={Reason}",
+                evt.Type,
+                evt.EventId,
+                reason);
+            await PublishToSubjectAsync(_options.Topics.RealtimeEvents, json, evt, ct)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        _realtimeMetrics?.RecordShardFallback(reason, shards.Count);
+        _logger.LogWarning(
+            "路由目录查询失败，分片 fallback 到所有活跃 shards。事件类型={Type}；事件编号={EventId}；原因={Reason}；shard 数={Count}",
+            evt.Type,
+            evt.EventId,
+            reason,
+            shards.Count);
+
+        foreach (var instanceId in shards)
+        {
+            if (string.IsNullOrWhiteSpace(instanceId))
+                continue;
+
+            var subject = ShardedSubjectFormatter.Format(_shardSubjectPattern!, instanceId);
+            await PublishToSubjectAsync(subject, json, evt, ct)
+                .ConfigureAwait(false);
+        }
+
+        _routingMetrics?.RecordShardPublish("realtime", "fallback", shards.Count);
     }
 
     private async Task PublishToSubjectAsync(

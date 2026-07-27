@@ -7,6 +7,7 @@ using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
+using ChatApp.Realtime.Infrastructure.Postgres.Transactions;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -26,6 +27,50 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
     {
         _databaseClient = databaseClient;
         _databaseSchema = databaseSchema;
+    }
+
+    /// <summary>
+    /// P0-2：在事务内获取 actor 的共享 advisory lock 并检查生命周期状态。
+    /// 返回 null 表示通过（用户活跃），返回非空 string 表示错误码。
+    /// </summary>
+    private async Task<string?> CheckActorLifecycleInTxAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        long actorUserId,
+        CancellationToken ct)
+    {
+        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
+                connection, transaction, _databaseSchema, actorUserId, ct)
+            .ConfigureAwait(false))
+            return "user_deleted";
+        return null;
+    }
+
+    /// <summary>
+    /// P0-2：批量检查目标用户是否已注销（不获取 advisory lock，仅事务内读 tombstone）。
+    /// 返回 null 表示全部活跃，返回非空 string 表示错误码。
+    /// </summary>
+    private async Task<string?> CheckTargetUsersLifecycleInTxAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        IReadOnlyList<long> userIds,
+        CancellationToken ct)
+    {
+        if (userIds.Count == 0)
+            return null;
+
+        await using var cmd = new NpgsqlCommand(
+            $"""
+             SELECT COUNT(*)
+             FROM {_databaseSchema.UserDeletionTombstonesTableSql}
+             WHERE user_id = ANY(@user_ids);
+             """,
+            connection,
+            transaction);
+        cmd.Parameters.AddWithValue("user_ids", userIds.ToArray());
+
+        var count = (long)(await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false) ?? 0);
+        return count > 0 ? "target_user_deleted" : null;
     }
 
     public async Task<GroupCreatePersistResult> CreateGroupAsync(
@@ -79,6 +124,23 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                     "request_conflict",
                     "请求编号已用于不同操作。");
             return GroupCreatePersistResult.Ok(existing.ConversationId!, null, null);
+        }
+
+        // P0-2：事务内检查 actor 和目标用户生命周期，防止已注销用户建群或被加入群。
+        var createActorError = await CheckActorLifecycleInTxAsync(
+            connection, transaction, creatorUserId, ct).ConfigureAwait(false);
+        if (createActorError is not null)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupCreatePersistResult.Fail(createActorError, "用户已注销，操作被拒绝。");
+        }
+
+        var createTargetError = await CheckTargetUsersLifecycleInTxAsync(
+            connection, transaction, members, ct).ConfigureAwait(false);
+        if (createTargetError is not null)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupCreatePersistResult.Fail(createTargetError, "目标用户已注销，无法添加。");
         }
 
         await using (var insertConv = new NpgsqlCommand(
@@ -243,6 +305,23 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             return GroupMutatePersistResult.Ok(existing.ConversationId!, null, null);
         }
 
+        // P0-2：事务内检查 actor 和目标用户生命周期。
+        var addActorError = await CheckActorLifecycleInTxAsync(
+            connection, transaction, actorUserId, ct).ConfigureAwait(false);
+        if (addActorError is not null)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupMutatePersistResult.Fail(addActorError, "用户已注销，操作被拒绝。");
+        }
+
+        var addTargetError = await CheckTargetUsersLifecycleInTxAsync(
+            connection, transaction, toAdd, ct).ConfigureAwait(false);
+        if (addTargetError is not null)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupMutatePersistResult.Fail(addTargetError, "目标用户已注销，无法添加。");
+        }
+
         var (title, actorRole, existingCount) = await LoadGroupContextAsync(
                 connection,
                 transaction,
@@ -375,6 +454,15 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             .BeginTransactionAsync(ct)
             .ConfigureAwait(false);
 
+        // P0-2：事务内检查 actor 生命周期。
+        var removeActorError = await CheckActorLifecycleInTxAsync(
+            connection, transaction, actorUserId, ct).ConfigureAwait(false);
+        if (removeActorError is not null)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupMutatePersistResult.Fail(removeActorError, "用户已注销，操作被拒绝。");
+        }
+
         var existing = await TryReadGroupMutationRequestAsync(
                 connection,
                 transaction,
@@ -505,6 +593,15 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         await using var transaction = await connection
             .BeginTransactionAsync(ct)
             .ConfigureAwait(false);
+
+        // P0-2：事务内检查 actor 生命周期。
+        var leaveActorError = await CheckActorLifecycleInTxAsync(
+            connection, transaction, actorUserId, ct).ConfigureAwait(false);
+        if (leaveActorError is not null)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupMutatePersistResult.Fail(leaveActorError, "用户已注销，操作被拒绝。");
+        }
 
         var existing = await TryReadGroupMutationRequestAsync(
                 connection,
@@ -639,6 +736,15 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         await using var transaction = await connection
             .BeginTransactionAsync(ct)
             .ConfigureAwait(false);
+
+        // P0-2：事务内检查 actor 生命周期。
+        var changeRoleActorError = await CheckActorLifecycleInTxAsync(
+            connection, transaction, actorUserId, ct).ConfigureAwait(false);
+        if (changeRoleActorError is not null)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupMutatePersistResult.Fail(changeRoleActorError, "用户已注销，操作被拒绝。");
+        }
 
         var existing = await TryReadGroupMutationRequestAsync(
                 connection,
@@ -827,6 +933,15 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             .BeginTransactionAsync(ct)
             .ConfigureAwait(false);
 
+        // P0-2：事务内检查 actor 生命周期。
+        var dissolveActorError = await CheckActorLifecycleInTxAsync(
+            connection, transaction, actorUserId, ct).ConfigureAwait(false);
+        if (dissolveActorError is not null)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupMutatePersistResult.Fail(dissolveActorError, "用户已注销，操作被拒绝。");
+        }
+
         var existing = await TryReadGroupMutationRequestAsync(
                 connection,
                 transaction,
@@ -947,6 +1062,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
              SELECT members.user_id, members.role, members.joined_at_ms
              FROM {_databaseSchema.ConversationMembersTableSql} AS members
              WHERE members.conversation_id = @conversation_id
+               AND members.left_at_ms IS NULL
                AND EXISTS (
                    SELECT 1
                    FROM {_databaseSchema.ConversationMembersTableSql} AS actor
@@ -1030,7 +1146,10 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                    AND m.left_at_ms IS NULL
              WHERE c.conversation_id = @conversation_id
                AND c.type = @group_type
-             FOR UPDATE OF m;
+               AND c.dissolved_at_ms IS NULL
+             -- P0-7：同时锁 conversations 与操作者成员行，使所有群写操作在群级别串行化，
+             -- 避免不同管理员并发读取相同 member_count 后突破群人数上限。
+             FOR UPDATE OF c, m;
              """,
             connection,
             transaction);
@@ -1147,6 +1266,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
              SELECT role
              FROM {_databaseSchema.ConversationMembersTableSql}
              WHERE conversation_id = @conversation_id AND user_id = @user_id
+               AND left_at_ms IS NULL
              FOR UPDATE;
              """,
             connection,
@@ -1193,6 +1313,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
              SELECT user_id, role, joined_at_ms
              FROM {_databaseSchema.ConversationMembersTableSql}
              WHERE conversation_id = @conversation_id
+               AND left_at_ms IS NULL
              ORDER BY role ASC, joined_at_ms ASC, user_id ASC;
              """,
             connection,
@@ -1224,6 +1345,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
              SELECT user_id
              FROM {_databaseSchema.ConversationMembersTableSql}
              WHERE conversation_id = @conversation_id
+               AND left_at_ms IS NULL
              ORDER BY user_id;
              """,
             connection,

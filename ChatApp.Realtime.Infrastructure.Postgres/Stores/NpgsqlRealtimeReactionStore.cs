@@ -11,6 +11,7 @@ using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using ChatApp.Realtime.Infrastructure.Postgres.Messaging;
 using ChatApp.Realtime.Infrastructure.Postgres.Outbox;
 using ChatApp.Realtime.Infrastructure.Postgres.Projections;
+using ChatApp.Realtime.Infrastructure.Postgres.Transactions;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -55,6 +56,16 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         await using var transaction = await connection
             .BeginTransactionAsync(ct)
             .ConfigureAwait(false);
+
+        // P0-2：事务内检查 actor 生命周期，防止已注销用户添加 reaction。
+        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
+                connection, transaction, _databaseSchema, actorUserId, ct)
+            .ConfigureAwait(false))
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return new MessageReactionPersistResult(
+                MessageReactionPersistStatus.NotAllowed, messageId);
+        }
 
         var access = await TryLockMessageAccessAsync(
                 connection,
@@ -255,6 +266,16 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         await using var transaction = await connection
             .BeginTransactionAsync(ct)
             .ConfigureAwait(false);
+
+        // P0-2：事务内检查 actor 生命周期，防止已注销用户移除 reaction。
+        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
+                connection, transaction, _databaseSchema, actorUserId, ct)
+            .ConfigureAwait(false))
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return new MessageReactionPersistResult(
+                MessageReactionPersistStatus.NotAllowed, messageId);
+        }
 
         var access = await TryLockMessageAccessAsync(
                 connection,

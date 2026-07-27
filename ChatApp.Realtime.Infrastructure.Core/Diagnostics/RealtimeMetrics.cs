@@ -38,6 +38,7 @@ public sealed class RealtimeMetrics : IDisposable
     private readonly Histogram<double> _processingDuration;
     private readonly Histogram<double> _historyQueryDuration;
     private readonly Counter<long> _overloadReplyCounter;
+    private readonly Counter<long> _shardFallbackCounter;
 
     private long _persisted;
     private long _duplicates;
@@ -116,6 +117,7 @@ public sealed class RealtimeMetrics : IDisposable
         _processingDuration = _meter.CreateHistogram<double>("realtime.messages.processing.duration", "ms");
         _historyQueryDuration = _meter.CreateHistogram<double>("realtime.history.duration", "ms");
         _overloadReplyCounter = _meter.CreateCounter<long>("realtime.overload.replies");
+        _shardFallbackCounter = _meter.CreateCounter<long>("realtime.routing.shard_fallback");
     }
 
     public void RecordPersisted()
@@ -334,6 +336,19 @@ public sealed class RealtimeMetrics : IDisposable
             1,
             new KeyValuePair<string, object?>("queue_kind", queueKind),
             new KeyValuePair<string, object?>("source", source));
+    }
+
+    /// <summary>
+    /// P0-9：记录一次分片 fallback 事件（路由目录查询失败时枚举所有活跃 shards 分别发布）。
+    /// </summary>
+    /// <param name="reason">fallback 原因：<c>lookup_failure</c> / <c>partial_lookup_failure</c> 等。</param>
+    /// <param name="shardCount">本次 fallback 实际命中的活跃 shard 数量；为 0 表示最终回退到广播。</param>
+    public void RecordShardFallback(string reason, int shardCount)
+    {
+        _shardFallbackCounter.Add(
+            1,
+            new KeyValuePair<string, object?>("reason", reason),
+            new KeyValuePair<string, object?>("shard_count", Math.Max(0, shardCount)));
     }
 
     public RealtimeMetricsSnapshot GetSnapshot() => new(

@@ -45,4 +45,13 @@ public sealed class NullWatcherGatewayDirectory : IWatcherGatewayDirectory
     {
         return Task.CompletedTask;
     }
+
+    /// <summary>
+    /// P0-9：空实现返回空集合，使发布方在无目录时再次回退到广播。
+    /// </summary>
+    public Task<IReadOnlyList<string>> ListActiveShardsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
+    }
 }
