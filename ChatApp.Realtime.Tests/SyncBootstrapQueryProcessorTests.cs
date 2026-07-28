@@ -1463,9 +1463,14 @@ public sealed class SyncBootstrapQueryProcessorTests
         }
 
         public Task<RealtimeHistoryMessage?> TryGetByIdAsync(
+            long userId,
             string messageId,
             CancellationToken ct = default) =>
             Task.FromResult(_messages.FirstOrDefault(m => m.MessageId == messageId));
+
+        public Task<bool> CanAccessMessageAsync(
+            long userId, string messageId, CancellationToken ct = default) =>
+            Task.FromResult(_messages.Any(m => m.MessageId == messageId));
 
         public Task<IReadOnlyDictionary<string, ResolvedSyncWatermark>> ResolveSyncWatermarksAsync(
             IReadOnlyList<ConversationSyncWatermarkInput> watermarks,

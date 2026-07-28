@@ -1,3 +1,4 @@
+using System.Linq;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using Npgsql;
@@ -116,5 +117,69 @@ internal static class UserLifecycleAdvisoryLock
         var state = await GetStateInTxAsync(connection, transaction, schema, userId, ct)
             .ConfigureAwait(false);
         return state == UserLifecycleState.Active;
+    }
+
+    /// <summary>
+    /// P0-2 / P0-4：批量获取多个用户的共享生命周期锁并检查活跃状态。
+    /// <para>
+    /// 按 userId 升序获取锁以避免死锁（消除 A→B 与 B→A 并发写入之间的死锁环）。
+    /// 用一条 SQL（UNNEST）获取全部 advisory locks，一条 SQL 批量查询 tombstone。
+    /// </para>
+    /// <para>
+    /// 返回 false 时，锁已在事务级别获取（事务回滚会自动释放），调用方应中止操作。
+    /// </para>
+    /// </summary>
+    public static async Task<bool> AcquireSharedAndCheckActiveManyAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        RealtimeDatabaseSchema schema,
+        IReadOnlyCollection<long> userIds,
+        CancellationToken ct)
+    {
+        if (userIds.Count == 0)
+            return true;
+
+        // 去重 + 按 userId 升序排序（避免死锁）
+        var sortedIds = userIds.Distinct().OrderBy(id => id).ToArray();
+
+        // 在 C# 中预计算 advisory lock 键（namespace XOR user_id），保持与单用户版本
+        // CombineKey 一致，避免 SQL 端 XOR 运算符歧义（PostgreSQL 中 # 为位异或，^ 为幂运算）。
+        var keys = new long[sortedIds.Length];
+        for (var i = 0; i < sortedIds.Length; i++)
+            keys[i] = CombineKey(sortedIds[i]);
+
+        // 一条 SQL 获取全部 advisory locks（UNNEST 保留数组顺序，按 userId 升序获取）
+        await using (var lockCmd = new NpgsqlCommand(
+                         """
+                         SELECT pg_advisory_xact_lock_shared(t.key)
+                         FROM UNNEST(@keys) AS t(key);
+                         """,
+                         connection,
+                         transaction))
+        {
+            lockCmd.Parameters.AddWithValue("keys", keys);
+            await lockCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+
+        // 一条 SQL 批量查询 tombstone。tombstone 表中仅存在 Deleting/Deleted 行（无 Active 行），
+        // 因此只要返回任意行即表示对应用户非活跃，应拒绝写入。
+        await using var stateCmd = new NpgsqlCommand(
+            $"""
+             SELECT user_id, state
+             FROM {schema.UserDeletionTombstonesTableSql}
+             WHERE user_id = ANY(@user_ids);
+             """,
+            connection,
+            transaction);
+        stateCmd.Parameters.AddWithValue("user_ids", sortedIds);
+
+        await using var reader = await stateCmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            var stateByte = reader.GetByte(1);
+            if (stateByte != (byte)UserLifecycleState.Active)
+                return false;
+        }
+        return true;
     }
 }

@@ -64,7 +64,11 @@ public sealed class RealtimeSchemaMigrationRunner
         new Migration033_OutboxConversationAudience(),
         new Migration034_OutboxPayloadUtf8(),
         new Migration035_MembershipPeriods(),
-        new Migration036_AccountCleanupJobs()
+        new Migration036_AccountCleanupJobs(),
+        new Migration037_ArchiveSnapshotColumns(),
+        new Migration038_MembershipPeriodsBackfillAndIndex(),
+        new Migration039_UniqueConversationSequence(),
+        new Migration040_SenderSequenceAndRetentionFloor()
     ];
 
     public async Task MigrateAsync(

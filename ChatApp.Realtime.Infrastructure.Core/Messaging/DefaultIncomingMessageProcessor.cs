@@ -46,6 +46,11 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             return validationError;
         }
 
+        // P0-5：在入口生成服务端权威时间，覆盖任何客户端提供的值。
+        // 下游所有排序、序列、tip、retention 决策均使用 ServerReceivedAtMs，
+        // 客户端上报的 ClientOccurredAtMs 仅用于诊断/展示。
+        command = command with { ServerReceivedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() };
+
         // Perf-3：移除事务外的 tombstone 预检查（连接 #1）。
         // SaveAsync 事务内的 UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync
         // 已做权威检查，预检查只会引入 TOCTOU 竞态与额外数据库往返。
@@ -125,7 +130,7 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             ForwardedFromPreview = command.ForwardedFromPreview,
             MentionedUserIds = sanitizedMentions.UserIds,
             MentionedRoles = sanitizedMentions.Roles,
-            ReceivedAtMs = command.ReceivedAtMs
+            ReceivedAtMs = command.ServerReceivedAtMs
         };
 
         var evt = new RealtimeEvent
@@ -157,7 +162,7 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                 ReceiverUserId = receiverUserId,
                 ConversationId = conversationId,
                 Content = command.Content,
-                ReceivedAtMs = command.ReceivedAtMs,
+                ReceivedAtMs = command.ServerReceivedAtMs,
                 ReplyToMessageId = command.ReplyToMessageId,
                 ReplyToSenderUserId = command.ReplyToSenderUserId,
                 ReplyToPreview = command.ReplyToPreview,
@@ -167,7 +172,7 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                 MentionedUserIds = sanitizedMentions.UserIds,
                 MentionedRoles = sanitizedMentions.Roles
             },
-            OccurredAtMs = command.ReceivedAtMs,
+            OccurredAtMs = command.ServerReceivedAtMs,
             TraceParent = RealtimeTraceContext.CaptureTraceParent(),
             TraceState = RealtimeTraceContext.CaptureTraceState()
         };

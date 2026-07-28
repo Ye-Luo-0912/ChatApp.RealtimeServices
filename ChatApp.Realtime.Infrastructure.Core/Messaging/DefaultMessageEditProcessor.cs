@@ -39,6 +39,10 @@ public sealed class DefaultMessageEditProcessor : IMessageEditProcessor
         if (validationError is not null)
             return validationError;
 
+        // P0-5：在入口生成服务端变更时间，覆盖任何客户端提供的值。
+        // 编辑窗口判断与 changed_at_ms 推进均使用此服务端权威时间。
+        var serverMutationAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
         var maxAgeMs = _options.MaxAgeMs;
         if (maxAgeMs <= 0)
         {
@@ -60,7 +64,7 @@ public sealed class DefaultMessageEditProcessor : IMessageEditProcessor
                 command.SenderUserId,
                 command.SenderSessionId,
                 command.Content,
-                command.OccurredAtMs,
+                serverMutationAtMs,
                 maxAgeMs,
                 command.MentionedUserIds,
                 command.MentionedRoles,
@@ -83,7 +87,7 @@ public sealed class DefaultMessageEditProcessor : IMessageEditProcessor
                     result.ConversationId,
                     result.Content ?? command.Content,
                     result.EditVersion ?? 1,
-                    result.EditedAtMs ?? command.OccurredAtMs);
+                    result.EditedAtMs ?? serverMutationAtMs);
 
             case MessageEditPersistStatus.Unchanged:
                 return MessageEditResult.Success(
@@ -92,7 +96,7 @@ public sealed class DefaultMessageEditProcessor : IMessageEditProcessor
                     result.ConversationId,
                     result.Content ?? command.Content,
                     result.EditVersion ?? 1,
-                    result.EditedAtMs ?? command.OccurredAtMs);
+                    result.EditedAtMs ?? serverMutationAtMs);
 
             case MessageEditPersistStatus.NotFound:
                 return MessageEditResult.Failed(

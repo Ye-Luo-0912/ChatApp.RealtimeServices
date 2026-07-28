@@ -163,7 +163,8 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 access.ReceiverUserId,
                 emoji,
                 emojiCount,
-                occurredAtMs)
+                occurredAtMs,
+                access.ConversationSequence)
             .ConfigureAwait(false);
 
         await session.CommitAsync().ConfigureAwait(false);
@@ -286,7 +287,8 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 access.ReceiverUserId,
                 emoji,
                 emojiCount,
-                occurredAtMs)
+                occurredAtMs,
+                access.ConversationSequence)
             .ConfigureAwait(false);
 
         await session.CommitAsync().ConfigureAwait(false);
@@ -355,10 +357,12 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         long receiverUserId;
         string? conversationId;
         long? recalledAtMs;
+        long? conversationSequence;
 
         await using (var command = new NpgsqlCommand(
                          $"""
-                          SELECT sender_user_id, receiver_user_id, conversation_id, recalled_at_ms
+                          SELECT sender_user_id, receiver_user_id, conversation_id, recalled_at_ms,
+                                 conversation_sequence
                           FROM {_databaseSchema.MessagesTableSql}
                           WHERE message_id = @message_id
                           FOR UPDATE
@@ -375,13 +379,15 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
             receiverUserId = reader.GetInt64(1);
             conversationId = reader.IsDBNull(2) ? null : reader.GetString(2);
             recalledAtMs = reader.IsDBNull(3) ? null : reader.GetInt64(3);
+            conversationSequence = reader.IsDBNull(4) ? null : reader.GetInt64(4);
         }
 
         return new MessageAccess(
             senderUserId,
             receiverUserId,
             conversationId,
-            recalledAtMs);
+            recalledAtMs,
+            conversationSequence);
     }
 
     /// <summary>
@@ -546,7 +552,8 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         long messageReceiverUserId,
         string emoji,
         int emojiCount,
-        long occurredAtMs)
+        long occurredAtMs,
+        long? conversationSequence)
     {
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
@@ -575,6 +582,7 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 emoji,
                 emojiCount,
                 occurredAtMs,
+                conversationSequence,
                 traceParent,
                 traceState));
 
@@ -607,7 +615,8 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                     MessageReceiverUserId = messageReceiverUserId,
                     Emoji = emoji,
                     EmojiCount = emojiCount,
-                    OccurredAtMs = occurredAtMs
+                    OccurredAtMs = occurredAtMs,
+                    ConversationSequence = conversationSequence
                 },
                 RealtimeJsonSerializerContext.Default.RealtimeReactionAddedPayload);
         }
@@ -675,7 +684,8 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         long SenderUserId,
         long ReceiverUserId,
         string? ConversationId,
-        long? RecalledAtMs);
+        long? RecalledAtMs,
+        long? ConversationSequence);
 
     private enum ReactionAddStatus
     {

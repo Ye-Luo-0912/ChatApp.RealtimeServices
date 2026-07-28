@@ -39,6 +39,10 @@ public sealed class DefaultMessageRecallProcessor : IMessageRecallProcessor
         if (validationError is not null)
             return validationError;
 
+        // P0-5：在入口生成服务端变更时间，覆盖任何客户端提供的值。
+        // 撤回窗口判断与 changed_at_ms 推进均使用此服务端权威时间。
+        var serverMutationAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
         var maxAgeMs = _options.MaxAgeMs;
         if (maxAgeMs <= 0)
         {
@@ -59,7 +63,7 @@ public sealed class DefaultMessageRecallProcessor : IMessageRecallProcessor
                 command.MessageId.Trim(),
                 command.SenderUserId,
                 command.SenderSessionId,
-                command.OccurredAtMs,
+                serverMutationAtMs,
                 maxAgeMs,
                 ct)
             .ConfigureAwait(false);
@@ -77,14 +81,14 @@ public sealed class DefaultMessageRecallProcessor : IMessageRecallProcessor
                     command.RequestId,
                     result.MessageId,
                     result.ConversationId,
-                    result.RecalledAtMs ?? command.OccurredAtMs);
+                    result.RecalledAtMs ?? serverMutationAtMs);
 
             case MessageRecallPersistStatus.Unchanged:
                 return MessageRecallResult.Success(
                     command.RequestId,
                     result.MessageId,
                     result.ConversationId,
-                    result.RecalledAtMs ?? command.OccurredAtMs);
+                    result.RecalledAtMs ?? serverMutationAtMs);
 
             case MessageRecallPersistStatus.NotFound:
                 return MessageRecallResult.Failed(

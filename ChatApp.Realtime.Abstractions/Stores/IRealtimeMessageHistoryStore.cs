@@ -57,8 +57,31 @@ public interface IRealtimeMessageHistoryStore
         IReadOnlyList<HistoryCatchUpQuery> queries,
         CancellationToken ct = default);
 
-    /// <summary>按消息 Id 读取单条（审核证据等）；不存在返回 null。</summary>
-    Task<RealtimeHistoryMessage?> TryGetByIdAsync(string messageId, CancellationToken ct = default);
+    /// <summary>
+    /// 按消息 Id 读取单条（审核证据等）；不存在或无权访问返回 null。
+    /// <para>
+    /// 二-4：在同一 SQL 内校验 <paramref name="userId"/> 是否有权访问该消息——
+    /// 群聊检查消息时间是否落入任一 membership period；单聊或无 period 记录时
+    /// 回退检查 conversation_members 是否存在记录。避免 TOCTOU。
+    /// </para>
+    /// </summary>
+    Task<RealtimeHistoryMessage?> TryGetByIdAsync(
+        long userId,
+        string messageId,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// 检查用户是否有权访问指定消息。
+    /// <para>
+    /// 直接检查消息时间是否落入任一 membership period（群聊），
+    /// 或消息为单聊且 conversation_members 中存在该用户记录（单聊回退）。
+    /// 用于精确消息查询、审核证据查询、Reply/Forward 验证。
+    /// </para>
+    /// </summary>
+    Task<bool> CanAccessMessageAsync(
+        long userId,
+        string messageId,
+        CancellationToken ct = default);
 
     /// <summary>
     /// 将客户端同步水位解析为可增量 catch-up 的真实消息，或标记失效。

@@ -73,11 +73,20 @@ public sealed class NoopRealtimeMessageHistoryStore : IRealtimeMessageHistorySto
             "未配置真实消息存储，无法批量查询会话补偿历史。");
     }
 
-    public Task<RealtimeHistoryMessage?> TryGetByIdAsync(string messageId, CancellationToken ct = default)
+    public Task<RealtimeHistoryMessage?> TryGetByIdAsync(
+        long userId, string messageId, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
         throw new InvalidOperationException(
             "未配置真实消息存储，无法按 Id 查询消息。");
+    }
+
+    public Task<bool> CanAccessMessageAsync(
+        long userId, string messageId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        throw new InvalidOperationException(
+            "未配置真实消息存储，无法校验消息访问权限。");
     }
 
     public Task<IReadOnlyDictionary<string, ResolvedSyncWatermark>> ResolveSyncWatermarksAsync(

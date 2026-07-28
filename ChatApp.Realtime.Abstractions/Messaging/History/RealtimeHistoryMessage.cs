@@ -7,6 +7,10 @@ public sealed class RealtimeHistoryMessage
     public long SenderUserId { get; init; }
     public long ReceiverUserId { get; init; }
     public string? ConversationId { get; init; }
+
+    /// <summary>服务端分配的会话内单调递增序列号；旧消息可缺省。</summary>
+    public long? ConversationSequence { get; init; }
+
     public required string Content { get; init; }
     public long ReceivedAtMs { get; init; }
     public long? DeliveredAtMs { get; init; }

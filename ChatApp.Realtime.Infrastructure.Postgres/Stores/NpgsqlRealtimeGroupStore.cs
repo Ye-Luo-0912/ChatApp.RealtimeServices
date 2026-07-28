@@ -57,35 +57,9 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
     }
 
     /// <summary>
-    /// P0-2：批量检查目标用户是否已注销（不获取 advisory lock，仅事务内读 tombstone）。
-    /// 返回 null 表示全部活跃，返回非空 string 表示错误码。
-    /// </summary>
-    private async Task<string?> CheckTargetUsersLifecycleInTxAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        IReadOnlyList<long> userIds,
-        CancellationToken ct)
-    {
-        if (userIds.Count == 0)
-            return null;
-
-        await using var cmd = new NpgsqlCommand(
-            $"""
-             SELECT COUNT(*)
-             FROM {_databaseSchema.UserDeletionTombstonesTableSql}
-             WHERE user_id = ANY(@user_ids);
-             """,
-            connection,
-            transaction);
-        cmd.Parameters.AddWithValue("user_ids", userIds.ToArray());
-
-        var count = (long)(await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false) ?? 0);
-        return count > 0 ? "target_user_deleted" : null;
-    }
-
-    /// <summary>
-    /// Membership periods：在业务事务内记录多个成员入群。
+    /// Membership periods：在业务事务内批量记录多个成员入群。
     /// 未注入 <see cref="IMembershipPeriodStore"/> 时（测试场景）为空操作。
+    /// 使用 UNNEST 单条 SQL，避免逐成员往返。
     /// </summary>
     private async Task RecordMembershipJoinsInTransactionAsync(
         NpgsqlConnection connection,
@@ -98,13 +72,10 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         if (_membershipPeriodStore is null || userIds.Count == 0)
             return;
 
-        foreach (var userId in userIds)
-        {
-            await _membershipPeriodStore
-                .RecordJoinInTransactionAsync(
-                    connection, transaction, conversationId, userId, joinedAtMs, ct)
-                .ConfigureAwait(false);
-        }
+        await _membershipPeriodStore
+            .RecordJoinsBatchInTransactionAsync(
+                connection, transaction, conversationId, joinedAtMs, userIds, ct)
+            .ConfigureAwait(false);
     }
 
     /// <summary>
@@ -182,21 +153,17 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             return GroupCreatePersistResult.Ok(existing.ConversationId!, null, null);
         }
 
-        // P0-2：事务内检查 actor 和目标用户生命周期，防止已注销用户建群或被加入群。
-        var createActorError = await CheckActorLifecycleInTxAsync(
-            connection, transaction, creatorUserId, ct).ConfigureAwait(false);
-        if (createActorError is not null)
+        // P0-2 / P0-4：事务内一次性获取 actor + 全部目标用户的共享 advisory lock 并检查生命周期状态。
+        // 按 userId 升序获取锁，避免死锁。防止已注销用户建群或被加入群，同时消除目标用户
+        // 在检查后开始删除的 TOCTOU 竞态。
+        // TODO: 用户存在性验证需要 users 表（当前 realtime schema 无独立 users 表，仅依赖 tombstone 检查删除状态）。
+        var createLifecycleIds = new List<long>(members.Count + 1) { creatorUserId };
+        createLifecycleIds.AddRange(members);
+        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveManyAsync(
+                connection, transaction, _databaseSchema, createLifecycleIds, ct).ConfigureAwait(false))
         {
             await transaction.RollbackAsync(ct).ConfigureAwait(false);
-            return GroupCreatePersistResult.Fail(createActorError, "用户已注销，操作被拒绝。");
-        }
-
-        var createTargetError = await CheckTargetUsersLifecycleInTxAsync(
-            connection, transaction, members, ct).ConfigureAwait(false);
-        if (createTargetError is not null)
-        {
-            await transaction.RollbackAsync(ct).ConfigureAwait(false);
-            return GroupCreatePersistResult.Fail(createTargetError, "目标用户已注销，无法添加。");
+            return GroupCreatePersistResult.Fail("user_deleted", "用户已注销，操作被拒绝。");
         }
 
         await using (var insertConv = new NpgsqlCommand(
@@ -373,21 +340,16 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             return GroupMutatePersistResult.Ok(existing.ConversationId!, null, null);
         }
 
-        // P0-2：事务内检查 actor 和目标用户生命周期。
-        var addActorError = await CheckActorLifecycleInTxAsync(
-            connection, transaction, actorUserId, ct).ConfigureAwait(false);
-        if (addActorError is not null)
+        // P0-2 / P0-4：事务内一次性获取 actor + 全部目标用户的共享 advisory lock 并检查生命周期状态。
+        // 按 userId 升序获取锁，避免死锁。消除目标用户在检查后开始删除的 TOCTOU 竞态。
+        // TODO: 用户存在性验证需要 users 表（当前 realtime schema 无独立 users 表，仅依赖 tombstone 检查删除状态）。
+        var addLifecycleIds = new List<long>(toAdd.Count + 1) { actorUserId };
+        addLifecycleIds.AddRange(toAdd);
+        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveManyAsync(
+                connection, transaction, _databaseSchema, addLifecycleIds, ct).ConfigureAwait(false))
         {
             await transaction.RollbackAsync(ct).ConfigureAwait(false);
-            return GroupMutatePersistResult.Fail(addActorError, "用户已注销，操作被拒绝。");
-        }
-
-        var addTargetError = await CheckTargetUsersLifecycleInTxAsync(
-            connection, transaction, toAdd, ct).ConfigureAwait(false);
-        if (addTargetError is not null)
-        {
-            await transaction.RollbackAsync(ct).ConfigureAwait(false);
-            return GroupMutatePersistResult.Fail(addTargetError, "目标用户已注销，无法添加。");
+            return GroupMutatePersistResult.Fail("user_deleted", "用户已注销，操作被拒绝。");
         }
 
         var (title, actorRole, existingCount) = await LoadGroupContextAsync(
@@ -612,11 +574,19 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
 
         await using (var softDelete = new NpgsqlCommand(
                          $"""
-                          UPDATE {_databaseSchema.ConversationMembersTableSql}
-                          SET left_at_ms = @occurred_at_ms
-                          WHERE conversation_id = @conversation_id
-                            AND user_id = @user_id
-                            AND left_at_ms IS NULL;
+                          UPDATE {_databaseSchema.ConversationMembersTableSql} AS m
+                          SET left_at_ms = @occurred_at_ms,
+                              left_sequence = c.last_sequence,
+                              left_message_id = c.last_message_id,
+                              left_message_preview = c.last_message_preview,
+                              left_message_at_ms = c.last_message_at_ms,
+                              left_sender_user_id = c.last_sender_user_id,
+                              sent_count_at_leave = m.sent_count
+                          FROM {_databaseSchema.ConversationsTableSql} AS c
+                          WHERE m.conversation_id = @conversation_id
+                            AND m.user_id = @user_id
+                            AND m.left_at_ms IS NULL
+                            AND c.conversation_id = @conversation_id;
                           """,
                          connection,
                          transaction))
@@ -756,11 +726,19 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
 
         await using (var softDelete = new NpgsqlCommand(
                          $"""
-                          UPDATE {_databaseSchema.ConversationMembersTableSql}
-                          SET left_at_ms = @occurred_at_ms
-                          WHERE conversation_id = @conversation_id
-                            AND user_id = @user_id
-                            AND left_at_ms IS NULL;
+                          UPDATE {_databaseSchema.ConversationMembersTableSql} AS m
+                          SET left_at_ms = @occurred_at_ms,
+                              left_sequence = c.last_sequence,
+                              left_message_id = c.last_message_id,
+                              left_message_preview = c.last_message_preview,
+                              left_message_at_ms = c.last_message_at_ms,
+                              left_sender_user_id = c.last_sender_user_id,
+                              sent_count_at_leave = m.sent_count
+                          FROM {_databaseSchema.ConversationsTableSql} AS c
+                          WHERE m.conversation_id = @conversation_id
+                            AND m.user_id = @user_id
+                            AND m.left_at_ms IS NULL
+                            AND c.conversation_id = @conversation_id;
                           """,
                          connection,
                          transaction))
@@ -1110,9 +1088,18 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
 
         await using (var dissolveMembers = new NpgsqlCommand(
                          $"""
-                          UPDATE {_databaseSchema.ConversationMembersTableSql}
-                          SET left_at_ms = @occurred_at_ms
-                          WHERE conversation_id = @conversation_id AND left_at_ms IS NULL;
+                          UPDATE {_databaseSchema.ConversationMembersTableSql} AS m
+                          SET left_at_ms = @occurred_at_ms,
+                              left_sequence = c.last_sequence,
+                              left_message_id = c.last_message_id,
+                              left_message_preview = c.last_message_preview,
+                              left_message_at_ms = c.last_message_at_ms,
+                              left_sender_user_id = c.last_sender_user_id,
+                              sent_count_at_leave = m.sent_count
+                          FROM {_databaseSchema.ConversationsTableSql} AS c
+                          WHERE m.conversation_id = @conversation_id
+                            AND m.left_at_ms IS NULL
+                            AND c.conversation_id = @conversation_id;
                           """,
                          connection,
                          transaction))
@@ -1360,16 +1347,29 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         await using var command = new NpgsqlCommand(
             $"""
              INSERT INTO {_databaseSchema.ConversationMembersTableSql} (
-                 conversation_id, user_id, peer_user_id, joined_at_ms, role, last_message_at_ms
+                 conversation_id, user_id, peer_user_id, joined_at_ms, role, last_message_at_ms,
+                 last_read_sequence, sent_count, sent_count_at_read, unread_count
              )
-             SELECT @conversation_id, t.user_id, NULL, @joined_at_ms, @role, @joined_at_ms
+             SELECT @conversation_id, t.user_id, NULL, @joined_at_ms, @role, @joined_at_ms,
+                    c.last_sequence, 0, 0, 0
              FROM UNNEST(@user_ids) AS t(user_id)
+             CROSS JOIN {_databaseSchema.ConversationsTableSql} AS c
+             WHERE c.conversation_id = @conversation_id
              ON CONFLICT (conversation_id, user_id) DO UPDATE
                  SET role = EXCLUDED.role,
                      joined_at_ms = EXCLUDED.joined_at_ms,
                      left_at_ms = NULL,
                      last_message_at_ms = EXCLUDED.last_message_at_ms,
-                     unread_count = 0
+                     last_read_sequence = EXCLUDED.last_read_sequence,
+                     sent_count = 0,
+                     sent_count_at_read = 0,
+                     unread_count = 0,
+                     left_sequence = NULL,
+                     left_message_id = NULL,
+                     left_message_preview = NULL,
+                     left_message_at_ms = NULL,
+                     left_sender_user_id = NULL,
+                     sent_count_at_leave = NULL
              WHERE conversation_members.left_at_ms IS NOT NULL
              RETURNING user_id;
              """,

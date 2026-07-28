@@ -79,7 +79,9 @@ public sealed class OutOfOrderUnreadTests
 
         Assert.True(list.Succeeded);
         var item = Assert.Single(list.Items, x => x.ConversationId == conversationId);
-        Assert.Equal(newerId, item.LastMessageId);
+        // P0-5：服务端到达时间权威。客户端上报的 ReceivedAtMs 不再决定 tip 排序，
+        // 后到达服务端的消息（此处为 olderId，第二条发送）拥有更晚的 ServerReceivedAtMs，成为 tip。
+        Assert.Equal(olderId, item.LastMessageId);
         Assert.Equal(2, item.UnreadCount);
     }
 }

@@ -46,11 +46,6 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
             message.MentionedUserIds,
             message.MentionedRoles);
 
-        // P1-4：EfCore 路径不绑定附件，但仍需要把应用层传入的 Payload 对象物化为 PayloadJson，
-        // 否则 Outbox 行会缺少 payload。附件参数为 null，保留原 payload 字段不变。
-        // 若 eventToPublish 已有 PayloadJson（旧调用方/测试），EnrichChatMessagePayload 也能处理。
-        eventToPublish = RealtimeMessageEventFactory.EnrichChatMessagePayload(eventToPublish, attachments: null);
-
         await using var dbContext = await _dbContextFactory
             .CreateDbContextAsync(ct)
             .ConfigureAwait(false);
@@ -100,7 +95,6 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
             }
 
             await transaction.CommitAsync(ct).ConfigureAwait(false);
-            // 消息与首条 Outbox 同 SaveChanges：重复投递不重建已 Published/Dead（或已清理）的 Outbox。
             _logger.LogDebug(
                 "实时消息已存在，跳过重复写入。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}",
                 message.ClientMessageId,
@@ -128,11 +122,33 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
             MentionedUserIds = message.MentionedUserIds,
             MentionedRoles = message.MentionedRoles
         });
-        dbContext.Outbox.Add(CreateOutboxEntity(eventToPublish, message.MessageId));
+
+        long? conversationSequence = null;
 
         try
         {
+            // 三-1：先持久化消息行（仅消息，不含 Outbox），以便检测唯一键冲突。
             await dbContext.SaveChangesAsync(ct).ConfigureAwait(false);
+
+            // 三-1：序列进入消息协议。先推进会话序列（O(1)），再用得到的序列号物化 payload。
+            if (!string.IsNullOrWhiteSpace(message.ConversationId))
+            {
+                conversationSequence = await AdvanceConversationSequenceAsync(
+                        dbContext,
+                        message,
+                        ct)
+                    .ConfigureAwait(false);
+            }
+
+            // P1-4 + 三-1：序列号已知后再物化 payload，使 PayloadJson 携带 ConversationSequence。
+            // EfCore 路径不绑定附件；附件参数为 null，保留原 payload 字段不变。
+            eventToPublish = RealtimeMessageEventFactory.EnrichChatMessagePayload(
+                eventToPublish,
+                attachments: null,
+                conversationSequence);
+
+            // 添加 Outbox 行：消息事件 + 发送方回声 + ConversationChanged。
+            dbContext.Outbox.Add(CreateOutboxEntity(eventToPublish, message.MessageId));
 
             if (message.SenderUserId != message.ReceiverUserId)
             {
@@ -142,18 +158,44 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
                         message.SenderUserId)));
             }
 
-            if (!string.IsNullOrWhiteSpace(message.ConversationId))
+            if (conversationSequence is not null)
             {
-                await AdvanceConversationAndEnqueueAsync(
-                        dbContext,
-                        message,
+                var preview = ConversationId.CreatePreview(message.Content);
+                // 接收方：ConversationChanged（含 last_sequence）。
+                dbContext.Outbox.Add(CreateOutboxEntity(
+                    ConversationWriteCommands.CreateConversationChangedEvent(
+                        message.ConversationId!,
+                        message.ReceiverUserId,
+                        message.SenderUserId,
+                        message.MessageId,
+                        preview,
+                        message.ReceivedAtMs,
+                        message.SenderUserId,
                         eventToPublish.TraceParent,
                         eventToPublish.TraceState,
-                        ct)
-                    .ConfigureAwait(false);
-                await dbContext.SaveChangesAsync(ct).ConfigureAwait(false);
+                        eventIdCause: null,
+                        ConversationType.Direct,
+                        title: null,
+                        lastSequence: conversationSequence)));
+                // 发送方：ConversationChanged（含 last_sequence），发送方自身不产生未读事件。
+                dbContext.Outbox.Add(CreateOutboxEntity(
+                    ConversationWriteCommands.CreateConversationChangedEvent(
+                        message.ConversationId!,
+                        message.SenderUserId,
+                        message.ReceiverUserId,
+                        message.MessageId,
+                        preview,
+                        message.ReceivedAtMs,
+                        message.SenderUserId,
+                        eventToPublish.TraceParent,
+                        eventToPublish.TraceState,
+                        eventIdCause: null,
+                        ConversationType.Direct,
+                        title: null,
+                        lastSequence: conversationSequence)));
             }
 
+            await dbContext.SaveChangesAsync(ct).ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
         }
         catch (DbUpdateException ex)
@@ -215,7 +257,7 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
             message.SenderUserId,
             message.ReceiverUserId);
 
-        return RealtimeMessagePersistResult.Created(message.MessageId);
+        return RealtimeMessagePersistResult.Created(message.MessageId, conversationSequence);
     }
 
     public async Task<MessageReceiptPersistResult> ApplyReceiptAsync(
@@ -288,11 +330,9 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
             message.SenderUserId);
     }
 
-    private async Task AdvanceConversationAndEnqueueAsync(
+    private async Task<long?> AdvanceConversationSequenceAsync(
         RealtimeDbContext dbContext,
         RealtimeMessageRecord message,
-        string? traceParent,
-        string? traceState,
         CancellationToken ct)
     {
         var connection = (NpgsqlConnection)dbContext.Database.GetDbConnection();
@@ -302,7 +342,9 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
 
         var conversationId = message.ConversationId!;
         var preview = ConversationId.CreatePreview(message.Content);
-        var (advanced, unread) = await ConversationWriteCommands.TryAdvanceAndIncrementUnreadAsync(
+        // P0-1 + 三-1：推进会话序列并回写 message.conversation_sequence。
+        // Outbox 事件由调用方在序列号已知后统一构造，确保 PayloadJson 携带 ConversationSequence。
+        var newSequence = await ConversationWriteCommands.TryAdvanceDirectSequenceAsync(
                 connection,
                 transaction,
                 _databaseSchema,
@@ -315,46 +357,7 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
                 ct)
             .ConfigureAwait(false);
 
-        if (advanced)
-        {
-            dbContext.Outbox.Add(CreateOutboxEntity(
-                ConversationWriteCommands.CreateConversationChangedEvent(
-                    conversationId,
-                    message.SenderUserId,
-                    message.ReceiverUserId,
-                    message.MessageId,
-                    preview,
-                    message.ReceivedAtMs,
-                    message.SenderUserId,
-                    traceParent,
-                    traceState)));
-            dbContext.Outbox.Add(CreateOutboxEntity(
-                ConversationWriteCommands.CreateConversationChangedEvent(
-                    conversationId,
-                    message.ReceiverUserId,
-                    message.SenderUserId,
-                    message.MessageId,
-                    preview,
-                    message.ReceivedAtMs,
-                    message.SenderUserId,
-                    traceParent,
-                    traceState)));
-        }
-
-        if (unread is int unreadCount)
-        {
-            dbContext.Outbox.Add(CreateOutboxEntity(
-                ConversationWriteCommands.CreateUnreadCountChangedEvent(
-                    conversationId,
-                    message.ReceiverUserId,
-                    unreadCount,
-                    lastReadMessageId: null,
-                    lastReadAtMs: null,
-                    causeMessageId: message.MessageId,
-                    message.ReceivedAtMs,
-                    traceParent,
-                    traceState)));
-        }
+        return newSequence;
     }
 
     private static RealtimeEvent CopyWithMessageId(RealtimeEvent evt, string messageId) =>

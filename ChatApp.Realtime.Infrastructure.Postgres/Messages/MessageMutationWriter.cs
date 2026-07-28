@@ -127,7 +127,8 @@ internal sealed class MessageMutationWriter
         var ct = _session.CancellationToken;
         await using var command = new NpgsqlCommand(
             $"""
-             SELECT sender_user_id, receiver_user_id, conversation_id, received_at_ms, recalled_at_ms
+             SELECT sender_user_id, receiver_user_id, conversation_id, received_at_ms, recalled_at_ms,
+                    conversation_sequence
              FROM {_session.Schema.MessagesTableSql}
              WHERE message_id = @message_id
              FOR UPDATE
@@ -144,7 +145,8 @@ internal sealed class MessageMutationWriter
             reader.GetInt64(1),
             reader.IsDBNull(2) ? null : reader.GetString(2),
             reader.GetInt64(3),
-            reader.IsDBNull(4) ? null : reader.GetInt64(4));
+            reader.IsDBNull(4) ? null : reader.GetInt64(4),
+            reader.IsDBNull(5) ? null : reader.GetInt64(5));
     }
 
     public async Task<int> ApplyRecallUpdateAsync(string messageId, long recalledAtMs)
@@ -178,7 +180,8 @@ internal sealed class MessageMutationWriter
         await using var command = new NpgsqlCommand(
             $"""
              SELECT sender_user_id, receiver_user_id, conversation_id, received_at_ms,
-                    recalled_at_ms, content, edit_version, mentioned_user_ids, mentioned_roles
+                    recalled_at_ms, content, edit_version, mentioned_user_ids, mentioned_roles,
+                    conversation_sequence
              FROM {_session.Schema.MessagesTableSql}
              WHERE message_id = @message_id
              FOR UPDATE
@@ -199,7 +202,8 @@ internal sealed class MessageMutationWriter
             reader.GetString(5),
             reader.GetInt32(6),
             reader.IsDBNull(7) ? null : reader.GetFieldValue<long[]>(7),
-            reader.IsDBNull(8) ? null : reader.GetFieldValue<string[]>(8));
+            reader.IsDBNull(8) ? null : reader.GetFieldValue<string[]>(8),
+            reader.IsDBNull(9) ? null : reader.GetInt64(9));
     }
 
     public async Task<int> ApplyEditUpdateAsync(
@@ -340,7 +344,8 @@ internal sealed class MessageMutationWriter
         long ReceiverUserId,
         string? ConversationId,
         long ReceivedAtMs,
-        long? RecalledAtMs);
+        long? RecalledAtMs,
+        long? ConversationSequence);
 
     public sealed record EditTargetRow(
         long SenderUserId,
@@ -351,5 +356,6 @@ internal sealed class MessageMutationWriter
         string Content,
         int EditVersion,
         long[]? MentionedUserIds,
-        string[]? MentionedRoles);
+        string[]? MentionedRoles,
+        long? ConversationSequence);
 }

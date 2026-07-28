@@ -3,6 +3,7 @@ using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using Npgsql;
+using NpgsqlTypes;
 
 namespace ChatApp.Realtime.Infrastructure.Postgres.Stores;
 
@@ -45,6 +46,46 @@ public sealed class NpgsqlMembershipPeriodStore(
         command.Parameters.AddWithValue("conversation_id", conversationId);
         command.Parameters.AddWithValue("user_id", userId);
         command.Parameters.AddWithValue("joined_at_ms", joinedAtMs);
+
+        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 在业务事务内批量记录入群。使用 UNNEST 单条 SQL 写入所有用户，
+    /// 避免逐成员往返；ON CONFLICT DO NOTHING 保证幂等。
+    /// </summary>
+    public async Task RecordJoinsBatchInTransactionAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string conversationId,
+        long joinedAtMs,
+        IReadOnlyList<long> userIds,
+        CancellationToken ct = default)
+    {
+        if (userIds.Count == 0)
+            return;
+
+        var npgsqlConnection = (NpgsqlConnection)connection;
+        var npgsqlTransaction = (NpgsqlTransaction)transaction;
+
+        var userIdArray = userIds as long[] ?? userIds.ToArray();
+        await using var command = new NpgsqlCommand(
+            $"""
+             INSERT INTO {databaseSchema.MembershipPeriodsTableSql}
+                 (conversation_id, user_id, joined_at_ms, left_at_ms, left_reason)
+             SELECT @conversation_id, t.user_id, @joined_at_ms, NULL, NULL
+             FROM UNNEST(@user_ids) AS t(user_id)
+             ON CONFLICT (conversation_id, user_id, joined_at_ms) DO NOTHING;
+             """,
+            npgsqlConnection,
+            npgsqlTransaction);
+
+        command.Parameters.AddWithValue("conversation_id", conversationId);
+        command.Parameters.AddWithValue("joined_at_ms", joinedAtMs);
+        command.Parameters.Add(new NpgsqlParameter("user_ids", NpgsqlDbType.Bigint | NpgsqlDbType.Array)
+        {
+            Value = userIdArray
+        });
 
         await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }

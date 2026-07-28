@@ -21,43 +21,6 @@ internal sealed class ConversationProjectionWriter
         _session = session;
     }
 
-    public Task<(bool Advanced, int? UnreadCount)> TryAdvanceAndIncrementUnreadAsync(
-        string conversationId,
-        long senderUserId,
-        long receiverUserId,
-        string messageId,
-        string preview,
-        long receivedAtMs) =>
-        ConversationWriteCommands.TryAdvanceAndIncrementUnreadAsync(
-            _session.Connection,
-            _session.Transaction,
-            _session.Schema,
-            conversationId,
-            senderUserId,
-            receiverUserId,
-            messageId,
-            preview,
-            receivedAtMs,
-            _session.CancellationToken);
-
-    public Task<(bool Advanced, IReadOnlyList<(long UserId, int UnreadCount)> Unreads)>
-        TryAdvanceGroupAndIncrementUnreadAsync(
-            string conversationId,
-            long senderUserId,
-            string messageId,
-            string preview,
-            long receivedAtMs) =>
-        ConversationWriteCommands.TryAdvanceGroupAndIncrementUnreadAsync(
-            _session.Connection,
-            _session.Transaction,
-            _session.Schema,
-            conversationId,
-            senderUserId,
-            messageId,
-            preview,
-            receivedAtMs,
-            _session.CancellationToken);
-
     /// <summary>
     /// Perf-1：群消息序列推进 O(1)。仅更新 conversations + 发送者 sent_count + message 序列号。
     /// 不再触碰其他成员行，不再生成 per-user UnreadCountChanged 事件。
@@ -80,9 +43,10 @@ internal sealed class ConversationProjectionWriter
             _session.CancellationToken);
 
     /// <summary>
-    /// Perf-1：单聊消息序列推进 O(1)。返回新序列号与接收方未读数。
+    /// Perf-1：单聊消息序列推进 O(1)。返回新序列号。
+    /// P0-1：不再返回接收方未读数；写入路径不再物化 unread_count。
     /// </summary>
-    public Task<(long? Sequence, int? ReceiverUnread)> TryAdvanceDirectSequenceAsync(
+    public Task<long?> TryAdvanceDirectSequenceAsync(
         string conversationId,
         long senderUserId,
         long receiverUserId,

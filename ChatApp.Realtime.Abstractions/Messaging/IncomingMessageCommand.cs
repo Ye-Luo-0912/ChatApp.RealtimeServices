@@ -48,5 +48,25 @@ public sealed record IncomingMessageCommand
     /// <summary>@提到的角色（如 "all"、"admin"）；目前仅供展示，无强校验。</summary>
     public IReadOnlyList<string>? MentionedRoles { get; init; }
 
-    public long ReceivedAtMs { get; init; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+    /// <summary>
+    /// 客户端上报的发生时间，仅用于诊断/展示。不参与排序、序列、tip、retention 等权威决策。
+    /// </summary>
+    public long ClientOccurredAtMs { get; init; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+    /// <summary>
+    /// 服务端接收时间，由入口（Processor）生成，用于排序、序列、tip、retention 等权威决策。
+    /// 默认值为构造时刻，Processor 会在 ProcessAsync 入口用当前服务端时间覆盖。
+    /// </summary>
+    public long ServerReceivedAtMs { get; init; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+    /// <summary>
+    /// 兼容旧代码的时间戳别名，映射到 <see cref="ClientOccurredAtMs"/>。
+    /// 新代码应直接使用 <see cref="ServerReceivedAtMs"/>（权威决策）或
+    /// <see cref="ClientOccurredAtMs"/>（展示）。
+    /// </summary>
+    public long ReceivedAtMs
+    {
+        get => ClientOccurredAtMs;
+        init => ClientOccurredAtMs = value;
+    }
 }

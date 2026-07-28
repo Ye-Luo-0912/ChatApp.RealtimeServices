@@ -2,7 +2,8 @@ namespace ChatApp.Realtime.Abstractions.Stores;
 
 public sealed record RealtimeMessagePersistResult(
     RealtimeMessagePersistKind Kind,
-    string MessageId)
+    string MessageId,
+    long? ConversationSequence = null)
 {
     public bool IsNew => Kind == RealtimeMessagePersistKind.Created;
     public bool IsConflict => Kind == RealtimeMessagePersistKind.ContentConflict;
@@ -10,8 +11,8 @@ public sealed record RealtimeMessagePersistResult(
     public bool IsNotAllowed => Kind == RealtimeMessagePersistKind.NotAllowed;
     public bool IsUserDeleted => Kind == RealtimeMessagePersistKind.UserDeleted;
 
-    public static RealtimeMessagePersistResult Created(string messageId) =>
-        new(RealtimeMessagePersistKind.Created, messageId);
+    public static RealtimeMessagePersistResult Created(string messageId, long? conversationSequence = null) =>
+        new(RealtimeMessagePersistKind.Created, messageId, conversationSequence);
 
     public static RealtimeMessagePersistResult Duplicate(string messageId) =>
         new(RealtimeMessagePersistKind.Duplicate, messageId);

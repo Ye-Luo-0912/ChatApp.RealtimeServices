@@ -35,7 +35,7 @@ public sealed class LeaveGroupHistoryPolicyTests : IAsyncLifetime
     public async Task LeftMember_CanStillReadConversationHistory()
     {
         var (client, schema) = await CreateStoreAsync("realtime_leave_history_read");
-        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema, membershipPeriodStore: new NpgsqlMembershipPeriodStore(client, schema));
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
@@ -84,7 +84,7 @@ public sealed class LeaveGroupHistoryPolicyTests : IAsyncLifetime
     public async Task RemovedMember_CanStillReadConversationHistory()
     {
         var (client, schema) = await CreateStoreAsync("realtime_removed_history_read");
-        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema, membershipPeriodStore: new NpgsqlMembershipPeriodStore(client, schema));
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
@@ -132,7 +132,7 @@ public sealed class LeaveGroupHistoryPolicyTests : IAsyncLifetime
     public async Task DissolvedGroup_FormerMembersCanStillReadHistory()
     {
         var (client, schema) = await CreateStoreAsync("realtime_dissolved_history_read");
-        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema, membershipPeriodStore: new NpgsqlMembershipPeriodStore(client, schema));
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
@@ -190,7 +190,7 @@ public sealed class LeaveGroupHistoryPolicyTests : IAsyncLifetime
     public async Task NeverMember_CannotReadConversationHistory()
     {
         var (client, schema) = await CreateStoreAsync("realtime_never_member_read");
-        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema, membershipPeriodStore: new NpgsqlMembershipPeriodStore(client, schema));
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
@@ -226,7 +226,7 @@ public sealed class LeaveGroupHistoryPolicyTests : IAsyncLifetime
     public async Task LeftMember_CannotSendNewMessage()
     {
         var (client, schema) = await CreateStoreAsync("realtime_leave_write_gate");
-        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema, membershipPeriodStore: new NpgsqlMembershipPeriodStore(client, schema));
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
@@ -281,7 +281,7 @@ public sealed class LeaveGroupHistoryPolicyTests : IAsyncLifetime
     public async Task LeftMember_CanReadHistory_AfterMode()
     {
         var (client, schema) = await CreateStoreAsync("realtime_leave_after_mode");
-        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema, membershipPeriodStore: new NpgsqlMembershipPeriodStore(client, schema));
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
@@ -326,7 +326,7 @@ public sealed class LeaveGroupHistoryPolicyTests : IAsyncLifetime
     public async Task LeftMember_CannotReadMessagesSentAfterLeaving()
     {
         var (client, schema) = await CreateStoreAsync("realtime_leave_boundary");
-        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema, membershipPeriodStore: new NpgsqlMembershipPeriodStore(client, schema));
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
@@ -375,7 +375,7 @@ public sealed class LeaveGroupHistoryPolicyTests : IAsyncLifetime
     public async Task DissolvedGroup_MembersCannotReadMessagesSentAfterDissolution()
     {
         var (client, schema) = await CreateStoreAsync("realtime_dissolved_boundary");
-        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema, membershipPeriodStore: new NpgsqlMembershipPeriodStore(client, schema));
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,
             schema,
@@ -423,7 +423,7 @@ public sealed class LeaveGroupHistoryPolicyTests : IAsyncLifetime
     public async Task LeftMember_DoesNotAppearInMemberListOrEventTargets()
     {
         var (client, schema) = await CreateStoreAsync("realtime_leave_member_list");
-        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema, membershipPeriodStore: new NpgsqlMembershipPeriodStore(client, schema));
         var conversationId = ConversationId.CreateGroup();
 
         await groupStore.CreateGroupAsync(
@@ -461,7 +461,7 @@ public sealed class LeaveGroupHistoryPolicyTests : IAsyncLifetime
     public async Task DissolvedGroup_NotInActiveConversationList()
     {
         var (client, schema) = await CreateStoreAsync("realtime_dissolved_conversation_list");
-        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema, membershipPeriodStore: new NpgsqlMembershipPeriodStore(client, schema));
         var conversationStore = new NpgsqlRealtimeConversationStore(
             client,
             schema);
@@ -509,7 +509,7 @@ public sealed class LeaveGroupHistoryPolicyTests : IAsyncLifetime
     public async Task LeftMember_CannotSetPrefsOrMarkRead()
     {
         var (client, schema) = await CreateStoreAsync("realtime_leave_write_prefs");
-        var groupStore = new NpgsqlRealtimeGroupStore(client, schema);
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema, membershipPeriodStore: new NpgsqlMembershipPeriodStore(client, schema));
         var conversationStore = new NpgsqlRealtimeConversationStore(
             client,
             schema);

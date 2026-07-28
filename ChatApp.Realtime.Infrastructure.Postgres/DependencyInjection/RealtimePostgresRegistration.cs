@@ -70,10 +70,12 @@ public static class RealtimePostgresRegistration
                 sp.GetService<RealtimeMetrics>()));
             services.RemoveAll<IRealtimeGroupStore>();
             // 审计 Outbox：注入 IGroupOperationAuditStore，使群操作审计在业务事务内写入。
+            // Membership periods：注入 IMembershipPeriodStore，使群操作在事务内记录入群/离群 period。
             services.AddSingleton<IRealtimeGroupStore>(sp => new NpgsqlRealtimeGroupStore(
                 sp.GetRequiredService<RealtimeDatabaseClient>(),
                 sp.GetRequiredService<RealtimeDatabaseSchema>(),
-                sp.GetRequiredService<IGroupOperationAuditStore>()));
+                sp.GetRequiredService<IGroupOperationAuditStore>(),
+                sp.GetRequiredService<IMembershipPeriodStore>()));
             services.RemoveAll<IRealtimeDeviceSyncCursorStore>();
             services.AddSingleton<IRealtimeDeviceSyncCursorStore, NpgsqlRealtimeDeviceSyncCursorStore>();
             services.RemoveAll<IRealtimeOutboxStore>();

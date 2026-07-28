@@ -14,4 +14,9 @@ public sealed class RealtimeConversationReadPayload
     public required long ReaderUserId { get; init; }
     public required string LastReadMessageId { get; init; }
     public long LastReadAtMs { get; init; }
+
+    /// <summary>
+    /// 已读序列水位。客户端应将此值保存为本地 last_read_sequence。
+    /// </summary>
+    public long? LastReadSequence { get; init; }
 }

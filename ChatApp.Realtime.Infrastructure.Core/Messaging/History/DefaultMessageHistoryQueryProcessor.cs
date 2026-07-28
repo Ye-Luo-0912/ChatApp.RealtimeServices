@@ -38,21 +38,14 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
 
         if (!string.IsNullOrWhiteSpace(query.MessageId))
         {
-            var message = await _store.TryGetByIdAsync(query.MessageId.Trim(), ct).ConfigureAwait(false);
+            // 二-4：TryGetByIdAsync 在同一 SQL 内校验 userId 是否有权访问该消息
+            // （群聊检查 membership period，单聊回退 conversation_members）。
+            // 返回 null 表示消息不存在或无权访问，统一映射为 not_found，避免泄露存在性。
+            var message = await _store
+                .TryGetByIdAsync(query.UserId, query.MessageId.Trim(), ct)
+                .ConfigureAwait(false);
             if (message is null)
-                return MessageHistoryPage.Failed(query.RequestId, "not_found", "消息不存在。");
-
-            if (message.SenderUserId != query.UserId && message.ReceiverUserId != query.UserId)
-            {
-                var conversationId = message.ConversationId;
-                if (string.IsNullOrWhiteSpace(conversationId)
-                    || !ConversationId.IsGroup(conversationId)
-                    || !await _store.IsConversationMemberAsync(query.UserId, conversationId, ct)
-                        .ConfigureAwait(false))
-                {
-                    return MessageHistoryPage.Failed(query.RequestId, "forbidden", "无权查看该消息。");
-                }
-            }
+                return MessageHistoryPage.Failed(query.RequestId, "not_found", "消息不存在或无权查看。");
 
             var enrichedSingle = await RealtimeHistoryAttachmentEnricher
                 .EnrichAsync(_attachmentStore, [message], ct)

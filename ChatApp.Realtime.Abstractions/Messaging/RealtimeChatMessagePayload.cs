@@ -14,10 +14,13 @@ public sealed class RealtimeChatMessagePayload
     public required long ReceiverUserId { get; init; }
     public required string Content { get; init; }
 
-    /// <summary>
-    /// 稳定会话编号；旧事件可缺省，新写入必带。
-    /// </summary>
+    /// <summary>稳定会话编号；旧事件可缺省，新写入必带。</summary>
     public string? ConversationId { get; init; }
+
+    /// <summary>
+    /// 服务端分配的会话内单调递增序列号。客户端据此重排、检测缺口、保存 last_read_sequence。
+    /// </summary>
+    public long? ConversationSequence { get; init; }
 
     public long ReceivedAtMs { get; init; }
 

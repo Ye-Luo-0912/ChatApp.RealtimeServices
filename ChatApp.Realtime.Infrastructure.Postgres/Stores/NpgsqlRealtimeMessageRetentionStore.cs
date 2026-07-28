@@ -58,10 +58,14 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
 
             var deletedIds = new List<string>(batchSize);
             var affectedConversations = new HashSet<string>(StringComparer.Ordinal);
+            // 三-3：记录被删除消息中每个会话的最大 conversation_sequence，
+            // 用于推进 retention_floor_sequence，避免已删除消息继续计入序列未读公式。
+            // conversation_sequence 为 NULL 的旧消息不参与 floor 推进。
+            var maxDeletedSequenceByConversation = new Dictionary<string, long>(StringComparer.Ordinal);
 
             await using (var select = new NpgsqlCommand(
                              $"""
-                              SELECT message_id, conversation_id
+                              SELECT message_id, conversation_id, conversation_sequence
                               FROM {databaseSchema.MessagesTableSql}
                               WHERE received_at_ms < @cutoff
                               ORDER BY received_at_ms, message_id
@@ -81,7 +85,22 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
                     {
                         var conversationId = reader.GetString(1);
                         if (!string.IsNullOrWhiteSpace(conversationId))
+                        {
                             affectedConversations.Add(conversationId);
+                            if (!reader.IsDBNull(2))
+                            {
+                                var seq = reader.GetInt64(2);
+                                if (maxDeletedSequenceByConversation.TryGetValue(conversationId, out var existing))
+                                {
+                                    if (seq > existing)
+                                        maxDeletedSequenceByConversation[conversationId] = seq;
+                                }
+                                else
+                                {
+                                    maxDeletedSequenceByConversation[conversationId] = seq;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -128,6 +147,16 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
                 deleteMessages.Parameters.AddWithValue("message_ids", deletedIds.ToArray());
                 await deleteMessages.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             }
+
+            // 三-3：推进 retention_floor_sequence 到被删除消息的最大 conversation_sequence，
+            // 使列表未读公式中的有效读水位 = GREATEST(last_read_sequence, retention_floor_sequence)，
+            // 已删除区间不再计入未读。仅推进有非 NULL 序列号的会话。
+            await AdvanceRetentionFloorAsync(
+                    connection,
+                    transaction,
+                    maxDeletedSequenceByConversation,
+                    ct)
+                .ConfigureAwait(false);
 
             var repaired = 0;
             var unreadRepaired = 0;
@@ -301,6 +330,40 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
         CancellationToken ct)
         => await ConversationProjectionRepair.RepairConversationTipsAsync(
             connection, transaction, databaseSchema, conversationIds, ct).ConfigureAwait(false);
+
+    /// <summary>
+    /// 三-3：把每个受影响会话的 <c>retention_floor_sequence</c> 推进到本批被删除消息的
+    /// 最大 <c>conversation_sequence</c>。GREATEST 保证 floor 只升不降，跨批乱序删除安全。
+    /// 仅推进字典中存在非 NULL 序列号的会话；空字典时短路返回。
+    /// </summary>
+    private async Task AdvanceRetentionFloorAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        IReadOnlyDictionary<string, long> maxDeletedSequenceByConversation,
+        CancellationToken ct)
+    {
+        if (maxDeletedSequenceByConversation.Count == 0)
+            return;
+
+        var conversationIds = maxDeletedSequenceByConversation.Keys.ToArray();
+        var maxSequences = maxDeletedSequenceByConversation.Values.ToArray();
+
+        await using var command = new NpgsqlCommand(
+            $"""
+             UPDATE {databaseSchema.ConversationsTableSql} AS c
+             SET retention_floor_sequence = GREATEST(
+                 COALESCE(c.retention_floor_sequence, 0),
+                 COALESCE(floor_seq, 0)
+             )
+             FROM UNNEST(@conversation_ids, @max_sequences) AS t(conversation_id, floor_seq)
+             WHERE c.conversation_id = t.conversation_id;
+             """,
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("conversation_ids", conversationIds);
+        command.Parameters.AddWithValue("max_sequences", maxSequences);
+        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
 
     /// <summary>
     /// Recounts <c>unread_count</c> from messages still present after the member's last-read

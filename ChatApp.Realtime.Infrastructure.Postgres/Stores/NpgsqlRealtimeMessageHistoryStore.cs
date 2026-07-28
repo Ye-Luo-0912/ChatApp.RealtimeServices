@@ -59,7 +59,8 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  history.edited_at_ms,
                  history.changed_at_ms,
              mentioned_user_ids,
-             mentioned_roles
+             mentioned_roles,
+             conversation_sequence
              FROM (
                  (
                      SELECT
@@ -83,7 +84,8 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                          edited_at_ms,
                          changed_at_ms,
                      mentioned_user_ids,
-                     mentioned_roles
+                     mentioned_roles,
+                     conversation_sequence
                      FROM {_databaseSchema.MessagesTableSql}
                      WHERE receiver_user_id = @user_id
                        AND (
@@ -120,7 +122,8 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                          edited_at_ms,
                          changed_at_ms,
                      mentioned_user_ids,
-                     mentioned_roles
+                     mentioned_roles,
+                     conversation_sequence
                      FROM {_databaseSchema.MessagesTableSql}
                      WHERE sender_user_id = @user_id
                        AND receiver_user_id <> @user_id
@@ -169,14 +172,15 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
             $"""
              WITH membership AS (
                  SELECT
-                     m.left_at_ms,
                      c.dissolved_at_ms,
-                     (m.user_id IS NOT NULL) AS is_member
-                 FROM {_databaseSchema.ConversationMembersTableSql} AS m
-                 INNER JOIN {_databaseSchema.ConversationsTableSql} AS c
-                     ON c.conversation_id = m.conversation_id
-                 WHERE m.conversation_id = @conversation_id
-                   AND m.user_id = @user_id
+                     EXISTS(
+                         SELECT 1
+                         FROM {_databaseSchema.ConversationMembersTableSql} AS m
+                         WHERE m.conversation_id = @conversation_id
+                           AND m.user_id = @user_id
+                     ) AS is_member
+                 FROM {_databaseSchema.ConversationsTableSql} AS c
+                 WHERE c.conversation_id = @conversation_id
              )
              SELECT
                  membership.is_member,
@@ -200,7 +204,8 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  msg.edited_at_ms,
                  msg.changed_at_ms,
              mentioned_user_ids,
-             mentioned_roles
+             mentioned_roles,
+             conversation_sequence
              FROM membership
              LEFT JOIN LATERAL (
                  SELECT
@@ -224,12 +229,34 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                      edited_at_ms,
                      changed_at_ms,
                  mentioned_user_ids,
-                 mentioned_roles
+                 mentioned_roles,
+                 conversation_sequence
                  FROM {_databaseSchema.MessagesTableSql}
                  WHERE conversation_id = @conversation_id
                    AND membership.is_member
-                   AND (membership.left_at_ms IS NULL OR received_at_ms <= membership.left_at_ms)
-                   AND (membership.dissolved_at_ms IS NULL OR received_at_ms <= membership.dissolved_at_ms)
+                   AND (
+                      -- 群聊：消息时间必须落入某个 membership period（支持多次入群/离群）
+                      EXISTS (
+                          SELECT 1
+                          FROM {_databaseSchema.MembershipPeriodsTableSql} p
+                          WHERE p.conversation_id = @conversation_id
+                            AND p.user_id = @user_id
+                            AND messages.received_at_ms >= p.joined_at_ms
+                            AND (p.left_at_ms IS NULL OR messages.received_at_ms <= p.left_at_ms)
+                      )
+                      OR
+                      -- 单聊或无 period 记录：消息为单聊且 conversation_members 存在该用户记录
+                      (
+                          messages.receiver_user_id > 0
+                          AND EXISTS (
+                              SELECT 1
+                              FROM {_databaseSchema.ConversationMembersTableSql} m
+                              WHERE m.conversation_id = @conversation_id
+                                AND m.user_id = @user_id
+                          )
+                      )
+                  )
+                   AND (membership.dissolved_at_ms IS NULL OR messages.received_at_ms <= membership.dissolved_at_ms)
                    AND (
                         @before_received_at_ms IS NULL
                         OR received_at_ms < @before_received_at_ms
@@ -275,14 +302,15 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
             $"""
              WITH membership AS (
                  SELECT
-                     m.left_at_ms,
                      c.dissolved_at_ms,
-                     (m.user_id IS NOT NULL) AS is_member
-                 FROM {_databaseSchema.ConversationMembersTableSql} AS m
-                 INNER JOIN {_databaseSchema.ConversationsTableSql} AS c
-                     ON c.conversation_id = m.conversation_id
-                 WHERE m.conversation_id = @conversation_id
-                   AND m.user_id = @user_id
+                     EXISTS(
+                         SELECT 1
+                         FROM {_databaseSchema.ConversationMembersTableSql} AS m
+                         WHERE m.conversation_id = @conversation_id
+                           AND m.user_id = @user_id
+                     ) AS is_member
+                 FROM {_databaseSchema.ConversationsTableSql} AS c
+                 WHERE c.conversation_id = @conversation_id
              )
              SELECT
                  membership.is_member,
@@ -306,7 +334,8 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  msg.edited_at_ms,
                  msg.changed_at_ms,
              mentioned_user_ids,
-             mentioned_roles
+             mentioned_roles,
+             conversation_sequence
              FROM membership
              LEFT JOIN LATERAL (
                  SELECT
@@ -330,12 +359,34 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                      edited_at_ms,
                      changed_at_ms,
                  mentioned_user_ids,
-                 mentioned_roles
+                 mentioned_roles,
+                 conversation_sequence
                  FROM {_databaseSchema.MessagesTableSql}
                  WHERE conversation_id = @conversation_id
                    AND membership.is_member
-                   AND (membership.left_at_ms IS NULL OR received_at_ms <= membership.left_at_ms)
-                   AND (membership.dissolved_at_ms IS NULL OR received_at_ms <= membership.dissolved_at_ms)
+                   AND (
+                      -- 群聊：消息时间必须落入某个 membership period（支持多次入群/离群）
+                      EXISTS (
+                          SELECT 1
+                          FROM {_databaseSchema.MembershipPeriodsTableSql} p
+                          WHERE p.conversation_id = @conversation_id
+                            AND p.user_id = @user_id
+                            AND messages.received_at_ms >= p.joined_at_ms
+                            AND (p.left_at_ms IS NULL OR messages.received_at_ms <= p.left_at_ms)
+                      )
+                      OR
+                      -- 单聊或无 period 记录：消息为单聊且 conversation_members 存在该用户记录
+                      (
+                          messages.receiver_user_id > 0
+                          AND EXISTS (
+                              SELECT 1
+                              FROM {_databaseSchema.ConversationMembersTableSql} m
+                              WHERE m.conversation_id = @conversation_id
+                                AND m.user_id = @user_id
+                          )
+                      )
+                  )
+                   AND (membership.dissolved_at_ms IS NULL OR messages.received_at_ms <= membership.dissolved_at_ms)
                    AND (
                         changed_at_ms > @after_changed_at_ms
                         OR (
@@ -611,7 +662,8 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  msg.edited_at_ms,
                  msg.changed_at_ms,
              mentioned_user_ids,
-             mentioned_roles
+             mentioned_roles,
+             conversation_sequence
              FROM membership
              LEFT JOIN LATERAL (
                  SELECT
@@ -635,7 +687,8 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                      edited_at_ms,
                      changed_at_ms,
                  mentioned_user_ids,
-                 mentioned_roles
+                 mentioned_roles,
+                 conversation_sequence
                  FROM {_databaseSchema.MessagesTableSql}
                  WHERE conversation_id = membership.conversation_id
                    AND membership.is_member
@@ -707,7 +760,7 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
     }
 
     public async Task<RealtimeHistoryMessage?> TryGetByIdAsync(
-        string messageId, CancellationToken ct = default)
+        long userId, string messageId, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(messageId);
 
@@ -738,12 +791,37 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                  edited_at_ms,
                  changed_at_ms,
              mentioned_user_ids,
-             mentioned_roles
+             mentioned_roles,
+             conversation_sequence
              FROM {_databaseSchema.MessagesTableSql}
              WHERE message_id = @message_id
+               AND (
+                   -- 群聊：消息时间必须落入某个 membership period（支持多次入群/离群）
+                   EXISTS (
+                       SELECT 1
+                       FROM {_databaseSchema.MembershipPeriodsTableSql} p
+                       WHERE p.conversation_id = messages.conversation_id
+                         AND p.user_id = @user_id
+                         AND messages.received_at_ms >= p.joined_at_ms
+                         AND (p.left_at_ms IS NULL OR messages.received_at_ms <= p.left_at_ms)
+                   )
+                   OR
+                   -- 单聊或无 period 记录：消息为单聊（receiver_user_id > 0）且
+                   -- conversation_members 中存在该用户记录（含已离群但未删除的回退场景）
+                   (
+                       messages.receiver_user_id > 0
+                       AND EXISTS (
+                           SELECT 1
+                           FROM {_databaseSchema.ConversationMembersTableSql} m
+                           WHERE m.conversation_id = messages.conversation_id
+                             AND m.user_id = @user_id
+                       )
+                   )
+               )
              LIMIT 1;
              """,
             connection);
+        command.Parameters.AddWithValue("user_id", userId);
         command.Parameters.AddWithValue("message_id", messageId.Trim());
 
         await using var reader = await command
@@ -753,6 +831,61 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
             return null;
 
         return ReadMessage(reader, offset: 0);
+    }
+
+    /// <summary>
+    /// 检查用户是否有权访问指定消息。
+    /// <para>
+    /// 群聊：消息时间必须落入某个 membership period；
+    /// 单聊或无 period 记录：消息 receiver_user_id > 0 且 conversation_members 中存在该用户记录。
+    /// </para>
+    /// </summary>
+    public async Task<bool> CanAccessMessageAsync(
+        long userId, string messageId, CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(userId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(messageId);
+
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT EXISTS (
+                 SELECT 1
+                 FROM {_databaseSchema.MessagesTableSql} msg
+                 WHERE msg.message_id = @message_id
+                   AND (
+                       -- 群聊：消息时间必须落入某个 membership period
+                       EXISTS (
+                           SELECT 1
+                           FROM {_databaseSchema.MembershipPeriodsTableSql} p
+                           WHERE p.conversation_id = msg.conversation_id
+                             AND p.user_id = @user_id
+                             AND msg.received_at_ms >= p.joined_at_ms
+                             AND (p.left_at_ms IS NULL OR msg.received_at_ms <= p.left_at_ms)
+                       )
+                       OR
+                       -- 单聊或无 period 记录：消息为单聊且 conversation_members 存在该用户记录
+                       (
+                           msg.receiver_user_id > 0
+                           AND EXISTS (
+                               SELECT 1
+                               FROM {_databaseSchema.ConversationMembersTableSql} m
+                               WHERE m.conversation_id = msg.conversation_id
+                                 AND m.user_id = @user_id
+                           )
+                       )
+                   )
+             );
+             """,
+            connection);
+        command.Parameters.AddWithValue("user_id", userId);
+        command.Parameters.AddWithValue("message_id", messageId.Trim());
+
+        var result = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return result is true;
     }
 
     public async Task<IReadOnlyDictionary<string, ResolvedSyncWatermark>> ResolveSyncWatermarksAsync(
@@ -1070,6 +1203,9 @@ public sealed class NpgsqlRealtimeMessageHistoryStore : IRealtimeMessageHistoryS
                 : reader.GetFieldValue<long[]>(offset + 19),
             MentionedRoles = reader.IsDBNull(offset + 20)
                 ? null
-                : reader.GetFieldValue<string[]>(offset + 20)
+                : reader.GetFieldValue<string[]>(offset + 20),
+            ConversationSequence = reader.IsDBNull(offset + 21)
+                ? null
+                : reader.GetInt64(offset + 21)
         };
 }

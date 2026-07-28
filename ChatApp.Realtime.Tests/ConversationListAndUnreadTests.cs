@@ -600,19 +600,31 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
             CreateMessage("msg-1", 9001, 9002, conversationId, "first", 100),
             CreateMessageReceivedEvent("evt-1", 9002, "msg-1", 100));
 
-        var read = await markReadProcessor.ProcessAsync(
+        var read1 = await markReadProcessor.ProcessAsync(
             new ConversationMarkReadCommand
             {
-                RequestId = "read-cycle",
+                RequestId = "read-cycle-1",
                 UserId = 9002,
                 ConversationId = conversationId
             });
-        Assert.True(read.Succeeded);
-        Assert.Equal(0, read.UnreadCount);
+        Assert.True(read1.Succeeded);
+        Assert.Equal(0, read1.UnreadCount);
 
         await messageStore.SaveAsync(
             CreateMessage("msg-2", 9001, 9002, conversationId, "second", 200),
             CreateMessageReceivedEvent("evt-2", 9002, "msg-2", 200));
+
+        // P0-1：消息写入不再发射 UnreadCountChanged 事件，未读数由序列公式派生。
+        // 仅 MarkRead 发射 UnreadCountChanged；两次 MarkRead 命中不同消息，事件 ID 必须不同。
+        var read2 = await markReadProcessor.ProcessAsync(
+            new ConversationMarkReadCommand
+            {
+                RequestId = "read-cycle-2",
+                UserId = 9002,
+                ConversationId = conversationId
+            });
+        Assert.True(read2.Succeeded);
+        Assert.Equal(0, read2.UnreadCount);
 
         await using var connection = await client.GetDataSource().OpenConnectionAsync();
         await using var command = new Npgsql.NpgsqlCommand(
@@ -639,8 +651,8 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
             unreadCounts.Add(payload.UnreadCount);
         }
 
-        Assert.Equal([1, 0, 1], unreadCounts);
-        Assert.Equal(3, eventIds.Distinct(StringComparer.Ordinal).Count());
+        Assert.Equal([0, 0], unreadCounts);
+        Assert.Equal(2, eventIds.Distinct(StringComparer.Ordinal).Count());
     }
 
     [Fact]

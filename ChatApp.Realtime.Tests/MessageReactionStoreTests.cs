@@ -104,7 +104,7 @@ public sealed class MessageReactionStoreTests : IAsyncLifetime
         var (messageStore, reactionStore, historyStore, conversationId, messageId) =
             await SeedAsync("realtime_reactions_sync");
 
-        var before = await historyStore.TryGetByIdAsync(messageId);
+        var before = await historyStore.TryGetByIdAsync(userId: 1001, messageId);
         Assert.NotNull(before);
         Assert.Equal(1_000, before!.ChangedAtMs);
 
@@ -117,7 +117,7 @@ public sealed class MessageReactionStoreTests : IAsyncLifetime
             new MessageReactionOptions());
         Assert.Equal(MessageReactionPersistStatus.Applied, applied.Status);
 
-        var after = await historyStore.TryGetByIdAsync(messageId);
+        var after = await historyStore.TryGetByIdAsync(userId: 1001, messageId);
         Assert.NotNull(after);
         Assert.Equal(5_000, after!.ChangedAtMs);
 

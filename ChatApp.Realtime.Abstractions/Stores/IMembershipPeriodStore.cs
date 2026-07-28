@@ -32,6 +32,22 @@ public interface IMembershipPeriodStore
         CancellationToken ct = default);
 
     /// <summary>
+    /// 批量记录成员加入（在群操作事务内调用，用 UNNEST 单条 SQL）。
+    /// <para>
+    /// 用于群创建 / 批量加成员等场景，避免逐成员往返。
+    /// 使用 ON CONFLICT DO NOTHING 确保幂等：同一 (conversation_id, user_id, joined_at_ms)
+    /// 重复写入不会报错。
+    /// </para>
+    /// </summary>
+    Task RecordJoinsBatchInTransactionAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string conversationId,
+        long joinedAtMs,
+        IReadOnlyList<long> userIds,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// 记录成员离群（在群操作事务内调用）。
     /// <para>
     /// 仅更新 <c>left_at_ms IS NULL</c> 的记录（当前活跃时间段），已关闭的时间段不受影响。

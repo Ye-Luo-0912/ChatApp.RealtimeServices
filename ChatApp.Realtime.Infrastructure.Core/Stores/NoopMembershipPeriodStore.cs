@@ -21,6 +21,18 @@ public sealed class NoopMembershipPeriodStore : IMembershipPeriodStore
         return Task.CompletedTask;
     }
 
+    public Task RecordJoinsBatchInTransactionAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string conversationId,
+        long joinedAtMs,
+        IReadOnlyList<long> userIds,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.CompletedTask;
+    }
+
     public Task RecordLeaveInTransactionAsync(
         DbConnection connection,
         DbTransaction transaction,

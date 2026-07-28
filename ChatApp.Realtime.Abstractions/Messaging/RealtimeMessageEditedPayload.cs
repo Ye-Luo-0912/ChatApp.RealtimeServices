@@ -11,6 +11,11 @@ public sealed class RealtimeMessageEditedPayload
     public long EditedAtMs { get; init; }
 
     /// <summary>
+    /// 编辑发生时会话的当前序列号（编辑不推进序列，此值为编辑时的 last_sequence 快照）。
+    /// </summary>
+    public long? ConversationSequence { get; init; }
+
+    /// <summary>
     /// 编辑后替换的 @提及用户 Id 列表。
     /// <para>
     /// 客户端可对比 <see cref="RealtimeChatMessagePayload.MentionedUserIds"/> 旧值与本字段新值，

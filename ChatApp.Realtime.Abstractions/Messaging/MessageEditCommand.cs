@@ -10,6 +10,12 @@ public sealed class MessageEditCommand
     public long OccurredAtMs { get; init; }
 
     /// <summary>
+    /// 服务端变更时间，由处理器入口生成，用于编辑窗口判断和 changed_at_ms 推进。
+    /// 客户端上报的 <see cref="OccurredAtMs"/> 仅用于诊断/展示。
+    /// </summary>
+    public long ServerMutationAtMs { get; init; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+    /// <summary>
     /// 编辑后替换的 @提及用户 Id 列表。
     /// <para>
     /// <c>null</c>（默认）表示不修改现有 mentions，保留消息原值；

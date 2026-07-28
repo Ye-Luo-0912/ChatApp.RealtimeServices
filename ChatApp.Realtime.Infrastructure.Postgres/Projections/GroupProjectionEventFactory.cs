@@ -31,6 +31,7 @@ internal static class GroupProjectionEventFactory
         long receiverUserId,
         string senderSessionId,
         long recalledAtMs,
+        long? conversationSequence,
         string? traceParent,
         string? traceState)
     {
@@ -40,7 +41,8 @@ internal static class GroupProjectionEventFactory
             ConversationId = conversationId,
             SenderUserId = senderUserId,
             ReceiverUserId = receiverUserId,
-            RecalledAtMs = recalledAtMs
+            RecalledAtMs = recalledAtMs,
+            ConversationSequence = conversationSequence
         };
 
         return new RealtimeEvent
@@ -79,6 +81,7 @@ internal static class GroupProjectionEventFactory
         long editedAtMs,
         IReadOnlyList<long>? mentionedUserIds,
         IReadOnlyList<string>? mentionedRoles,
+        long? conversationSequence,
         string? traceParent,
         string? traceState)
     {
@@ -91,6 +94,7 @@ internal static class GroupProjectionEventFactory
             Content = content,
             EditVersion = editVersion,
             EditedAtMs = editedAtMs,
+            ConversationSequence = conversationSequence,
             MentionedUserIds = mentionedUserIds,
             MentionedRoles = mentionedRoles
         };
@@ -126,6 +130,7 @@ internal static class GroupProjectionEventFactory
         string emoji,
         int emojiCount,
         long occurredAtMs,
+        long? conversationSequence,
         string? traceParent,
         string? traceState)
     {
@@ -144,7 +149,8 @@ internal static class GroupProjectionEventFactory
                     MessageReceiverUserId = messageReceiverUserId,
                     Emoji = emoji,
                     EmojiCount = emojiCount,
-                    OccurredAtMs = occurredAtMs
+                    OccurredAtMs = occurredAtMs,
+                    ConversationSequence = conversationSequence
                 },
                 RealtimeJsonSerializerContext.Default.RealtimeReactionAddedPayload);
         }
@@ -161,7 +167,8 @@ internal static class GroupProjectionEventFactory
                     MessageReceiverUserId = messageReceiverUserId,
                     Emoji = emoji,
                     EmojiCount = emojiCount,
-                    OccurredAtMs = occurredAtMs
+                    OccurredAtMs = occurredAtMs,
+                    ConversationSequence = conversationSequence
                 },
                 RealtimeJsonSerializerContext.Default.RealtimeReactionRemovedPayload);
         }
@@ -243,6 +250,7 @@ internal static class GroupProjectionEventFactory
         string lastReadMessageId,
         long lastReadAtMs,
         long occurredAtMs,
+        long? lastReadSequence,
         string? traceParent,
         string? traceState)
     {
@@ -251,7 +259,8 @@ internal static class GroupProjectionEventFactory
             ConversationId = conversationId,
             ReaderUserId = readerUserId,
             LastReadMessageId = lastReadMessageId,
-            LastReadAtMs = lastReadAtMs
+            LastReadAtMs = lastReadAtMs,
+            LastReadSequence = lastReadSequence
         };
 
         return new RealtimeEvent
