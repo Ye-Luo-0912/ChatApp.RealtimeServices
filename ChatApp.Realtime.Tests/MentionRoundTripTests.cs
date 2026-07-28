@@ -14,8 +14,17 @@ public sealed class MentionRoundTripTests
     private const string GroupConversationId = "grp:0123456789abcdef0123456789abcdef";
 
     [Fact]
-    public async Task ProcessAsync_PropagatesMentions_FromCommand_ToMessageRecord_AndEventPayload()
+    public async Task ProcessAsync_PropagatesSanitizedMentions_ForManagerSender()
     {
+        // 发送方 1001 是群 Owner（管理员），可 @all/@admin。
+        // 非群成员 9999 与自身 1001 静默移除；重复项去重；结果按升序排列。
+        var members = new List<ConversationMemberItem>
+        {
+            new() { UserId = 1001, Role = ConversationMemberRole.Owner },
+            new() { UserId = 2001, Role = ConversationMemberRole.Member },
+            new() { UserId = 2002, Role = ConversationMemberRole.Member },
+            new() { UserId = 2003, Role = ConversationMemberRole.Admin }
+        };
         var store = new CapturingStore();
         var signal = new RecordingRealtimeOutboxSignal();
         using var metrics = new RealtimeMetrics();
@@ -24,13 +33,13 @@ public sealed class MentionRoundTripTests
             signal,
             metrics,
             NoopTombstoneAndLedger.Tombstone,
-            NoopTombstoneAndLedger.Ledger,
+            new FakeGroupStore(members),
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var command = ValidGroupCommand() with
         {
-            MentionedUserIds = [2001L, 2002, 2003],
-            MentionedRoles = ["all", "admin"]
+            MentionedUserIds = [1001L, 2003, 2001, 9999, 2001, 2002],
+            MentionedRoles = ["all", "admin", "all", "unknown"]
         };
 
         var result = await processor.ProcessAsync(command);
@@ -39,20 +48,26 @@ public sealed class MentionRoundTripTests
         Assert.NotNull(store.Message);
         Assert.NotNull(store.Event);
 
-        // 消息记录携带 mention 字段
-        Assert.Equal(command.MentionedUserIds, store.Message!.MentionedUserIds);
-        Assert.Equal(command.MentionedRoles, store.Message!.MentionedRoles);
+        // 自身(1001)移除、非成员(9999)移除、去重、升序排列
+        Assert.Equal(new long[] { 2001, 2002, 2003 }, store.Message!.MentionedUserIds);
+        // 白名单外角色(unknown)移除、去重、Ordinal 升序（"admin" < "all"）
+        Assert.Equal(new[] { "admin", "all" }, store.Message!.MentionedRoles);
 
-        // P1-4：Processor 传 Payload 对象（不预序列化 PayloadJson），Store 负责一次性物化。
-        // 这里直接校验 Payload 对象的 mention 字段。
         var payload = Assert.IsType<RealtimeChatMessagePayload>(store.Event!.Payload);
-        Assert.Equal(command.MentionedUserIds, payload.MentionedUserIds);
-        Assert.Equal(command.MentionedRoles, payload.MentionedRoles);
+        Assert.Equal(store.Message.MentionedUserIds, payload.MentionedUserIds);
+        Assert.Equal(store.Message.MentionedRoles, payload.MentionedRoles);
     }
 
     [Fact]
-    public async Task ProcessAsync_PropagatesNullMentions_ForGroupWithoutMentions()
+    public async Task ProcessAsync_FiltersManagerOnlyRoles_ForNonManagerSender()
     {
+        // 发送方 2001 是普通 Member，不能 @all/@admin；用户 mention 仍生效。
+        var members = new List<ConversationMemberItem>
+        {
+            new() { UserId = 1001, Role = ConversationMemberRole.Owner },
+            new() { UserId = 2001, Role = ConversationMemberRole.Member },
+            new() { UserId = 2002, Role = ConversationMemberRole.Member }
+        };
         var store = new CapturingStore();
         var signal = new RecordingRealtimeOutboxSignal();
         using var metrics = new RealtimeMetrics();
@@ -61,7 +76,80 @@ public sealed class MentionRoundTripTests
             signal,
             metrics,
             NoopTombstoneAndLedger.Tombstone,
-            NoopTombstoneAndLedger.Ledger,
+            new FakeGroupStore(members),
+            NullLogger<DefaultIncomingMessageProcessor>.Instance);
+
+        var command = ValidGroupCommand() with
+        {
+            SenderUserId = 2001,
+            MentionedUserIds = [1001L, 2002, 9999],
+            MentionedRoles = ["all", "admin"]
+        };
+
+        var result = await processor.ProcessAsync(command);
+
+        Assert.True(result.Succeeded);
+        Assert.NotNull(store.Message);
+
+        // 非成员 9999 移除、升序
+        Assert.Equal(new long[] { 1001, 2002 }, store.Message!.MentionedUserIds);
+        // 非管理员的 @all/@admin 全部移除
+        Assert.Null(store.Message!.MentionedRoles);
+
+        var payload = Assert.IsType<RealtimeChatMessagePayload>(store.Event!.Payload);
+        Assert.Equal(store.Message.MentionedUserIds, payload.MentionedUserIds);
+        Assert.Null(payload.MentionedRoles);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_RemovesSelfMentionAndDeduplicates()
+    {
+        var members = new List<ConversationMemberItem>
+        {
+            new() { UserId = 1001, Role = ConversationMemberRole.Owner },
+            new() { UserId = 2001, Role = ConversationMemberRole.Member }
+        };
+        var store = new CapturingStore();
+        var signal = new RecordingRealtimeOutboxSignal();
+        using var metrics = new RealtimeMetrics();
+        var processor = new DefaultIncomingMessageProcessor(
+            store,
+            signal,
+            metrics,
+            NoopTombstoneAndLedger.Tombstone,
+            new FakeGroupStore(members),
+            NullLogger<DefaultIncomingMessageProcessor>.Instance);
+
+        var command = ValidGroupCommand() with
+        {
+            MentionedUserIds = [1001L, 1001, 2001, 2001]
+        };
+
+        var result = await processor.ProcessAsync(command);
+
+        Assert.True(result.Succeeded);
+        Assert.NotNull(store.Message);
+        // 自身全部移除、去重后仅剩 2001
+        Assert.Equal(new long[] { 2001 }, store.Message!.MentionedUserIds);
+        Assert.Null(store.Message!.MentionedRoles);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_PropagatesNullMentions_ForGroupWithoutMentions()
+    {
+        var members = new List<ConversationMemberItem>
+        {
+            new() { UserId = 1001, Role = ConversationMemberRole.Owner }
+        };
+        var store = new CapturingStore();
+        var signal = new RecordingRealtimeOutboxSignal();
+        using var metrics = new RealtimeMetrics();
+        var processor = new DefaultIncomingMessageProcessor(
+            store,
+            signal,
+            metrics,
+            NoopTombstoneAndLedger.Tombstone,
+            new FakeGroupStore(members),
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var result = await processor.ProcessAsync(ValidGroupCommand());
@@ -87,7 +175,7 @@ public sealed class MentionRoundTripTests
             signal,
             metrics,
             NoopTombstoneAndLedger.Tombstone,
-            NoopTombstoneAndLedger.Ledger,
+            new FakeGroupStore([]),
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         // 单聊场景下 mention 仍然透传（Gateway 侧已规整为 null，但 Realtime 侧不二次过滤）
@@ -174,6 +262,8 @@ public sealed class MentionRoundTripTests
             string content,
             long editedAtMs,
             long maxAgeMs,
+            IReadOnlyList<long>? mentionedUserIds = null,
+            IReadOnlyList<string>? mentionedRoles = null,
             CancellationToken ct = default) =>
             Task.FromResult(new MessageEditPersistResult(MessageEditPersistStatus.NotFound, messageId));
 
@@ -189,8 +279,15 @@ public sealed class MentionRoundTripTests
             Task.CompletedTask;
     }
 
-    private sealed class AlwaysMemberGroupStore : IRealtimeGroupStore
+    private sealed class FakeGroupStore : IRealtimeGroupStore
     {
+        private readonly IReadOnlyList<ConversationMemberItem> _members;
+
+        public FakeGroupStore(IReadOnlyList<ConversationMemberItem> members)
+        {
+            _members = members;
+        }
+
         public Task<GroupCreatePersistResult> CreateGroupAsync(
             string requestId,
             long creatorUserId,
@@ -255,17 +352,17 @@ public sealed class MentionRoundTripTests
             long actorUserId,
             string conversationId,
             CancellationToken ct = default) =>
-            Task.FromResult<IReadOnlyList<ConversationMemberItem>>([]);
+            Task.FromResult(_members);
 
         public Task<IReadOnlyList<long>> ListActiveMemberUserIdsAsync(
             string conversationId,
             CancellationToken ct = default) =>
-            Task.FromResult<IReadOnlyList<long>>([]);
+            Task.FromResult<IReadOnlyList<long>>(_members.Select(m => m.UserId).ToArray());
 
         public Task<bool> IsActiveMemberAsync(
             string conversationId,
             long userId,
             CancellationToken ct = default) =>
-            Task.FromResult(true);
+            Task.FromResult(_members.Any(m => m.UserId == userId));
     }
 }

@@ -126,6 +126,8 @@ public sealed class DefaultMessageRecallProcessorTests
             string content,
             long editedAtMs,
             long maxAgeMs,
+            IReadOnlyList<long>? mentionedUserIds = null,
+            IReadOnlyList<string>? mentionedRoles = null,
             CancellationToken ct = default) =>
             throw new NotSupportedException();
 

@@ -13,8 +13,10 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
     private readonly IRealtimeMessageStore _messageStore;
     private readonly IRealtimeOutboxSignal _outboxSignal;
     private readonly RealtimeMetrics _metrics;
+    // Perf-3：tombstone 预检查已移除——SaveAsync 事务内的 advisory lock + tombstone 检查是权威的。
+    // 字段保留：构造签名兼容，且未来其他 Processor 复用同一依赖图。
     private readonly IUserDeletionTombstoneStore _tombstoneStore;
-    private readonly ICommandIdempotencyLedger _idempotencyLedger;
+    private readonly IRealtimeGroupStore _groupStore;
     private readonly ILogger<DefaultIncomingMessageProcessor> _logger;
 
     public DefaultIncomingMessageProcessor(
@@ -22,14 +24,14 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
         IRealtimeOutboxSignal outboxSignal,
         RealtimeMetrics metrics,
         IUserDeletionTombstoneStore tombstoneStore,
-        ICommandIdempotencyLedger idempotencyLedger,
+        IRealtimeGroupStore groupStore,
         ILogger<DefaultIncomingMessageProcessor> logger)
     {
         _messageStore = messageStore;
         _outboxSignal = outboxSignal;
         _metrics = metrics;
         _tombstoneStore = tombstoneStore;
-        _idempotencyLedger = idempotencyLedger;
+        _groupStore = groupStore;
         _logger = logger;
     }
 
@@ -44,20 +46,10 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             return validationError;
         }
 
-        // LongTerm-1：账号已注销用户的旧命令回放必须直接拒绝，防止 retention GC
-        // 清理消息行后 JetStream replay 将旧命令当作新消息重新写入。
-        if (await _tombstoneStore.IsUserDeletedAsync(command.SenderUserId, ct).ConfigureAwait(false))
-        {
-            _metrics.RecordProcessingFailure("user_deleted");
-            _logger.LogWarning(
-                "入站消息被拒绝：发送用户已注销。发送用户={SenderUserId}；命令编号={CommandId}",
-                command.SenderUserId,
-                command.CommandId);
-            return MessageProcessResult.Failed(
-                "user_deleted",
-                "发送用户已注销，旧命令不再处理。",
-                MessageFailureKind.Permanent);
-        }
+        // Perf-3：移除事务外的 tombstone 预检查（连接 #1）。
+        // SaveAsync 事务内的 UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync
+        // 已做权威检查，预检查只会引入 TOCTOU 竞态与额外数据库往返。
+        // 用户已注销时 SaveAsync 返回 UserDeleted，由下方分支统一处理。
 
         string conversationId;
         long receiverUserId;
@@ -65,9 +57,12 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             ? null
             : command.ConversationId.Trim();
 
-        if (explicitConversationId is not null && ConversationId.IsGroup(explicitConversationId))
+        var isGroupMessage = explicitConversationId is not null
+                             && ConversationId.IsGroup(explicitConversationId);
+
+        if (isGroupMessage)
         {
-            conversationId = explicitConversationId;
+            conversationId = explicitConversationId!;
             receiverUserId = 0;
             // Perf-2：删除 Processor 的群成员预检查。该查询不具备事务权威性
             // （查询成功后用户仍可能立即被移除），且每条群消息多一次数据库往返。
@@ -98,51 +93,19 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             receiverUserId = command.ReceiverUserId;
         }
 
-        // LongTerm-1：独立幂等账本检查。解耦幂等性依据与 messages 行生命周期：
-        // 消息行被 retention GC 或账号删除清理后，账本仍保留命令处理结果，
-        // 防止 JetStream replay 将旧命令当作新消息重新写入。
-        // P0-8：v3 指纹覆盖会话、回复、转发、@提及等字段，区分真重放与内容冲突
-        var fingerprint = RealtimeMessageFingerprint.Compute(
-            receiverUserId,
-            command.Content,
-            command.AttachmentIds,
+        // Mentions 业务闭环：去重 / 排除自身 / 截断 / 群成员校验 / @all|@admin 权限校验。
+        // 所有违规一律静默过滤——不拒绝整条消息，符合 Realtime"消息必达"语义。
+        // 单聊场景下：仅做基本去重与排除自身（mention 通常无意义但保留透传）。
+        // 群聊场景下：进一步用群活跃成员集合过滤 MentionedUserIds，并按发送者角色过滤 @all|@admin。
+        var sanitizedMentions = await SanitizeMentionsAsync(
+            command,
             conversationId,
-            command.ReplyToMessageId,
-            command.ForwardedFromMessageId,
-            command.MentionedUserIds,
-            command.MentionedRoles);
+            isGroupMessage,
+            ct).ConfigureAwait(false);
 
-        var ledgerEntry = await _idempotencyLedger
-            .FindAsync(command.SenderUserId, command.ClientMessageId, ct)
-            .ConfigureAwait(false);
-        if (ledgerEntry is not null)
-        {
-            if (string.Equals(ledgerEntry.ContentFingerprint, fingerprint, StringComparison.Ordinal))
-            {
-                // 幂等重放：内容指纹匹配，返回已有消息编号，不调用 Store。
-                _metrics.RecordDuplicate();
-                _outboxSignal.Notify();
-                _logger.LogDebug(
-                    "幂等账本命中（重放）。发送用户={SenderUserId}；客户端消息编号={ClientMessageId}；已有消息={MessageId}",
-                    command.SenderUserId,
-                    command.ClientMessageId,
-                    ledgerEntry.MessageId);
-                return MessageProcessResult.Success(ledgerEntry.MessageId ?? command.CommandId);
-            }
-
-            // 内容冲突：相同 (sender, client_message_id) 但指纹不一致。
-            _metrics.RecordIdempotencyConflict();
-            _metrics.RecordProcessingFailure("idempotency_conflict");
-            _logger.LogWarning(
-                "幂等账本命中（冲突）。发送用户={SenderUserId}；客户端消息编号={ClientMessageId}；已有消息={MessageId}",
-                command.SenderUserId,
-                command.ClientMessageId,
-                ledgerEntry.MessageId);
-            return MessageProcessResult.Failed(
-                "idempotency_conflict",
-                "相同客户端消息编号已存在但内容不一致。",
-                MessageFailureKind.Permanent);
-        }
+        // Perf-3：移除事务外的 ledger.FindAsync（连接 #2）与 fingerprint 计算。
+        // 幂等账本查询与记录已下沉到 SaveAsync 事务内（NpgsqlRealtimeMessageStore），
+        // fingerprint 由 SaveAsync 内部计算，避免重复。
 
         var record = new RealtimeMessageRecord
         {
@@ -160,8 +123,8 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             ForwardedFromMessageId = command.ForwardedFromMessageId,
             ForwardedFromSenderUserId = command.ForwardedFromSenderUserId,
             ForwardedFromPreview = command.ForwardedFromPreview,
-            MentionedUserIds = command.MentionedUserIds,
-            MentionedRoles = command.MentionedRoles,
+            MentionedUserIds = sanitizedMentions.UserIds,
+            MentionedRoles = sanitizedMentions.Roles,
             ReceivedAtMs = command.ReceivedAtMs
         };
 
@@ -201,8 +164,8 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                 ForwardedFromMessageId = command.ForwardedFromMessageId,
                 ForwardedFromSenderUserId = command.ForwardedFromSenderUserId,
                 ForwardedFromPreview = command.ForwardedFromPreview,
-                MentionedUserIds = command.MentionedUserIds,
-                MentionedRoles = command.MentionedRoles
+                MentionedUserIds = sanitizedMentions.UserIds,
+                MentionedRoles = sanitizedMentions.Roles
             },
             OccurredAtMs = command.ReceivedAtMs,
             TraceParent = RealtimeTraceContext.CaptureTraceParent(),
@@ -219,16 +182,7 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                 record.ClientMessageId,
                 record.SenderUserId,
                 persisted.MessageId);
-            // LongTerm-1：回填账本（messages 表冲突但账本未命中，说明是迁移前数据）。
-            await RecordLedgerBestEffortAsync(
-                command.CommandId,
-                command.SenderUserId,
-                command.ClientMessageId,
-                fingerprint,
-                IdempotencyLedgerResultKind.Conflict,
-                persisted.MessageId,
-                command.ReceivedAtMs,
-                ct).ConfigureAwait(false);
+            // Perf-3：账本回填已由 SaveAsync 事务内完成（Conflict 分支）。
             return MessageProcessResult.Failed(
                 "idempotency_conflict",
                 "相同客户端消息编号已存在但内容不一致。",
@@ -281,30 +235,12 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                 record.ReceiverUserId);
 
             _metrics.RecordDuplicate();
-            // LongTerm-1：回填账本（messages 表命中但账本未命中，说明是迁移前数据）。
-            await RecordLedgerBestEffortAsync(
-                command.CommandId,
-                command.SenderUserId,
-                command.ClientMessageId,
-                fingerprint,
-                IdempotencyLedgerResultKind.Duplicate,
-                persisted.MessageId,
-                command.ReceivedAtMs,
-                ct).ConfigureAwait(false);
+            // Perf-3：账本回填已由 SaveAsync 事务内完成（Duplicate 分支）。
             return MessageProcessResult.Success(persisted.MessageId);
         }
 
         _metrics.RecordPersisted();
-        // LongTerm-1：记录 Created 结果到独立账本，解耦幂等性与 messages 行生命周期。
-        await RecordLedgerBestEffortAsync(
-            command.CommandId,
-            command.SenderUserId,
-            command.ClientMessageId,
-            fingerprint,
-            IdempotencyLedgerResultKind.Created,
-            persisted.MessageId,
-            command.ReceivedAtMs,
-            ct).ConfigureAwait(false);
+        // Perf-3：账本 Created 记录已由 SaveAsync 事务内完成。
 
         _logger.LogDebug(
             "入站消息已处理。消息编号={MessageId}；发送用户={SenderUserId}；接收用户={ReceiverUserId}",
@@ -316,35 +252,87 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
     }
 
     /// <summary>
-    /// LongTerm-1：best-effort 记录幂等账本。写入失败不阻断主流程（消息已持久化）。
-    /// 失败时仅记录日志：retention GC 后旧命令可能"复活"，但 tombstone 检查会拒绝已注销用户，
-    /// 且 retention GC 周期远大于此 crash 窗口。
+    /// 规范化 mention 字段。群聊场景下加载成员列表以做群成员校验与发送者角色判定。
+    /// 单聊场景下仅做基本去重 + 排除自身；mention 通常无意义但保留透传。
     /// </summary>
-    private async Task RecordLedgerBestEffortAsync(
-        string commandId,
-        long senderUserId,
-        string clientMessageId,
-        string fingerprint,
-        IdempotencyLedgerResultKind kind,
-        string? messageId,
-        long receivedAtMs,
+    private async Task<SanitizedMentions> SanitizeMentionsAsync(
+        IncomingMessageCommand command,
+        string conversationId,
+        bool isGroupMessage,
         CancellationToken ct)
     {
+        // 单聊或无 mention：默认 sender 视为"管理员"（@all/@admin 在单聊无意义但允许透传），
+        // 不做群成员过滤。
+        if (!isGroupMessage)
+        {
+            var directUserIds = MentionValidator.AsReadOnly(
+                MentionValidator.NormalizeUserIds(command.MentionedUserIds, command.SenderUserId));
+            var directRoles = MentionValidator.AsReadOnly(
+                MentionValidator.NormalizeRoles(command.MentionedRoles, isManager: true));
+            return new SanitizedMentions(directUserIds, directRoles);
+        }
+
+        // 群聊：加载成员列表（含角色）。
+        // ListMembersAsync 要求 actor 是当前成员；若发送方不是成员则返回空列表，
+        // 此时按"无群上下文"处理——基本去重 + 排除自身 + 视为非管理员，
+        // 由下游 SaveAsync 的权威成员校验拒绝消息。
+        IReadOnlyList<ConversationMemberItem> members;
         try
         {
-            await _idempotencyLedger
-                .RecordAsync(commandId, senderUserId, clientMessageId,
-                    fingerprint, kind, messageId, receivedAtMs, ct)
+            members = await _groupStore
+                .ListMembersAsync(command.SenderUserId, conversationId, ct)
                 .ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException)
         {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // 群存储异常不应阻塞消息写入；退化为基本去重，下游 SaveAsync 会做权威校验。
             _logger.LogWarning(
                 ex,
-                "幂等账本写入失败（不阻断主流程）。发送用户={SenderUserId}；客户端消息编号={ClientMessageId}",
-                senderUserId,
-                clientMessageId);
+                "群成员查询失败，退化为基本 mention 规范化。会话={ConversationId}；发送用户={SenderUserId}",
+                conversationId,
+                command.SenderUserId);
+            var fallbackUserIds = MentionValidator.AsReadOnly(
+                MentionValidator.NormalizeUserIds(command.MentionedUserIds, command.SenderUserId));
+            var fallbackRoles = MentionValidator.AsReadOnly(
+                MentionValidator.NormalizeRoles(command.MentionedRoles, isManager: false));
+            return new SanitizedMentions(fallbackUserIds, fallbackRoles);
         }
+
+        if (members.Count == 0)
+        {
+            // 发送方不是群成员：基本去重 + 视为非管理员。下游 SaveAsync 会拒绝。
+            var nonMemberUserIds = MentionValidator.AsReadOnly(
+                MentionValidator.NormalizeUserIds(command.MentionedUserIds, command.SenderUserId));
+            var nonMemberRoles = MentionValidator.AsReadOnly(
+                MentionValidator.NormalizeRoles(command.MentionedRoles, isManager: false));
+            return new SanitizedMentions(nonMemberUserIds, nonMemberRoles);
+        }
+
+        // 找到发送者的角色：Owner/Admin 视为管理员，可 @all/@admin。
+        var isManager = false;
+        var activeMemberUserIds = new HashSet<long>(members.Count);
+        foreach (var m in members)
+        {
+            activeMemberUserIds.Add(m.UserId);
+            if (m.UserId == command.SenderUserId
+                && (m.Role == ConversationMemberRole.Owner || m.Role == ConversationMemberRole.Admin))
+            {
+                isManager = true;
+            }
+        }
+
+        var sanitizedUserIds = MentionValidator.AsReadOnly(
+            MentionValidator.NormalizeUserIds(
+                command.MentionedUserIds,
+                command.SenderUserId,
+                activeMemberUserIds));
+        var sanitizedRoles = MentionValidator.AsReadOnly(
+            MentionValidator.NormalizeRoles(command.MentionedRoles, isManager));
+        return new SanitizedMentions(sanitizedUserIds, sanitizedRoles);
     }
 
     private static MessageProcessResult? Validate(IncomingMessageCommand command)
@@ -445,41 +433,17 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                 "缺少转发原消息编号时不能携带转发元数据。");
         }
 
-        // P0-8：@提及用户与角色校验
-        if (command.MentionedUserIds is { Count: > 0 })
-        {
-            if (command.MentionedUserIds.Count > 50)
-                return MessageProcessResult.Failed(
-                    "too_many_mentions",
-                    "单条消息 @提及用户数不能超过 50。");
-            // 去重校验：不允许重复的用户 Id
-            var seenMentionedUsers = new HashSet<long>();
-            foreach (var mentionedUserId in command.MentionedUserIds)
-            {
-                if (!seenMentionedUsers.Add(mentionedUserId))
-                    return MessageProcessResult.Failed(
-                        "duplicate_mentioned_user",
-                        "@提及用户列表不能包含重复的用户编号。");
-            }
-        }
-
-        if (command.MentionedRoles is { Count: > 0 })
-        {
-            if (command.MentionedRoles.Count > 5)
-                return MessageProcessResult.Failed(
-                    "too_many_mentioned_roles",
-                    "单条消息 @提及角色数不能超过 5。");
-            foreach (var role in command.MentionedRoles)
-            {
-                // 仅允许 "all" 和 "admin" 两个角色
-                if (!string.Equals(role, "all", StringComparison.Ordinal)
-                    && !string.Equals(role, "admin", StringComparison.Ordinal))
-                    return MessageProcessResult.Failed(
-                        "invalid_mentioned_role",
-                        "@提及角色仅允许 'all' 和 'admin'。");
-            }
-        }
+        // Mentions 业务校验已迁移到 MentionValidator（在 SanitizeMentionsAsync 中调用）：
+        // - 数量超限：截断而非拒绝
+        // - 重复用户/角色：去重而非拒绝
+        // - @自己：静默移除
+        // - 非群成员：静默移除（群聊场景）
+        // - @all/@admin 非管理员发送：静默移除（群聊场景）
 
         return null;
     }
+
+    private sealed record SanitizedMentions(
+        IReadOnlyList<long>? UserIds,
+        IReadOnlyList<string>? Roles);
 }

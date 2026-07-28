@@ -70,7 +70,9 @@ public sealed class OutboxPublisherWorker : BackgroundService
                         continue;
                     }
 
-                    await PublishBatchAsync(records, stoppingToken).ConfigureAwait(false);
+                    // P1-3：记录认领时间，发布前据此判断是否需要续租 lease。
+                    var claimedAt = DateTimeOffset.UtcNow;
+                    await PublishBatchAsync(records, claimedAt, stoppingToken).ConfigureAwait(false);
                     retryAttempt = 0;
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -112,9 +114,33 @@ public sealed class OutboxPublisherWorker : BackgroundService
     /// <summary>
     /// P1-3：并行发布一批记录，收集结果后按状态分组批量更新，避免逐事件数据库往返。
     /// 发布与状态更新解耦：发布失败但 lease 未过期的记录会在下一轮被原实例或其它实例重新认领。
+    /// 发布前若距认领已超过 lease 的一半，先续租避免发布期间 lease 过期导致其他实例重复认领。
     /// </summary>
-    private async Task PublishBatchAsync(IReadOnlyList<RealtimeOutboxRecord> records, CancellationToken ct)
+    private async Task PublishBatchAsync(
+        IReadOnlyList<RealtimeOutboxRecord> records,
+        DateTimeOffset claimedAt,
+        CancellationToken ct)
     {
+        // P1-3：如果距认领已超过 lease 的一半，先续租避免发布期间 lease 过期。
+        var lease = TimeSpan.FromSeconds(_options.LeaseSeconds);
+        if (DateTimeOffset.UtcNow - claimedAt > lease / 2)
+        {
+            try
+            {
+                await _outboxStore
+                    .ExtendLeaseBatchAsync(records, lease, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Outbox lease 续租失败，继续尝试发布。");
+            }
+        }
+
         var published = new List<RealtimeOutboxRecord>(records.Count);
         var failed = new List<(RealtimeOutboxRecord Record, string Error, TimeSpan Delay)>(records.Count);
         var deadLetters = new List<(RealtimeOutboxRecord Record, string Error)>(records.Count);
@@ -137,13 +163,30 @@ public sealed class OutboxPublisherWorker : BackgroundService
                 activity?.SetTag("chat.event.type", record.Event.Type.ToString());
                 try
                 {
+                    // Perf-4：如果 Outbox 行携带预序列化的 UTF-8 payload，直接发送避免重新序列化；
+                    // 否则回退到 PublishAsync/PublishToManyAsync（内部会序列化）。
+                    var payload = record.PayloadUtf8;
                     if (record.Event.TargetUserIds is { Length: > 0 })
                     {
-                        await _publisher.PublishToManyAsync(record.Event, token).ConfigureAwait(false);
+                        if (payload is { Length: > 0 })
+                        {
+                            await _publisher.PublishToManyWithPayloadAsync(record.Event, payload, token).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await _publisher.PublishToManyAsync(record.Event, token).ConfigureAwait(false);
+                        }
                     }
                     else
                     {
-                        await _publisher.PublishAsync(record.Event, token).ConfigureAwait(false);
+                        if (payload is { Length: > 0 })
+                        {
+                            await _publisher.PublishWithPayloadAsync(record.Event, payload, token).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await _publisher.PublishAsync(record.Event, token).ConfigureAwait(false);
+                        }
                     }
                     results[index] = new PublishOutcome(record, Succeeded: true, Error: null);
                 }
@@ -165,7 +208,6 @@ public sealed class OutboxPublisherWorker : BackgroundService
             if (outcome.Succeeded)
             {
                 published.Add(outcome.Record);
-                _metrics.RecordOutboxPublished();
             }
             else if (outcome.Record.AttemptCount >= _options.MaxAttempts)
             {
@@ -179,9 +221,15 @@ public sealed class OutboxPublisherWorker : BackgroundService
             }
         }
 
-        // 批量状态更新
+        // 批量状态更新：用实际命中记录数更新 metrics，避免 lease 过期被其他实例接手后仍计数。
         if (published.Count > 0)
-            await _outboxStore.MarkPublishedBatchAsync(published, ct).ConfigureAwait(false);
+        {
+            var publishedAffected = await _outboxStore
+                .MarkPublishedBatchAsync(published, ct)
+                .ConfigureAwait(false);
+            for (var i = 0; i < publishedAffected; i++)
+                _metrics.RecordOutboxPublished();
+        }
 
         if (failed.Count > 0)
         {

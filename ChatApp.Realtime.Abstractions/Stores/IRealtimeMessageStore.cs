@@ -37,6 +37,11 @@ public interface IRealtimeMessageStore
 
     /// <summary>
     /// 发送方编辑消息正文（不改附件）：递增 edit_version，写入 edited_at_ms / changed_at_ms，并投递 Outbox。
+    /// <para>
+    /// <paramref name="mentionedUserIds"/> 与 <paramref name="mentionedRoles"/> 为 <c>null</c> 时
+    /// 不修改消息已存的 mentions；非空数组（包括空数组）会替换原值并经过与新增消息一致的 MentionValidator 规范化
+    /// （去重 / 排除自身 / 截断 / 群成员校验 / @all|@admin 权限校验）。
+    /// </para>
     /// </summary>
     Task<MessageEditPersistResult> ApplyEditAsync(
         string requestId,
@@ -46,6 +51,8 @@ public interface IRealtimeMessageStore
         string content,
         long editedAtMs,
         long maxAgeMs,
+        IReadOnlyList<long>? mentionedUserIds = null,
+        IReadOnlyList<string>? mentionedRoles = null,
         CancellationToken ct = default);
 
     /// <summary>

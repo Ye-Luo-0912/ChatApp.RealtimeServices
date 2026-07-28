@@ -169,7 +169,7 @@ public sealed class RealtimeBusinessEventContractTests
             UnreadCount = 1
         };
 
-        Assert.Equal(2, conversation.PayloadVersion);
+        Assert.Equal(3, conversation.PayloadVersion);
         Assert.Equal(1, unread.PayloadVersion);
 
         var conversationJson = System.Text.Json.JsonSerializer.Serialize(

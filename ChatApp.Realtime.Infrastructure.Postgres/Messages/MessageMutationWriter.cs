@@ -178,7 +178,7 @@ internal sealed class MessageMutationWriter
         await using var command = new NpgsqlCommand(
             $"""
              SELECT sender_user_id, receiver_user_id, conversation_id, received_at_ms,
-                    recalled_at_ms, content, edit_version
+                    recalled_at_ms, content, edit_version, mentioned_user_ids, mentioned_roles
              FROM {_session.Schema.MessagesTableSql}
              WHERE message_id = @message_id
              FOR UPDATE
@@ -197,23 +197,31 @@ internal sealed class MessageMutationWriter
             reader.GetInt64(3),
             reader.IsDBNull(4) ? null : reader.GetInt64(4),
             reader.GetString(5),
-            reader.GetInt32(6));
+            reader.GetInt32(6),
+            reader.IsDBNull(7) ? null : reader.GetFieldValue<long[]>(7),
+            reader.IsDBNull(8) ? null : reader.GetFieldValue<string[]>(8));
     }
 
     public async Task<int> ApplyEditUpdateAsync(
         string messageId,
         string content,
         int editVersion,
-        long editedAtMs)
+        long editedAtMs,
+        long[]? mentionedUserIds,
+        string[]? mentionedRoles)
     {
         var ct = _session.CancellationToken;
+        // mentions 为 null 时保留原值（COALESCE 语义：NULL 输入 → 不修改该列）；
+        // 非空数组（包括空数组）替换原值。
         await using var command = new NpgsqlCommand(
             $"""
              UPDATE {_session.Schema.MessagesTableSql}
              SET content = @content,
                  edit_version = @edit_version,
                  edited_at_ms = @edited_at_ms,
-                 changed_at_ms = @edited_at_ms
+                 changed_at_ms = @edited_at_ms,
+                 mentioned_user_ids = COALESCE(@mentioned_user_ids, mentioned_user_ids),
+                 mentioned_roles = COALESCE(@mentioned_roles, mentioned_roles)
              WHERE message_id = @message_id
                AND recalled_at_ms IS NULL
              """,
@@ -223,12 +231,45 @@ internal sealed class MessageMutationWriter
         command.Parameters.AddWithValue("content", content);
         command.Parameters.AddWithValue("edit_version", editVersion);
         command.Parameters.AddWithValue("edited_at_ms", editedAtMs);
+        // Npgsql：空数组需写为 DBNull 才能置 NULL；非空数组直接传入。
+        // MentionValidator.AsReadOnly 已经把"全部过滤掉"的 mention 规整为 null，
+        // 但编辑路径调用方需区分"不修改（null）"与"清空（empty）"。
+        // 此处 long[]?/string[]? 为 null → COALESCE 保留原值；为空数组 → 置 NULL（语义为无 mention）。
+        command.Parameters.AddWithValue(
+            "mentioned_user_ids",
+            mentionedUserIds is null
+                ? DBNull.Value
+                : mentionedUserIds.Length == 0
+                    ? DBNull.Value
+                    : mentionedUserIds);
+        command.Parameters.AddWithValue(
+            "mentioned_roles",
+            mentionedRoles is null
+                ? DBNull.Value
+                : mentionedRoles.Length == 0
+                    ? DBNull.Value
+                    : mentionedRoles);
         return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
-    public static string ComputeMutationFingerprint(short operation, string messageId, string content)
+    public static string ComputeMutationFingerprint(
+        short operation,
+        string messageId,
+        string content,
+        IReadOnlyList<long>? mentionedUserIds = null,
+        IReadOnlyList<string>? mentionedRoles = null)
     {
-        var input = System.Text.Encoding.UTF8.GetBytes($"{operation}\n{messageId}\n{content}");
+        // 编辑指纹纳入 mentions，保证"同 RequestId 不同 mentions"被判为 RequestConflict；
+        // 撤回 operation=2 不传 mentions，null → "null" 哨兵，与历史 v1 指纹不同，
+        // 但本仓所有 mutation_requests 行均按当前代码版本写入，不存在跨版本比对。
+        var usersPart = mentionedUserIds is null
+            ? "null"
+            : string.Join(",", mentionedUserIds);
+        var rolesPart = mentionedRoles is null
+            ? "null"
+            : string.Join(",", mentionedRoles);
+        var input = System.Text.Encoding.UTF8.GetBytes(
+            $"{operation}\n{messageId}\n{content}\n{usersPart}\n{rolesPart}");
         return Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(input));
     }
 
@@ -308,5 +349,7 @@ internal sealed class MessageMutationWriter
         long ReceivedAtMs,
         long? RecalledAtMs,
         string Content,
-        int EditVersion);
+        int EditVersion,
+        long[]? MentionedUserIds,
+        string[]? MentionedRoles);
 }

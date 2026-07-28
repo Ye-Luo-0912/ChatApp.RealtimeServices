@@ -20,13 +20,23 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
 
     private readonly RealtimeDatabaseClient _databaseClient;
     private readonly RealtimeDatabaseSchema _databaseSchema;
+    private readonly IGroupOperationAuditStore? _auditStore;
+    private readonly IMembershipPeriodStore? _membershipPeriodStore;
 
     public NpgsqlRealtimeGroupStore(
         RealtimeDatabaseClient databaseClient,
-        RealtimeDatabaseSchema databaseSchema)
+        RealtimeDatabaseSchema databaseSchema,
+        IGroupOperationAuditStore? auditStore = null,
+        IMembershipPeriodStore? membershipPeriodStore = null)
     {
         _databaseClient = databaseClient;
         _databaseSchema = databaseSchema;
+        // 审计 Outbox：可选注入。生产 DI 路径由 RealtimePostgresRegistration 注入
+        // NpgsqlGroupOperationAuditStore；未注入时（测试场景）跳过事务内审计。
+        _auditStore = auditStore;
+        // Membership periods：可选注入。生产 DI 路径由 RealtimePostgresRegistration 注入
+        // NpgsqlMembershipPeriodStore；未注入时（测试场景）跳过 membership period 记录。
+        _membershipPeriodStore = membershipPeriodStore;
     }
 
     /// <summary>
@@ -71,6 +81,52 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
 
         var count = (long)(await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false) ?? 0);
         return count > 0 ? "target_user_deleted" : null;
+    }
+
+    /// <summary>
+    /// Membership periods：在业务事务内记录多个成员入群。
+    /// 未注入 <see cref="IMembershipPeriodStore"/> 时（测试场景）为空操作。
+    /// </summary>
+    private async Task RecordMembershipJoinsInTransactionAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        string conversationId,
+        IReadOnlyList<long> userIds,
+        long joinedAtMs,
+        CancellationToken ct)
+    {
+        if (_membershipPeriodStore is null || userIds.Count == 0)
+            return;
+
+        foreach (var userId in userIds)
+        {
+            await _membershipPeriodStore
+                .RecordJoinInTransactionAsync(
+                    connection, transaction, conversationId, userId, joinedAtMs, ct)
+                .ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Membership periods：在业务事务内记录单个成员离群。
+    /// 未注入 <see cref="IMembershipPeriodStore"/> 时（测试场景）为空操作。
+    /// </summary>
+    private async Task RecordMembershipLeaveInTransactionAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        string conversationId,
+        long userId,
+        long leftAtMs,
+        string leftReason,
+        CancellationToken ct)
+    {
+        if (_membershipPeriodStore is null)
+            return;
+
+        await _membershipPeriodStore
+            .RecordLeaveInTransactionAsync(
+                connection, transaction, conversationId, userId, leftAtMs, leftReason, ct)
+            .ConfigureAwait(false);
     }
 
     public async Task<GroupCreatePersistResult> CreateGroupAsync(
@@ -203,6 +259,11 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 ct)
             .ConfigureAwait(false);
 
+        // Membership periods：记录所有初始成员入群（与群创建同事务）。
+        await RecordMembershipJoinsInTransactionAsync(
+                connection, transaction, conversationId, members, occurredAtMs, ct)
+            .ConfigureAwait(false);
+
         var events = new List<RealtimeEvent>(2);
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
@@ -246,6 +307,13 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 succeeded: true,
                 errorCode: null,
                 ct)
+            .ConfigureAwait(false);
+        // 审计 Outbox：在业务事务内写入审计，失败则整个事务回滚。
+        await RecordAuditInTransactionAsync(
+                connection, transaction,
+                GroupConversationOperation.Create, creatorUserId, conversationId,
+                targetUserId: null, previousRole: null, newRole: null,
+                requestId, actorSessionId, succeeded: true, errorCode: null, occurredAtMs, ct)
             .ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return GroupCreatePersistResult.Ok(conversationId, title, memberItems);
@@ -366,6 +434,11 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             return GroupMutatePersistResult.Ok(conversationId, title);
         }
 
+        // Membership periods：记录新入群成员（与加成员同事务）。
+        await RecordMembershipJoinsInTransactionAsync(
+                connection, transaction, conversationId, insertedUserIds, occurredAtMs, ct)
+            .ConfigureAwait(false);
+
         var allMembers = await ListMembersInTxAsync(connection, transaction, conversationId, ct)
             .ConfigureAwait(false);
         if (allMembers.Count > RealtimeWireLimits.MaxTargetUserIdsPerEvent)
@@ -425,6 +498,13 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 succeeded: true,
                 errorCode: null,
                 ct)
+            .ConfigureAwait(false);
+        // 审计 Outbox：在业务事务内写入审计，失败则整个事务回滚。
+        await RecordAuditInTransactionAsync(
+                connection, transaction,
+                GroupConversationOperation.AddMembers, actorUserId, conversationId,
+                targetUserId: null, previousRole: null, newRole: null,
+                requestId, actorSessionId, succeeded: true, errorCode: null, occurredAtMs, ct)
             .ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return GroupMutatePersistResult.Ok(conversationId, title, allMembers);
@@ -547,6 +627,12 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             await softDelete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
 
+        // Membership periods：记录被移除成员离群（与移除操作同事务）。
+        await RecordMembershipLeaveInTransactionAsync(
+                connection, transaction, conversationId, targetUserId,
+                occurredAtMs, leftReason: "removed", ct)
+            .ConfigureAwait(false);
+
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
         var evt = CreateMemberRemovedAggregatedEvent(
@@ -571,6 +657,13 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 succeeded: true,
                 errorCode: null,
                 ct)
+            .ConfigureAwait(false);
+        // 审计 Outbox：在业务事务内写入审计，失败则整个事务回滚。
+        await RecordAuditInTransactionAsync(
+                connection, transaction,
+                GroupConversationOperation.RemoveMember, actorUserId, conversationId,
+                targetUserId, previousRole: null, newRole: null,
+                requestId, actorSessionId, succeeded: true, errorCode: null, occurredAtMs, ct)
             .ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return GroupMutatePersistResult.Ok(conversationId, title);
@@ -678,6 +771,12 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             await softDelete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
 
+        // Membership periods：记录主动退群成员离群（与退群操作同事务）。
+        await RecordMembershipLeaveInTransactionAsync(
+                connection, transaction, conversationId, actorUserId,
+                occurredAtMs, leftReason: "leave", ct)
+            .ConfigureAwait(false);
+
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
         var evt = CreateMemberLeftAggregatedEvent(
@@ -701,6 +800,13 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 succeeded: true,
                 errorCode: null,
                 ct)
+            .ConfigureAwait(false);
+        // 审计 Outbox：在业务事务内写入审计，失败则整个事务回滚。
+        await RecordAuditInTransactionAsync(
+                connection, transaction,
+                GroupConversationOperation.Leave, actorUserId, conversationId,
+                targetUserId: null, previousRole: null, newRole: null,
+                requestId, actorSessionId, succeeded: true, errorCode: null, occurredAtMs, ct)
             .ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return GroupMutatePersistResult.Ok(conversationId, title);
@@ -803,6 +909,13 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                     succeeded: true,
                     errorCode: null,
                     ct)
+                .ConfigureAwait(false);
+            // 审计 Outbox：角色未变（幂等 no-op）但仍记录审计，失败则整个事务回滚。
+            await RecordAuditInTransactionAsync(
+                    connection, transaction,
+                    GroupConversationOperation.ChangeRole, actorUserId, conversationId,
+                    targetUserId, previousRole, newRole,
+                    requestId, actorSessionId, succeeded: true, errorCode: null, occurredAtMs, ct)
                 .ConfigureAwait(false);
             await transaction.CommitAsync(ct).ConfigureAwait(false);
             return GroupMutatePersistResult.Ok(conversationId, title)
@@ -910,6 +1023,13 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 errorCode: null,
                 ct)
             .ConfigureAwait(false);
+        // 审计 Outbox：在业务事务内写入审计，失败则整个事务回滚。
+        await RecordAuditInTransactionAsync(
+                connection, transaction,
+                GroupConversationOperation.ChangeRole, actorUserId, conversationId,
+                targetUserId, previousRole, newRole,
+                requestId, actorSessionId, succeeded: true, errorCode: null, occurredAtMs, ct)
+            .ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return GroupMutatePersistResult.Ok(conversationId, title)
             with { PreviousRole = previousRole, NewRole = newRole };
@@ -1002,6 +1122,15 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             await dissolveMembers.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
 
+        // Membership periods：记录全员离群（与解散操作同事务）。
+        foreach (var memberId in notifyTargets)
+        {
+            await RecordMembershipLeaveInTransactionAsync(
+                    connection, transaction, conversationId, memberId,
+                    occurredAtMs, leftReason: "dissolved", ct)
+                .ConfigureAwait(false);
+        }
+
         await using (var dissolveConv = new NpgsqlCommand(
                          $"""
                           UPDATE {_databaseSchema.ConversationsTableSql}
@@ -1041,6 +1170,13 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 succeeded: true,
                 errorCode: null,
                 ct)
+            .ConfigureAwait(false);
+        // 审计 Outbox：在业务事务内写入审计，失败则整个事务回滚。
+        await RecordAuditInTransactionAsync(
+                connection, transaction,
+                GroupConversationOperation.Dissolve, actorUserId, conversationId,
+                targetUserId: null, previousRole: null, newRole: null,
+                requestId, actorSessionId, succeeded: true, errorCode: null, occurredAtMs, ct)
             .ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return GroupMutatePersistResult.Ok(conversationId, title);
@@ -1714,6 +1850,57 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
     private static string ComputeGroupFingerprint(short operation, string keyData) =>
         Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(
             System.Text.Encoding.UTF8.GetBytes($"{operation}\n{keyData}")));
+
+    /// <summary>
+    /// 审计 Outbox：在业务事务内写入群操作审计记录。
+    /// <para>
+    /// 复用调用方已有的连接与事务，与业务变更 / outbox / 幂等账本同生共死。
+    /// 审计失败向上抛出，由 <c>await using</c> 释放事务触发回滚，
+    /// 保证“业务变更成功 ⇒ 审计已记录”，审计不会静默丢失。
+    /// </para>
+    /// <para>
+    /// 仅在成功路径调用：失败路径已回滚事务，审计改由 Processor 走 best-effort
+    /// <see cref="IGroupOperationAuditStore.RecordAsync"/> 记录失败尝试。
+    /// </para>
+    /// </summary>
+    private async Task RecordAuditInTransactionAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        GroupConversationOperation operation,
+        long actorUserId,
+        string? conversationId,
+        long? targetUserId,
+        ConversationMemberRole? previousRole,
+        ConversationMemberRole? newRole,
+        string requestId,
+        string? actorSessionId,
+        bool succeeded,
+        string? errorCode,
+        long occurredAtMs,
+        CancellationToken ct)
+    {
+        if (_auditStore is null)
+            return;
+
+        var entry = new GroupOperationAuditEntry
+        {
+            ActorUserId = actorUserId,
+            ConversationId = conversationId,
+            Operation = operation,
+            TargetUserId = targetUserId,
+            PreviousRole = previousRole,
+            NewRole = newRole,
+            RequestId = requestId,
+            ActorSessionId = actorSessionId,
+            Succeeded = succeeded,
+            ErrorCode = errorCode,
+            OccurredAtMs = occurredAtMs
+        };
+
+        await _auditStore
+            .RecordInTransactionAsync(entry, connection, transaction, ct)
+            .ConfigureAwait(false);
+    }
 
     private sealed record GroupMutationRequestRow(
         short Operation,

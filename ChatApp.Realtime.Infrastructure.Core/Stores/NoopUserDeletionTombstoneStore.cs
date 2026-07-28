@@ -22,6 +22,17 @@ public sealed class NoopUserDeletionTombstoneStore(ILogger<NoopUserDeletionTombs
         return Task.FromResult(UserLifecycleState.Active);
     }
 
+    public Task<IReadOnlyDictionary<long, UserLifecycleState>> BatchGetUserLifecycleStateAsync(
+        IReadOnlyList<long> userIds,
+        CancellationToken ct = default)
+    {
+        logger.LogDebug("Noop batch lifecycle check: {Count} users assumed active", userIds.Count);
+        var result = new Dictionary<long, UserLifecycleState>(userIds.Count);
+        foreach (var id in userIds)
+            result.TryAdd(id, UserLifecycleState.Active);
+        return Task.FromResult<IReadOnlyDictionary<long, UserLifecycleState>>(result);
+    }
+
     public Task RecordDeletionAsync(
         long userId,
         string deletionEventId,

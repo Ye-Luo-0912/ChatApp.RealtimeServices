@@ -25,24 +25,35 @@ public interface IRealtimeOutboxStore
         CancellationToken ct = default);
 
     /// <summary>
-    /// 批量将认领中的事件标记为已发布。用 UNNEST 配对 event_id + claim_token 校验所有权，
-    /// 单次 UPDATE 完成，避免逐事件数据库往返。
+    /// 批量续租已认领的 Outbox 记录的 lease。用 claim_token 校验所有权，
+    /// 仅续租仍处于 Pending 且 claim_token 匹配的记录，防止续租已被其他实例认领的记录。
+    /// 返回实际续租的记录数。
     /// </summary>
-    Task MarkPublishedBatchAsync(
+    Task<int> ExtendLeaseBatchAsync(
+        IReadOnlyList<RealtimeOutboxRecord> records,
+        TimeSpan leaseExtension,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// 批量将认领中的事件标记为已发布。用 UNNEST 配对 event_id + claim_token 校验所有权，
+    /// 单次 UPDATE 完成，避免逐事件数据库往返。返回实际命中记录数。
+    /// </summary>
+    Task<int> MarkPublishedBatchAsync(
         IReadOnlyList<RealtimeOutboxRecord> records,
         CancellationToken ct = default);
 
     /// <summary>
     /// 批量将认领中的事件标记为失败（待重试）。每条携带各自的 error 和 retryDelay。
+    /// 返回实际命中记录数。
     /// </summary>
-    Task MarkFailedBatchAsync(
+    Task<int> MarkFailedBatchAsync(
         IReadOnlyList<(RealtimeOutboxRecord Record, string Error, TimeSpan RetryDelay)> failures,
         CancellationToken ct = default);
 
     /// <summary>
-    /// 批量将认领中的事件标记为死信。每条携带各自的 error。
+    /// 批量将认领中的事件标记为死信。每条携带各自的 error。返回实际命中记录数。
     /// </summary>
-    Task MarkDeadBatchAsync(
+    Task<int> MarkDeadBatchAsync(
         IReadOnlyList<(RealtimeOutboxRecord Record, string Error)> deadLetters,
         CancellationToken ct = default);
 

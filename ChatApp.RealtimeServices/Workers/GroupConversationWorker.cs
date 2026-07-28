@@ -16,6 +16,7 @@ namespace ChatApp.RealtimeServices.Workers;
 public sealed class GroupConversationWorker : BackgroundService
 {
     private const string WorkerName = nameof(GroupConversationWorker);
+    private const QueryPoolKind PoolKind = QueryPoolKind.Mutation;
     private readonly IGroupConversationConsumer _consumer;
     private readonly IGroupConversationProcessor _processor;
     private readonly RealtimeReadinessState _readinessState;
@@ -49,7 +50,7 @@ public sealed class GroupConversationWorker : BackgroundService
     {
         _logger.LogInformation(
             "??????????????={Concurrency}?????={Capacity}????={Slots}",
-            _queryGate.Permits,
+            _queryGate.MutationPermits,
             _options.HistoryQueryQueueCapacity,
             Math.Max(1, _options.HistoryQueryWorkerSlots));
         _readinessState.MarkStarted(WorkerName);
@@ -194,7 +195,7 @@ public sealed class GroupConversationWorker : BackgroundService
             try
             {
                 var gateAcquired = await _queryGate
-                    .WaitAsync(_options.OverloadGateTimeoutMs, ct)
+                    .WaitAsync(PoolKind, _options.OverloadGateTimeoutMs, ct)
                     .ConfigureAwait(false);
                 if (!gateAcquired)
                 {
@@ -219,71 +220,69 @@ public sealed class GroupConversationWorker : BackgroundService
                     }
                     continue;
                 }
+                GroupConversationResult result;
                 try
                 {
-                    GroupConversationResult result;
-                    try
+                    var identityError = NatsGatewayIdentity.ValidateHistoryUser(
+                        _trust.RequireGatewayIdentity,
+                        envelope.TrustedUserId,
+                        envelope.Command.ActorUserId);
+                    if (identityError is not null)
                     {
-                        var identityError = NatsGatewayIdentity.ValidateHistoryUser(
-                            _trust.RequireGatewayIdentity,
-                            envelope.TrustedUserId,
-                            envelope.Command.ActorUserId);
-                        if (identityError is not null)
-                        {
-                            result = GroupConversationResult.Failed(
-                                envelope.Command.RequestId,
-                                identityError,
-                                "???????????????????????????");
-                        }
-                        else
-                        {
-                            result = await _processor
-                                .ProcessAsync(envelope.Command, ct)
-                                .ConfigureAwait(false);
-                        }
-                    }
-                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        RealtimeTelemetry.RecordException(activity, ex);
-                        _logger.LogError(
-                            ex,
-                            "???????????={WorkerIndex}?????={RequestId}",
-                            workerIndex,
-                            envelope.Command.RequestId);
                         result = GroupConversationResult.Failed(
                             envelope.Command.RequestId,
-                            "group_conversation_unavailable",
-                            _options.EnableDetailedErrors
-                                ? ex.Message
-                                : "?????????????????");
+                            identityError,
+                            "???????????????????????????");
                     }
-
-                    try
+                    else
                     {
-                        await envelope.ReplyAsync(result, ct).ConfigureAwait(false);
-                        succeeded = result.Succeeded;
-                        outcome = result.ErrorCode;
+                        result = await _processor
+                            .ProcessAsync(envelope.Command, ct)
+                            .ConfigureAwait(false);
                     }
-                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        outcome = "reply_failed";
-                        _logger.LogWarning(
-                            ex,
-                            "??????????????={RequestId}",
-                            envelope.Command.RequestId);
-                    }
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    RealtimeTelemetry.RecordException(activity, ex);
+                    _logger.LogError(
+                        ex,
+                        "???????????={WorkerIndex}?????={RequestId}",
+                        workerIndex,
+                        envelope.Command.RequestId);
+                    result = GroupConversationResult.Failed(
+                        envelope.Command.RequestId,
+                        "group_conversation_unavailable",
+                        _options.EnableDetailedErrors
+                            ? ex.Message
+                            : "?????????????????");
                 }
                 finally
                 {
-                    _queryGate.Release();
+                    _queryGate.Release(PoolKind);
+                }
+
+                // Reply 在 permit 释放后执行，避免 NATS 网络时间占用数据库 permit
+                try
+                {
+                    await envelope.ReplyAsync(result, ct).ConfigureAwait(false);
+                    succeeded = result.Succeeded;
+                    outcome = result.ErrorCode;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    outcome = "reply_failed";
+                    _logger.LogWarning(
+                        ex,
+                        "??????????????={RequestId}",
+                        envelope.Command.RequestId);
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)

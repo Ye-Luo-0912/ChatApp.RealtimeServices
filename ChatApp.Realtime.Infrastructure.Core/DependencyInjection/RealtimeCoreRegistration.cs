@@ -73,6 +73,7 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IUserDeletionTombstoneStore, NoopUserDeletionTombstoneStore>();
         services.TryAddSingleton<ICommandIdempotencyLedger, NoopCommandIdempotencyLedger>();
         services.TryAddSingleton<IGroupOperationAuditStore, NoopGroupOperationAuditStore>();
+        services.TryAddSingleton<IMembershipPeriodStore, NoopMembershipPeriodStore>();
         services.TryAddSingleton<IDeadLetterPublisher, NoopDeadLetterPublisher>();
 
         return services;

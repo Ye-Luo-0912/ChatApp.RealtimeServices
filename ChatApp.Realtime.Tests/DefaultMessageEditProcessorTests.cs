@@ -158,6 +158,8 @@ public sealed class DefaultMessageEditProcessorTests
             string content,
             long editedAtMs,
             long maxAgeMs,
+            IReadOnlyList<long>? mentionedUserIds = null,
+            IReadOnlyList<string>? mentionedRoles = null,
             CancellationToken ct = default)
         {
             LastRequestId = requestId;

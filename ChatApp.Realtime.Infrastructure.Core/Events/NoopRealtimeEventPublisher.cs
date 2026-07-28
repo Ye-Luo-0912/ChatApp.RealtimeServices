@@ -26,4 +26,12 @@ public sealed class NoopRealtimeEventPublisher : IRealtimeEventPublisher
     }
 
     public Task PublishToManyAsync(RealtimeEvent evt, CancellationToken ct = default) => Task.CompletedTask;
+
+    /// <summary>Perf-4：Noop 实现直接复用 <see cref="PublishAsync"/>，忽略预序列化 payload。</summary>
+    public Task PublishWithPayloadAsync(RealtimeEvent evt, ReadOnlyMemory<byte>? payload, CancellationToken ct = default)
+        => PublishAsync(evt, ct);
+
+    /// <summary>Perf-4：Noop 实现直接复用 <see cref="PublishToManyAsync"/>，忽略预序列化 payload。</summary>
+    public Task PublishToManyWithPayloadAsync(RealtimeEvent evt, ReadOnlyMemory<byte>? payload, CancellationToken ct = default)
+        => PublishToManyAsync(evt, ct);
 }

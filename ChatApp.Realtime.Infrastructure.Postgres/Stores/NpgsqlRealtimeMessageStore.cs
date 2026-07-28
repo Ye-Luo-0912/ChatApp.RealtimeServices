@@ -5,6 +5,7 @@ using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
+using ChatApp.Realtime.Infrastructure.Core.Messaging;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Attachments;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
@@ -30,6 +31,13 @@ namespace ChatApp.Realtime.Infrastructure.Postgres.Stores;
 /// <see cref="AttachmentBindingWriter"/> / <see cref="PostgresOutboxWriter"/> /
 /// <see cref="RealtimeMessageEventFactory"/>，单事务一致性不变、不增加数据库往返。
 /// </para>
+/// <para>
+/// Perf-3：Incoming 消息热路径合并为单事务。<see cref="ICommandIdempotencyLedger"/> 的
+/// 查询与记录下沉到 <see cref="SaveAsync"/> 事务内，消除 Processor 中 2 次独立连接获取。
+/// ledger 参数为可选（默认 null）：未注入时回退到仅依赖 messages 表唯一索引的幂等行为
+/// （测试与未配置 PostgreSQL 场景）；生产 DI 路径由 <c>RealtimePostgresRegistration</c>
+/// 注入 <see cref="NpgsqlCommandIdempotencyLedger"/>。
+/// </para>
 /// </summary>
 public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
 {
@@ -37,6 +45,7 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
     private readonly RealtimeDatabaseClient _databaseClient;
     private readonly RealtimeDatabaseSchema _databaseSchema;
     private readonly IConversationMessageMutationPolicy _mutationPolicy;
+    private readonly ICommandIdempotencyLedger? _idempotencyLedger;
     private readonly ILogger<NpgsqlRealtimeMessageStore> _logger;
 
     public NpgsqlRealtimeMessageStore(
@@ -44,7 +53,8 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         RealtimeDatabaseSchema databaseSchema,
         IConversationMessageMutationPolicy mutationPolicy,
         ILogger<NpgsqlRealtimeMessageStore> logger,
-        RealtimeMetrics? metrics = null)
+        RealtimeMetrics? metrics = null,
+        ICommandIdempotencyLedger? idempotencyLedger = null)
     {
         _databaseClient = databaseClient;
         _databaseSchema = databaseSchema;
@@ -52,6 +62,8 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         // Reliability-4：传入 RealtimeMetrics，由 session 在事务提交成功后记录 outbox 入队行数。
         _sessionFactory = new RealtimeWriteSessionFactory(databaseClient, databaseSchema, metrics);
         _logger = logger;
+        // Perf-3：可选注入幂等账本，未注入时 SaveAsync 跳过 ledger 操作。
+        _idempotencyLedger = idempotencyLedger;
     }
 
     public async Task<RealtimeMessagePersistResult> SaveAsync(
@@ -108,6 +120,47 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             }
         }
 
+        // Perf-3：在事务内查询独立幂等账本，消除 Processor 中事务外的 FindAsync 连接获取。
+        // 账本 canonical 解耦幂等性依据与 messages 行生命周期：消息行被 retention GC 或
+        // 账号删除清理后，账本仍保留命令处理结果，防止 JetStream replay 将旧命令当作新消息重新写入。
+        if (_idempotencyLedger is not null)
+        {
+            var ledgerEntry = await _idempotencyLedger
+                .FindInTransactionAsync(
+                    session.Connection,
+                    session.Transaction,
+                    message.SenderUserId,
+                    message.ClientMessageId,
+                    ct)
+                .ConfigureAwait(false);
+            if (ledgerEntry is not null)
+            {
+                if (string.Equals(ledgerEntry.ContentFingerprint, fingerprint, StringComparison.Ordinal))
+                {
+                    // 幂等重放：内容指纹匹配。ledger 是 canonical，消息可能已被 retention GC 清理。
+                    // 不写消息，直接提交空事务（仅释放 advisory lock）。
+                    await session.CommitAsync().ConfigureAwait(false);
+                    _logger.LogDebug(
+                        "入站消息账本命中（重放）。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}；已有消息={MessageId}",
+                        message.ClientMessageId,
+                        message.SenderUserId,
+                        ledgerEntry.MessageId);
+                    return RealtimeMessagePersistResult.Duplicate(
+                        ledgerEntry.MessageId ?? message.MessageId);
+                }
+
+                // 内容冲突：指纹不一致。回滚事务（advisory lock 释放），不覆盖 canonical。
+                await session.RollbackAsync().ConfigureAwait(false);
+                _logger.LogWarning(
+                    "入站消息账本命中（冲突）。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}；已有消息={MessageId}",
+                    message.ClientMessageId,
+                    message.SenderUserId,
+                    ledgerEntry.MessageId);
+                return RealtimeMessagePersistResult.Conflict(
+                    ledgerEntry.MessageId ?? message.MessageId);
+            }
+        }
+
         var messageWriter = new MessageWriter(session);
         var attachmentWriter = new AttachmentBindingWriter(session);
         var conversationWriter = new ConversationProjectionWriter(session);
@@ -136,13 +189,50 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                     existing.MentionedUserIds,
                     existing.MentionedRoles))
             {
-                await session.RollbackAsync().ConfigureAwait(false);
+                // Perf-3：messages 表冲突但账本未命中（迁移前数据），事务内回填账本 canonical。
+                // COMMIT 而非 ROLLBACK：消息 INSERT 是 0 行（无变更），仅持久化 ledger 行。
+                // 事务内原子性保证：ledger 写入失败则整个事务回滚（更正确的行为）。
+                if (_idempotencyLedger is not null)
+                {
+                    await _idempotencyLedger
+                        .RecordInTransactionAsync(
+                            session.Connection,
+                            session.Transaction,
+                            message.MessageId,
+                            message.SenderUserId,
+                            message.ClientMessageId,
+                            fingerprint,
+                            IdempotencyLedgerResultKind.Conflict,
+                            existing.MessageId,
+                            message.ReceivedAtMs,
+                            ct)
+                        .ConfigureAwait(false);
+                }
+                await session.CommitAsync().ConfigureAwait(false);
                 _logger.LogWarning(
                     "入站消息幂等键内容冲突。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}；已有消息={MessageId}",
                     message.ClientMessageId,
                     message.SenderUserId,
                     existing.MessageId);
                 return RealtimeMessagePersistResult.Conflict(existing.MessageId);
+            }
+
+            // Perf-3：messages 表命中但账本未命中（迁移前数据），事务内回填账本 canonical。
+            if (_idempotencyLedger is not null)
+            {
+                await _idempotencyLedger
+                    .RecordInTransactionAsync(
+                        session.Connection,
+                        session.Transaction,
+                        message.MessageId,
+                        message.SenderUserId,
+                        message.ClientMessageId,
+                        fingerprint,
+                        IdempotencyLedgerResultKind.Duplicate,
+                        existing.MessageId,
+                        message.ReceivedAtMs,
+                        ct)
+                    .ConfigureAwait(false);
             }
 
             // 消息与 Outbox 同事务提交：重复投递不重建 Published/Dead（及清理后的）Outbox 行。
@@ -219,20 +309,45 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 return RealtimeMessagePersistResult.NotAllowed(message.MessageId);
             }
 
-            // Perf-9：群消息走统一 GroupProjectionDelta 协议，广播事件聚合为单行 Outbox。
+            // Perf-1：群消息走 O(1) 序列推进，不再更新成员的 unread_count / last_message_at_ms。
+            // 未读数由客户端根据广播中的 last_sequence 与本地 last_read_sequence 派生。
+            var newSequence = await conversationWriter
+                .TryAdvanceGroupSequenceAsync(
+                    message.ConversationId!,
+                    message.SenderUserId,
+                    message.MessageId,
+                    ConversationId.CreatePreview(message.Content),
+                    message.ReceivedAtMs)
+                .ConfigureAwait(false);
+
+            if (newSequence is null)
+            {
+                await session.RollbackAsync().ConfigureAwait(false);
+                _logger.LogWarning(
+                    "群消息写入拒绝：会话不存在或非群。消息={MessageId}；会话={ConversationId}",
+                    message.MessageId,
+                    message.ConversationId);
+                return RealtimeMessagePersistResult.NotAllowed(message.MessageId);
+            }
+
+            // Perf-1：群消息只产生 1 行广播 Outbox（ConversationChanged + last_sequence）。
+            // 不再生成 per-user UnreadCountChanged 事件，Outbox 行数从 1+N 降为 1。
             var delta = new GroupProjectionDelta(message.ConversationId!, memberIds);
             delta.AddBroadcast(RealtimeMessageEventFactory.CreateGroupMessageAggregatedEvent(
                 createdEvent,
                 message,
                 memberIds));
 
-            await AdvanceGroupConversationAndEnqueueAsync(
-                    conversationWriter,
-                    message,
-                    delta,
-                    createdEvent.TraceParent,
-                    createdEvent.TraceState)
-                .ConfigureAwait(false);
+            delta.AddBroadcast(GroupProjectionEventFactory.CreateGroupConversationChangedBroadcast(
+                message.ConversationId!,
+                message.MessageId,
+                ConversationId.CreatePreview(message.Content),
+                message.ReceivedAtMs,
+                message.SenderUserId,
+                causeToken: null,
+                createdEvent.TraceParent,
+                createdEvent.TraceState,
+                newSequence));
 
             await outboxWriter.InsertManyAsync(delta.Build()).ConfigureAwait(false);
         }
@@ -246,17 +361,90 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
 
             if (!string.IsNullOrWhiteSpace(message.ConversationId))
             {
-                await AdvanceDirectConversationAndEnqueueAsync(
-                        conversationWriter,
-                        message,
+                // Perf-1：单聊也走 O(1) 序列推进。接收方 unread_count 在同事务内基于序列公式派生，
+                // 单聊接收方仅 1 人，仍是 O(1)。
+                var (newSequence, receiverUnread) = await conversationWriter
+                    .TryAdvanceDirectSequenceAsync(
+                        message.ConversationId!,
+                        message.SenderUserId,
+                        message.ReceiverUserId,
+                        message.MessageId,
+                        ConversationId.CreatePreview(message.Content),
+                        message.ReceivedAtMs)
+                    .ConfigureAwait(false);
+
+                if (newSequence is not null)
+                {
+                    // 接收方：ConversationChanged（含 last_sequence）+ UnreadCountChanged。
+                    outboxEvents.Add(ConversationWriteCommands.CreateConversationChangedEvent(
+                        message.ConversationId!,
+                        message.ReceiverUserId,
+                        message.SenderUserId,
+                        message.MessageId,
+                        ConversationId.CreatePreview(message.Content),
+                        message.ReceivedAtMs,
+                        message.SenderUserId,
                         createdEvent.TraceParent,
                         createdEvent.TraceState,
-                        outboxEvents)
-                    .ConfigureAwait(false);
+                        eventIdCause: null,
+                        ConversationType.Direct,
+                        title: null,
+                        lastSequence: newSequence));
+
+                    if (receiverUnread is int ru)
+                    {
+                        outboxEvents.Add(ConversationWriteCommands.CreateUnreadCountChangedEvent(
+                            message.ConversationId!,
+                            message.ReceiverUserId,
+                            ru,
+                            lastReadMessageId: null,
+                            lastReadAtMs: null,
+                            causeMessageId: message.MessageId,
+                            message.ReceivedAtMs,
+                            createdEvent.TraceParent,
+                            createdEvent.TraceState));
+                    }
+
+                    // 发送方：ConversationChanged（含 last_sequence），发送方自身不产生未读事件。
+                    outboxEvents.Add(ConversationWriteCommands.CreateConversationChangedEvent(
+                        message.ConversationId!,
+                        message.SenderUserId,
+                        message.ReceiverUserId,
+                        message.MessageId,
+                        ConversationId.CreatePreview(message.Content),
+                        message.ReceivedAtMs,
+                        message.SenderUserId,
+                        createdEvent.TraceParent,
+                        createdEvent.TraceState,
+                        eventIdCause: null,
+                        ConversationType.Direct,
+                        title: null,
+                        lastSequence: newSequence));
+                }
             }
 
             await outboxWriter.InsertManyAsync(outboxEvents).ConfigureAwait(false);
         }
+
+        // Perf-3：事务内记录 Created 结果到独立账本，解耦幂等性与 messages 行生命周期。
+        // 与消息写入同生共死：ledger INSERT 失败则整个事务回滚（更正确的行为）。
+        if (_idempotencyLedger is not null)
+        {
+            await _idempotencyLedger
+                .RecordInTransactionAsync(
+                    session.Connection,
+                    session.Transaction,
+                    message.MessageId,
+                    message.SenderUserId,
+                    message.ClientMessageId,
+                    fingerprint,
+                    IdempotencyLedgerResultKind.Created,
+                    message.MessageId,
+                    message.ReceivedAtMs,
+                    ct)
+                .ConfigureAwait(false);
+        }
+
         await session.CommitAsync().ConfigureAwait(false);
 
         _logger.LogDebug(
@@ -265,115 +453,6 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             message.SenderUserId,
             message.ReceiverUserId);
         return RealtimeMessagePersistResult.Created(message.MessageId);
-    }
-
-    private static async Task AdvanceGroupConversationAndEnqueueAsync(
-        ConversationProjectionWriter conversationWriter,
-        RealtimeMessageRecord message,
-        GroupProjectionDelta delta,
-        string? traceParent,
-        string? traceState)
-    {
-        var conversationId = message.ConversationId!;
-        var preview = ConversationId.CreatePreview(message.Content);
-
-        var (advanced, unreads) = await conversationWriter
-            .TryAdvanceGroupAndIncrementUnreadAsync(
-                conversationId,
-                message.SenderUserId,
-                message.MessageId,
-                preview,
-                message.ReceivedAtMs)
-            .ConfigureAwait(false);
-
-        if (advanced)
-        {
-            // Perf-9：ConversationChanged 聚合为 1 行广播事件（原来按成员 N 行）。
-            delta.AddBroadcast(GroupProjectionEventFactory.CreateGroupConversationChangedBroadcast(
-                conversationId,
-                message.MessageId,
-                preview,
-                message.ReceivedAtMs,
-                message.SenderUserId,
-                causeToken: null,
-                traceParent,
-                traceState));
-        }
-
-        // UnreadCountChanged 保持逐用户：每个成员的绝对未读数不同，无法聚合为同一 payload。
-        // 如需聚合需要演进 RealtimeUnreadCountChangedPayload 为 delta 语义（Perf-9 后续工作）。
-        foreach (var (userId, unreadCount) in unreads)
-        {
-            delta.AddPerUser(ConversationWriteCommands.CreateUnreadCountChangedEvent(
-                conversationId,
-                userId,
-                unreadCount,
-                lastReadMessageId: null,
-                lastReadAtMs: null,
-                causeMessageId: message.MessageId,
-                message.ReceivedAtMs,
-                traceParent,
-                traceState));
-        }
-    }
-
-    private static async Task AdvanceDirectConversationAndEnqueueAsync(
-        ConversationProjectionWriter conversationWriter,
-        RealtimeMessageRecord message,
-        string? traceParent,
-        string? traceState,
-        List<RealtimeEvent> outboxEvents)
-    {
-        var conversationId = message.ConversationId!;
-        var preview = ConversationId.CreatePreview(message.Content);
-
-        var (advanced, unread) = await conversationWriter
-            .TryAdvanceAndIncrementUnreadAsync(
-                conversationId,
-                message.SenderUserId,
-                message.ReceiverUserId,
-                message.MessageId,
-                preview,
-                message.ReceivedAtMs)
-            .ConfigureAwait(false);
-
-        if (advanced)
-        {
-            outboxEvents.Add(ConversationWriteCommands.CreateConversationChangedEvent(
-                conversationId,
-                message.SenderUserId,
-                message.ReceiverUserId,
-                message.MessageId,
-                preview,
-                message.ReceivedAtMs,
-                message.SenderUserId,
-                traceParent,
-                traceState));
-            outboxEvents.Add(ConversationWriteCommands.CreateConversationChangedEvent(
-                conversationId,
-                message.ReceiverUserId,
-                message.SenderUserId,
-                message.MessageId,
-                preview,
-                message.ReceivedAtMs,
-                message.SenderUserId,
-                traceParent,
-                traceState));
-        }
-
-        if (unread is int unreadCount)
-        {
-            outboxEvents.Add(ConversationWriteCommands.CreateUnreadCountChangedEvent(
-                conversationId,
-                message.ReceiverUserId,
-                unreadCount,
-                lastReadMessageId: null,
-                lastReadAtMs: null,
-                causeMessageId: message.MessageId,
-                message.ReceivedAtMs,
-                traceParent,
-                traceState));
-        }
     }
 
     public async Task<MessageReceiptPersistResult> ApplyReceiptAsync(
@@ -402,11 +481,12 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         long? readAtMs;
         string? conversationId;
         long messageReceivedAtMs;
+        long? messageSequence;
 
         await using (var command = new NpgsqlCommand(
                          $"""
                           SELECT sender_user_id, receiver_user_id, delivered_at_ms, read_at_ms,
-                                 conversation_id, received_at_ms
+                                 conversation_id, received_at_ms, conversation_sequence
                           FROM {_databaseSchema.MessagesTableSql}
                           WHERE message_id = @message_id
                           FOR UPDATE
@@ -431,6 +511,7 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             readAtMs = reader.IsDBNull(3) ? null : reader.GetInt64(3);
             conversationId = reader.IsDBNull(4) ? null : reader.GetString(4);
             messageReceivedAtMs = reader.GetInt64(5);
+            messageSequence = reader.IsDBNull(6) ? null : reader.GetInt64(6);
         }
 
         if (receiverUserId != receipt.ReceiverUserId)
@@ -487,17 +568,33 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             .ConfigureAwait(false);
 
         if (receipt.ReceiptType == MessageReceiptType.Read
-            && !string.IsNullOrWhiteSpace(conversationId))
+            && !string.IsNullOrWhiteSpace(conversationId)
+            && messageSequence is long targetSequence)
         {
-            var unreadEvent = await conversationWriter
-                .TryAdvanceReadStateAsync(
-                    receipt.ReceiverUserId,
+            // Perf-1：使用 O(1) 序列化 MarkRead，消除 COUNT 扫描。
+            var readResult = await conversationWriter
+                .TryAdvanceReadBySequenceAsync(
                     conversationId,
-                    messageReceivedAtMs,
-                    receipt.MessageId)
+                    receipt.ReceiverUserId,
+                    targetSequence,
+                    receipt.MessageId,
+                    messageReceivedAtMs)
                 .ConfigureAwait(false);
-            if (unreadEvent is not null)
+
+            if (readResult.Advanced)
             {
+                var traceParent = RealtimeTraceContext.CaptureTraceParent();
+                var traceState = RealtimeTraceContext.CaptureTraceState();
+                var unreadEvent = ConversationWriteCommands.CreateUnreadCountChangedEvent(
+                    conversationId,
+                    receipt.ReceiverUserId,
+                    readResult.UnreadCount,
+                    receipt.MessageId,
+                    messageReceivedAtMs,
+                    causeMessageId: receipt.MessageId,
+                    receipt.OccurredAtMs,
+                    traceParent,
+                    traceState);
                 await outboxWriter.InsertAsync(unreadEvent).ConfigureAwait(false);
             }
         }
@@ -888,6 +985,8 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         string content,
         long editedAtMs,
         long maxAgeMs,
+        IReadOnlyList<long>? mentionedUserIds = null,
+        IReadOnlyList<string>? mentionedRoles = null,
         CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(requestId);
@@ -900,7 +999,9 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         var payloadFingerprint = MessageMutationWriter.ComputeMutationFingerprint(
             operation: 1,
             messageId,
-            content);
+            content,
+            mentionedUserIds,
+            mentionedRoles);
 
         await using var session = await _sessionFactory.BeginAsync(ct).ConfigureAwait(false);
 
@@ -1106,8 +1207,62 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         }
 
         var nextVersion = target.EditVersion + 1;
+
+        // Mentions 业务闭环：编辑路径的 mention 规范化。
+        // null 表示不修改现有 mentions（COALESCE 保留原值）；非空数组经过 MentionValidator
+        // 规范化后替换原值。规范化逻辑与新增消息一致：
+        // 去重 / 排除自身 / 截断 / 群成员校验 / @all|@admin 权限校验。
+        var hasMentionChanges = mentionedUserIds is not null || mentionedRoles is not null;
+        long[]? dbMentionUserIds = null;
+        string[]? dbMentionRoles = null;
+        IReadOnlyList<long>? payloadMentionUserIds = null;
+        IReadOnlyList<string>? payloadMentionRoles = null;
+        IReadOnlyList<long>? groupMemberIds = null;
+
+        var isGroup = !string.IsNullOrWhiteSpace(target.ConversationId)
+                      && ConversationId.IsGroup(target.ConversationId);
+
+        if (hasMentionChanges && isGroup)
+        {
+            groupMemberIds = await conversationWriter
+                .ListActiveMemberUserIdsAsync(target.ConversationId!)
+                .ConfigureAwait(false);
+            var senderRole = await conversationWriter
+                .TryGetMemberRoleAsync(target.ConversationId!, senderUserId)
+                .ConfigureAwait(false);
+            var isManager = senderRole == (short)ConversationMemberRole.Owner
+                            || senderRole == (short)ConversationMemberRole.Admin;
+            var memberSet = new HashSet<long>(groupMemberIds);
+            dbMentionUserIds = mentionedUserIds is not null
+                ? MentionValidator.NormalizeUserIds(mentionedUserIds, senderUserId, memberSet)
+                : null;
+            dbMentionRoles = mentionedRoles is not null
+                ? MentionValidator.NormalizeRoles(mentionedRoles, isManager)
+                : null;
+            payloadMentionUserIds = MentionValidator.AsReadOnly(dbMentionUserIds);
+            payloadMentionRoles = MentionValidator.AsReadOnly(dbMentionRoles);
+        }
+        else if (hasMentionChanges)
+        {
+            // 单聊：基本去重 + 排除自身；@all/@admin 无意义但允许透传（isManager=true）。
+            dbMentionUserIds = mentionedUserIds is not null
+                ? MentionValidator.NormalizeUserIds(mentionedUserIds, senderUserId)
+                : null;
+            dbMentionRoles = mentionedRoles is not null
+                ? MentionValidator.NormalizeRoles(mentionedRoles, isManager: true)
+                : null;
+            payloadMentionUserIds = MentionValidator.AsReadOnly(dbMentionUserIds);
+            payloadMentionRoles = MentionValidator.AsReadOnly(dbMentionRoles);
+        }
+
         var affected = await mutationWriter
-            .ApplyEditUpdateAsync(messageId, content, nextVersion, editedAtMs)
+            .ApplyEditUpdateAsync(
+                messageId,
+                content,
+                nextVersion,
+                editedAtMs,
+                dbMentionUserIds,
+                dbMentionRoles)
             .ConfigureAwait(false);
         if (affected == 0)
         {
@@ -1147,16 +1302,18 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
 
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
-        var isGroup = !string.IsNullOrWhiteSpace(target.ConversationId)
-                      && ConversationId.IsGroup(target.ConversationId);
 
         if (isGroup)
         {
             // Perf-9：群编辑走统一 GroupProjectionDelta 协议，广播事件聚合为单行 Outbox。
-            var memberIds = await conversationWriter
-                .ListActiveMemberUserIdsAsync(target.ConversationId!)
-                .ConfigureAwait(false);
-            var delta = new GroupProjectionDelta(target.ConversationId!, memberIds);
+            // 复用 mention 规范化阶段已加载的成员列表（若未加载则在此加载）。
+            if (groupMemberIds is null)
+            {
+                groupMemberIds = await conversationWriter
+                    .ListActiveMemberUserIdsAsync(target.ConversationId!)
+                    .ConfigureAwait(false);
+            }
+            var delta = new GroupProjectionDelta(target.ConversationId!, groupMemberIds);
 
             delta.AddBroadcast(GroupProjectionEventFactory.CreateGroupMessageEditedBroadcast(
                 messageId,
@@ -1167,6 +1324,8 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 content,
                 nextVersion,
                 editedAtMs,
+                payloadMentionUserIds,
+                payloadMentionRoles,
                 traceParent,
                 traceState));
 
@@ -1197,7 +1356,9 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                     ReceiverUserId = target.ReceiverUserId,
                     Content = content,
                     EditVersion = nextVersion,
-                    EditedAtMs = editedAtMs
+                    EditedAtMs = editedAtMs,
+                    MentionedUserIds = payloadMentionUserIds,
+                    MentionedRoles = payloadMentionRoles
                 },
                 RealtimeJsonSerializerContext.Default.RealtimeMessageEditedPayload);
 

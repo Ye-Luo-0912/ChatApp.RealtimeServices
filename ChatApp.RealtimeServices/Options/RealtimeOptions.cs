@@ -35,8 +35,27 @@ public sealed class RealtimeOptions
 
     /// <summary>
     /// 所有查询类 Worker（历史 / 会话列表 / 已读 / 偏好 / 同步）共享的数据库并发预算。
+    /// 旧字段，保留用于兼容。新部署应使用 ReadQueryConcurrency / InteractiveQueryConcurrency / MutationQueryConcurrency。
     /// </summary>
     public int HistoryQueryConcurrency { get; init; } = 8;
+
+    /// <summary>
+    /// Perf-6：读类查询 Worker（History / Sync / ConversationList）的数据库并发预算。
+    /// 重型读操作可能长时间占用连接，需要较高吞吐但允许排队。
+    /// </summary>
+    public int ReadQueryConcurrency { get; init; } = 6;
+
+    /// <summary>
+    /// Perf-6：交互类查询 Worker（MarkRead / SetPrefs）的数据库并发预算。
+    /// 低延迟操作，需要快速响应，不应被重型读饿死。
+    /// </summary>
+    public int InteractiveQueryConcurrency { get; init; } = 4;
+
+    /// <summary>
+    /// Perf-6：变更类查询 Worker（Group / Edit / Recall / Reaction）的数据库并发预算。
+    /// 写操作通常中等延迟，需要独立的并发池避免与读操作互相影响。
+    /// </summary>
+    public int MutationQueryConcurrency { get; init; } = 4;
 
     /// <summary>每个查询 Worker 的入队容量（非总和）。</summary>
     public int HistoryQueryQueueCapacity { get; init; } = 256;
@@ -68,4 +87,24 @@ public sealed class RealtimeOptions
     /// 客户端应在收到 <c>server_busy</c> 后至少等待该时长再重试。
     /// </summary>
     public int OverloadRetryAfterMs { get; init; } = 500;
+
+    /// <summary>
+    /// LongTerm-2：账号清理 Saga 每批处理的附件数量。内存有界，默认 200。
+    /// </summary>
+    public int AccountCleanupBatchSize { get; init; } = 200;
+
+    /// <summary>
+    /// LongTerm-2：账号清理 Saga 单阶段最大重试次数。超过后标记 failed，避免无限重试。
+    /// </summary>
+    public int AccountCleanupMaxRetries { get; init; } = 5;
+
+    /// <summary>
+    /// LongTerm-2：账号清理 Saga 轮询间隔（毫秒）。无 pending 作业时的空转间隔。
+    /// </summary>
+    public int AccountCleanupPollIntervalMs { get; init; } = 1000;
+
+    /// <summary>
+    /// LongTerm-2：账号清理 Saga 单周期最大处理的作业数。防止长时间占用 Worker。
+    /// </summary>
+    public int AccountCleanupMaxBatchesPerCycle { get; init; } = 10;
 }

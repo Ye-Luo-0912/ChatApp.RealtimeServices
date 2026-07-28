@@ -1,3 +1,4 @@
+using System.Data.Common;
 using ChatApp.Realtime.Abstractions.Stores;
 
 namespace ChatApp.Realtime.Tests.TestDoubles;
@@ -5,6 +6,7 @@ namespace ChatApp.Realtime.Tests.TestDoubles;
 /// <summary>
 /// LongTerm-1：测试用 Noop tombstone / 幂等账本。无 logger 依赖，保持测试简洁。
 /// 默认行为：IsUserDeleted=false、FindAsync=null、Record/Purge 为空操作。
+/// Perf-3：FindInTransactionAsync / RecordInTransactionAsync 同样为 Noop。
 /// </summary>
 internal static class NoopTombstoneAndLedger
 {
@@ -18,6 +20,16 @@ internal static class NoopTombstoneAndLedger
 
         public Task<UserLifecycleState> GetLifecycleStateAsync(long userId, CancellationToken ct = default) =>
             Task.FromResult(UserLifecycleState.Active);
+
+        public Task<IReadOnlyDictionary<long, UserLifecycleState>> BatchGetUserLifecycleStateAsync(
+            IReadOnlyList<long> userIds,
+            CancellationToken ct = default)
+        {
+            var result = new Dictionary<long, UserLifecycleState>(userIds.Count);
+            foreach (var id in userIds)
+                result.TryAdd(id, UserLifecycleState.Active);
+            return Task.FromResult<IReadOnlyDictionary<long, UserLifecycleState>>(result);
+        }
 
         public Task RecordDeletionAsync(
             long userId,
@@ -42,6 +54,27 @@ internal static class NoopTombstoneAndLedger
             Task.FromResult<IdempotencyLedgerEntry?>(null);
 
         public Task RecordAsync(
+            string commandId,
+            long senderUserId,
+            string clientMessageId,
+            string contentFingerprint,
+            IdempotencyLedgerResultKind kind,
+            string? messageId,
+            long receivedAtMs,
+            CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task<IdempotencyLedgerEntry?> FindInTransactionAsync(
+            DbConnection connection,
+            DbTransaction transaction,
+            long senderUserId,
+            string clientMessageId,
+            CancellationToken ct = default) =>
+            Task.FromResult<IdempotencyLedgerEntry?>(null);
+
+        public Task RecordInTransactionAsync(
+            DbConnection connection,
+            DbTransaction transaction,
             string commandId,
             long senderUserId,
             string clientMessageId,

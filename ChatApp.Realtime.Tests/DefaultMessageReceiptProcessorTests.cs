@@ -137,6 +137,8 @@ public sealed class DefaultMessageReceiptProcessorTests
             string content,
             long editedAtMs,
             long maxAgeMs,
+            IReadOnlyList<long>? mentionedUserIds = null,
+            IReadOnlyList<string>? mentionedRoles = null,
             CancellationToken ct = default) =>
             Task.FromResult(new MessageEditPersistResult(MessageEditPersistStatus.NotFound, messageId));
 

@@ -1295,6 +1295,16 @@ public sealed class SyncBootstrapQueryProcessorTests
             CancellationToken ct = default) =>
             Task.FromResult(_items);
 
+        public Task<IReadOnlyList<ConversationListItem>> QueryArchivedListAsync(
+            long userId,
+            bool? beforeIsPinned,
+            long? beforePinnedAtMs,
+            long? beforeLastMessageAtMs,
+            string? beforeConversationId,
+            int take,
+            CancellationToken ct = default) =>
+            Task.FromResult(_items);
+
         public Task<ConversationReadAdvanceResult> AdvanceReadCursorAsync(
             long userId,
             string conversationId,

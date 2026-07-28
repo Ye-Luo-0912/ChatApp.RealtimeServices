@@ -6,7 +6,7 @@ namespace ChatApp.Realtime.Abstractions.Conversations;
 /// </summary>
 public sealed class RealtimeConversationChangedPayload
 {
-    public const int CurrentPayloadVersion = 2;
+    public const int CurrentPayloadVersion = 3;
 
     public int PayloadVersion { get; init; } = CurrentPayloadVersion;
 
@@ -38,4 +38,10 @@ public sealed class RealtimeConversationChangedPayload
 
     /// <summary>免打扰截止时间（Unix ms）；null 且 IsMuted=true 表示永久。</summary>
     public long? MutedUntilMs { get; init; }
+
+    /// <summary>
+    /// v3 起可空附加：会话当前最大序列号。客户端可基于本地 last_read_sequence 派生未读增量，
+    /// 避免服务端在群消息写入时为每个成员生成 UnreadCountChanged 事件（O(N)→O(1) Outbox）。
+    /// </summary>
+    public long? LastSequence { get; init; }
 }

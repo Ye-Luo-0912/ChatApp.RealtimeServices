@@ -562,8 +562,10 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
             });
         Assert.True(clamped.Succeeded);
         Assert.True(clamped.Changed);
-        // 游标钳到 tip；tip 之后仍存在的孤儿消息会计入未读。
-        Assert.Equal(1, clamped.UnreadCount);
+        // Perf-1：序列模型下游标钳到 tip（msg-2, seq=2）。
+        // 直接 INSERT 绕过 Store 的孤儿消息无 conversation_sequence，不计入序列未读。
+        // 生产路径所有消息经 Store 写入，均会被分配序列号。
+        Assert.Equal(0, clamped.UnreadCount);
         Assert.Equal("msg-2", clamped.LastReadMessageId);
         Assert.Equal(200, clamped.LastReadAtMs);
 
@@ -574,7 +576,7 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
                 UserId = 7002,
                 Limit = 10
             });
-        Assert.Equal(1, Assert.Single(list.Items).UnreadCount);
+        Assert.Equal(0, Assert.Single(list.Items).UnreadCount);
         Assert.Equal("msg-2", list.Items[0].LastReadMessageId);
         Assert.Equal(200, list.Items[0].LastReadAtMs);
     }
@@ -724,6 +726,16 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
     private sealed class ThrowingConversationStore : IRealtimeConversationStore
     {
         public Task<IReadOnlyList<ConversationListItem>> QueryListAsync(
+            long userId,
+            bool? beforeIsPinned,
+            long? beforePinnedAtMs,
+            long? beforeLastMessageAtMs,
+            string? beforeConversationId,
+            int take,
+            CancellationToken ct = default) =>
+            throw new InvalidOperationException("partial cursor must fail validation before store.");
+
+        public Task<IReadOnlyList<ConversationListItem>> QueryArchivedListAsync(
             long userId,
             bool? beforeIsPinned,
             long? beforePinnedAtMs,

@@ -39,31 +39,41 @@ public sealed class NoopRealtimeOutboxStore : IRealtimeOutboxStore
         return Task.CompletedTask;
     }
 
-    public Task MarkPublishedBatchAsync(
+    public Task<int> MarkPublishedBatchAsync(
         IReadOnlyList<RealtimeOutboxRecord> records,
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(records);
         ct.ThrowIfCancellationRequested();
-        return Task.CompletedTask;
+        return Task.FromResult(0);
     }
 
-    public Task MarkFailedBatchAsync(
+    public Task<int> MarkFailedBatchAsync(
         IReadOnlyList<(RealtimeOutboxRecord Record, string Error, TimeSpan RetryDelay)> failures,
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(failures);
         ct.ThrowIfCancellationRequested();
-        return Task.CompletedTask;
+        return Task.FromResult(0);
     }
 
-    public Task MarkDeadBatchAsync(
+    public Task<int> MarkDeadBatchAsync(
         IReadOnlyList<(RealtimeOutboxRecord Record, string Error)> deadLetters,
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(deadLetters);
         ct.ThrowIfCancellationRequested();
-        return Task.CompletedTask;
+        return Task.FromResult(0);
+    }
+
+    public Task<int> ExtendLeaseBatchAsync(
+        IReadOnlyList<RealtimeOutboxRecord> records,
+        TimeSpan leaseExtension,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(0);
     }
 
     public Task<bool> ReplayDeadAsync(string eventId, CancellationToken ct = default)

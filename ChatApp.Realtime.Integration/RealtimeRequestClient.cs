@@ -7,7 +7,6 @@ using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.Ephemeral;
 using ChatApp.Realtime.Integration.Serialization;
-using NATS.Client.Core;
 
 namespace ChatApp.Realtime.Integration;
 

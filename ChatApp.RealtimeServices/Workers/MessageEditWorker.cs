@@ -16,6 +16,7 @@ namespace ChatApp.RealtimeServices.Workers;
 public sealed class MessageEditWorker : BackgroundService
 {
     private const string WorkerName = nameof(MessageEditWorker);
+    private const QueryPoolKind PoolKind = QueryPoolKind.Mutation;
     private readonly IMessageEditConsumer _consumer;
     private readonly IMessageEditProcessor _processor;
     private readonly RealtimeReadinessState _readinessState;
@@ -49,7 +50,7 @@ public sealed class MessageEditWorker : BackgroundService
     {
         _logger.LogInformation(
             "消息编辑工作器已启动。共享并发={Concurrency}；队列容量={Capacity}；工作槽={Slots}",
-            _queryGate.Permits,
+            _queryGate.MutationPermits,
             _options.HistoryQueryQueueCapacity,
             Math.Max(1, _options.HistoryQueryWorkerSlots));
         _readinessState.MarkStarted(WorkerName);
@@ -194,7 +195,7 @@ public sealed class MessageEditWorker : BackgroundService
             try
             {
                 var gateAcquired = await _queryGate
-                    .WaitAsync(_options.OverloadGateTimeoutMs, ct)
+                    .WaitAsync(PoolKind, _options.OverloadGateTimeoutMs, ct)
                     .ConfigureAwait(false);
                 if (!gateAcquired)
                 {
@@ -219,71 +220,69 @@ public sealed class MessageEditWorker : BackgroundService
                     }
                     continue;
                 }
+                MessageEditResult result;
                 try
                 {
-                    MessageEditResult result;
-                    try
+                    var identityError = NatsGatewayIdentity.ValidateHistoryUser(
+                        _trust.RequireGatewayIdentity,
+                        envelope.TrustedUserId,
+                        envelope.Command.SenderUserId);
+                    if (identityError is not null)
                     {
-                        var identityError = NatsGatewayIdentity.ValidateHistoryUser(
-                            _trust.RequireGatewayIdentity,
-                            envelope.TrustedUserId,
-                            envelope.Command.SenderUserId);
-                        if (identityError is not null)
-                        {
-                            result = MessageEditResult.Failed(
-                                envelope.Command.RequestId,
-                                identityError,
-                                "网关身份校验失败：编辑发送方与可信身份头不匹配或缺失。");
-                        }
-                        else
-                        {
-                            result = await _processor
-                                .ProcessAsync(envelope.Command, ct)
-                                .ConfigureAwait(false);
-                        }
-                    }
-                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        RealtimeTelemetry.RecordException(activity, ex);
-                        _logger.LogError(
-                            ex,
-                            "消息编辑失败。工作槽={WorkerIndex}；请求编号={RequestId}",
-                            workerIndex,
-                            envelope.Command.RequestId);
                         result = MessageEditResult.Failed(
                             envelope.Command.RequestId,
-                            "message_edit_unavailable",
-                            _options.EnableDetailedErrors
-                                ? ex.Message
-                                : "消息编辑服务暂时不可用，请稍后重试。");
+                            identityError,
+                            "网关身份校验失败：编辑发送方与可信身份头不匹配或缺失。");
                     }
-
-                    try
+                    else
                     {
-                        await envelope.ReplyAsync(result, ct).ConfigureAwait(false);
-                        succeeded = result.Succeeded;
-                        outcome = result.ErrorCode;
+                        result = await _processor
+                            .ProcessAsync(envelope.Command, ct)
+                            .ConfigureAwait(false);
                     }
-                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        outcome = "reply_failed";
-                        _logger.LogWarning(
-                            ex,
-                            "消息编辑响应发送失败。请求编号={RequestId}",
-                            envelope.Command.RequestId);
-                    }
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    RealtimeTelemetry.RecordException(activity, ex);
+                    _logger.LogError(
+                        ex,
+                        "消息编辑失败。工作槽={WorkerIndex}；请求编号={RequestId}",
+                        workerIndex,
+                        envelope.Command.RequestId);
+                    result = MessageEditResult.Failed(
+                        envelope.Command.RequestId,
+                        "message_edit_unavailable",
+                        _options.EnableDetailedErrors
+                            ? ex.Message
+                            : "消息编辑服务暂时不可用，请稍后重试。");
                 }
                 finally
                 {
-                    _queryGate.Release();
+                    _queryGate.Release(PoolKind);
+                }
+
+                // Reply 在 permit 释放后执行，避免 NATS 网络时间占用数据库 permit
+                try
+                {
+                    await envelope.ReplyAsync(result, ct).ConfigureAwait(false);
+                    succeeded = result.Succeeded;
+                    outcome = result.ErrorCode;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    outcome = "reply_failed";
+                    _logger.LogWarning(
+                        ex,
+                        "消息编辑响应发送失败。请求编号={RequestId}",
+                        envelope.Command.RequestId);
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)

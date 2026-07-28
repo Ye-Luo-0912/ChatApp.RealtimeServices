@@ -40,6 +40,12 @@ public sealed class NatsRoutingOptions
     /// </para>
     /// </summary>
     public string? RealtimeEventsShardSubjectPattern { get; init; }
+
+    /// <summary>
+    /// 分片发布有限并行度，映射到 <see cref="RealtimeQueueOptions.ShardPublishParallelism"/>。
+    /// 默认 4。小于 1 时按 1 处理。
+    /// </summary>
+    public int ShardPublishParallelism { get; init; } = 4;
 }
 
 public sealed class NatsAuthOptions

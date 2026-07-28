@@ -63,6 +63,10 @@ internal static class GroupProjectionEventFactory
     /// <summary>
     /// 群消息编辑广播事件模板。EventId 按 (messageId, conversationId, editVersion) 派生，不纳入 target。
     /// 必须纳入 editVersion，否则连续编辑会被 Outbox 冲突吞掉。
+    /// <para>
+    /// <paramref name="mentionedUserIds"/> / <paramref name="mentionedRoles"/> 为 <c>null</c> 时
+    /// 表示本次编辑未修改 mentions，客户端应沿用上次已知值；非空数组表示编辑后替换的 mentions。
+    /// </para>
     /// </summary>
     public static RealtimeEvent CreateGroupMessageEditedBroadcast(
         string messageId,
@@ -73,6 +77,8 @@ internal static class GroupProjectionEventFactory
         string content,
         int editVersion,
         long editedAtMs,
+        IReadOnlyList<long>? mentionedUserIds,
+        IReadOnlyList<string>? mentionedRoles,
         string? traceParent,
         string? traceState)
     {
@@ -84,7 +90,9 @@ internal static class GroupProjectionEventFactory
             ReceiverUserId = receiverUserId,
             Content = content,
             EditVersion = editVersion,
-            EditedAtMs = editedAtMs
+            EditedAtMs = editedAtMs,
+            MentionedUserIds = mentionedUserIds,
+            MentionedRoles = mentionedRoles
         };
 
         return new RealtimeEvent
@@ -191,7 +199,8 @@ internal static class GroupProjectionEventFactory
         long senderUserId,
         string? causeToken,
         string? traceParent,
-        string? traceState)
+        string? traceState,
+        long? lastSequence = null)
     {
         var payload = new RealtimeConversationChangedPayload
         {
@@ -201,7 +210,8 @@ internal static class GroupProjectionEventFactory
             LastMessageId = lastMessageId,
             LastMessagePreview = preview,
             LastMessageAtMs = receivedAtMs,
-            LastSenderUserId = senderUserId
+            LastSenderUserId = senderUserId,
+            LastSequence = lastSequence
         };
 
         return new RealtimeEvent

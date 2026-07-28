@@ -19,6 +19,19 @@ public sealed class NoopRealtimeConversationStore : IRealtimeConversationStore
         throw new InvalidOperationException("未配置真实会话存储，无法查询会话列表。");
     }
 
+    public Task<IReadOnlyList<ConversationListItem>> QueryArchivedListAsync(
+        long userId,
+        bool? beforeIsPinned,
+        long? beforePinnedAtMs,
+        long? beforeLastMessageAtMs,
+        string? beforeConversationId,
+        int take,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        throw new InvalidOperationException("未配置真实会话存储，无法查询已离群会话列表。");
+    }
+
     public Task<ConversationReadAdvanceResult> AdvanceReadCursorAsync(
         long userId,
         string conversationId,

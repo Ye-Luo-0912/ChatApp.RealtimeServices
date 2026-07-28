@@ -1,4 +1,5 @@
 using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Routing;
 
 namespace ChatApp.Realtime.Infrastructure.Postgres.Projections;
 
@@ -51,7 +52,7 @@ internal sealed class GroupProjectionDelta
     /// <remarks>调用方必须确保 <paramref name="template"/> 使用 target-independent EventId。</remarks>
     public GroupProjectionDelta AddBroadcast(RealtimeEvent template)
     {
-        _events.Add(WithTargets(template, _memberUserIds));
+        _events.Add(WithTargets(template, _memberUserIds, ConversationId));
         return this;
     }
 
@@ -62,7 +63,7 @@ internal sealed class GroupProjectionDelta
     {
         if (targets.Count == 0)
             return this;
-        _events.Add(WithTargets(template, targets.ToArray()));
+        _events.Add(WithTargets(template, targets.ToArray(), conversationId: null));
         return this;
     }
 
@@ -82,7 +83,7 @@ internal sealed class GroupProjectionDelta
     /// <summary>当前已收集的事件总数（广播 + 逐用户）。</summary>
     public int Count => _events.Count;
 
-    private static RealtimeEvent WithTargets(RealtimeEvent template, long[] targets) => new()
+    private static RealtimeEvent WithTargets(RealtimeEvent template, long[] targets, string? conversationId) => new()
     {
         EventId = template.EventId,
         Type = template.Type,
@@ -94,6 +95,8 @@ internal sealed class GroupProjectionDelta
         OccurredAtMs = template.OccurredAtMs,
         TraceParent = template.TraceParent,
         TraceState = template.TraceState,
-        TargetUserIds = targets
+        TargetUserIds = targets,
+        AudienceKind = conversationId is null ? null : AudienceKind.Conversation,
+        ConversationId = conversationId
     };
 }

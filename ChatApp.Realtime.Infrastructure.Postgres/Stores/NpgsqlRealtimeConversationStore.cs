@@ -2,10 +2,12 @@ using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Stores;
+using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using ChatApp.Realtime.Infrastructure.Postgres.Outbox;
 using ChatApp.Realtime.Infrastructure.Postgres.Projections;
+using ChatApp.Realtime.Infrastructure.Postgres.Transactions;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -15,13 +17,17 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
 {
     private readonly RealtimeDatabaseClient _databaseClient;
     private readonly RealtimeDatabaseSchema _databaseSchema;
+    private readonly RealtimeWriteSessionFactory _sessionFactory;
 
     public NpgsqlRealtimeConversationStore(
         RealtimeDatabaseClient databaseClient,
-        RealtimeDatabaseSchema databaseSchema)
+        RealtimeDatabaseSchema databaseSchema,
+        RealtimeMetrics? metrics = null)
     {
         _databaseClient = databaseClient;
         _databaseSchema = databaseSchema;
+        // Reliability-4：传入 RealtimeMetrics，由 session 在事务提交成功后记录 outbox 入队行数。
+        _sessionFactory = new RealtimeWriteSessionFactory(databaseClient, databaseSchema, metrics);
     }
 
     public async Task<IReadOnlyList<ConversationListItem>> QueryListAsync(
@@ -53,7 +59,17 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                  c.last_message_preview,
                  COALESCE(m.last_message_at_ms, c.last_message_at_ms) AS last_message_at_ms,
                  c.last_sender_user_id,
-                 m.unread_count,
+                 -- Perf-1：群聊 unread_count 不再在消息写入时物化更新，改由序列列派生；
+                 -- 单聊 unread_count 仍在写入时维护，但此处统一用序列公式派生，保证两类会话一致。
+                 LEAST(
+                     GREATEST(
+                         COALESCE(c.last_sequence, 0)
+                         - COALESCE(m.last_read_sequence, 0)
+                         - (m.sent_count - m.sent_count_at_read),
+                         0
+                     ),
+                     {ConversationWriteCommands.MaxTrackedUnreadCount}
+                 )::int AS unread_count,
                  m.last_read_message_id,
                  m.last_read_at_ms,
                  m.is_pinned,
@@ -126,6 +142,117 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
         return items;
     }
 
+    public async Task<IReadOnlyList<ConversationListItem>> QueryArchivedListAsync(
+        long userId,
+        bool? beforeIsPinned,
+        long? beforePinnedAtMs,
+        long? beforeLastMessageAtMs,
+        string? beforeConversationId,
+        int take,
+        CancellationToken ct = default)
+    {
+        take = Math.Clamp(take, 1, 101);
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+
+        // 排序键与游标必须一致：置顶 → 置顶时间 → 最后消息时间 → ConversationId。
+        // NULLS LAST 用 MinValue 哨兵，保证 keyset 比较与 ORDER BY 语义一致。
+        const long nullSortSentinel = long.MinValue;
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT
+                 c.conversation_id,
+                 c.type,
+                 m.peer_user_id,
+                 c.title,
+                 c.last_message_id,
+                 c.last_message_preview,
+                 COALESCE(m.last_message_at_ms, c.last_message_at_ms) AS last_message_at_ms,
+                 c.last_sender_user_id,
+                 -- Perf-1：与 QueryListAsync 一致的序列派生公式，保证两类会话口径相同。
+                 LEAST(
+                     GREATEST(
+                         COALESCE(c.last_sequence, 0)
+                         - COALESCE(m.last_read_sequence, 0)
+                         - (m.sent_count - m.sent_count_at_read),
+                         0
+                     ),
+                     {ConversationWriteCommands.MaxTrackedUnreadCount}
+                 )::int AS unread_count,
+                 m.last_read_message_id,
+                 m.last_read_at_ms,
+                 m.is_pinned,
+                 m.pinned_at_ms,
+                 m.is_muted,
+                 m.muted_until_ms
+             FROM {_databaseSchema.ConversationMembersTableSql} AS m
+             INNER JOIN {_databaseSchema.ConversationsTableSql} AS c
+                 ON c.conversation_id = m.conversation_id
+             WHERE m.user_id = @user_id
+               AND m.left_at_ms IS NOT NULL
+               AND c.type = {(int)ConversationType.Group}
+               AND (
+                    @before_id IS NULL
+                    OR (
+                        m.is_pinned::int,
+                        COALESCE(m.pinned_at_ms, {nullSortSentinel}),
+                        COALESCE(m.last_message_at_ms, c.last_message_at_ms, {nullSortSentinel}),
+                        c.conversation_id
+                    ) < (
+                        @before_pinned::int,
+                        COALESCE(@before_pinned_at, {nullSortSentinel}),
+                        COALESCE(@before_at, {nullSortSentinel}),
+                        @before_id
+                    )
+               )
+             ORDER BY
+                 m.is_pinned DESC,
+                 m.pinned_at_ms DESC NULLS LAST,
+                 COALESCE(m.last_message_at_ms, c.last_message_at_ms) DESC NULLS LAST,
+                 c.conversation_id DESC
+             LIMIT @take;
+             """,
+            connection);
+        command.Parameters.AddWithValue("user_id", userId);
+        var beforePinned = command.Parameters.Add("before_pinned", NpgsqlDbType.Boolean);
+        beforePinned.Value = (object?)beforeIsPinned ?? DBNull.Value;
+        var beforePinnedAt = command.Parameters.Add("before_pinned_at", NpgsqlDbType.Bigint);
+        beforePinnedAt.Value = (object?)beforePinnedAtMs ?? DBNull.Value;
+        var beforeAt = command.Parameters.Add("before_at", NpgsqlDbType.Bigint);
+        beforeAt.Value = (object?)beforeLastMessageAtMs ?? DBNull.Value;
+        var beforeId = command.Parameters.Add("before_id", NpgsqlDbType.Text);
+        beforeId.Value = (object?)beforeConversationId ?? DBNull.Value;
+        command.Parameters.AddWithValue("take", take);
+
+        var items = new List<ConversationListItem>(take);
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            items.Add(new ConversationListItem
+            {
+                ConversationId = reader.GetString(0),
+                Type = (ConversationType)reader.GetInt16(1),
+                PeerUserId = reader.IsDBNull(2) ? null : reader.GetInt64(2),
+                Title = reader.IsDBNull(3) ? null : reader.GetString(3),
+                LastMessageId = reader.IsDBNull(4) ? null : reader.GetString(4),
+                LastMessagePreview = reader.IsDBNull(5) ? null : reader.GetString(5),
+                LastMessageAtMs = reader.IsDBNull(6) ? null : reader.GetInt64(6),
+                LastSenderUserId = reader.IsDBNull(7) ? null : reader.GetInt64(7),
+                UnreadCount = reader.GetInt32(8),
+                LastReadMessageId = reader.IsDBNull(9) ? null : reader.GetString(9),
+                LastReadAtMs = reader.IsDBNull(10) ? null : reader.GetInt64(10),
+                IsPinned = reader.GetBoolean(11),
+                PinnedAtMs = reader.IsDBNull(12) ? null : reader.GetInt64(12),
+                IsMuted = reader.GetBoolean(13),
+                MutedUntilMs = reader.IsDBNull(14) ? null : reader.GetInt64(14)
+            });
+        }
+
+        return items;
+    }
+
     public async Task<ConversationMemberPrefsResult> SetMemberPrefsAsync(
         long userId,
         string conversationId,
@@ -134,11 +261,9 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
         long? mutedUntilMs,
         CancellationToken ct = default)
     {
-        await using var connection = await _databaseClient
-            .GetDataSource()
-            .OpenConnectionAsync(ct)
-            .ConfigureAwait(false);
-        await using var transaction = await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
+        // Reliability-4：使用 RealtimeWriteSession 统一事务上下文，
+        // Outbox 入队计数在 CommitAsync 成功后才推到 metrics，避免回滚导致 pending 漂移。
+        await using var session = await _sessionFactory.BeginAsync(ct).ConfigureAwait(false);
 
         ConversationType type;
         long? peerUserId;
@@ -164,25 +289,25 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                                 m.pinned_at_ms,
                                 m.is_muted,
                                 m.muted_until_ms
-                            FROM {_databaseSchema.ConversationMembersTableSql} AS m
-                            INNER JOIN {_databaseSchema.ConversationsTableSql} AS c
+                            FROM {session.Schema.ConversationMembersTableSql} AS m
+                            INNER JOIN {session.Schema.ConversationsTableSql} AS c
                                 ON c.conversation_id = m.conversation_id
                             WHERE m.conversation_id = @conversation_id
                               AND m.user_id = @user_id
                               AND m.left_at_ms IS NULL
                             FOR UPDATE OF m;
                             """,
-                           connection,
-                           transaction))
+                           session.Connection,
+                           session.Transaction))
         {
             load.Parameters.AddWithValue("conversation_id", conversationId);
             load.Parameters.AddWithValue("user_id", userId);
-            await using (var reader = await load.ExecuteReaderAsync(ct).ConfigureAwait(false))
+            await using (var reader = await load.ExecuteReaderAsync(session.CancellationToken).ConfigureAwait(false))
             {
-                if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+                if (!await reader.ReadAsync(session.CancellationToken).ConfigureAwait(false))
                 {
                     await reader.CloseAsync().ConfigureAwait(false);
-                    await transaction.RollbackAsync(ct).ConfigureAwait(false);
+                    await session.RollbackAsync().ConfigureAwait(false);
                     return new ConversationMemberPrefsResult(false, false, false, false, null);
                 }
 
@@ -236,7 +361,7 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
 
         if (!changed)
         {
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await session.CommitAsync().ConfigureAwait(false);
             return new ConversationMemberPrefsResult(
                 true,
                 false,
@@ -247,7 +372,7 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
 
         await using (var update = new NpgsqlCommand(
                            $"""
-                            UPDATE {_databaseSchema.ConversationMembersTableSql}
+                            UPDATE {session.Schema.ConversationMembersTableSql}
                             SET is_pinned = @is_pinned,
                                 pinned_at_ms = @pinned_at_ms,
                                 is_muted = @is_muted,
@@ -255,8 +380,8 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                             WHERE conversation_id = @conversation_id
                               AND user_id = @user_id;
                             """,
-                           connection,
-                           transaction))
+                           session.Connection,
+                           session.Transaction))
         {
             update.Parameters.AddWithValue("is_pinned", nextPinned);
             update.Parameters.AddWithValue("pinned_at_ms", (object?)nextPinnedAtMs ?? DBNull.Value);
@@ -264,15 +389,15 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
             update.Parameters.AddWithValue("muted_until_ms", (object?)nextMutedUntilMs ?? DBNull.Value);
             update.Parameters.AddWithValue("conversation_id", conversationId);
             update.Parameters.AddWithValue("user_id", userId);
-            await update.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            await update.ExecuteNonQueryAsync(session.CancellationToken).ConfigureAwait(false);
         }
 
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
-        await OutboxInsertHelper.InsertAsync(
-                connection,
-                transaction,
-                _databaseSchema,
+        var inserted = await OutboxInsertHelper.InsertAsync(
+                session.Connection,
+                session.Transaction,
+                session.Schema,
                 ConversationWriteCommands.CreateConversationPrefsChangedEvent(
                     conversationId,
                     userId,
@@ -289,10 +414,12 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                     now,
                     traceParent,
                     traceState),
-                ct)
+                session.CancellationToken)
             .ConfigureAwait(false);
+        // Reliability-4：累计到 session，由 CommitAsync 在事务提交成功后统一记录到 metrics。
+        session.RecordOutboxInsert(inserted);
 
-        await transaction.CommitAsync(ct).ConfigureAwait(false);
+        await session.CommitAsync().ConfigureAwait(false);
         return new ConversationMemberPrefsResult(
             true,
             true,
@@ -308,15 +435,14 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
         string? readMessageId,
         CancellationToken ct = default)
     {
-        await using var connection = await _databaseClient
-            .GetDataSource()
-            .OpenConnectionAsync(ct)
-            .ConfigureAwait(false);
-        await using var transaction = await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
+        // Reliability-4：使用 RealtimeWriteSession 统一事务上下文，
+        // Outbox 入队计数在 CommitAsync 成功后才推到 metrics，避免回滚导致 pending 漂移。
+        await using var session = await _sessionFactory.BeginAsync(ct).ConfigureAwait(false);
         _ = readAtMs; // 权威时间由 messageId 解析；保留参数以兼容调用方。
 
         long? tipAtMs = null;
         string? tipMessageId = null;
+        long tipSequence = 0;
         long? currentReadAtMs = null;
         string? currentReadMessageId = null;
         var currentUnread = 0;
@@ -327,48 +453,51 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                             SELECT
                                 c.last_message_at_ms,
                                 c.last_message_id,
+                                c.last_sequence,
                                 m.last_read_at_ms,
                                 m.last_read_message_id,
                                 m.unread_count
-                            FROM {_databaseSchema.ConversationMembersTableSql} AS m
-                            INNER JOIN {_databaseSchema.ConversationsTableSql} AS c
+                            FROM {session.Schema.ConversationMembersTableSql} AS m
+                            INNER JOIN {session.Schema.ConversationsTableSql} AS c
                                 ON c.conversation_id = m.conversation_id
                             WHERE m.conversation_id = @conversation_id
                               AND m.user_id = @user_id
                               AND m.left_at_ms IS NULL
                             FOR UPDATE OF m;
                             """,
-                           connection,
-                           transaction))
+                           session.Connection,
+                           session.Transaction))
         {
             load.Parameters.AddWithValue("conversation_id", conversationId);
             load.Parameters.AddWithValue("user_id", userId);
-            await using var reader = await load.ExecuteReaderAsync(ct).ConfigureAwait(false);
-            if (await reader.ReadAsync(ct).ConfigureAwait(false))
+            await using var reader = await load.ExecuteReaderAsync(session.CancellationToken).ConfigureAwait(false);
+            if (await reader.ReadAsync(session.CancellationToken).ConfigureAwait(false))
             {
                 memberFound = true;
                 tipAtMs = reader.IsDBNull(0) ? null : reader.GetInt64(0);
                 tipMessageId = reader.IsDBNull(1) ? null : reader.GetString(1);
-                currentReadAtMs = reader.IsDBNull(2) ? null : reader.GetInt64(2);
-                currentReadMessageId = reader.IsDBNull(3) ? null : reader.GetString(3);
-                currentUnread = reader.GetInt32(4);
+                tipSequence = reader.IsDBNull(2) ? 0 : reader.GetInt64(2);
+                currentReadAtMs = reader.IsDBNull(3) ? null : reader.GetInt64(3);
+                currentReadMessageId = reader.IsDBNull(4) ? null : reader.GetString(4);
+                currentUnread = reader.GetInt32(5);
             }
         }
 
         if (!memberFound)
         {
-            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            await session.RollbackAsync().ConfigureAwait(false);
             return new ConversationReadAdvanceResult(false, false, 0, null, null);
         }
 
         long targetAtMs;
         string targetMessageId;
+        long targetSequence;
         // messageId 为空：推进到 tip。非空：以库内时间为权威，忽略客户端 readAtMs。
         if (string.IsNullOrWhiteSpace(readMessageId))
         {
             if (tipAtMs is null || string.IsNullOrWhiteSpace(tipMessageId))
             {
-                await transaction.CommitAsync(ct).ConfigureAwait(false);
+                await session.CommitAsync().ConfigureAwait(false);
                 return new ConversationReadAdvanceResult(
                     true,
                     false,
@@ -379,20 +508,22 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
 
             targetAtMs = tipAtMs.Value;
             targetMessageId = tipMessageId;
+            targetSequence = tipSequence;
         }
         else
         {
             var resolved = await TryResolveReadCursorMessageAsync(
-                    connection,
-                    transaction,
+                    session.Connection,
+                    session.Transaction,
+                    session.Schema,
                     conversationId,
                     readMessageId,
-                    ct)
+                    session.CancellationToken)
                 .ConfigureAwait(false);
             if (resolved is null)
             {
                 // 消息不存在或不属于该会话：忽略客户端游标，不前进。
-                await transaction.CommitAsync(ct).ConfigureAwait(false);
+                await session.CommitAsync().ConfigureAwait(false);
                 return new ConversationReadAdvanceResult(
                     true,
                     false,
@@ -403,6 +534,7 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
 
             targetAtMs = resolved.Value.ReceivedAtMs;
             targetMessageId = resolved.Value.MessageId;
+            targetSequence = resolved.Value.ConversationSequence ?? tipSequence;
 
             // 限制在当前会话 tip 以内，防止未来游标把后续消息全部视作已读。
             if (tipAtMs is not null
@@ -411,55 +543,35 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
             {
                 targetAtMs = tipAtMs.Value;
                 targetMessageId = tipMessageId;
+                targetSequence = tipSequence;
             }
         }
 
-        var shouldAdvance = currentReadAtMs is null
-            || currentReadAtMs.Value < targetAtMs
-            || (currentReadAtMs.Value == targetAtMs
-                && (currentReadMessageId is null
-                    || string.CompareOrdinal(currentReadMessageId, targetMessageId) < 0));
-        if (!shouldAdvance)
+        // Perf-1：使用 O(1) 序列化 MarkRead，消除 COUNT 扫描。
+        var readResult = await ConversationWriteCommands.TryAdvanceReadBySequenceAsync(
+                session.Connection,
+                session.Transaction,
+                session.Schema,
+                conversationId,
+                userId,
+                targetSequence,
+                targetMessageId,
+                targetAtMs,
+                session.CancellationToken)
+            .ConfigureAwait(false);
+
+        if (!readResult.Advanced)
         {
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await session.CommitAsync().ConfigureAwait(false);
             return new ConversationReadAdvanceResult(
                 true,
                 false,
-                currentUnread,
+                readResult.UnreadCount,
                 currentReadMessageId,
                 currentReadAtMs);
         }
 
-        var unread = await CountUnreadBoundedAsync(
-                connection,
-                transaction,
-                conversationId,
-                userId,
-                targetAtMs,
-                targetMessageId,
-                ct)
-            .ConfigureAwait(false);
-
-        await using (var update = new NpgsqlCommand(
-                           $"""
-                            UPDATE {_databaseSchema.ConversationMembersTableSql}
-                            SET last_read_at_ms = @read_at_ms,
-                                last_read_message_id = @read_message_id,
-                                unread_count = @unread_count
-                            WHERE conversation_id = @conversation_id
-                              AND user_id = @user_id;
-                            """,
-                           connection,
-                           transaction))
-        {
-            update.Parameters.AddWithValue("read_at_ms", targetAtMs);
-            update.Parameters.AddWithValue("read_message_id", targetMessageId);
-            update.Parameters.AddWithValue("unread_count", unread);
-            update.Parameters.AddWithValue("conversation_id", conversationId);
-            update.Parameters.AddWithValue("user_id", userId);
-            await update.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-        }
-
+        var unread = readResult.UnreadCount;
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
@@ -477,11 +589,11 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
             traceState);
 
         var memberIds = await ConversationWriteCommands.ListActiveMemberUserIdsAsync(
-                connection,
-                transaction,
-                _databaseSchema,
+                session.Connection,
+                session.Transaction,
+                session.Schema,
                 conversationId,
-                ct)
+                session.CancellationToken)
             .ConfigureAwait(false);
 
         // Perf-9：群已读走统一 GroupProjectionDelta 协议，ConversationRead 广播聚合为单行 Outbox。
@@ -512,13 +624,15 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
             // 读者自身的未读数变更保持逐用户。
             delta.AddPerUser(readerUnreadEvent);
 
-            await OutboxInsertHelper.InsertManyAsync(
-                    connection,
-                    transaction,
-                    _databaseSchema,
+            var groupInserted = await OutboxInsertHelper.InsertManyAsync(
+                    session.Connection,
+                    session.Transaction,
+                    session.Schema,
                     delta.Build(),
-                    ct)
+                    session.CancellationToken)
                 .ConfigureAwait(false);
+            // Reliability-4：累计到 session，由 CommitAsync 在事务提交成功后统一记录到 metrics。
+            session.RecordOutboxInsert(groupInserted);
         }
         else
         {
@@ -540,16 +654,17 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                     traceState));
             }
 
-            await OutboxInsertHelper.InsertManyAsync(
-                    connection,
-                    transaction,
-                    _databaseSchema,
+            var directInserted = await OutboxInsertHelper.InsertManyAsync(
+                    session.Connection,
+                    session.Transaction,
+                    session.Schema,
                     events,
-                    ct)
+                    session.CancellationToken)
                 .ConfigureAwait(false);
+            session.RecordOutboxInsert(directInserted);
         }
 
-        await transaction.CommitAsync(ct).ConfigureAwait(false);
+        await session.CommitAsync().ConfigureAwait(false);
         return new ConversationReadAdvanceResult(
             true,
             true,
@@ -558,17 +673,18 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
             targetAtMs);
     }
 
-    private async Task<(long ReceivedAtMs, string MessageId)?> TryResolveReadCursorMessageAsync(
+    private async Task<(long ReceivedAtMs, string MessageId, long? ConversationSequence)?> TryResolveReadCursorMessageAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
+        RealtimeDatabaseSchema schema,
         string conversationId,
         string messageId,
         CancellationToken ct)
     {
         await using var command = new NpgsqlCommand(
             $"""
-             SELECT received_at_ms, message_id
-             FROM {_databaseSchema.MessagesTableSql}
+             SELECT received_at_ms, message_id, conversation_sequence
+             FROM {schema.MessagesTableSql}
              WHERE conversation_id = @conversation_id
                AND message_id = @message_id
              LIMIT 1;
@@ -581,7 +697,8 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
         if (!await reader.ReadAsync(ct).ConfigureAwait(false))
             return null;
 
-        return (reader.GetInt64(0), reader.GetString(1));
+        return (reader.GetInt64(0), reader.GetString(1),
+            reader.IsDBNull(2) ? null : reader.GetInt64(2));
     }
 
     private static bool IsMessageAfter(
@@ -592,39 +709,4 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
         candidateAtMs > tipAtMs
         || (candidateAtMs == tipAtMs
             && string.CompareOrdinal(candidateMessageId, tipMessageId) > 0);
-
-    private async Task<int> CountUnreadBoundedAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        string conversationId,
-        long userId,
-        long readAtMs,
-        string readMessageId,
-        CancellationToken ct)
-    {
-        await using var command = new NpgsqlCommand(
-            $"""
-             SELECT COUNT(*)::int
-             FROM (
-                 SELECT 1
-                 FROM {_databaseSchema.MessagesTableSql}
-                 WHERE conversation_id = @conversation_id
-                   AND sender_user_id <> @user_id
-                   AND (
-                        received_at_ms > @read_at_ms
-                        OR (received_at_ms = @read_at_ms AND message_id > @read_message_id)
-                   )
-                 LIMIT @max_unread
-             ) AS bounded;
-             """,
-            connection,
-            transaction);
-        command.Parameters.AddWithValue("conversation_id", conversationId);
-        command.Parameters.AddWithValue("user_id", userId);
-        command.Parameters.AddWithValue("read_at_ms", readAtMs);
-        command.Parameters.AddWithValue("read_message_id", readMessageId);
-        command.Parameters.AddWithValue("max_unread", ConversationWriteCommands.MaxTrackedUnreadCount);
-        var result = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
-        return result is int count ? count : Convert.ToInt32(result);
-    }
 }

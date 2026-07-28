@@ -1,4 +1,6 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
@@ -13,8 +15,10 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
 {
     private readonly JetStreamContextManager _contextManager;
     private readonly IGatewayDirectory _gatewayDirectory;
+    private readonly IConversationGatewayDirectory _conversationGatewayDirectory;
     private readonly IWatcherGatewayDirectory _watcherGatewayDirectory;
     private readonly string? _shardSubjectPattern;
+    private readonly int _maxShardParallelism;
     private readonly RoutingMetrics? _routingMetrics;
     private readonly RealtimeMetrics? _realtimeMetrics;
     private readonly ILogger<JetStreamRealtimeEventPublisher>? _logger;
@@ -26,22 +30,34 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
         RoutingMetrics? routingMetrics = null,
         IWatcherGatewayDirectory? watcherGatewayDirectory = null,
         RealtimeMetrics? realtimeMetrics = null,
-        ILogger<JetStreamRealtimeEventPublisher>? logger = null)
+        IConversationGatewayDirectory? conversationGatewayDirectory = null,
+        ILogger<JetStreamRealtimeEventPublisher>? logger = null,
+        int maxShardParallelism = 4)
     {
         _contextManager = contextManager;
         _gatewayDirectory = gatewayDirectory ?? NullGatewayDirectory.Instance;
         _watcherGatewayDirectory = watcherGatewayDirectory ?? NullWatcherGatewayDirectory.Instance;
+        _conversationGatewayDirectory = conversationGatewayDirectory ?? NullConversationGatewayDirectory.Instance;
         _shardSubjectPattern = string.IsNullOrWhiteSpace(shardSubjectPattern)
             ? null
             : shardSubjectPattern;
+        // 分片发布有限并行度：小于 1 视为 1（顺序），避免无界并发打爆 NATS 连接。
+        _maxShardParallelism = maxShardParallelism < 1 ? 1 : maxShardParallelism;
         _routingMetrics = routingMetrics;
         _realtimeMetrics = realtimeMetrics;
         _logger = logger;
     }
 
-    public async Task PublishAsync(RealtimeEvent evt, CancellationToken ct = default)
+    /// <summary>Perf-4：旧入口，回退到序列化路径。实际逻辑在 <see cref="PublishWithPayloadAsync"/>。</summary>
+    public Task PublishAsync(RealtimeEvent evt, CancellationToken ct = default)
+        => PublishWithPayloadAsync(evt, null, ct);
+
+    public async Task PublishWithPayloadAsync(RealtimeEvent evt, ReadOnlyMemory<byte>? payloadUtf8, CancellationToken ct = default)
     {
-        var payload = JsonSerializer.Serialize(evt, RealtimeJsonSerializerContext.Default.RealtimeEvent);
+        // Perf-4：优先使用预序列化的 UTF-8 字节，避免重新序列化；为空时回退到序列化路径。
+        var payload = payloadUtf8 is { Length: > 0 } bytes
+            ? Encoding.UTF8.GetString(bytes.Span)
+            : JsonSerializer.Serialize(evt, RealtimeJsonSerializerContext.Default.RealtimeEvent);
 
         // 账号清理事件始终广播（Server Saga 共享 durable consumer）。
         if (evt.Type is RealtimeEventType.UserAccountDeleted
@@ -100,30 +116,29 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
             return;
         }
 
-        foreach (var instanceId in gateways)
-        {
-            if (string.IsNullOrWhiteSpace(instanceId))
-                continue;
-
-            var subject = ShardedSubjectFormatter.Format(_shardSubjectPattern, instanceId);
-            await _contextManager
-                .PublishRealtimeEventToSubjectAsync(subject, evt.EventId + ":" + instanceId, payload, ct)
-                .ConfigureAwait(false);
-        }
+        await PublishToShardsParallelAsync(gateways, payload, evt, ct)
+            .ConfigureAwait(false);
 
         _routingMetrics?.RecordShardPublish("realtime", "single", gateways.Count);
     }
 
-    public async Task PublishToManyAsync(RealtimeEvent evt, CancellationToken ct = default)
+    /// <summary>Perf-4：旧入口，回退到序列化路径。实际逻辑在 <see cref="PublishToManyWithPayloadAsync"/>。</summary>
+    public Task PublishToManyAsync(RealtimeEvent evt, CancellationToken ct = default)
+        => PublishToManyWithPayloadAsync(evt, null, ct);
+
+    public async Task PublishToManyWithPayloadAsync(RealtimeEvent evt, ReadOnlyMemory<byte>? payloadUtf8, CancellationToken ct = default)
     {
         // 未携带多目标列表时回退到单目标发布路径。
         if (evt.TargetUserIds is null || evt.TargetUserIds.Length == 0)
         {
-            await PublishAsync(evt, ct).ConfigureAwait(false);
+            await PublishWithPayloadAsync(evt, payloadUtf8, ct).ConfigureAwait(false);
             return;
         }
 
-        var payload = JsonSerializer.Serialize(evt, RealtimeJsonSerializerContext.Default.RealtimeEvent);
+        // Perf-4：优先使用预序列化的 UTF-8 字节，避免重新序列化；为空时回退到序列化路径。
+        var payload = payloadUtf8 is { Length: > 0 } bytes
+            ? Encoding.UTF8.GetString(bytes.Span)
+            : JsonSerializer.Serialize(evt, RealtimeJsonSerializerContext.Default.RealtimeEvent);
 
         // 非分片模式：广播单条消息，各 Gateway 自行遍历 TargetUserIds 投递本机会话。
         if (_shardSubjectPattern is null)
@@ -133,6 +148,31 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
                 .PublishRealtimeEventAsync(evt.EventId, payload, ct)
                 .ConfigureAwait(false);
             return;
+        }
+
+        // Perf-2：会话级受众路由——一次查询返回该会话所有在线成员所在的 Gateway 实例集合，
+        // 替代逐用户查询 N 个 Redis keys。失败时回退到 per-user 路由。
+        if (evt.AudienceKind == AudienceKind.Conversation && !string.IsNullOrWhiteSpace(evt.ConversationId))
+        {
+            var convSw = Stopwatch.StartNew();
+            var convLookup = await _conversationGatewayDirectory
+                .GetConversationGatewaysAsync(evt.ConversationId, ct)
+                .ConfigureAwait(false);
+            convSw.Stop();
+            _routingMetrics?.RecordDirectoryQuery("gateway", "conversation", convSw.Elapsed, convLookup.Gateways.Count);
+
+            if (convLookup.Kind == GatewayLookupResultKind.Success && convLookup.Gateways.Count > 0)
+            {
+                await PublishToShardsParallelAsync(convLookup.Gateways, payload, evt, ct)
+                    .ConfigureAwait(false);
+
+                _routingMetrics?.RecordShardPublish("realtime", "conversation", convLookup.Gateways.Count);
+                _routingMetrics?.RecordFanout(evt.TargetUserIds!.Length, convLookup.Gateways.Count);
+                return;
+            }
+
+            // LookupFailure 或无在线实例：回退到 per-user 路由（下方逻辑）。
+            _routingMetrics?.RecordBroadcastFallback("realtime", "conversation_fallback");
         }
 
         // 分片模式：批量查询所有目标用户的在线 Gateway 集合，按实例聚合投递。
@@ -173,15 +213,8 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
             return;
         }
 
-        foreach (var instanceId in instances)
-        {
-            var subject = ShardedSubjectFormatter.Format(_shardSubjectPattern, instanceId);
-            // 使用复合 MsgId 避免 JetStream 跨 subject 去重吞掉分片消息。
-            var msgId = evt.EventId + ":" + instanceId;
-            await _contextManager
-                .PublishRealtimeEventToSubjectAsync(subject, msgId, payload, ct)
-                .ConfigureAwait(false);
-        }
+        await PublishToShardsParallelAsync(instances, payload, evt, ct)
+            .ConfigureAwait(false);
 
         _routingMetrics?.RecordShardPublish("realtime", "many", instances.Count);
         _routingMetrics?.RecordFanout(evt.TargetUserIds!.Length, instances.Count);
@@ -233,19 +266,97 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
             reason,
             shards.Count);
 
-        foreach (var instanceId in shards)
-        {
-            if (string.IsNullOrWhiteSpace(instanceId))
-                continue;
-
-            var subject = ShardedSubjectFormatter.Format(_shardSubjectPattern!, instanceId);
-            // 使用复合 MsgId 避免 JetStream 跨 subject 去重吞掉分片消息。
-            var msgId = evt.EventId + ":" + instanceId;
-            await _contextManager
-                .PublishRealtimeEventToSubjectAsync(subject, msgId, payload, ct)
-                .ConfigureAwait(false);
-        }
+        await PublishToShardsParallelAsync(shards, payload, evt, ct)
+            .ConfigureAwait(false);
 
         _routingMetrics?.RecordShardPublish("realtime", "fallback", shards.Count);
+    }
+
+    /// <summary>
+    /// 分片发布有限并行：向多个 Gateway shard 定向投递。
+    /// <para>
+    /// 单 shard 走顺序 await 快速路径（无并发开销）；多 shard 使用
+    /// <see cref="Parallel.ForEachAsync"/> 限制并发度为 <c>_maxShardParallelism</c>，
+    /// 避免无界 <c>Task.WhenAll</c> 在大扇出场景下打爆 NATS 连接。
+    /// 单个 shard 发布失败仅记录日志，不中断其他 shard；仅当全部失败时向上抛出
+    /// <see cref="AggregateException"/>，让上游 outbox/重试逻辑处理整体故障。
+    /// </para>
+    /// </summary>
+    private async Task PublishToShardsParallelAsync(
+        IEnumerable<string> instanceIds,
+        string payload,
+        RealtimeEvent evt,
+        CancellationToken ct)
+    {
+        // 预先过滤空白实例并物化，便于计数与单 shard 快速路径判定。
+        var shards = new List<string>();
+        foreach (var id in instanceIds)
+        {
+            if (!string.IsNullOrWhiteSpace(id))
+                shards.Add(id);
+        }
+
+        if (shards.Count == 0)
+            return;
+
+        // 单 shard 快速路径：保持顺序 await，无并发开销。
+        if (shards.Count == 1)
+        {
+            await PublishSingleShardAsync(shards[0], payload, evt, ct).ConfigureAwait(false);
+            return;
+        }
+
+        // 多 shard 有限并行：单个 shard 失败不中断其他 shard。
+        var failures = new ConcurrentQueue<Exception>();
+        await Parallel.ForEachAsync(
+            shards,
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = _maxShardParallelism,
+                CancellationToken = ct
+            },
+            async (instanceId, token) =>
+            {
+                try
+                {
+                    await PublishSingleShardAsync(instanceId, payload, evt, token)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    // 外部取消：向上传播，不视为分片失败。
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    failures.Enqueue(ex);
+                    _logger?.LogWarning(
+                        "分片发布失败，跳过该 shard。事件类型={Type}；事件编号={EventId}；shard={InstanceId}；原因={Message}",
+                        evt.Type,
+                        evt.EventId,
+                        instanceId,
+                        ex.Message);
+                }
+            }).ConfigureAwait(false);
+
+        // 全部失败时向上抛出，让上游重试；部分成功则视为已投递（避免重复投递健康 shard）。
+        if (failures.Count == shards.Count)
+        {
+            throw new AggregateException(failures);
+        }
+    }
+
+    private async Task PublishSingleShardAsync(
+        string instanceId,
+        string payload,
+        RealtimeEvent evt,
+        CancellationToken ct)
+    {
+        var subject = ShardedSubjectFormatter.Format(_shardSubjectPattern!, instanceId);
+        // 使用复合 MsgId 避免 JetStream 跨 subject 去重吞掉分片消息。
+        var msgId = evt.EventId + ":" + instanceId;
+        await _contextManager
+            .PublishRealtimeEventToSubjectAsync(subject, msgId, payload, ct)
+            .ConfigureAwait(false);
     }
 }

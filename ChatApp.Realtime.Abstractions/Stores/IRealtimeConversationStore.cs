@@ -14,6 +14,19 @@ public interface IRealtimeConversationStore
         CancellationToken ct = default);
 
     /// <summary>
+    /// 查询已离群（left_at_ms IS NOT NULL）的群会话列表，供用户查看历史。
+    /// 单聊会话没有 left_at_ms 概念，此方法仅返回群会话（c.type = 2）。
+    /// </summary>
+    Task<IReadOnlyList<ConversationListItem>> QueryArchivedListAsync(
+        long userId,
+        bool? beforeIsPinned,
+        long? beforePinnedAtMs,
+        long? beforeLastMessageAtMs,
+        string? beforeConversationId,
+        int take,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// 将已读游标推进到指定位置（仅前进）。
     /// <paramref name="readMessageId"/> 为空时推进到会话当前最后消息；
     /// 非空时以库内该消息的 received_at_ms 为准（忽略 <paramref name="readAtMs"/>），并钳到 tip。

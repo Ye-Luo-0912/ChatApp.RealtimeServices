@@ -58,7 +58,13 @@ public sealed class RealtimeSchemaMigrationRunner
         new Migration027_UserLifecycleState(),
         new Migration028_GroupOperationAudit(),
         new Migration029_LeaveGroupHistoryPolicy(),
-        new Migration030_DeviceSyncCursorChangedAtColumn()
+        new Migration030_DeviceSyncCursorChangedAtColumn(),
+        new Migration031_MessageReactionsEmojiIndex(),
+        new Migration032_SequenceModel(),
+        new Migration033_OutboxConversationAudience(),
+        new Migration034_OutboxPayloadUtf8(),
+        new Migration035_MembershipPeriods(),
+        new Migration036_AccountCleanupJobs()
     ];
 
     public async Task MigrateAsync(

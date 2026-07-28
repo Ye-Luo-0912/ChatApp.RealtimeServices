@@ -382,13 +382,13 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
         return (page, catchUps);
     }
 
-    private static int MeasureSyncBootstrapPageUtf8Json(SyncBootstrapPage page)
-    {
-        var json = JsonSerializer.Serialize(
+    /// <summary>
+    /// Perf-4：直接序列化为 UTF-8 字节并返回长度，避免中间 string 分配。
+    /// </summary>
+    private static int MeasureSyncBootstrapPageUtf8Json(SyncBootstrapPage page) =>
+        JsonSerializer.SerializeToUtf8Bytes(
             page,
-            RealtimeJsonSerializerContext.Default.SyncBootstrapPage);
-        return Encoding.UTF8.GetByteCount(json);
-    }
+            RealtimeJsonSerializerContext.Default.SyncBootstrapPage).Length;
 
     /// <summary>
     /// 仅持久化 bootstrap 实际返回的最后一条消息。

@@ -17,4 +17,8 @@
     <ProjectReference Include="..\ChatApp.Realtime.Abstractions\ChatApp.Realtime.Abstractions.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="ChatApp.Realtime.Infrastructure.Postgres" />
+  </ItemGroup>
+
 </Project>

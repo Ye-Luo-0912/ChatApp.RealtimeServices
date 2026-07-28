@@ -386,6 +386,42 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
         return objectKeys;
     }
 
+    public async Task<int> DeleteByAttachmentIdsAsync(
+        IReadOnlyList<string> attachmentIds,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(attachmentIds);
+        var ids = attachmentIds
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (ids.Length == 0)
+            return 0;
+
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+
+        await using var command = new NpgsqlCommand(
+            $"""
+            DELETE FROM {_databaseSchema.AttachmentsTableSql}
+            WHERE attachment_id = ANY(@attachment_ids);
+            """,
+            connection);
+        var param = command.Parameters.Add("attachment_ids", NpgsqlDbType.Array | NpgsqlDbType.Text);
+        param.Value = ids;
+
+        var affected = await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        if (affected > 0)
+        {
+            _logger.LogDebug(
+                "已按 attachment_id 批量删除附件元数据。删除行={Deleted}",
+                affected);
+        }
+        return affected;
+    }
+
     private async Task<RealtimeAttachmentRecord?> TryGetByIdAsync(
         NpgsqlConnection connection,
         string attachmentId,

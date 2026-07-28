@@ -1,14 +1,9 @@
-using System.Diagnostics;
 using System.Text.Json;
-using System.Threading.Channels;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
-using ChatApp.Realtime.Abstractions.Queueing;
-using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
-using ChatApp.Realtime.Infrastructure.Core.Health;
+using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.RealtimeServices.Options;
-using ChatApp.RealtimeServices.Workers.Reliability;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -16,241 +11,291 @@ using Microsoft.Extensions.Options;
 namespace ChatApp.RealtimeServices.Workers;
 
 /// <summary>
-/// 消费 Realtime 域事件并执行账号删除清理（非网关推送路径）。
-/// Reliability-2：迁入 <see cref="PartitionedConsumerRuntime{TEnvelope}"/>，
-/// 获得订阅重连退避、SubscriptionConnected 信号、RecordMessageConsumed 进展上报、
-/// processor fault propagation 与 QueueDepth 报告。枚举结束后自动重新订阅而非进入永久 heartbeat。
+/// 账号清理可续跑 Saga Worker。
+/// <para>
+/// LongTerm-2：取代原内联一次性清理。从 <c>account_cleanup_jobs</c> 表轮询 pending 作业，
+/// 按 phase（attachments → metadata → completed）分批推进清理。
+/// </para>
+/// <para>
+/// 内存有界：每批最多 <see cref="RealtimeOptions.AccountCleanupBatchSize"/>（默认 200）个对象。
+/// 断点续跑：通过 cursor（最后处理的 attachment_id）记录进度，崩溃后从 cursor 续跑。
+/// 事务有界：每批一次 purge Outbox + 一次 DELETE，不产生数百个串行小事务。
+/// 失败有上限：超过 <see cref="RealtimeOptions.AccountCleanupMaxRetries"/> 标记 failed。
+/// </para>
 /// </summary>
 public sealed class AccountCleanupWorker : BackgroundService
 {
     private const string WorkerName = nameof(AccountCleanupWorker);
 
-    private readonly IRealtimeEventConsumer _consumer;
-    private readonly IUserAccountDeletedProcessor _processor;
-    private readonly IDeadLetterPublisher _deadLetterPublisher;
-    private readonly RealtimeReadinessState _readinessState;
-    private readonly RealtimeMetrics _metrics;
+    private readonly IAccountCleanupJobStore _jobStore;
+    private readonly IRealtimeAttachmentStore _attachmentStore;
+    private readonly IRealtimeMessageStore _messageStore;
+    private readonly IRealtimeDeviceSyncCursorStore _deviceSyncCursorStore;
+    private readonly IUserDeletionTombstoneStore _tombstoneStore;
+    private readonly IRealtimeOutboxSignal _outboxSignal;
     private readonly RealtimeOptions _options;
-    private readonly RealtimeQueueOptions _queueOptions;
     private readonly ILogger<AccountCleanupWorker> _logger;
 
     public AccountCleanupWorker(
-        IRealtimeEventConsumer consumer,
-        IUserAccountDeletedProcessor processor,
-        IDeadLetterPublisher deadLetterPublisher,
-        RealtimeReadinessState readinessState,
-        RealtimeMetrics metrics,
+        IAccountCleanupJobStore jobStore,
+        IRealtimeAttachmentStore attachmentStore,
+        IRealtimeMessageStore messageStore,
+        IRealtimeDeviceSyncCursorStore deviceSyncCursorStore,
+        IUserDeletionTombstoneStore tombstoneStore,
+        IRealtimeOutboxSignal outboxSignal,
         IOptions<RealtimeOptions> options,
-        RealtimeQueueOptions queueOptions,
         ILogger<AccountCleanupWorker> logger)
     {
-        _consumer = consumer;
-        _processor = processor;
-        _deadLetterPublisher = deadLetterPublisher;
-        _readinessState = readinessState;
-        _metrics = metrics;
+        _jobStore = jobStore;
+        _attachmentStore = attachmentStore;
+        _messageStore = messageStore;
+        _deviceSyncCursorStore = deviceSyncCursorStore;
+        _tombstoneStore = tombstoneStore;
+        _outboxSignal = outboxSignal;
         _options = options.Value;
-        _queueOptions = queueOptions;
         _logger = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation(
-            "账号清理工作器已启动。消费者={Consumer}；处理器={Processor}；分区并发={Concurrency}；队列容量={Capacity}",
-            _consumer.GetType().Name,
-            _processor.GetType().Name,
-            _options.ProcessingConcurrency,
-            _options.ProcessingQueueCapacity);
+            "账号清理 Saga Worker 已启动。批次大小={BatchSize}；最大重试={MaxRetries}；轮询间隔={PollMs}ms",
+            _options.AccountCleanupBatchSize,
+            _options.AccountCleanupMaxRetries,
+            _options.AccountCleanupPollIntervalMs);
 
-        var runtime = new PartitionedConsumerRuntime<RealtimeEventEnvelope>(
-            WorkerName,
-            _options.ProcessingConcurrency,
-            _options.ProcessingQueueCapacity,
-            _options.WorkerIntervalMs,
-            _readinessState,
-            _logger);
-
-        await runtime.RunAsync(
-            consume: ct => _consumer.ConsumeAsync(ct),
-            getPartition: env => GetPartition(env.Event.TargetUserId, _options.ProcessingConcurrency),
-            processPartition: (partition, reader, ct) => ProcessPartitionAsync(partition, reader, ct),
-            stoppingToken).ConfigureAwait(false);
-    }
-
-    private async Task ProcessPartitionAsync(
-        int partition,
-        ChannelReader<LeasedEnvelope<RealtimeEventEnvelope>> reader,
-        CancellationToken ct)
-    {
-        await foreach (var leased in reader.ReadAllAsync(ct).ConfigureAwait(false))
+        while (!stoppingToken.IsCancellationRequested)
         {
-            var envelope = leased.Envelope;
-            using var activity = RealtimeTelemetry.StartConsumer(
-                "account_cleanup.process",
-                default);
-            var started = Stopwatch.GetTimestamp();
             try
             {
-                await ProcessOneAsync(envelope, ct).ConfigureAwait(false);
+                var processed = await ProcessOneCycleAsync(stoppingToken).ConfigureAwait(false);
+                if (processed == 0)
+                {
+                    await Task.Delay(_options.AccountCleanupPollIntervalMs, stoppingToken)
+                        .ConfigureAwait(false);
+                }
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                throw;
+                break;
             }
             catch (Exception ex)
             {
-                RealtimeTelemetry.RecordException(activity, ex);
-                _metrics.RecordProcessingFailure("cleanup_unhandled");
-                _logger.LogError(
-                    ex,
-                    "账号清理处理异常，将 NAK 等待重投。分区={Partition}；事件={EventId}",
-                    partition,
-                    envelope.Event.EventId);
-                await TryNakAsync(envelope, ct).ConfigureAwait(false);
-            }
-            finally
-            {
-                if (leased.Lease is not null)
-                    await leased.Lease.DisposeAsync().ConfigureAwait(false);
-                _readinessState.MarkHeartbeat(WorkerName);
-                _metrics.RecordProcessingDuration(Stopwatch.GetElapsedTime(started));
+                _logger.LogError(ex, "账号清理 Saga 周期异常，将在间隔后重试。");
+                await Task.Delay(_options.AccountCleanupPollIntervalMs, stoppingToken)
+                    .ConfigureAwait(false);
             }
         }
+
+        _logger.LogInformation("账号清理 Saga Worker 已停止。");
     }
 
-    private async Task ProcessOneAsync(RealtimeEventEnvelope envelope, CancellationToken ct)
+    private async Task<int> ProcessOneCycleAsync(CancellationToken ct)
     {
-        var evt = envelope.Event;
-
-        // 毒丸阈值：投递次数达到上限，转入 DLQ 并 ACK，避免无限重投。
-        if (envelope.DeliveryCount is not null
-            && envelope.DeliveryCount >= (ulong)_options.PoisonDeliveryThreshold)
+        var maxBatches = Math.Max(1, _options.AccountCleanupMaxBatchesPerCycle);
+        var processed = 0;
+        for (var i = 0; i < maxBatches; i++)
         {
-            await DeadLetterAndAckAsync(
-                envelope,
-                "max_cleanup_deliveries",
-                "账号清理事件投递次数达到毒丸阈值。",
-                ct).ConfigureAwait(false);
-            return;
+            var job = await _jobStore.GetNextPendingAsync(ct).ConfigureAwait(false);
+            if (job is null)
+                return processed;
+
+            await ProcessJobAsync(job, ct).ConfigureAwait(false);
+            processed++;
         }
-
-        // 账号清理 worker 仅处理 UserAccountDeleted；其它事件类型直接 ACK 跳过。
-        if (evt.Type is RealtimeEventType.AccountCleanupCompleted
-            or RealtimeEventType.AttachmentBlobsPurge)
-        {
-            // 完成 / blob GC 事件由其它订阅方（Server）处理；清理 worker 直接 ACK。
-            await TryAckAsync(envelope, ct).ConfigureAwait(false);
-            return;
-        }
-
-        if (evt.Type != RealtimeEventType.UserAccountDeleted)
-        {
-            // 同 subject 上的其它事件：ACK 跳过，不阻塞清理队列。
-            await TryAckAsync(envelope, ct).ConfigureAwait(false);
-            return;
-        }
-
-        var result = await _processor.ProcessAsync(evt, ct).ConfigureAwait(false);
-        if (result.Succeeded)
-        {
-            await TryAckAsync(envelope, ct).ConfigureAwait(false);
-            _logger.LogDebug(
-                "账号清理成功。事件={EventId}；目标用户={TargetUserId}",
-                evt.EventId,
-                evt.TargetUserId);
-            return;
-        }
-
-        _metrics.RecordProcessingFailure(result.FailureKind.ToString());
-        _logger.LogWarning(
-            "账号清理失败。事件={EventId}；错误={ErrorCode}；投递次数={DeliveryCount}",
-            evt.EventId,
-            result.ErrorCode,
-            envelope.DeliveryCount);
-
-        if (result.FailureKind == MessageFailureKind.Permanent)
-        {
-            // 永久失败：转入 DLQ 并 ACK，避免毒丸阻塞队列。
-            await DeadLetterAndAckAsync(
-                envelope,
-                result.ErrorCode ?? "cleanup_permanent",
-                result.ErrorMessage ?? "账号清理永久失败。",
-                ct).ConfigureAwait(false);
-            return;
-        }
-
-        // 瞬时失败：NAK 等待重投（JetStream durable Backoff 控制重投间隔）。
-        await TryNakAsync(envelope, ct).ConfigureAwait(false);
+        return processed;
     }
 
-    private async Task DeadLetterAndAckAsync(
-        RealtimeEventEnvelope envelope,
-        string reasonCode,
-        string reason,
-        CancellationToken ct)
-    {
-        var evt = envelope.Event;
-        var payload = JsonSerializer.Serialize(
-            evt,
-            RealtimeJsonSerializerContext.Default.RealtimeEvent);
-        await _deadLetterPublisher.PublishAsync(
-            new DeadLetterMessage
-            {
-                DeadLetterId = DeadLetterIds.Create(evt.EventId, reasonCode),
-                CommandId = evt.EventId,
-                SourceSubject = _queueOptions.Topics.AccountCleanup,
-                ReasonCode = reasonCode,
-                Reason = reason,
-                Payload = payload,
-                DeliveryCount = envelope.DeliveryCount
-            },
-            ct).ConfigureAwait(false);
-        _metrics.RecordDeadLetter(reasonCode);
-        await TryAckAsync(envelope, ct).ConfigureAwait(false);
-        _logger.LogWarning(
-            "账号清理事件已进入死信流。事件={EventId}；原因={ReasonCode}；投递次数={DeliveryCount}",
-            evt.EventId,
-            reasonCode,
-            envelope.DeliveryCount);
-    }
-
-    private async Task TryAckAsync(RealtimeEventEnvelope envelope, CancellationToken ct)
+    private async Task ProcessJobAsync(AccountCleanupJob job, CancellationToken ct)
     {
         try
         {
-            await envelope.AckAsync(ct).ConfigureAwait(false);
+            switch (job.Phase)
+            {
+                case AccountCleanupJob.PhaseAttachments:
+                    await ProcessAttachmentsPhaseAsync(job, ct).ConfigureAwait(false);
+                    break;
+                case AccountCleanupJob.PhaseMetadata:
+                    await ProcessMetadataPhaseAsync(job, ct).ConfigureAwait(false);
+                    break;
+                case AccountCleanupJob.PhaseCompleted:
+                    await ProcessCompletedPhaseAsync(job, ct).ConfigureAwait(false);
+                    break;
+                default:
+                    _logger.LogWarning(
+                        "账号清理 Saga 遇到未知 phase，标记失败。用户={UserId}；阶段={Phase}",
+                        job.UserId,
+                        job.Phase);
+                    await _jobStore
+                        .RecordFailureAsync(job.UserId, job.Phase, _options.AccountCleanupMaxRetries, ct)
+                        .ConfigureAwait(false);
+                    break;
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
-            _metrics.RecordProcessingFailure("cleanup_ack");
             _logger.LogError(
                 ex,
-                "账号清理 ACK 失败，消息可能被安全重投。事件={EventId}",
-                envelope.Event.EventId);
+                "账号清理 Saga phase 失败。用户={UserId}；阶段={Phase}",
+                job.UserId,
+                job.Phase);
+            await _jobStore
+                .RecordFailureAsync(job.UserId, job.Phase, _options.AccountCleanupMaxRetries, ct)
+                .ConfigureAwait(false);
         }
     }
 
-    private async Task TryNakAsync(RealtimeEventEnvelope envelope, CancellationToken ct)
+    /// <summary>
+    /// attachments 阶段：分批列出附件元数据 → 写 purge Outbox → 删除本批元数据 → 更新游标。
+    /// 每批 <see cref="RealtimeOptions.AccountCleanupBatchSize"/> 条，内存有界。
+    /// </summary>
+    private async Task ProcessAttachmentsPhaseAsync(AccountCleanupJob job, CancellationToken ct)
     {
-        try
+        var batchSize = Math.Max(1, _options.AccountCleanupBatchSize);
+
+        // 通过 cursor（attachment_id）分页读取，内存有界。
+        var records = await _attachmentStore
+            .ListForUserExportAsync(job.UserId, job.Cursor, batchSize, ct)
+            .ConfigureAwait(false);
+
+        if (records.Count == 0)
         {
-            await envelope.NakAsync(ct).ConfigureAwait(false);
+            // 附件全部清理完毕，进入 metadata 阶段。
+            _logger.LogInformation(
+                "账号清理 attachments 阶段完成。用户={UserId}",
+                job.UserId);
+            await _jobStore
+                .CompletePhaseAsync(job.UserId, AccountCleanupJob.PhaseAttachments, ct)
+                .ConfigureAwait(false);
+            return;
         }
-        catch (Exception ex)
-        {
-            _metrics.RecordProcessingFailure("cleanup_nak");
-            _logger.LogError(
-                ex,
-                "账号清理 NAK 失败，等待 AckWait 触发重投。事件={EventId}",
-                envelope.Event.EventId);
-        }
+
+        var objectKeys = records.Select(r => r.ObjectKey).ToArray();
+        var attachmentIds = records.Select(r => r.AttachmentId).ToArray();
+        var lastAttachmentId = records[^1].AttachmentId;
+
+        // purge EventId 基于 userId + 起始 cursor，保证幂等（崩溃重跑不会产生重复 purge）。
+        var cursorForEventId = job.Cursor ?? "start";
+        var purgeEventId = AttachmentEventIdFactory.CreateAttachmentBlobsPurgeEventId(
+            $"cleanup:{job.UserId}",
+            cursorForEventId.GetHashCode());
+
+        await _messageStore
+            .EnqueueEventAsync(
+                new RealtimeEvent
+                {
+                    EventId = purgeEventId,
+                    Type = RealtimeEventType.AttachmentBlobsPurge,
+                    TargetUserId = job.UserId,
+                    OccurredAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    PayloadJson = JsonSerializer.Serialize(
+                        new AttachmentBlobsPurgePayload
+                        {
+                            UserId = job.UserId,
+                            ObjectKeys = objectKeys,
+                            // Saga 模式下每批为独立 chunk，ChunkCount=1 表示无总片数信息。
+                            ChunkIndex = 0,
+                            ChunkCount = 1
+                        },
+                        RealtimeJsonSerializerContext.Default.AttachmentBlobsPurgePayload),
+                },
+                ct)
+            .ConfigureAwait(false);
+
+        // 删除本批附件元数据（单事务 DELETE WHERE attachment_id = ANY(...)）。
+        await _attachmentStore
+            .DeleteByAttachmentIdsAsync(attachmentIds, ct)
+            .ConfigureAwait(false);
+
+        // 更新游标为本批最后一条 attachment_id，支持断点续跑。
+        await _jobStore
+            .UpdateProgressAsync(
+                job.UserId,
+                AccountCleanupJob.PhaseAttachments,
+                lastAttachmentId,
+                AccountCleanupJob.StatusRunning,
+                ct)
+            .ConfigureAwait(false);
+
+        // 通知 Outbox Publisher 尽快发布 purge 事件。
+        _outboxSignal.Notify();
+
+        _logger.LogDebug(
+            "账号清理 attachments 批次完成。用户={UserId}；本批={Count}；游标={Cursor}",
+            job.UserId,
+            records.Count,
+            lastAttachmentId);
     }
 
-    private static int GetPartition(long targetUserId, int partitionCount)
+    /// <summary>
+    /// metadata 阶段：清理设备游标 + 消息，写 AccountCleanupCompleted Outbox。
+    /// 消息删除内部已分批（DELETE LIMIT 循环），无需 cursor。
+    /// </summary>
+    private async Task ProcessMetadataPhaseAsync(AccountCleanupJob job, CancellationToken ct)
     {
-        // 按 TargetUserId 分区，确保同一用户的清理事件串行处理。
-        var key = unchecked((ulong)targetUserId);
-        return (int)(key % (ulong)partitionCount);
+        // 清理设备同步游标。
+        var cursorDeleted = await _deviceSyncCursorStore
+            .DeleteByUserAsync(job.UserId, ct)
+            .ConfigureAwait(false);
+
+        // 清理该用户全部消息（内部已分批，直到无剩余行）。
+        var deleted = await _messageStore
+            .DeleteByUserAsync(job.UserId, batchSize: 1000, ct)
+            .ConfigureAwait(false);
+
+        // 写 AccountCleanupCompleted Outbox（幂等 EventId）。
+        await _messageStore
+            .EnqueueEventAsync(
+                new RealtimeEvent
+                {
+                    EventId = $"cleanup-done:{job.UserId}",
+                    Type = RealtimeEventType.AccountCleanupCompleted,
+                    TargetUserId = job.UserId,
+                    OccurredAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    PayloadJson = null,
+                },
+                ct)
+            .ConfigureAwait(false);
+
+        _outboxSignal.Notify();
+
+        _logger.LogInformation(
+            "账号清理 metadata 阶段完成。用户={UserId}；删除消息数={Deleted}；设备游标={Cursors}",
+            job.UserId,
+            deleted,
+            cursorDeleted);
+
+        // 进入 completed 阶段。
+        await _jobStore
+            .CompletePhaseAsync(job.UserId, AccountCleanupJob.PhaseMetadata, ct)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// completed 阶段：将 tombstone 升级为 Deleted，标记作业完成。
+    /// </summary>
+    private async Task ProcessCompletedPhaseAsync(AccountCleanupJob job, CancellationToken ct)
+    {
+        await _tombstoneStore
+            .RecordDeletionCompletedAsync(job.UserId, ct)
+            .ConfigureAwait(false);
+
+        // completed phase 标记完成（无下一阶段）。
+        await _jobStore
+            .UpdateProgressAsync(
+                job.UserId,
+                AccountCleanupJob.PhaseCompleted,
+                null,
+                AccountCleanupJob.StatusCompleted,
+                ct)
+            .ConfigureAwait(false);
+
+        _logger.LogInformation(
+            "账号清理 Saga 全部完成。用户={UserId}",
+            job.UserId);
     }
 }

@@ -22,15 +22,19 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
     private readonly RealtimeDatabaseClient _databaseClient;
     private readonly RealtimeDatabaseSchema _databaseSchema;
     private readonly IConversationMessageMutationPolicy _mutationPolicy;
+    private readonly RealtimeWriteSessionFactory _sessionFactory;
 
     public NpgsqlRealtimeReactionStore(
         RealtimeDatabaseClient databaseClient,
         RealtimeDatabaseSchema databaseSchema,
-        IConversationMessageMutationPolicy mutationPolicy)
+        IConversationMessageMutationPolicy mutationPolicy,
+        RealtimeMetrics? metrics = null)
     {
         _databaseClient = databaseClient;
         _databaseSchema = databaseSchema;
         _mutationPolicy = mutationPolicy;
+        // Reliability-4：传入 RealtimeMetrics，由 session 在事务提交成功后记录 outbox 入队行数。
+        _sessionFactory = new RealtimeWriteSessionFactory(databaseClient, databaseSchema, metrics);
     }
 
     public async Task<MessageReactionPersistResult> AddAsync(
@@ -49,33 +53,29 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(actorUserId);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(occurredAtMs);
 
-        await using var connection = await _databaseClient
-            .GetDataSource()
-            .OpenConnectionAsync(ct)
-            .ConfigureAwait(false);
-        await using var transaction = await connection
-            .BeginTransactionAsync(ct)
-            .ConfigureAwait(false);
+        // Reliability-4：使用 RealtimeWriteSession 统一事务上下文，
+        // Outbox 入队计数在 CommitAsync 成功后才推到 metrics，避免回滚导致 pending 漂移。
+        await using var session = await _sessionFactory.BeginAsync(ct).ConfigureAwait(false);
 
         // P0-2：事务内检查 actor 生命周期，防止已注销用户添加 reaction。
         if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
-                connection, transaction, _databaseSchema, actorUserId, ct)
+                session.Connection, session.Transaction, session.Schema, actorUserId, session.CancellationToken)
             .ConfigureAwait(false))
         {
-            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            await session.RollbackAsync().ConfigureAwait(false);
             return new MessageReactionPersistResult(
                 MessageReactionPersistStatus.NotAllowed, messageId);
         }
 
         var access = await TryLockMessageAccessAsync(
-                connection,
-                transaction,
+                session.Connection,
+                session.Transaction,
                 messageId,
-                ct)
+                session.CancellationToken)
             .ConfigureAwait(false);
         if (access is null)
         {
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await session.CommitAsync().ConfigureAwait(false);
             return new MessageReactionPersistResult(
                 MessageReactionPersistStatus.NotFound,
                 messageId);
@@ -83,7 +83,7 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
 
         if (access.RecalledAtMs is not null)
         {
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await session.CommitAsync().ConfigureAwait(false);
             return new MessageReactionPersistResult(
                 MessageReactionPersistStatus.AlreadyRecalled,
                 messageId,
@@ -94,20 +94,20 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         // P0-8：群消息 Reaction 需验证操作者仍是当前群成员，防离群后修改旧消息。
         var addAuth = await _mutationPolicy
             .AuthorizeMutationAsync(
-                connection,
-                transaction,
-                _databaseSchema,
+                session.Connection,
+                session.Transaction,
+                session.Schema,
                 new MessageMutationContext(
                     access.ConversationId,
                     access.SenderUserId,
                     access.ReceiverUserId,
                     actorUserId,
                     MessageMutationOperation.Reaction),
-                ct)
+                session.CancellationToken)
             .ConfigureAwait(false);
         if (!addAuth.Allowed)
         {
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await session.CommitAsync().ConfigureAwait(false);
             return new MessageReactionPersistResult(
                 MessageReactionPersistStatus.NotAllowed,
                 messageId,
@@ -115,43 +115,36 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 emoji);
         }
 
-        var exists = await ReactionExistsAsync(
-                connection,
-                transaction,
+        // Perf-10：将 exists/count/limit/insert/bump/final-count 压成单条 CTE，7 次往返→1 次。
+        // PostgreSQL 数据修改 CTE 不互相可见目标表变更，但可读 RETURNING 输出；
+        // 最终 emoji_count 由 pre-insert 计数 + 是否插入调整得出。
+        var (addStatus, emojiCount) = await TryAddReactionCteAsync(
+                session.Connection,
+                session.Transaction,
                 messageId,
                 actorUserId,
                 emoji,
-                ct)
+                occurredAtMs,
+                options.MaxReactionsPerUserPerMessage,
+                options.MaxDistinctEmojisPerMessage,
+                session.CancellationToken)
             .ConfigureAwait(false);
-        if (exists)
+
+        if (addStatus == ReactionAddStatus.AlreadyExists)
         {
-            var existingCount = await CountEmojiAsync(
-                    connection,
-                    transaction,
-                    messageId,
-                    emoji,
-                    ct)
-                .ConfigureAwait(false);
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await session.CommitAsync().ConfigureAwait(false);
             return new MessageReactionPersistResult(
                 MessageReactionPersistStatus.Unchanged,
                 messageId,
                 access.ConversationId,
                 emoji,
                 occurredAtMs,
-                existingCount);
+                emojiCount);
         }
 
-        var userCount = await CountUserReactionsAsync(
-                connection,
-                transaction,
-                messageId,
-                actorUserId,
-                ct)
-            .ConfigureAwait(false);
-        if (userCount >= options.MaxReactionsPerUserPerMessage)
+        if (addStatus == ReactionAddStatus.LimitExceeded)
         {
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await session.CommitAsync().ConfigureAwait(false);
             return new MessageReactionPersistResult(
                 MessageReactionPersistStatus.LimitExceeded,
                 messageId,
@@ -159,69 +152,8 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 emoji);
         }
 
-        var emojiExists = await EmojiExistsOnMessageAsync(
-                connection,
-                transaction,
-                messageId,
-                emoji,
-                ct)
-            .ConfigureAwait(false);
-        if (!emojiExists)
-        {
-            var distinct = await CountDistinctEmojisAsync(
-                    connection,
-                    transaction,
-                    messageId,
-                    ct)
-                .ConfigureAwait(false);
-            if (distinct >= options.MaxDistinctEmojisPerMessage)
-            {
-                await transaction.CommitAsync(ct).ConfigureAwait(false);
-                return new MessageReactionPersistResult(
-                    MessageReactionPersistStatus.LimitExceeded,
-                    messageId,
-                    access.ConversationId,
-                    emoji);
-            }
-        }
-
-        await using (var insert = new NpgsqlCommand(
-                         $"""
-                          INSERT INTO {_databaseSchema.MessageReactionsTableSql}
-                              (message_id, user_id, emoji, created_at_ms)
-                          VALUES
-                              (@message_id, @user_id, @emoji, @created_at_ms)
-                          ON CONFLICT (message_id, user_id, emoji) DO NOTHING;
-                          """,
-                         connection,
-                         transaction))
-        {
-            insert.Parameters.AddWithValue("message_id", messageId);
-            insert.Parameters.AddWithValue("user_id", actorUserId);
-            insert.Parameters.AddWithValue("emoji", emoji);
-            insert.Parameters.AddWithValue("created_at_ms", occurredAtMs);
-            await insert.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-        }
-
-        await BumpChangedAtAsync(
-                connection,
-                transaction,
-                messageId,
-                occurredAtMs,
-                ct)
-            .ConfigureAwait(false);
-
-        var emojiCount = await CountEmojiAsync(
-                connection,
-                transaction,
-                messageId,
-                emoji,
-                ct)
-            .ConfigureAwait(false);
-
         await InsertReactionEventsAsync(
-                connection,
-                transaction,
+                session,
                 added: true,
                 messageId,
                 access.ConversationId,
@@ -231,11 +163,10 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 access.ReceiverUserId,
                 emoji,
                 emojiCount,
-                occurredAtMs,
-                ct)
+                occurredAtMs)
             .ConfigureAwait(false);
 
-        await transaction.CommitAsync(ct).ConfigureAwait(false);
+        await session.CommitAsync().ConfigureAwait(false);
         return new MessageReactionPersistResult(
             MessageReactionPersistStatus.Applied,
             messageId,
@@ -259,33 +190,29 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(actorUserId);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(occurredAtMs);
 
-        await using var connection = await _databaseClient
-            .GetDataSource()
-            .OpenConnectionAsync(ct)
-            .ConfigureAwait(false);
-        await using var transaction = await connection
-            .BeginTransactionAsync(ct)
-            .ConfigureAwait(false);
+        // Reliability-4：使用 RealtimeWriteSession 统一事务上下文，
+        // Outbox 入队计数在 CommitAsync 成功后才推到 metrics，避免回滚导致 pending 漂移。
+        await using var session = await _sessionFactory.BeginAsync(ct).ConfigureAwait(false);
 
         // P0-2：事务内检查 actor 生命周期，防止已注销用户移除 reaction。
         if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
-                connection, transaction, _databaseSchema, actorUserId, ct)
+                session.Connection, session.Transaction, session.Schema, actorUserId, session.CancellationToken)
             .ConfigureAwait(false))
         {
-            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            await session.RollbackAsync().ConfigureAwait(false);
             return new MessageReactionPersistResult(
                 MessageReactionPersistStatus.NotAllowed, messageId);
         }
 
         var access = await TryLockMessageAccessAsync(
-                connection,
-                transaction,
+                session.Connection,
+                session.Transaction,
                 messageId,
-                ct)
+                session.CancellationToken)
             .ConfigureAwait(false);
         if (access is null)
         {
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await session.CommitAsync().ConfigureAwait(false);
             return new MessageReactionPersistResult(
                 MessageReactionPersistStatus.NotFound,
                 messageId);
@@ -293,7 +220,7 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
 
         if (access.RecalledAtMs is not null)
         {
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await session.CommitAsync().ConfigureAwait(false);
             return new MessageReactionPersistResult(
                 MessageReactionPersistStatus.AlreadyRecalled,
                 messageId,
@@ -304,20 +231,20 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         // P0-8：群消息 Reaction 移除同样需验证操作者仍是当前群成员。
         var removeAuth = await _mutationPolicy
             .AuthorizeMutationAsync(
-                connection,
-                transaction,
-                _databaseSchema,
+                session.Connection,
+                session.Transaction,
+                session.Schema,
                 new MessageMutationContext(
                     access.ConversationId,
                     access.SenderUserId,
                     access.ReceiverUserId,
                     actorUserId,
                     MessageMutationOperation.Reaction),
-                ct)
+                session.CancellationToken)
             .ConfigureAwait(false);
         if (!removeAuth.Allowed)
         {
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await session.CommitAsync().ConfigureAwait(false);
             return new MessageReactionPersistResult(
                 MessageReactionPersistStatus.NotAllowed,
                 messageId,
@@ -325,34 +252,20 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 emoji);
         }
 
-        int deleted;
-        await using (var delete = new NpgsqlCommand(
-                         $"""
-                          DELETE FROM {_databaseSchema.MessageReactionsTableSql}
-                          WHERE message_id = @message_id
-                            AND user_id = @user_id
-                            AND emoji = @emoji;
-                          """,
-                         connection,
-                         transaction))
-        {
-            delete.Parameters.AddWithValue("message_id", messageId);
-            delete.Parameters.AddWithValue("user_id", actorUserId);
-            delete.Parameters.AddWithValue("emoji", emoji);
-            deleted = await delete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-        }
-
-        var emojiCount = await CountEmojiAsync(
-                connection,
-                transaction,
+        // Perf-10：DELETE + bump + count 压成单条 CTE，3 次往返→1 次。
+        var (removed, emojiCount) = await TryRemoveReactionCteAsync(
+                session.Connection,
+                session.Transaction,
                 messageId,
+                actorUserId,
                 emoji,
-                ct)
+                occurredAtMs,
+                session.CancellationToken)
             .ConfigureAwait(false);
 
-        if (deleted == 0)
+        if (!removed)
         {
-            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            await session.CommitAsync().ConfigureAwait(false);
             return new MessageReactionPersistResult(
                 MessageReactionPersistStatus.Unchanged,
                 messageId,
@@ -362,17 +275,8 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 emojiCount);
         }
 
-        await BumpChangedAtAsync(
-                connection,
-                transaction,
-                messageId,
-                occurredAtMs,
-                ct)
-            .ConfigureAwait(false);
-
         await InsertReactionEventsAsync(
-                connection,
-                transaction,
+                session,
                 added: false,
                 messageId,
                 access.ConversationId,
@@ -382,11 +286,10 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 access.ReceiverUserId,
                 emoji,
                 emojiCount,
-                occurredAtMs,
-                ct)
+                occurredAtMs)
             .ConfigureAwait(false);
 
-        await transaction.CommitAsync(ct).ConfigureAwait(false);
+        await session.CommitAsync().ConfigureAwait(false);
         return new MessageReactionPersistResult(
             MessageReactionPersistStatus.Applied,
             messageId,
@@ -481,141 +384,159 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
             recalledAtMs);
     }
 
-    private async Task<bool> ReactionExistsAsync(
+    /// <summary>
+    /// Perf-10：Add Reaction 单 CTE。将 exists 检查、用户上限、emoji 去重上限、INSERT、bump changed_at、
+    /// 最终 emoji 计数压成一次数据库往返。利用 (message_id, emoji) 索引加速 emoji 过滤。
+    /// </summary>
+    /// <remarks>
+    /// PostgreSQL 数据修改 CTE 不互相可见目标表变更，但可读 RETURNING 输出。
+    /// 最终 emoji_count = pre_count + (是否插入 ? 1 : 0)。
+    /// pre_count 在 INSERT 之前读取，包含当前用户已有的同 emoji 反应（若已存在则 INSERT 会被 ON CONFLICT 跳过）。
+    /// </remarks>
+    private async Task<(ReactionAddStatus status, int emojiCount)> TryAddReactionCteAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
         string messageId,
         long userId,
         string emoji,
+        long occurredAtMs,
+        int maxPerUser,
+        int maxDistinctEmojis,
         CancellationToken ct)
     {
         await using var command = new NpgsqlCommand(
             $"""
-             SELECT 1
-             FROM {_databaseSchema.MessageReactionsTableSql}
-             WHERE message_id = @message_id
-               AND user_id = @user_id
-               AND emoji = @emoji
-             LIMIT 1;
+             WITH
+             existing AS (
+                 SELECT 1 FROM {_databaseSchema.MessageReactionsTableSql}
+                 WHERE message_id = @message_id AND user_id = @user_id AND emoji = @emoji
+                 LIMIT 1
+             ),
+             user_cnt AS (
+                 SELECT COUNT(*)::int AS v FROM {_databaseSchema.MessageReactionsTableSql}
+                 WHERE message_id = @message_id AND user_id = @user_id
+             ),
+             emoji_exists_other AS (
+                 SELECT 1 FROM {_databaseSchema.MessageReactionsTableSql}
+                 WHERE message_id = @message_id AND emoji = @emoji AND user_id <> @user_id
+                 LIMIT 1
+             ),
+             distinct_other AS (
+                 SELECT COUNT(DISTINCT emoji)::int AS v FROM {_databaseSchema.MessageReactionsTableSql}
+                 WHERE message_id = @message_id AND user_id <> @user_id
+             ),
+             emoji_count_pre AS (
+                 SELECT COUNT(*)::int AS v FROM {_databaseSchema.MessageReactionsTableSql}
+                 WHERE message_id = @message_id AND emoji = @emoji
+             ),
+             decision AS (
+                 SELECT CASE
+                     WHEN EXISTS(SELECT 1 FROM existing) THEN 0
+                     WHEN (SELECT v FROM user_cnt) >= @max_per_user THEN 1
+                     WHEN NOT EXISTS(SELECT 1 FROM emoji_exists_other)
+                          AND (SELECT v FROM distinct_other) >= @max_distinct THEN 1
+                     ELSE 2
+                 END AS status
+             ),
+             ins AS (
+                 INSERT INTO {_databaseSchema.MessageReactionsTableSql}
+                     (message_id, user_id, emoji, created_at_ms)
+                 SELECT @message_id, @user_id, @emoji, @created_at_ms
+                 WHERE (SELECT status FROM decision) = 2
+                 ON CONFLICT (message_id, user_id, emoji) DO NOTHING
+                 RETURNING 1
+             ),
+             bump AS (
+                 UPDATE {_databaseSchema.MessagesTableSql}
+                 SET changed_at_ms = GREATEST(changed_at_ms, @changed_at_ms)
+                 WHERE message_id = @message_id AND EXISTS (SELECT 1 FROM ins)
+             )
+             SELECT
+                 CASE
+                     WHEN EXISTS(SELECT 1 FROM ins) THEN 2
+                     ELSE (SELECT status FROM decision)
+                 END,
+                 (SELECT v FROM emoji_count_pre) +
+                     CASE WHEN EXISTS(SELECT 1 FROM ins) THEN 1 ELSE 0 END;
              """,
             connection,
             transaction);
+
         command.Parameters.AddWithValue("message_id", messageId);
         command.Parameters.AddWithValue("user_id", userId);
         command.Parameters.AddWithValue("emoji", emoji);
-        var result = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
-        return result is not null;
+        command.Parameters.AddWithValue("created_at_ms", occurredAtMs);
+        command.Parameters.AddWithValue("changed_at_ms", occurredAtMs);
+        command.Parameters.AddWithValue("max_per_user", maxPerUser);
+        command.Parameters.AddWithValue("max_distinct", maxDistinctEmojis);
+
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+            return (ReactionAddStatus.LimitExceeded, 0);
+
+        var status = reader.GetInt32(0);
+        var count = reader.GetInt32(1);
+        return (status switch
+        {
+            0 => ReactionAddStatus.AlreadyExists,
+            1 => ReactionAddStatus.LimitExceeded,
+            _ => ReactionAddStatus.Inserted
+        }, count);
     }
 
-    private async Task<bool> EmojiExistsOnMessageAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        string messageId,
-        string emoji,
-        CancellationToken ct)
-    {
-        await using var command = new NpgsqlCommand(
-            $"""
-             SELECT 1
-             FROM {_databaseSchema.MessageReactionsTableSql}
-             WHERE message_id = @message_id
-               AND emoji = @emoji
-             LIMIT 1;
-             """,
-            connection,
-            transaction);
-        command.Parameters.AddWithValue("message_id", messageId);
-        command.Parameters.AddWithValue("emoji", emoji);
-        var result = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
-        return result is not null;
-    }
-
-    private async Task<int> CountUserReactionsAsync(
+    /// <summary>
+    /// Perf-10：Remove Reaction 单 CTE。DELETE + bump changed_at + emoji 计数压成一次往返。
+    /// </summary>
+    private async Task<(bool deleted, int emojiCount)> TryRemoveReactionCteAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
         string messageId,
         long userId,
-        CancellationToken ct)
-    {
-        await using var command = new NpgsqlCommand(
-            $"""
-             SELECT COUNT(*)::int
-             FROM {_databaseSchema.MessageReactionsTableSql}
-             WHERE message_id = @message_id
-               AND user_id = @user_id;
-             """,
-            connection,
-            transaction);
-        command.Parameters.AddWithValue("message_id", messageId);
-        command.Parameters.AddWithValue("user_id", userId);
-        var result = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
-        return result is int count ? count : Convert.ToInt32(result);
-    }
-
-    private async Task<int> CountDistinctEmojisAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        string messageId,
-        CancellationToken ct)
-    {
-        await using var command = new NpgsqlCommand(
-            $"""
-             SELECT COUNT(DISTINCT emoji)::int
-             FROM {_databaseSchema.MessageReactionsTableSql}
-             WHERE message_id = @message_id;
-             """,
-            connection,
-            transaction);
-        command.Parameters.AddWithValue("message_id", messageId);
-        var result = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
-        return result is int count ? count : Convert.ToInt32(result);
-    }
-
-    private async Task<int> CountEmojiAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        string messageId,
         string emoji,
-        CancellationToken ct)
-    {
-        await using var command = new NpgsqlCommand(
-            $"""
-             SELECT COUNT(*)::int
-             FROM {_databaseSchema.MessageReactionsTableSql}
-             WHERE message_id = @message_id
-               AND emoji = @emoji;
-             """,
-            connection,
-            transaction);
-        command.Parameters.AddWithValue("message_id", messageId);
-        command.Parameters.AddWithValue("emoji", emoji);
-        var result = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
-        return result is int count ? count : Convert.ToInt32(result);
-    }
-
-    private async Task BumpChangedAtAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        string messageId,
         long occurredAtMs,
         CancellationToken ct)
     {
         await using var command = new NpgsqlCommand(
             $"""
-             UPDATE {_databaseSchema.MessagesTableSql}
-             SET changed_at_ms = GREATEST(changed_at_ms, @changed_at_ms)
-             WHERE message_id = @message_id;
+             WITH
+             emoji_count_pre AS (
+                 SELECT COUNT(*)::int AS v FROM {_databaseSchema.MessageReactionsTableSql}
+                 WHERE message_id = @message_id AND emoji = @emoji
+             ),
+             del AS (
+                 DELETE FROM {_databaseSchema.MessageReactionsTableSql}
+                 WHERE message_id = @message_id AND user_id = @user_id AND emoji = @emoji
+                 RETURNING 1
+             ),
+             bump AS (
+                 UPDATE {_databaseSchema.MessagesTableSql}
+                 SET changed_at_ms = GREATEST(changed_at_ms, @changed_at_ms)
+                 WHERE message_id = @message_id AND EXISTS (SELECT 1 FROM del)
+             )
+             SELECT
+                 EXISTS(SELECT 1 FROM del),
+                 (SELECT v FROM emoji_count_pre) -
+                     CASE WHEN EXISTS(SELECT 1 FROM del) THEN 1 ELSE 0 END;
              """,
             connection,
             transaction);
+
         command.Parameters.AddWithValue("message_id", messageId);
+        command.Parameters.AddWithValue("user_id", userId);
+        command.Parameters.AddWithValue("emoji", emoji);
         command.Parameters.AddWithValue("changed_at_ms", occurredAtMs);
-        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+            return (false, 0);
+
+        var deleted = reader.GetBoolean(0);
+        var count = reader.GetInt32(1);
+        return (deleted, count);
     }
 
     private async Task InsertReactionEventsAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
+        RealtimeWriteSession session,
         bool added,
         string messageId,
         string? conversationId,
@@ -625,8 +546,7 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         long messageReceiverUserId,
         string emoji,
         int emojiCount,
-        long occurredAtMs,
-        CancellationToken ct)
+        long occurredAtMs)
     {
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
@@ -636,11 +556,11 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
             && ConversationId.IsGroup(conversationId))
         {
             var memberIds = await ConversationWriteCommands.ListActiveMemberUserIdsAsync(
-                    connection,
-                    transaction,
-                    _databaseSchema,
+                    session.Connection,
+                    session.Transaction,
+                    session.Schema,
                     conversationId,
-                    ct)
+                    session.CancellationToken)
                 .ConfigureAwait(false);
 
             var delta = new GroupProjectionDelta(conversationId, memberIds);
@@ -658,13 +578,15 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 traceParent,
                 traceState));
 
-            await OutboxInsertHelper.InsertManyAsync(
-                    connection,
-                    transaction,
-                    _databaseSchema,
+            var inserted = await OutboxInsertHelper.InsertManyAsync(
+                    session.Connection,
+                    session.Transaction,
+                    session.Schema,
                     delta.Build(),
-                    ct)
+                    session.CancellationToken)
                 .ConfigureAwait(false);
+            // Reliability-4：累计到 session，由 CommitAsync 在事务提交成功后统一记录到 metrics。
+            session.RecordOutboxInsert(inserted);
             return;
         }
 
@@ -739,13 +661,14 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
             });
         }
 
-        await OutboxInsertHelper.InsertManyAsync(
-                connection,
-                transaction,
-                _databaseSchema,
+        var directInserted = await OutboxInsertHelper.InsertManyAsync(
+                session.Connection,
+                session.Transaction,
+                session.Schema,
                 events,
-                ct)
+                session.CancellationToken)
             .ConfigureAwait(false);
+        session.RecordOutboxInsert(directInserted);
     }
 
     private sealed record MessageAccess(
@@ -753,4 +676,11 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         long ReceiverUserId,
         string? ConversationId,
         long? RecalledAtMs);
+
+    private enum ReactionAddStatus
+    {
+        AlreadyExists,
+        LimitExceeded,
+        Inserted
+    }
 }

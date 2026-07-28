@@ -19,4 +19,13 @@ public sealed class RealtimeQueueOptions
     /// </para>
     /// </summary>
     public string? RealtimeEventsShardSubjectPattern { get; set; }
+
+    /// <summary>
+    /// 分片发布有限并行度：向多个 Gateway shard 定向投递时的最大并发发布数。
+    /// <para>
+    /// 默认 4，避免无界 <c>Task.WhenAll</c> 在大扇出场景下打爆 NATS 连接。
+    /// 单 shard 路径保持顺序 await（无并发开销）。小于 1 时按 1 处理。
+    /// </para>
+    /// </summary>
+    public int ShardPublishParallelism { get; set; } = 4;
 }

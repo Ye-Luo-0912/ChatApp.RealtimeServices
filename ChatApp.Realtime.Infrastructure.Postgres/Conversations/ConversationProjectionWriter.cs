@@ -58,6 +58,69 @@ internal sealed class ConversationProjectionWriter
             receivedAtMs,
             _session.CancellationToken);
 
+    /// <summary>
+    /// Perf-1：群消息序列推进 O(1)。仅更新 conversations + 发送者 sent_count + message 序列号。
+    /// 不再触碰其他成员行，不再生成 per-user UnreadCountChanged 事件。
+    /// </summary>
+    public Task<long?> TryAdvanceGroupSequenceAsync(
+        string conversationId,
+        long senderUserId,
+        string messageId,
+        string preview,
+        long receivedAtMs) =>
+        ConversationWriteCommands.TryAdvanceGroupSequenceAsync(
+            _session.Connection,
+            _session.Transaction,
+            _session.Schema,
+            conversationId,
+            senderUserId,
+            messageId,
+            preview,
+            receivedAtMs,
+            _session.CancellationToken);
+
+    /// <summary>
+    /// Perf-1：单聊消息序列推进 O(1)。返回新序列号与接收方未读数。
+    /// </summary>
+    public Task<(long? Sequence, int? ReceiverUnread)> TryAdvanceDirectSequenceAsync(
+        string conversationId,
+        long senderUserId,
+        long receiverUserId,
+        string messageId,
+        string preview,
+        long receivedAtMs) =>
+        ConversationWriteCommands.TryAdvanceDirectSequenceAsync(
+            _session.Connection,
+            _session.Transaction,
+            _session.Schema,
+            conversationId,
+            senderUserId,
+            receiverUserId,
+            messageId,
+            preview,
+            receivedAtMs,
+            _session.CancellationToken);
+
+    /// <summary>
+    /// Perf-1：基于序列的 O(1) MarkRead。
+    /// </summary>
+    public Task<SequenceReadAdvanceResult> TryAdvanceReadBySequenceAsync(
+        string conversationId,
+        long userId,
+        long targetSequence,
+        string targetMessageId,
+        long targetReceivedAtMs) =>
+        ConversationWriteCommands.TryAdvanceReadBySequenceAsync(
+            _session.Connection,
+            _session.Transaction,
+            _session.Schema,
+            conversationId,
+            userId,
+            targetSequence,
+            targetMessageId,
+            targetReceivedAtMs,
+            _session.CancellationToken);
+
     public Task<IReadOnlyList<long>> ListActiveMemberUserIdsAsync(string conversationId) =>
         ConversationWriteCommands.ListActiveMemberUserIdsAsync(
             _session.Connection,
@@ -65,6 +128,29 @@ internal sealed class ConversationProjectionWriter
             _session.Schema,
             conversationId,
             _session.CancellationToken);
+
+    /// <summary>
+    /// 查询指定用户在群会话中的角色（事务内）。
+    /// 用于消息编辑路径的 @all/@admin 权限校验：Owner/Admin 视为管理员。
+    /// 返回 null 表示用户不是成员或会话不存在。
+    /// </summary>
+    public async Task<short?> TryGetMemberRoleAsync(string conversationId, long userId)
+    {
+        var ct = _session.CancellationToken;
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT role
+             FROM {_session.Schema.ConversationMembersTableSql}
+             WHERE conversation_id = @conversation_id
+               AND user_id = @user_id
+             """,
+            _session.Connection,
+            _session.Transaction);
+        command.Parameters.AddWithValue("conversation_id", conversationId);
+        command.Parameters.AddWithValue("user_id", userId);
+        var result = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return result is short role ? role : null;
+    }
 
     /// <summary>
     /// 当被撤回/编辑的消息恰为会话 tip 时，更新 tip 摘要；返回是否命中并更新。

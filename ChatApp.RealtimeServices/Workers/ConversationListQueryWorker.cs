@@ -16,6 +16,7 @@ namespace ChatApp.RealtimeServices.Workers;
 public sealed class ConversationListQueryWorker : BackgroundService
 {
     private const string WorkerName = nameof(ConversationListQueryWorker);
+    private const QueryPoolKind PoolKind = QueryPoolKind.Read;
     private readonly IConversationListQueryConsumer _consumer;
     private readonly IConversationListQueryProcessor _processor;
     private readonly RealtimeReadinessState _readinessState;
@@ -49,7 +50,7 @@ public sealed class ConversationListQueryWorker : BackgroundService
     {
         _logger.LogInformation(
             "会话列表查询工作器已启动。共享并发={Concurrency}；队列容量={Capacity}；工作槽={Slots}",
-            _queryGate.Permits,
+            _queryGate.ReadPermits,
             _options.HistoryQueryQueueCapacity,
             Math.Max(1, _options.HistoryQueryWorkerSlots));
         _readinessState.MarkStarted(WorkerName);
@@ -194,7 +195,7 @@ public sealed class ConversationListQueryWorker : BackgroundService
             try
             {
                 var gateAcquired = await _queryGate
-                    .WaitAsync(_options.OverloadGateTimeoutMs, ct)
+                    .WaitAsync(PoolKind, _options.OverloadGateTimeoutMs, ct)
                     .ConfigureAwait(false);
                 if (!gateAcquired)
                 {
@@ -219,71 +220,69 @@ public sealed class ConversationListQueryWorker : BackgroundService
                     }
                     continue;
                 }
+                ConversationListPage page;
                 try
                 {
-                    ConversationListPage page;
-                    try
+                    var identityError = NatsGatewayIdentity.ValidateHistoryUser(
+                        _trust.RequireGatewayIdentity,
+                        envelope.TrustedUserId,
+                        envelope.Query.UserId);
+                    if (identityError is not null)
                     {
-                        var identityError = NatsGatewayIdentity.ValidateHistoryUser(
-                            _trust.RequireGatewayIdentity,
-                            envelope.TrustedUserId,
-                            envelope.Query.UserId);
-                        if (identityError is not null)
-                        {
-                            page = ConversationListPage.Failed(
-                                envelope.Query.RequestId,
-                                identityError,
-                                "网关身份校验失败：会话列表用户与可信身份头不匹配或缺失。");
-                        }
-                        else
-                        {
-                            page = await _processor
-                                .ProcessAsync(envelope.Query, ct)
-                                .ConfigureAwait(false);
-                        }
-                    }
-                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        RealtimeTelemetry.RecordException(activity, ex);
-                        _logger.LogError(
-                            ex,
-                            "会话列表查询失败。工作槽={WorkerIndex}；请求编号={RequestId}",
-                            workerIndex,
-                            envelope.Query.RequestId);
                         page = ConversationListPage.Failed(
                             envelope.Query.RequestId,
-                            "conversation_list_unavailable",
-                            _options.EnableDetailedErrors
-                                ? ex.Message
-                                : "会话列表服务暂时不可用，请稍后重试。");
+                            identityError,
+                            "网关身份校验失败：会话列表用户与可信身份头不匹配或缺失。");
                     }
-
-                    try
+                    else
                     {
-                        await envelope.ReplyAsync(page, ct).ConfigureAwait(false);
-                        succeeded = page.Succeeded;
-                        outcome = page.ErrorCode;
+                        page = await _processor
+                            .ProcessAsync(envelope.Query, ct)
+                            .ConfigureAwait(false);
                     }
-                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        outcome = "reply_failed";
-                        _logger.LogWarning(
-                            ex,
-                            "会话列表查询响应发送失败。请求编号={RequestId}",
-                            envelope.Query.RequestId);
-                    }
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    RealtimeTelemetry.RecordException(activity, ex);
+                    _logger.LogError(
+                        ex,
+                        "会话列表查询失败。工作槽={WorkerIndex}；请求编号={RequestId}",
+                        workerIndex,
+                        envelope.Query.RequestId);
+                    page = ConversationListPage.Failed(
+                        envelope.Query.RequestId,
+                        "conversation_list_unavailable",
+                        _options.EnableDetailedErrors
+                            ? ex.Message
+                            : "会话列表服务暂时不可用，请稍后重试。");
                 }
                 finally
                 {
-                    _queryGate.Release();
+                    _queryGate.Release(PoolKind);
+                }
+
+                // Reply 在 permit 释放后执行，避免 NATS 网络时间占用数据库 permit
+                try
+                {
+                    await envelope.ReplyAsync(page, ct).ConfigureAwait(false);
+                    succeeded = page.Succeeded;
+                    outcome = page.ErrorCode;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    outcome = "reply_failed";
+                    _logger.LogWarning(
+                        ex,
+                        "会话列表查询响应发送失败。请求编号={RequestId}",
+                        envelope.Query.RequestId);
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)

@@ -126,5 +126,10 @@ public sealed class RealtimeHistoryAttachmentEnricherTests
             int batchSize = 1000,
             CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<string>>([]);
+
+        public Task<int> DeleteByAttachmentIdsAsync(
+            IReadOnlyList<string> attachmentIds,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 }

@@ -7,4 +7,5 @@ public sealed record RealtimeOutboxRecord(
     RealtimeEvent Event,
     int AttemptCount,
     string LockOwner,
-    string ClaimToken);
+    string ClaimToken,
+    ReadOnlyMemory<byte>? PayloadUtf8 = null);

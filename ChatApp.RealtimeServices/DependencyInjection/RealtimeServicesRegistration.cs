@@ -9,6 +9,7 @@ using ChatApp.Realtime.Infrastructure.Nats.DependencyInjection;
 using ChatApp.Realtime.Infrastructure.Postgres.Configuration;
 using ChatApp.Realtime.Infrastructure.Postgres.DependencyInjection;
 using ChatApp.Realtime.Infrastructure.Redis.DependencyInjection;
+using ChatApp.Realtime.Infrastructure.Redis.Routing;
 using ChatApp.RealtimeServices.Concurrency;
 using ChatApp.RealtimeServices.Diagnostics;
 using ChatApp.RealtimeServices.Options;
@@ -77,6 +78,18 @@ public static class RealtimeServicesRegistration
         services.AddRealtimeDatabaseInitializer(
             databaseOptions.InitializeSchemaOnStart,
             connectionOptions.RealtimeDatabase);
+
+        // Perf-2：会话级受众路由目录。有 Garnet/Redis 配置时使用 Redis 实现，
+        // 未配置时使用空实现（Publisher 收到 LookupFailure 后回退到 per-user 路由，保证不丢事件）。
+        // 与 IGatewayDirectory 装配方式一致：Redis 在前注册真实实现，无 Redis 时回退 Null。
+        if (!string.IsNullOrWhiteSpace(connectionOptions.Garnet))
+        {
+            services.TryAddSingleton<IConversationGatewayDirectory, RedisConversationGatewayDirectory>();
+        }
+        else
+        {
+            services.TryAddSingleton<IConversationGatewayDirectory>(NullConversationGatewayDirectory.Instance);
+        }
 
         services.AddHostedService<RealtimeStartupReporter>();
 
@@ -371,7 +384,8 @@ public static class RealtimeServicesRegistration
                 MessagePersistence = options.Subjects.MessagePersistence,
                 DeadLetters = options.Subjects.DeadLetters
             },
-            RealtimeEventsShardSubjectPattern = shardPattern
+            RealtimeEventsShardSubjectPattern = shardPattern,
+            ShardPublishParallelism = options.Routing.ShardPublishParallelism
         };
     }
 

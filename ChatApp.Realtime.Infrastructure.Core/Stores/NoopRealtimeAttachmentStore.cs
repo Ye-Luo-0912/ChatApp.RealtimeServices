@@ -67,4 +67,15 @@ public sealed class NoopRealtimeAttachmentStore(ILogger<NoopRealtimeAttachmentSt
         logger.LogInformation("P0 默认实现跳过附件清理。用户={UserId}", userId);
         return Task.FromResult<IReadOnlyList<string>>([]);
     }
+
+    public Task<int> DeleteByAttachmentIdsAsync(
+        IReadOnlyList<string> attachmentIds,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (attachmentIds.Count == 0)
+            return Task.FromResult(0);
+        logger.LogCritical("未配置附件存储，拒绝按 ID 批量删除附件。数量={Count}", attachmentIds.Count);
+        throw new InvalidOperationException("未配置真实附件存储。");
+    }
 }

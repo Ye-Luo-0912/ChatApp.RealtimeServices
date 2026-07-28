@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
@@ -44,11 +45,18 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
         _realtimeMetrics = realtimeMetrics;
     }
 
-    public async Task PublishAsync(RealtimeEvent evt, CancellationToken ct = default)
+    /// <summary>Perf-4：旧入口，回退到序列化路径。实际逻辑在 <see cref="PublishWithPayloadAsync"/>。</summary>
+    public Task PublishAsync(RealtimeEvent evt, CancellationToken ct = default)
+        => PublishWithPayloadAsync(evt, null, ct);
+
+    public async Task PublishWithPayloadAsync(RealtimeEvent evt, ReadOnlyMemory<byte>? payloadUtf8, CancellationToken ct = default)
     {
-        var json = JsonSerializer.Serialize(
-            evt,
-            RealtimeJsonSerializerContext.Default.RealtimeEvent);
+        // Perf-4：优先使用预序列化的 UTF-8 字节，避免重新序列化；为空时回退到序列化路径。
+        var json = payloadUtf8 is { Length: > 0 } bytes
+            ? Encoding.UTF8.GetString(bytes.Span)
+            : JsonSerializer.Serialize(
+                evt,
+                RealtimeJsonSerializerContext.Default.RealtimeEvent);
 
         // 账号清理相关事件始终广播。
         var isAccountCleanup = evt.Type is RealtimeEventType.UserAccountDeleted
@@ -122,18 +130,25 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
         _routingMetrics?.RecordShardPublish("realtime", "single", gateways.Count);
     }
 
-    public async Task PublishToManyAsync(RealtimeEvent evt, CancellationToken ct = default)
+    /// <summary>Perf-4：旧入口，回退到序列化路径。实际逻辑在 <see cref="PublishToManyWithPayloadAsync"/>。</summary>
+    public Task PublishToManyAsync(RealtimeEvent evt, CancellationToken ct = default)
+        => PublishToManyWithPayloadAsync(evt, null, ct);
+
+    public async Task PublishToManyWithPayloadAsync(RealtimeEvent evt, ReadOnlyMemory<byte>? payloadUtf8, CancellationToken ct = default)
     {
         // 未携带多目标列表时回退到单目标发布路径。
         if (evt.TargetUserIds is null || evt.TargetUserIds.Length == 0)
         {
-            await PublishAsync(evt, ct).ConfigureAwait(false);
+            await PublishWithPayloadAsync(evt, payloadUtf8, ct).ConfigureAwait(false);
             return;
         }
 
-        var json = JsonSerializer.Serialize(
-            evt,
-            RealtimeJsonSerializerContext.Default.RealtimeEvent);
+        // Perf-4：优先使用预序列化的 UTF-8 字节，避免重新序列化；为空时回退到序列化路径。
+        var json = payloadUtf8 is { Length: > 0 } bytes
+            ? Encoding.UTF8.GetString(bytes.Span)
+            : JsonSerializer.Serialize(
+                evt,
+                RealtimeJsonSerializerContext.Default.RealtimeEvent);
 
         // 非分片模式：广播单条消息，各 Gateway 自行遍历 TargetUserIds 投递本机会话。
         if (_shardSubjectPattern is null)

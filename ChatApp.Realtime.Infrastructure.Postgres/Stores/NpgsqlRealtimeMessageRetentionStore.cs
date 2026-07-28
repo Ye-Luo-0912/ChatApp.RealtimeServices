@@ -262,7 +262,7 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
                 .Select(a => a.ObjectKey)
                 .Distinct(StringComparer.Ordinal)
                 .ToArray();
-            var chunkSize = DefaultUserAccountDeletedProcessor.AttachmentPurgeChunkSize;
+            const int chunkSize = 200;
             var chunkCount = (keys.Length + chunkSize - 1) / chunkSize;
             for (var i = 0; i < chunkCount; i++)
             {

@@ -86,7 +86,9 @@ public static class RealtimeNatsRegistration
                     sp.GetService<RoutingMetrics>(),
                     sp.GetService<IWatcherGatewayDirectory>(),
                     sp.GetService<RealtimeMetrics>(),
-                    sp.GetService<ILogger<JetStreamRealtimeEventPublisher>>());
+                    sp.GetService<IConversationGatewayDirectory>(),
+                    sp.GetService<ILogger<JetStreamRealtimeEventPublisher>>(),
+                    queueOptions.ShardPublishParallelism);
             });
             services.RemoveAll<IRealtimeEventConsumer>();
             services.AddSingleton<IRealtimeEventConsumer, JetStreamRealtimeEventConsumer>();

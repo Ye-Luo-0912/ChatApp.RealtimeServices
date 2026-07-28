@@ -1,3 +1,5 @@
+using System.Data.Common;
+
 namespace ChatApp.Realtime.Abstractions.Stores;
 
 /// <summary>
@@ -31,6 +33,40 @@ public interface ICommandIdempotencyLedger
     /// </para>
     /// </summary>
     Task RecordAsync(
+        string commandId,
+        long senderUserId,
+        string clientMessageId,
+        string contentFingerprint,
+        IdempotencyLedgerResultKind kind,
+        string? messageId,
+        long receivedAtMs,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Perf-3：在指定连接和事务内查询幂等账本，避免事务外独立连接。
+    /// <para>
+    /// 与 <see cref="FindAsync"/> 语义一致，但复用调用方已有的连接与事务，
+    /// 消除 Incoming 消息热路径中的独立连接获取。返回 null 表示未命中（或账本未启用）。
+    /// </para>
+    /// </summary>
+    Task<IdempotencyLedgerEntry?> FindInTransactionAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        long senderUserId,
+        string clientMessageId,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Perf-3：在指定连接和事务内记录幂等账本，避免事务外独立连接。
+    /// <para>
+    /// 与 <see cref="RecordAsync"/> 语义一致（ON CONFLICT DO NOTHING 保护 canonical），
+    /// 但复用调用方已有的连接与事务。事务内失败不再被吞掉——应让整个事务回滚，
+    /// 保证 ledger 与 messages 行的原子性。
+    /// </para>
+    /// </summary>
+    Task RecordInTransactionAsync(
+        DbConnection connection,
+        DbTransaction transaction,
         string commandId,
         long senderUserId,
         string clientMessageId,

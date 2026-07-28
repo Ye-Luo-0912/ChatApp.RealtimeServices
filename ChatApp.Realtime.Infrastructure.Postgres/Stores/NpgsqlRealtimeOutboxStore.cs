@@ -54,7 +54,8 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
                  attempt_count = item.attempt_count + 1
              FROM candidates
              WHERE item.event_id = candidates.event_id
-             RETURNING item.event_id, item.payload_json, item.attempt_count, item.locked_by, item.claim_token;
+             RETURNING item.event_id, item.payload_json, item.attempt_count, item.locked_by, item.claim_token,
+                 item.audience_kind, item.conversation_id, item.payload_utf8;
              """,
             connection);
         command.Parameters.AddWithValue("now", now);
@@ -67,16 +68,27 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
         await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await reader.ReadAsync(ct).ConfigureAwait(false))
         {
+            // Perf-2：AudienceKind / ConversationId 作为 RealtimeEvent 的 init 属性，
+            // 已在此处随 payload_json 反序列化一并填充，Publisher 直接从 evt 读取即可路由。
+            // RETURNING 同时带回 audience_kind(5) / conversation_id(6) 列，保证读写字段对齐，
+            // 并为后续按会话批量扫描/重放提供 SQL 级可用性。
             var evt = JsonSerializer.Deserialize(
                           reader.GetString(1),
                           RealtimeJsonSerializerContext.Default.RealtimeEvent)
                       ?? throw new JsonException("Outbox 事件反序列化结果为空。");
+            // Perf-4：payload_utf8 可为 NULL（旧数据），NULL 时 Publisher 回退到序列化路径。
+            ReadOnlyMemory<byte>? payloadUtf8 = null;
+            if (!reader.IsDBNull(7))
+            {
+                payloadUtf8 = reader.GetFieldValue<byte[]>(7);
+            }
             records.Add(new RealtimeOutboxRecord(
                 reader.GetString(0),
                 evt,
                 reader.GetInt32(2),
                 reader.GetString(3),
-                reader.GetString(4)));
+                reader.GetString(4),
+                payloadUtf8));
         }
 
         return records;
@@ -446,13 +458,13 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
             reader.IsDBNull(11) ? null : reader.GetString(11));
     }
 
-    public Task MarkPublishedBatchAsync(
+    public Task<int> MarkPublishedBatchAsync(
         IReadOnlyList<RealtimeOutboxRecord> records,
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(records);
         if (records.Count == 0)
-            return Task.CompletedTask;
+            return Task.FromResult(0);
 
         var eventIds = records.Select(r => r.EventId).ToArray();
         var claimTokens = records.Select(r => r.ClaimToken).ToArray();
@@ -472,13 +484,13 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
             ct);
     }
 
-    public Task MarkFailedBatchAsync(
+    public Task<int> MarkFailedBatchAsync(
         IReadOnlyList<(RealtimeOutboxRecord Record, string Error, TimeSpan RetryDelay)> failures,
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(failures);
         if (failures.Count == 0)
-            return Task.CompletedTask;
+            return Task.FromResult(0);
 
         var eventIds = failures.Select(f => f.Record.EventId).ToArray();
         var claimTokens = failures.Select(f => f.Record.ClaimToken).ToArray();
@@ -498,13 +510,13 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
             ct);
     }
 
-    public Task MarkDeadBatchAsync(
+    public Task<int> MarkDeadBatchAsync(
         IReadOnlyList<(RealtimeOutboxRecord Record, string Error)> deadLetters,
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(deadLetters);
         if (deadLetters.Count == 0)
-            return Task.CompletedTask;
+            return Task.FromResult(0);
 
         var eventIds = deadLetters.Select(d => d.Record.EventId).ToArray();
         var claimTokens = deadLetters.Select(d => d.Record.ClaimToken).ToArray();
@@ -525,6 +537,43 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
             nextAttempts: null,
             errors,
             ct);
+    }
+
+    /// <summary>
+    /// P1-3：批量续租已认领记录的 lease。用 UNNEST 配对 event_id + claim_token 校验所有权，
+    /// 仅续租仍处于 Pending 且 claim_token 匹配的记录，防止续租已被其他实例认领的记录。
+    /// 返回受影响行数。
+    /// </summary>
+    public async Task<int> ExtendLeaseBatchAsync(
+        IReadOnlyList<RealtimeOutboxRecord> records,
+        TimeSpan leaseExtension,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+        if (records.Count == 0)
+            return 0;
+
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var lockedUntil = now + (long)leaseExtension.TotalMilliseconds;
+        var eventIds = records.Select(r => r.EventId).ToArray();
+        var claimTokens = records.Select(r => r.ClaimToken).ToArray();
+
+        await using var connection = await _databaseClient.GetDataSource()
+            .OpenConnectionAsync(ct).ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            $"""
+             UPDATE {_databaseSchema.OutboxTableSql} AS item
+             SET locked_until_ms = @locked_until
+             FROM UNNEST(@event_ids, @claim_tokens) AS arr(event_id, claim_token)
+             WHERE item.event_id = arr.event_id
+               AND item.claim_token = arr.claim_token
+               AND item.status = {(short)RealtimeOutboxStatus.Pending}
+             """,
+            connection);
+        command.Parameters.AddWithValue("locked_until", lockedUntil);
+        command.Parameters.AddWithValue("event_ids", eventIds);
+        command.Parameters.AddWithValue("claim_tokens", claimTokens);
+        return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
     private async Task UpdateAsync(
@@ -557,9 +606,9 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
 
     /// <summary>
     /// P1-3：批量状态更新。用 UNNEST 配对 event_id + claim_token 校验所有权，
-    /// 单次 UPDATE 完成一批记录的状态变更，避免逐事件数据库往返。
+    /// 单次 UPDATE 完成一批记录的状态变更，避免逐事件数据库往返。返回受影响行数。
     /// </summary>
-    private async Task ExecuteBatchUpdateAsync(
+    private async Task<int> ExecuteBatchUpdateAsync(
         string setClause,
         string[] eventIds,
         string[] claimTokens,
@@ -602,6 +651,6 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
         if (errors is not null)
             command.Parameters.AddWithValue("errors", errors);
 
-        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 }

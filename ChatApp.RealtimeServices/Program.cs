@@ -201,7 +201,8 @@ catch (Exception ex)
 static async Task<int> RunHealthCheckCommandAsync(string[] commandArgs)
 {
     var url = commandArgs.Length > 1 ? commandArgs[1] : "http://127.0.0.1:8080/ready";
-    using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+    using var client = new HttpClient();
+    client.Timeout = TimeSpan.FromSeconds(3);
     try
     {
         using var response = await client.GetAsync(url).ConfigureAwait(false);

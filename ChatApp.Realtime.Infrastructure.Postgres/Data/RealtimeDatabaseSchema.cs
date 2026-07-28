@@ -22,6 +22,8 @@ public sealed class RealtimeDatabaseSchema
     public string UserDeletionTombstonesTableSql => $"{QuotedSchema}.\"user_deletion_tombstones\"";
     public string CommandIdempotencyLedgerTableSql => $"{QuotedSchema}.\"command_idempotency_ledger\"";
     public string GroupOperationAuditTableSql => $"{QuotedSchema}.\"group_operation_audit\"";
+    public string MembershipPeriodsTableSql => $"{QuotedSchema}.\"conversation_membership_periods\"";
+    public string AccountCleanupJobsTableSql => $"{QuotedSchema}.\"account_cleanup_jobs\"";
     public string OutboxTableSql => $"{QuotedSchema}.\"outbox\"";
     public string SchemaMigrationsTableSql => $"{QuotedSchema}.\"schema_migrations\"";
     public string SchemaMigrationCheckpointsTableSql =>

@@ -461,6 +461,8 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
         string content,
         long editedAtMs,
         long maxAgeMs,
+        IReadOnlyList<long>? mentionedUserIds = null,
+        IReadOnlyList<string>? mentionedRoles = null,
         CancellationToken ct = default) =>
         throw new NotSupportedException(
             "EfCoreRealtimeMessageStore 不支持编辑；请使用 NpgsqlRealtimeMessageStore。");

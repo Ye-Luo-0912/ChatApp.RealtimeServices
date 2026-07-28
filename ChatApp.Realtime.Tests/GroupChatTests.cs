@@ -169,7 +169,7 @@ public sealed class GroupChatTests : IAsyncLifetime
             new RecordingRealtimeOutboxSignal(),
             metrics,
             NoopTombstoneAndLedger.Tombstone,
-            NoopTombstoneAndLedger.Ledger,
+            groupStore,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var rejected = await processor.ProcessAsync(new IncomingMessageCommand

@@ -56,13 +56,17 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                         occurredAtMs,
                         ct)
                     .ConfigureAwait(false);
-                await RecordAuditAsync(command, result.Succeeded, result.ErrorCode,
-                    result.ConversationId ?? conversationId, null, null, occurredAtMs, ct);
                 if (!result.Succeeded)
+                {
+                    // 失败尝试审计：业务事务已回滚，best-effort 记录失败尝试。
+                    await RecordAuditAsync(command, succeeded: false, result.ErrorCode,
+                        result.ConversationId ?? conversationId, null, null, occurredAtMs, ct);
                     return GroupConversationResult.Failed(
                         command.RequestId,
                         result.ErrorCode!,
                         result.ErrorMessage!);
+                }
+                // 成功路径：审计已由 store 在业务事务内写入（审计 Outbox），此处不再重复。
                 _outboxSignal.Notify();
                 return GroupConversationResult.Success(
                     command.RequestId,
@@ -81,13 +85,16 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                         occurredAtMs,
                         ct)
                     .ConfigureAwait(false);
-                await RecordAuditAsync(command, result.Succeeded, result.ErrorCode,
-                    result.ConversationId, null, null, occurredAtMs, ct);
                 if (!result.Succeeded)
+                {
+                    await RecordAuditAsync(command, succeeded: false, result.ErrorCode,
+                        result.ConversationId, null, null, occurredAtMs, ct);
                     return GroupConversationResult.Failed(
                         command.RequestId,
                         result.ErrorCode!,
                         result.ErrorMessage!);
+                }
+                // 成功路径：审计已由 store 在业务事务内写入（审计 Outbox），此处不再重复。
                 if (result.Members is { Count: > 0 })
                     _outboxSignal.Notify();
                 return GroupConversationResult.Success(
@@ -107,13 +114,16 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                         occurredAtMs,
                         ct)
                     .ConfigureAwait(false);
-                await RecordAuditAsync(command, result.Succeeded, result.ErrorCode,
-                    result.ConversationId, null, null, occurredAtMs, ct);
                 if (!result.Succeeded)
+                {
+                    await RecordAuditAsync(command, succeeded: false, result.ErrorCode,
+                        result.ConversationId, null, null, occurredAtMs, ct);
                     return GroupConversationResult.Failed(
                         command.RequestId,
                         result.ErrorCode!,
                         result.ErrorMessage!);
+                }
+                // 成功路径：审计已由 store 在业务事务内写入（审计 Outbox），此处不再重复。
                 _outboxSignal.Notify();
                 return GroupConversationResult.Success(
                     command.RequestId,
@@ -130,13 +140,16 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                         occurredAtMs,
                         ct)
                     .ConfigureAwait(false);
-                await RecordAuditAsync(command, result.Succeeded, result.ErrorCode,
-                    result.ConversationId, null, null, occurredAtMs, ct);
                 if (!result.Succeeded)
+                {
+                    await RecordAuditAsync(command, succeeded: false, result.ErrorCode,
+                        result.ConversationId, null, null, occurredAtMs, ct);
                     return GroupConversationResult.Failed(
                         command.RequestId,
                         result.ErrorCode!,
                         result.ErrorMessage!);
+                }
+                // 成功路径：审计已由 store 在业务事务内写入（审计 Outbox），此处不再重复。
                 _outboxSignal.Notify();
                 return GroupConversationResult.Success(
                     command.RequestId,
@@ -155,13 +168,16 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                         occurredAtMs,
                         ct)
                     .ConfigureAwait(false);
-                await RecordAuditAsync(command, result.Succeeded, result.ErrorCode,
-                    result.ConversationId, result.PreviousRole, result.NewRole, occurredAtMs, ct);
                 if (!result.Succeeded)
+                {
+                    await RecordAuditAsync(command, succeeded: false, result.ErrorCode,
+                        result.ConversationId, result.PreviousRole, result.NewRole, occurredAtMs, ct);
                     return GroupConversationResult.Failed(
                         command.RequestId,
                         result.ErrorCode!,
                         result.ErrorMessage!);
+                }
+                // 成功路径：审计已由 store 在业务事务内写入（审计 Outbox），此处不再重复。
                 _outboxSignal.Notify();
                 return GroupConversationResult.Success(
                     command.RequestId,
@@ -206,13 +222,16 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                         occurredAtMs,
                         ct)
                     .ConfigureAwait(false);
-                await RecordAuditAsync(command, result.Succeeded, result.ErrorCode,
-                    result.ConversationId, null, null, occurredAtMs, ct);
                 if (!result.Succeeded)
+                {
+                    await RecordAuditAsync(command, succeeded: false, result.ErrorCode,
+                        result.ConversationId, null, null, occurredAtMs, ct);
                     return GroupConversationResult.Failed(
                         command.RequestId,
                         result.ErrorCode!,
                         result.ErrorMessage!);
+                }
+                // 成功路径：审计已由 store 在业务事务内写入（审计 Outbox），此处不再重复。
                 _outboxSignal.Notify();
                 return GroupConversationResult.Success(
                     command.RequestId,
@@ -227,7 +246,14 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
         }
     }
 
-    /// <summary>Feature 2：记录群操作审计（best-effort，不阻断主流程）。</summary>
+    /// <summary>
+    /// 失败尝试审计（best-effort，不阻断主流程）。
+    /// <para>
+    /// 仅在 store 操作返回失败时调用：业务事务已回滚，无法在事务内记录审计，
+    /// 故走事务外 best-effort 路径留痕失败尝试。
+    /// 成功路径的审计由 store 在业务事务内写入（审计 Outbox），保证不丢失。
+    /// </para>
+    /// </summary>
     private async Task RecordAuditAsync(
         GroupConversationCommand command,
         bool succeeded,

@@ -24,6 +24,22 @@ public interface IUserDeletionTombstoneStore
     Task<UserLifecycleState> GetLifecycleStateAsync(long userId, CancellationToken ct = default);
 
     /// <summary>
+    /// 批量查询多个用户的生命周期状态。
+    /// <para>
+    /// 单条 SQL（user_id = ANY(@user_ids)）一次取回所有目标用户的状态。
+    /// 未在 tombstone 表中找到的用户视为 Active；tombstone 表中 state=Deleting/Deleted 的用户返回对应状态。
+    /// 返回字典对每个输入 userId（去重后）包含一个条目。
+    /// </para>
+    /// <para>
+    /// 注意：本方法不获取 advisory lock，仅做读检查。适用于 Create/AddMembers 等群操作
+    /// 在事务外快速批量过滤目标用户；事务内的强一致校验仍需走 advisory lock 路径。
+    /// </para>
+    /// </summary>
+    Task<IReadOnlyDictionary<long, UserLifecycleState>> BatchGetUserLifecycleStateAsync(
+        IReadOnlyList<long> userIds,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// 记录用户删除开始（state=Deleting）。幂等（PK 冲突视为成功）。
     /// 应在账号删除清理开始前调用，确保旧命令在清理过程中也能被拒绝。
     /// </summary>

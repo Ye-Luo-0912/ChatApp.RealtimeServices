@@ -62,6 +62,8 @@ public sealed class DefaultMessageEditProcessor : IMessageEditProcessor
                 command.Content,
                 command.OccurredAtMs,
                 maxAgeMs,
+                command.MentionedUserIds,
+                command.MentionedRoles,
                 ct)
             .ConfigureAwait(false);
 

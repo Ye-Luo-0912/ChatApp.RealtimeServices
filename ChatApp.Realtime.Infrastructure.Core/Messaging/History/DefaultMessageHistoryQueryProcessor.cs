@@ -1,4 +1,3 @@
-using System.Text;
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Messaging.History;
@@ -62,7 +61,8 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
                 .EnrichAsync(_reactionStore, enrichedSingle, query.UserId, ct)
                 .ConfigureAwait(false);
             var single = MessageHistoryPage.Success(query.RequestId, enrichedSingle, null, false);
-            if (MeasureUtf8Json(single) > MaximumResponseBytes)
+            // Perf-4：直接序列化为 UTF-8 字节，避免中间 string 分配。
+            if (MeasureUtf8JsonBytes(single) > MaximumResponseBytes)
             {
                 return MessageHistoryPage.Failed(
                     query.RequestId,
@@ -139,8 +139,9 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
     /// 单条超过 packing 余量但仍 ≤ 硬上限 → 单独返回该条并置 HasMore。
     /// </summary>
     /// <remarks>
-    /// Perf-4：旧实现每加入一条消息就重新序列化整个 Page，导致 O(N²) 序列化开销。
-    /// 新实现先逐条序列化获取精确字节（O(N)），线性累加判断预算，最后仅做一次完整序列化验证。
+    /// Perf-4：每个 item 仅序列化一次（直接到 UTF-8 byte[]），保存 byte segment 用于预算判断；
+    /// 最终仅做一次完整 page 序列化验证；超预算直接移除尾部 item 后再序列化一次。
+    /// 避免旧实现 O(N²) 的反复序列化，也避免 UTF-16 中间 string 分配。
     /// </remarks>
     private static MessageHistoryPage PackByActualUtf8Json(
         string requestId,
@@ -148,11 +149,11 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
         int pageSize,
         bool isAfterMode)
     {
-        // O(N)：逐条序列化获取精确字节大小。
-        var perItemBytes = new int[rows.Count];
+        // O(N)：逐条序列化为 UTF-8 字节，保存 segment 用于精确预算判断。
+        var perItemBytes = new byte[rows.Count][];
         for (var i = 0; i < rows.Count; i++)
         {
-            perItemBytes[i] = MeasureSingleMessageUtf8Json(rows[i]);
+            perItemBytes[i] = SerializeSingleMessageUtf8Json(rows[i]);
         }
 
         // 页面 JSON 结构开销估算：
@@ -171,7 +172,7 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
             if (items.Count >= pageSize)
                 break;
 
-            var itemSize = perItemBytes[i] + (items.Count > 0 ? itemSeparatorOverhead : 0);
+            var itemSize = perItemBytes[i].Length + (items.Count > 0 ? itemSeparatorOverhead : 0);
 
             if (items.Count > 0 && accumulated + itemSize > budget)
                 break;
@@ -185,13 +186,13 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
 
         // 一次完整序列化验证：估算可能偏低（cursor 实际大小、JSON 转义差异），
         // 超预算则移除最后一条并重新构建（最多重试一次，仍 O(N)）。
-        var finalBytes = MeasureUtf8Json(page);
+        var finalBytes = MeasureUtf8JsonBytes(page);
         if (finalBytes > RealtimeWireLimits.PackingBudgetBytes && items.Count > 1)
         {
             items.RemoveAt(items.Count - 1);
             hasMore = rows.Count > items.Count;
             page = BuildPackedPage(requestId, items, hasMore, isAfterMode);
-            finalBytes = MeasureUtf8Json(page);
+            finalBytes = MeasureUtf8JsonBytes(page);
         }
 
         if (items.Count == 1 && finalBytes > MaximumResponseBytes)
@@ -205,13 +206,14 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
         return page;
     }
 
-    private static int MeasureSingleMessageUtf8Json(RealtimeHistoryMessage message)
-    {
-        var json = JsonSerializer.Serialize(
+    /// <summary>
+    /// Perf-4：直接序列化为 UTF-8 字节，避免 <c>Serialize</c> 返回 string 再 <c>GetByteCount</c>
+    /// 产生的 UTF-16 中间字符串分配。
+    /// </summary>
+    private static byte[] SerializeSingleMessageUtf8Json(RealtimeHistoryMessage message) =>
+        JsonSerializer.SerializeToUtf8Bytes(
             message,
             RealtimeJsonSerializerContext.Default.RealtimeHistoryMessage);
-        return Encoding.UTF8.GetByteCount(json);
-    }
 
     private static MessageHistoryPage BuildPackedPage(
         string requestId,
@@ -232,13 +234,13 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
         return MessageHistoryPage.Success(requestId, items, nextCursor, hasMore);
     }
 
-    private static int MeasureUtf8Json(MessageHistoryPage page)
-    {
-        var json = JsonSerializer.Serialize(
+    /// <summary>
+    /// Perf-4：直接序列化为 UTF-8 字节并返回长度，避免中间 string 分配。
+    /// </summary>
+    private static int MeasureUtf8JsonBytes(MessageHistoryPage page) =>
+        JsonSerializer.SerializeToUtf8Bytes(
             page,
-            RealtimeJsonSerializerContext.Default.MessageHistoryPage);
-        return Encoding.UTF8.GetByteCount(json);
-    }
+            RealtimeJsonSerializerContext.Default.MessageHistoryPage).Length;
 
     private static MessageHistoryPage? Validate(MessageHistoryQuery query)
     {

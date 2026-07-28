@@ -76,6 +76,55 @@ public sealed class NpgsqlUserDeletionTombstoneStore(
         };
     }
 
+    public async Task<IReadOnlyDictionary<long, UserLifecycleState>> BatchGetUserLifecycleStateAsync(
+        IReadOnlyList<long> userIds,
+        CancellationToken ct = default)
+    {
+        if (userIds.Count == 0)
+            return new Dictionary<long, UserLifecycleState>();
+
+        // 默认所有用户为 Active，未在 tombstone 表中找到的用户保持 Active。
+        var result = new Dictionary<long, UserLifecycleState>(userIds.Count);
+        foreach (var id in userIds)
+            result.TryAdd(id, UserLifecycleState.Active);
+
+        if (!databaseClient.IsConfigured)
+            return result;
+
+        // 仅查询有效 userId，避免无意义扫描；去重后传入数组参数。
+        var candidateIds = userIds.Where(id => id > 0).Distinct().ToArray();
+        if (candidateIds.Length == 0)
+            return result;
+
+        await using var connection = await databaseClient.GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT user_id, state
+             FROM {databaseSchema.UserDeletionTombstonesTableSql}
+             WHERE user_id = ANY(@user_ids);
+             """,
+            connection);
+        command.Parameters.AddWithValue("user_ids", candidateIds);
+
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            var userId = reader.GetInt64(0);
+            var stateByte = reader.GetByte(1);
+            result[userId] = stateByte switch
+            {
+                1 => UserLifecycleState.Deleting,
+                2 => UserLifecycleState.Deleted,
+                _ => UserLifecycleState.Active
+            };
+        }
+
+        return result;
+    }
+
     public async Task RecordDeletionAsync(
         long userId,
         string deletionEventId,

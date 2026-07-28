@@ -23,7 +23,7 @@ public sealed class DefaultIncomingMessageProcessorTests
             signal,
             metrics,
             NoopTombstoneAndLedger.Tombstone,
-            NoopTombstoneAndLedger.Ledger,
+            new AlwaysMemberGroupStore(),
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
         var command = ValidCommand();
 
@@ -60,7 +60,7 @@ public sealed class DefaultIncomingMessageProcessorTests
             new RecordingRealtimeOutboxSignal(),
             metrics,
             NoopTombstoneAndLedger.Tombstone,
-            NoopTombstoneAndLedger.Ledger,
+            new AlwaysMemberGroupStore(),
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         await processor.ProcessAsync(ValidCommand());
@@ -83,14 +83,14 @@ public sealed class DefaultIncomingMessageProcessorTests
             new RecordingRealtimeOutboxSignal(),
             firstMetrics,
             NoopTombstoneAndLedger.Tombstone,
-            NoopTombstoneAndLedger.Ledger,
+            new AlwaysMemberGroupStore(),
             NullLogger<DefaultIncomingMessageProcessor>.Instance).ProcessAsync(command);
         await new DefaultIncomingMessageProcessor(
             secondStore,
             new RecordingRealtimeOutboxSignal(),
             secondMetrics,
             NoopTombstoneAndLedger.Tombstone,
-            NoopTombstoneAndLedger.Ledger,
+            new AlwaysMemberGroupStore(),
             NullLogger<DefaultIncomingMessageProcessor>.Instance).ProcessAsync(command);
 
         Assert.Equal(firstStore.Event!.EventId, secondStore.Event!.EventId);
@@ -108,7 +108,7 @@ public sealed class DefaultIncomingMessageProcessorTests
             signal,
             metrics,
             NoopTombstoneAndLedger.Tombstone,
-            NoopTombstoneAndLedger.Ledger,
+            new AlwaysMemberGroupStore(),
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var result = await processor.ProcessAsync(ValidCommand());
@@ -128,7 +128,7 @@ public sealed class DefaultIncomingMessageProcessorTests
             signal,
             metrics,
             NoopTombstoneAndLedger.Tombstone,
-            NoopTombstoneAndLedger.Ledger,
+            new AlwaysMemberGroupStore(),
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
         var command = ValidCommand() with { Content = " " };
 
@@ -152,7 +152,7 @@ public sealed class DefaultIncomingMessageProcessorTests
             signal,
             metrics,
             NoopTombstoneAndLedger.Tombstone,
-            NoopTombstoneAndLedger.Ledger,
+            new AlwaysMemberGroupStore(),
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var result = await processor.ProcessAsync(ValidCommand());
@@ -174,7 +174,7 @@ public sealed class DefaultIncomingMessageProcessorTests
             signal,
             metrics,
             NoopTombstoneAndLedger.Tombstone,
-            NoopTombstoneAndLedger.Ledger,
+            new AlwaysMemberGroupStore(),
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
         var command = ValidCommand() with { ReceiverUserId = 1001 };
 
@@ -243,6 +243,8 @@ public sealed class DefaultIncomingMessageProcessorTests
             string content,
             long editedAtMs,
             long maxAgeMs,
+            IReadOnlyList<long>? mentionedUserIds = null,
+            IReadOnlyList<string>? mentionedRoles = null,
             CancellationToken ct = default) =>
             Task.FromResult(new MessageEditPersistResult(MessageEditPersistStatus.NotFound, messageId));
 

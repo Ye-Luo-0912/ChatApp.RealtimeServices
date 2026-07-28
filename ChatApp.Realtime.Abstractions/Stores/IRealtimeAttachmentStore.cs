@@ -55,4 +55,13 @@ public interface IRealtimeAttachmentStore
         long userId,
         int batchSize = 1000,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// 按 attachment_id 主键批量删除附件行，返回已删除行数。
+    /// 用于账号清理 Saga 分批删除：列出 200 条 → 写 purge Outbox → 删除这 200 条 → 更新游标。
+    /// 一次 DELETE（单事务），避免 <see cref="DeleteByUserAsync"/> 的循环小事务。
+    /// </summary>
+    Task<int> DeleteByAttachmentIdsAsync(
+        IReadOnlyList<string> attachmentIds,
+        CancellationToken ct = default);
 }

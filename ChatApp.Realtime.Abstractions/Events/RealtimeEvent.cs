@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using ChatApp.Realtime.Abstractions.Routing;
 
 namespace ChatApp.Realtime.Abstractions.Events;
 
@@ -35,6 +36,25 @@ public sealed class RealtimeEvent
     /// 为空时回退到 <see cref="TargetUserId"/> 单目标路径。
     /// </summary>
     public long[]? TargetUserIds { get; init; }
+
+    /// <summary>
+    /// Perf-2：事件受众类型，决定 Publisher 的路由策略。
+    /// <para>
+    /// <see cref="AudienceKind.Conversation"/> 时使用 <see cref="ConversationId"/>
+    /// 通过 <c>IConversationGatewayDirectory</c> 一次查询会话在线 Gateway 实例集合，
+    /// 替代逐用户查询 <see cref="TargetUserIds"/>。
+    /// </para>
+    /// <para>
+    /// 默认 null 等同 <see cref="AudienceKind.User"/>，兼容历史路径。
+    /// </para>
+    /// </summary>
+    public AudienceKind? AudienceKind { get; init; }
+
+    /// <summary>
+    /// Perf-2：会话级路由使用的会话编号。
+    /// 仅当 <see cref="AudienceKind"/> = <see cref="Routing.AudienceKind.Conversation"/> 时使用。
+    /// </summary>
+    public string? ConversationId { get; init; }
 
     /// <summary>
     /// P1-4：应用层（如 <c>DefaultIncomingMessageProcessor</c>）可将已构造的 payload 对象通过此属性
