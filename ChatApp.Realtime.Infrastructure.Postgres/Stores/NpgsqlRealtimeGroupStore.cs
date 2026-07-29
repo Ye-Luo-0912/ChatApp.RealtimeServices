@@ -3,6 +3,7 @@ using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Protocol;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
@@ -1139,18 +1140,34 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
 
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
-        var evt = CreateConversationCreatedAggregatedEvent(
-            conversationId,
-            title,
-            actorUserId,
-            notifyTargets.ToArray(),
-            occurredAtMs,
-            actorSessionId,
-            traceParent,
-            traceState,
-            causeToken: $"group-dissolved:{occurredAtMs}");
+        var dissolvedPayload = new RealtimeConversationDissolvedPayload
+        {
+            ConversationId = conversationId,
+            Title = title,
+            DissolvedAtMs = occurredAtMs,
+            ActorUserId = actorUserId
+        };
 
-        await OutboxInsertHelper.InsertManyAsync(connection, transaction, _databaseSchema, [evt], ct).ConfigureAwait(false);
+        var dissolveEventId = ConversationEventIdFactory.CreateConversationDissolvedEventId(
+            conversationId, occurredAtMs);
+
+        var dissolveEvt = new RealtimeEvent
+        {
+            EventId = dissolveEventId,
+            Type = RealtimeEventType.ConversationDissolved,
+            TargetUserId = 0,
+            ActorUserId = actorUserId,
+            SessionId = actorSessionId,
+            PayloadJson = JsonSerializer.Serialize(dissolvedPayload, RealtimeJsonSerializerContext.Default.RealtimeConversationDissolvedPayload),
+            OccurredAtMs = occurredAtMs,
+            TraceParent = traceParent,
+            TraceState = traceState,
+            TargetUserIds = notifyTargets.ToArray(),
+            AudienceKind = AudienceKind.Conversation,
+            ConversationId = conversationId
+        };
+
+        await OutboxInsertHelper.InsertManyAsync(connection, transaction, _databaseSchema, [dissolveEvt], ct).ConfigureAwait(false);
         await InsertGroupMutationRequestAsync(
                 connection,
                 transaction,

@@ -112,5 +112,11 @@ public enum RealtimeEventType : byte
     /// <see cref="RealtimeEvent.TargetUserIds"/> 携带全部目标成员，Payload.Members 携带本次新增成员。
     /// </para>
     /// </summary>
-    MembersAdded = 22
+    MembersAdded = 22,
+
+    /// <summary>
+    /// 群解散。payload 为 <see cref="RealtimeConversationDissolvedPayload"/>。
+    /// 客户端据此明确识别群已解散，与普通 ConversationChanged 区分。
+    /// </summary>
+    ConversationDissolved = 23,
 }

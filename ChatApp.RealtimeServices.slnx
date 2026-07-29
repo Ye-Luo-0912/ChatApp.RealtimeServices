@@ -8,4 +8,5 @@
   <Project Path="ChatApp.Realtime.Integration/ChatApp.Realtime.Integration.csproj" />
   <Project Path="ChatApp.Realtime.Tests/ChatApp.Realtime.Tests.csproj" />
   <Project Path="ChatApp.Realtime.IntegrationTests/ChatApp.Realtime.IntegrationTests.csproj" />
+  <Project Path="ChatApp.Realtime.Benchmarks/ChatApp.Realtime.Benchmarks.csproj" />
 </Solution>

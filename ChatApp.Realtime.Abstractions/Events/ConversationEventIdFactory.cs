@@ -115,4 +115,17 @@ public static class ConversationEventIdFactory
             $"convreadagg:{conversationId}:{readerUserId}:{lastReadMessageId}:{lastReadAtMs}");
         return Convert.ToHexStringLower(SHA256.HashData(input));
     }
+
+    /// <summary>
+    /// 群解散事件幂等 Id。按 (conversationId, dissolvedAtMs) 派生，不纳入 target。
+    /// 用于群解散广播，确保同一解散操作只产生一行 Outbox。
+    /// </summary>
+    public static string CreateConversationDissolvedEventId(
+        string conversationId,
+        long dissolvedAtMs)
+    {
+        var input = Encoding.UTF8.GetBytes(
+            $"convdissolved:{conversationId}:{dissolvedAtMs}");
+        return Convert.ToHexStringLower(SHA256.HashData(input));
+    }
 }

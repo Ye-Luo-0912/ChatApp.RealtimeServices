@@ -1,6 +1,7 @@
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Core.Conversations;
@@ -13,6 +14,8 @@ using ChatApp.Realtime.Infrastructure.Postgres.Migrations;
 using ChatApp.Realtime.Infrastructure.Postgres.Stores;
 using ChatApp.Realtime.Tests.TestDoubles;
 using Microsoft.Extensions.Logging.Abstractions;
+using Npgsql;
+using System.Text.Json;
 using Testcontainers.PostgreSql;
 
 namespace ChatApp.Realtime.Tests;
@@ -548,6 +551,83 @@ public sealed class LeaveGroupHistoryPolicyTests : IAsyncLifetime
             readAtMs: 1_700_000_002_000,
             readMessageId: "msg-x");
         Assert.False(readResult.Found);
+    }
+
+    [Fact]
+    public async Task Dissolve_ProducesConversationDissolvedEvent()
+    {
+        var (client, schema) = await CreateStoreAsync("realtime_dissolved_event_type");
+        var groupStore = new NpgsqlRealtimeGroupStore(client, schema, membershipPeriodStore: new NpgsqlMembershipPeriodStore(client, schema));
+        var conversationId = ConversationId.CreateGroup();
+        const long dissolvedAtMs = 1_700_000_001_000;
+
+        await groupStore.CreateGroupAsync(
+            "req-create-dissolve-evt",
+            10,
+            conversationId,
+            "DissolveEvent",
+            [20, 30],
+            "s10",
+            1_700_000_000_000);
+
+        var dissolve = await groupStore.DissolveAsync(
+            "req-dissolve-evt",
+            10,
+            conversationId,
+            "s10",
+            dissolvedAtMs);
+        Assert.True(dissolve.Succeeded);
+
+        // Outbox：应产生一行 ConversationDissolved 事件，且 audience_kind=Conversation。
+        await using var connection = await client.GetDataSource().OpenConnectionAsync();
+        await using var outbox = new NpgsqlCommand(
+            $"""
+             SELECT event_type, payload_utf8, target_user_ids, audience_kind, conversation_id
+             FROM {schema.OutboxTableSql}
+             WHERE event_type = @dissolved
+             """,
+            connection);
+        outbox.Parameters.AddWithValue("dissolved", (short)RealtimeEventType.ConversationDissolved);
+
+        short eventType = 0;
+        byte[]? payloadUtf8 = null;
+        long[]? targetUserIds = null;
+        short audienceKind = 0;
+        string? rowConversationId = null;
+        await using (var reader = await outbox.ExecuteReaderAsync())
+        {
+            Assert.True(await reader.ReadAsync(), "未找到 ConversationDissolved 事件");
+            eventType = reader.GetInt16(0);
+            payloadUtf8 = (byte[])reader.GetValue(1);
+            targetUserIds = reader.IsDBNull(2) ? null : (long[])reader.GetValue(2);
+            audienceKind = reader.GetInt16(3);
+            rowConversationId = reader.IsDBNull(4) ? null : reader.GetString(4);
+            Assert.False(await reader.ReadAsync(), "ConversationDissolved 事件应只有一行");
+        }
+
+        Assert.Equal((short)RealtimeEventType.ConversationDissolved, eventType);
+        Assert.Equal((short)AudienceKind.Conversation, audienceKind);
+        Assert.Equal(conversationId, rowConversationId);
+
+        // 全员目标：包含 Owner(10) 与被通知成员 20、30。
+        Assert.NotNull(targetUserIds);
+        Array.Sort(targetUserIds!);
+        Assert.Equal([10L, 20L, 30L], targetUserIds);
+
+        // payload_utf8 为 RealtimeEvent 的 wire 序列化；其 PayloadJson 为 RealtimeConversationDissolvedPayload。
+        Assert.NotNull(payloadUtf8);
+        var outboxEvent = JsonSerializer.Deserialize(
+            payloadUtf8,
+            RealtimeJsonSerializerContext.Default.RealtimeEvent)!;
+        Assert.NotNull(outboxEvent.PayloadJson);
+        var dissolvedPayload = JsonSerializer.Deserialize(
+            outboxEvent.PayloadJson!,
+            RealtimeJsonSerializerContext.Default.RealtimeConversationDissolvedPayload)!;
+        Assert.Equal(conversationId, dissolvedPayload.ConversationId);
+        Assert.Equal(dissolvedAtMs, dissolvedPayload.DissolvedAtMs);
+        Assert.Equal("DissolveEvent", dissolvedPayload.Title);
+        Assert.Equal(10L, dissolvedPayload.ActorUserId);
+        Assert.Equal(RealtimeConversationDissolvedPayload.CurrentPayloadVersion, dissolvedPayload.PayloadVersion);
     }
 
     private static async Task SendGroupMessageAsync(

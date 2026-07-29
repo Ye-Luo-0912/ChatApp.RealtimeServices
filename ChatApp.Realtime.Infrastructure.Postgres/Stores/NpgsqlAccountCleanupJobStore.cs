@@ -142,6 +142,7 @@ public sealed class NpgsqlAccountCleanupJobStore(
         command.Parameters.AddWithValue("cursor", (object?)cursor ?? DBNull.Value);
         command.Parameters.AddWithValue("status", status);
         command.Parameters.AddWithValue("claim_token", claimToken);
+        command.Parameters.AddWithValue("running", AccountCleanupJob.StatusRunning);
         command.Parameters.AddWithValue("now_ms", nowMs);
 
         await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
@@ -186,6 +187,7 @@ public sealed class NpgsqlAccountCleanupJobStore(
         completeCommand.Parameters.AddWithValue("phase", phase);
         completeCommand.Parameters.AddWithValue("completed", AccountCleanupJob.StatusCompleted);
         completeCommand.Parameters.AddWithValue("claim_token", claimToken);
+        completeCommand.Parameters.AddWithValue("running", AccountCleanupJob.StatusRunning);
         completeCommand.Parameters.AddWithValue("now_ms", nowMs);
         await completeCommand.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
 
@@ -264,7 +266,7 @@ public sealed class NpgsqlAccountCleanupJobStore(
             FROM candidates
             WHERE item.user_id = candidates.user_id AND item.phase = candidates.phase
             RETURNING item.user_id, item.phase, item.cursor, item.status, item.retry_count,
-                item.claim_token, item.locked_by, item.locked_until_ms, item.updated_at_ms;
+                item.updated_at_ms, item.claim_token, item.locked_by, item.locked_until_ms;
             """,
             connection,
             transaction);
@@ -276,14 +278,19 @@ public sealed class NpgsqlAccountCleanupJobStore(
         command.Parameters.AddWithValue("locked_until", lockedUntilMs);
         command.Parameters.AddWithValue("max_retries", maxRetries);
 
-        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
-        if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+        AccountCleanupJob? job = null;
+        await using (var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false))
+        {
+            if (await reader.ReadAsync(ct).ConfigureAwait(false))
+                job = Map(reader);
+        }
+
+        if (job is null)
         {
             await transaction.RollbackAsync(ct).ConfigureAwait(false);
             return null;
         }
 
-        var job = Map(reader);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
 
         logger.LogDebug(
@@ -392,6 +399,7 @@ public sealed class NpgsqlAccountCleanupJobStore(
         cursorCmd.Parameters.AddWithValue("phase", AccountCleanupJob.PhaseAttachments);
         cursorCmd.Parameters.AddWithValue("cursor", lastAttachmentId);
         cursorCmd.Parameters.AddWithValue("claim_token", claimToken);
+        cursorCmd.Parameters.AddWithValue("running", AccountCleanupJob.StatusRunning);
         cursorCmd.Parameters.AddWithValue("now_ms", nowMs);
 
         var affected = await cursorCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);

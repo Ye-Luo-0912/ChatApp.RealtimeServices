@@ -688,6 +688,228 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
         Assert.Equal(2, item.UnreadCount);
     }
 
+    /// <summary>
+    /// 二-2：单聊序列模型未读公式集成测试。
+    /// <para>
+    /// 验证 last_sequence / last_read_sequence / retention_floor_sequence 三者协同：
+    /// 1. 发送 4 条消息后未读 = 4（last_sequence=4, last_read_sequence=0, floor=0）
+    /// 2. MarkRead 到第 2 条后未读 = 2（last_read_sequence=2）
+    /// 3. 再发 2 条后未读 = 4（last_sequence=6, last_read_sequence=2）
+    /// 4. MarkRead 到 tip 后未读 = 0
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task DirectMessage_SequenceModel_UnreadCorrectAcrossReadAndNewMessages()
+    {
+        var (client, schema) = await CreateDatabaseAsync("realtime_conv_seq_unread_cycle");
+        var messageStore = new NpgsqlRealtimeMessageStore(
+            client,
+            schema,
+            TestMutationPolicy.Instance,
+            NullLogger<NpgsqlRealtimeMessageStore>.Instance);
+        var conversationStore = new NpgsqlRealtimeConversationStore(client, schema);
+        var listProcessor = new DefaultConversationListQueryProcessor(conversationStore);
+        var markReadProcessor = new DefaultConversationMarkReadProcessor(
+            conversationStore,
+            new RecordingRealtimeOutboxSignal());
+
+        var conversationId = ConversationId.CreateDirect(11_001, 11_002);
+        // 发送 4 条消息
+        for (var i = 1; i <= 4; i++)
+        {
+            await messageStore.SaveAsync(
+                CreateMessage($"seq-msg-{i}", 11_001, 11_002, conversationId, $"msg-{i}", i * 100),
+                CreateMessageReceivedEvent($"seq-evt-{i}", 11_002, $"seq-msg-{i}", i * 100));
+        }
+
+        // 未读 = 4
+        var list1 = await listProcessor.ProcessAsync(
+            new ConversationListQuery
+            {
+                RequestId = "seq-list-1",
+                UserId = 11_002,
+                Limit = 10
+            });
+        Assert.True(list1.Succeeded);
+        Assert.Equal(4, Assert.Single(list1.Items).UnreadCount);
+        Assert.Equal("seq-msg-4", Assert.Single(list1.Items).LastMessageId);
+
+        // 读到第 2 条
+        var read1 = await markReadProcessor.ProcessAsync(
+            new ConversationMarkReadCommand
+            {
+                RequestId = "seq-read-1",
+                UserId = 11_002,
+                ConversationId = conversationId,
+                ReadMessageId = "seq-msg-2"
+            });
+        Assert.True(read1.Succeeded);
+        Assert.Equal(2, read1.UnreadCount);
+
+        // 列表未读 = 2
+        var list2 = await listProcessor.ProcessAsync(
+            new ConversationListQuery
+            {
+                RequestId = "seq-list-2",
+                UserId = 11_002,
+                Limit = 10
+            });
+        Assert.True(list2.Succeeded);
+        Assert.Equal(2, Assert.Single(list2.Items).UnreadCount);
+
+        // 再发 2 条
+        for (var i = 5; i <= 6; i++)
+        {
+            await messageStore.SaveAsync(
+                CreateMessage($"seq-msg-{i}", 11_001, 11_002, conversationId, $"msg-{i}", i * 100),
+                CreateMessageReceivedEvent($"seq-evt-{i}", 11_002, $"seq-msg-{i}", i * 100));
+        }
+
+        // 未读 = 4（last_sequence=6, last_read_sequence=2）
+        var list3 = await listProcessor.ProcessAsync(
+            new ConversationListQuery
+            {
+                RequestId = "seq-list-3",
+                UserId = 11_002,
+                Limit = 10
+            });
+        Assert.True(list3.Succeeded);
+        Assert.Equal(4, Assert.Single(list3.Items).UnreadCount);
+        Assert.Equal("seq-msg-6", Assert.Single(list3.Items).LastMessageId);
+
+        // 读到 tip
+        var read2 = await markReadProcessor.ProcessAsync(
+            new ConversationMarkReadCommand
+            {
+                RequestId = "seq-read-2",
+                UserId = 11_002,
+                ConversationId = conversationId
+            });
+        Assert.True(read2.Succeeded);
+        Assert.Equal(0, read2.UnreadCount);
+
+        // 列表未读 = 0
+        var list4 = await listProcessor.ProcessAsync(
+            new ConversationListQuery
+            {
+                RequestId = "seq-list-4",
+                UserId = 11_002,
+                Limit = 10
+            });
+        Assert.True(list4.Succeeded);
+        Assert.Equal(0, Assert.Single(list4.Items).UnreadCount);
+    }
+
+    /// <summary>
+    /// 二-3：归档快照列表门禁测试。
+    /// <para>
+    /// 验证 <see cref="IRealtimeConversationStore.QueryArchivedListAsync"/> 在用户离群后
+    /// 返回离群时刻的消息快照（left_message_*）而非群当前 tip。
+    /// 否则群在用户离开后继续活跃时，归档用户会看到离群后的最新预览。
+    /// </para>
+    /// <para>
+    /// 验证步骤：
+    /// 1. 创建群，发送 2 条消息
+    /// 2. 成员离群（快照记录 tip = msg-before-leave）
+    /// 3. 离群后再发 1 条消息（tip 推进到 msg-after-leave）
+    /// 4. 归档列表返回 left_message（msg-before-leave），未读=0
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ArchiveSnapshot_LeavesGroup_ShowsSnapshotMessageNotCurrentTip()
+    {
+        var (client, schema) = await CreateDatabaseAsync("realtime_conv_archive_snapshot");
+        var groupStore = new NpgsqlRealtimeGroupStore(
+            client,
+            schema,
+            membershipPeriodStore: new NpgsqlMembershipPeriodStore(client, schema));
+        var messageStore = new NpgsqlRealtimeMessageStore(
+            client,
+            schema,
+            TestMutationPolicy.Instance,
+            NullLogger<NpgsqlRealtimeMessageStore>.Instance);
+        var conversationStore = new NpgsqlRealtimeConversationStore(client, schema);
+
+        var conversationId = ConversationId.CreateGroup();
+        const long owner = 12_001;
+        const long member = 12_002;
+        await groupStore.CreateGroupAsync(
+            "req-archive-create",
+            owner,
+            conversationId,
+            "ArchiveSnapshot",
+            [member],
+            "s-owner",
+            1_700_000_000_000);
+
+        // 发送 2 条消息
+        await SendGroupMessageAsync(messageStore, conversationId, owner, "msg-before-1", 1_700_000_000_100);
+        await SendGroupMessageAsync(messageStore, conversationId, owner, "msg-before-2", 1_700_000_000_200);
+
+        // 成员离群（快照记录 tip = msg-before-2）
+        var leave = await groupStore.LeaveAsync(
+            "req-archive-leave",
+            member,
+            conversationId,
+            "s-member",
+            1_700_000_001_000);
+        Assert.True(leave.Succeeded);
+
+        // 离群后再发 1 条消息（tip 推进到 msg-after-leave）
+        await SendGroupMessageAsync(messageStore, conversationId, owner, "msg-after-leave", 1_700_000_002_000);
+
+        // 归档列表：应返回离群快照（msg-before-2），而非当前 tip（msg-after-leave）
+        var archived = await conversationStore.QueryArchivedListAsync(
+            userId: member,
+            beforeIsPinned: null,
+            beforePinnedAtMs: null,
+            beforeLastMessageAtMs: null,
+            beforeConversationId: null,
+            take: 10);
+
+        var archivedItem = Assert.Single(archived);
+        Assert.Equal(conversationId, archivedItem.ConversationId);
+        Assert.Equal(ConversationType.Group, archivedItem.Type);
+        // 关键断言：归档列表显示离群时刻的消息，而非群当前 tip
+        Assert.Equal("g-msg-before-2", archivedItem.LastMessageId);
+        Assert.Equal("msg-before-2", archivedItem.LastMessagePreview);
+        Assert.Equal(1_700_000_000_200, archivedItem.LastMessageAtMs);
+        // 离群后未读永远为 0
+        Assert.Equal(0, archivedItem.UnreadCount);
+    }
+
+    private static async Task SendGroupMessageAsync(
+        NpgsqlRealtimeMessageStore messageStore,
+        string conversationId,
+        long senderUserId,
+        string content,
+        long receivedAtMs)
+    {
+        var message = new RealtimeMessageRecord
+        {
+            MessageId = $"g-{content}",
+            ClientMessageId = $"g-client-{content}",
+            SenderUserId = senderUserId,
+            SenderSessionId = $"s{senderUserId}",
+            ReceiverUserId = 0,
+            ConversationId = conversationId,
+            Content = content,
+            ReceivedAtMs = receivedAtMs
+        };
+        var template = new RealtimeEvent
+        {
+            EventId = MessageEventIdFactory.CreateMessageReceivedEventId(senderUserId, message.ClientMessageId, 1),
+            Type = RealtimeEventType.MessageReceived,
+            TargetUserId = senderUserId,
+            ActorUserId = senderUserId,
+            MessageId = message.MessageId,
+            SessionId = message.SenderSessionId!,
+            OccurredAtMs = receivedAtMs
+        };
+        var persisted = await messageStore.SaveAsync(message, template);
+        Assert.Equal(RealtimeMessagePersistKind.Created, persisted.Kind);
+    }
+
     private async Task<(RealtimeDatabaseClient Client, RealtimeDatabaseSchema Schema)> CreateDatabaseAsync(
         string schemaName)
     {

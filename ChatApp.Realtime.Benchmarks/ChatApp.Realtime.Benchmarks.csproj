@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <OutputType>Exe</OutputType>
+    <!-- BenchmarkDotNet 需要 Release 模式 -->
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" Version="0.14.0" />
+    <PackageReference Include="Npgsql" Version="10.0.2" />
+    <PackageReference Include="Testcontainers.PostgreSql" Version="4.7.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ChatApp.Realtime.Abstractions\ChatApp.Realtime.Abstractions.csproj" />
+    <ProjectReference Include="..\ChatApp.Realtime.Infrastructure.Postgres\ChatApp.Realtime.Infrastructure.Postgres.csproj" />
+  </ItemGroup>
+
+</Project>

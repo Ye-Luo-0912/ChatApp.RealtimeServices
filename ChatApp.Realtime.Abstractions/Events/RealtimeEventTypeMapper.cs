@@ -23,6 +23,7 @@ public static class RealtimeEventTypeMapper
             RealtimeEventNames.RoleChanged => RealtimeEventType.RoleChanged,
             RealtimeEventNames.MembersAdded => RealtimeEventType.MembersAdded,
             RealtimeEventNames.ConversationRead => RealtimeEventType.ConversationRead,
+            RealtimeEventNames.ConversationDissolved => RealtimeEventType.ConversationDissolved,
             _ => throw new ArgumentOutOfRangeException(nameof(businessName), businessName, null)
         };
 }

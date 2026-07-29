@@ -196,6 +196,83 @@ public sealed class OutboxTypedColumnDeleteTests : IAsyncLifetime
         Assert.Equal(RealtimeEventType.UserAccountDeleted, restored.Type);
     }
 
+    /// <summary>
+    /// 四-1/六-4：新记录的 payload_utf8 不包含 TargetUserIds（数据库列是唯一权威），
+    /// 因此 DeleteByUserAsync(A) 只需 array_remove 修改 target_user_ids 列，
+    /// 不需要重写 payload_utf8。验证：
+    /// - target_user_ids 列：移除 A，保留 B
+    /// - payload_utf8 列：从未包含 A 或 B（因 OutboxInsertHelper 已排除路由字段）
+    /// - DeleteByUserAsync 不重写 payload_utf8（仍可反序列化为无 TargetUserIds 的 wire 事件）
+    /// </summary>
+    [Fact]
+    public async Task DeleteByUser_PreservesPayloadUtf8_ForNewMultiTargetRows()
+    {
+        const string schemaName = "realtime_p0_payload_utf8_cleanup";
+        var connectionString = _postgres.GetConnectionString();
+        var schema = new RealtimeDatabaseSchema(schemaName);
+        var client = new RealtimeDatabaseClient(
+            connectionString,
+            NullLogger<RealtimeDatabaseClient>.Instance);
+
+        await ApplyMigrationsAsync(
+            client,
+            schema,
+            RealtimeSchemaMigrationRunner.DefaultMigrations());
+
+        var store = new NpgsqlRealtimeMessageStore(
+            client,
+            schema,
+            TestMutationPolicy.Instance,
+            NullLogger<NpgsqlRealtimeMessageStore>.Instance);
+
+        const long userA = 5_001;
+        const long userB = 5_002;
+        // 入队多目标事件：TargetUserIds 同时包含 A 与 B
+        await store.EnqueueEventAsync(new RealtimeEvent
+        {
+            EventId = "enq-payload-cleanup",
+            Type = RealtimeEventType.MessageReceived,
+            TargetUserId = userA,
+            TargetUserIds = [userA, userB],
+            OccurredAtMs = 1
+        });
+
+        // 入队后立即读回列值，验证 payload_utf8 中 TargetUserIds 被置为 null（路由字段由 target_user_ids 列权威管理）
+        var beforeDelete = await GetOutboxRowAsync(connectionString, schema, "enq-payload-cleanup");
+        Assert.NotNull(beforeDelete.PayloadUtf8);
+        Assert.NotNull(beforeDelete.TargetUserIds);
+        Assert.Equal([userA, userB], beforeDelete.TargetUserIds);
+        // 反序列化验证 payload_utf8 中 TargetUserIds 为 null（已被 OutboxInsertHelper 剥离）
+        var beforeRestored = JsonSerializer.Deserialize(
+            beforeDelete.PayloadUtf8!.Value.Span,
+            RealtimeJsonSerializerContext.Default.RealtimeEvent);
+        Assert.NotNull(beforeRestored);
+        Assert.Null(beforeRestored!.TargetUserIds);
+        // userB 仅存在于 TargetUserIds（已被剥离），不应出现在 payload 中
+        var payloadTextBefore = System.Text.Encoding.UTF8.GetString(beforeDelete.PayloadUtf8!.Value.ToArray());
+        Assert.DoesNotContain(userB.ToString(System.Globalization.CultureInfo.InvariantCulture), payloadTextBefore);
+
+        // DeleteByUserAsync(A)：仅 array_remove 修改 target_user_ids，payload_utf8 不重写
+        await store.DeleteByUserAsync(userA);
+
+        var afterDelete = await GetOutboxRowAsync(connectionString, schema, "enq-payload-cleanup");
+        Assert.NotNull(afterDelete.PayloadUtf8);
+        Assert.NotNull(afterDelete.TargetUserIds);
+        // target_user_ids 不再包含 A
+        Assert.DoesNotContain(userA, afterDelete.TargetUserIds!);
+        // target_user_ids 仍包含 B
+        Assert.Contains(userB, afterDelete.TargetUserIds!);
+        // payload_utf8 内容与删除前完全一致（未被重写）
+        Assert.Equal(beforeDelete.PayloadUtf8!.Value.ToArray(), afterDelete.PayloadUtf8!.Value.ToArray());
+        // payload_utf8 反序列化仍能成功（wire 事件结构完好）
+        var restored = JsonSerializer.Deserialize(
+            afterDelete.PayloadUtf8!.Value.Span,
+            RealtimeJsonSerializerContext.Default.RealtimeEvent);
+        Assert.NotNull(restored);
+        Assert.Equal("enq-payload-cleanup", restored!.EventId);
+        Assert.Null(restored.TargetUserIds);
+    }
+
     private static async Task ApplyMigrationsAsync(
         RealtimeDatabaseClient client,
         RealtimeDatabaseSchema schema,
@@ -255,9 +332,47 @@ public sealed class OutboxTypedColumnDeleteTests : IAsyncLifetime
         return rows;
     }
 
+    private static async Task<OutboxPayloadRow> GetOutboxRowAsync(
+        string connectionString,
+        RealtimeDatabaseSchema schema,
+        string eventId)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var cmd = new NpgsqlCommand(
+            $"""
+             SELECT payload_utf8, target_user_ids
+             FROM {schema.OutboxTableSql}
+             WHERE event_id = @event_id;
+             """,
+            connection);
+        cmd.Parameters.AddWithValue("event_id", eventId);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        byte[]? payloadUtf8 = null;
+        if (!reader.IsDBNull(0))
+        {
+            payloadUtf8 = (byte[])reader.GetValue(0);
+        }
+
+        long[]? targetUserIds = null;
+        if (!reader.IsDBNull(1))
+        {
+            targetUserIds = (long[])reader.GetValue(1);
+        }
+
+        return new OutboxPayloadRow(
+            payloadUtf8 is null ? null : new ReadOnlyMemory<byte>(payloadUtf8),
+            targetUserIds);
+    }
+
     private sealed record OutboxRow(
         string EventId,
         long TargetUserId,
         short EventType,
         string? PayloadJson);
+
+    private sealed record OutboxPayloadRow(
+        ReadOnlyMemory<byte>? PayloadUtf8,
+        long[]? TargetUserIds);
 }

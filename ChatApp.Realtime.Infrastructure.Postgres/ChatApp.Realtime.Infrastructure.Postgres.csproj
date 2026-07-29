@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="ChatApp.Realtime.Tests" />
+    <InternalsVisibleTo Include="ChatApp.Realtime.Benchmarks" />
   </ItemGroup>
 
 </Project>

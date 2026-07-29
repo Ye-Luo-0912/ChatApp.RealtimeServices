@@ -15,6 +15,7 @@ namespace ChatApp.Realtime.Infrastructure.Core.Serialization;
 [JsonSerializable(typeof(AttachmentRef))]
 [JsonSerializable(typeof(List<AttachmentRef>))]
 [JsonSerializable(typeof(RealtimeConversationChangedPayload))]
+[JsonSerializable(typeof(RealtimeConversationDissolvedPayload))]
 [JsonSerializable(typeof(RealtimeUnreadCountChangedPayload))]
 [JsonSerializable(typeof(RealtimeConversationReadPayload))]
 [JsonSerializable(typeof(AttachmentBlobsPurgePayload))]
