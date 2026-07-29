@@ -196,7 +196,7 @@ public sealed class MessageRetentionStoreTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task PurgeBatch_RepairsUnreadCount_ForMemberWhoHadNotReadOldMessages()
+    public async Task PurgeBatch_DoesNotRepairMaterializedUnreadCount_AfterRetention()
     {
         const string schemaName = "realtime_retention_unread";
         var (_, schema, store) = await CreateStoreAsync(schemaName);
@@ -229,10 +229,12 @@ public sealed class MessageRetentionStoreTests : IAsyncLifetime
 
         var result = await store.TryPurgeBatchAsync(cutoffReceivedAtMs: 10_000, batchSize: 100);
         Assert.Equal(2, result.DeletedCount);
-        Assert.True(result.MembersUnreadRepaired >= 1);
+        // P0-2：Retention 不再修复物化 unread_count 列；列表查询改用序列公式派生。
+        Assert.Equal(0, result.MembersUnreadRepaired);
 
         Assert.Equal(["new-1"], await ListMessageIdsAsync(cs, schema));
-        Assert.Equal(1, await GetUnreadCountAsync(cs, schema, "c-unread", userId: 20));
+        // 物化 unread_count 保持原值不变（未修复）。
+        Assert.Equal(3, await GetUnreadCountAsync(cs, schema, "c-unread", userId: 20));
         Assert.Equal(0, await GetUnreadCountAsync(cs, schema, "c-unread", userId: 10));
     }
 

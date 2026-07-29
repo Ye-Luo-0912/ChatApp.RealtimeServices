@@ -132,7 +132,9 @@ internal sealed class MessageWriter
             $"""
              SELECT message_id, receiver_user_id, content, content_fingerprint,
                     conversation_id, reply_to_message_id, forwarded_from_message_id,
-                    mentioned_user_ids, mentioned_roles
+                    mentioned_user_ids, mentioned_roles,
+                    reply_to_sender_user_id, reply_to_preview,
+                    forwarded_from_sender_user_id, forwarded_from_preview
              FROM {_session.Schema.MessagesTableSql}
              WHERE sender_user_id = @sender_user_id AND client_message_id = @client_message_id
              """,
@@ -144,7 +146,7 @@ internal sealed class MessageWriter
         if (!await reader.ReadAsync(ct).ConfigureAwait(false))
             throw new InvalidOperationException("检测到消息冲突，但无法读取已有消息编号。");
 
-        // P0-8：读取 v3 指纹覆盖字段，用于旧版本指纹的重算比对
+        // P0-8/P0-10：读取 v4 指纹覆盖字段（含 Reply/Forward 的 sender/preview），用于旧版本指纹的重算比对
         return new ExistingMessage(
             reader.GetString(0),
             reader.GetInt64(1),
@@ -154,7 +156,11 @@ internal sealed class MessageWriter
             reader.IsDBNull(5) ? null : reader.GetString(5),
             reader.IsDBNull(6) ? null : reader.GetString(6),
             reader.IsDBNull(7) ? null : reader.GetFieldValue<long[]>(7),
-            reader.IsDBNull(8) ? null : reader.GetFieldValue<string[]>(8));
+            reader.IsDBNull(8) ? null : reader.GetFieldValue<string[]>(8),
+            reader.IsDBNull(9) ? null : reader.GetInt64(9),
+            reader.IsDBNull(10) ? null : reader.GetString(10),
+            reader.IsDBNull(11) ? null : reader.GetInt64(11),
+            reader.IsDBNull(12) ? null : reader.GetString(12));
     }
 
     public async Task<IReadOnlyList<string>> ListAttachmentIdsAsync(string messageId)
@@ -186,5 +192,9 @@ internal sealed class MessageWriter
         string? ReplyToMessageId,
         string? ForwardedFromMessageId,
         long[]? MentionedUserIds,
-        string[]? MentionedRoles);
+        string[]? MentionedRoles,
+        long? ReplyToSenderUserId = null,
+        string? ReplyToPreview = null,
+        long? ForwardedFromSenderUserId = null,
+        string? ForwardedFromPreview = null);
 }

@@ -73,6 +73,26 @@ public interface IRealtimeGroupStore
         string conversationId,
         long userId,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// P0-3：查询指定用户在群会话中的角色（仅活跃成员）。
+    /// 用于群消息 mention 规范化时判定发送者是否为管理员（Owner/Admin），
+    /// 替代遍历全量成员列表。返回 null 表示用户不是活跃成员。
+    /// </summary>
+    Task<ConversationMemberRole?> GetMemberRoleAsync(
+        long userId,
+        string conversationId,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// P0-3：批量校验指定用户集合中哪些是群的活跃成员。
+    /// 用于群消息 mention 规范化时过滤非成员 mention，替代加载全量成员列表。
+    /// 返回输入集合中属于活跃成员的子集（按 user_id 升序）。
+    /// </summary>
+    Task<IReadOnlyList<long>> ValidateMembersAsync(
+        string conversationId,
+        IReadOnlyList<long> userIds,
+        CancellationToken ct = default);
 }
 
 public readonly record struct GroupCreatePersistResult(

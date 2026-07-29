@@ -142,8 +142,11 @@ public sealed class DefaultUserAccountDeletedProcessorTests
             long userId, string phase, string? cursor, string status, string claimToken, CancellationToken ct = default) =>
             Task.CompletedTask;
 
-        public Task CompletePhaseAsync(long userId, string phase, string claimToken, CancellationToken ct = default) =>
-            Task.CompletedTask;
+        public Task<bool> CompletePhaseAsync(long userId, string phase, string claimToken, CancellationToken ct = default) =>
+            Task.FromResult(true);
+
+        public Task<bool> ReleaseToPendingAsync(long userId, string phase, string claimToken, CancellationToken ct = default) =>
+            Task.FromResult(true);
 
         public Task<AccountCleanupJob?> GetNextPendingAsync(
             string instanceId, TimeSpan leaseDuration, CancellationToken ct = default) =>

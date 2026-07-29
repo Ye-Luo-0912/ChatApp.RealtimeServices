@@ -33,5 +33,11 @@ public sealed class RealtimeMessageRecord
     /// <summary>@提到的角色（如 "all"、"admin"）；目前仅供展示，无强校验。</summary>
     public IReadOnlyList<string>? MentionedRoles { get; init; }
 
+    /// <summary>
+    /// P0-10：由 Processor 在 mentions sanitization 之前基于原始请求计算的内容指纹。
+    /// 若非 null，SaveAsync 直接使用此值；否则 SaveAsync 内部回退到基于 sanitized mentions 重算。
+    /// </summary>
+    public string? RequestFingerprint { get; init; }
+
     public long ReceivedAtMs { get; init; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 }

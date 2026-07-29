@@ -1273,6 +1273,73 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         return scalar is not null;
     }
 
+    /// <summary>
+    /// P0-3：查询指定用户在群会话中的角色（仅活跃成员）。
+    /// 单条 SQL，O(1) 索引命中，替代 ListMembersAsync 的全量加载。
+    /// </summary>
+    public async Task<ConversationMemberRole?> GetMemberRoleAsync(
+        long userId,
+        string conversationId,
+        CancellationToken ct = default)
+    {
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT role
+             FROM {_databaseSchema.ConversationMembersTableSql}
+             WHERE user_id = @user_id
+               AND conversation_id = @conversation_id
+               AND left_at_ms IS NULL;
+             """,
+            connection);
+        command.Parameters.AddWithValue("user_id", userId);
+        command.Parameters.AddWithValue("conversation_id", conversationId);
+        var scalar = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return scalar is short role ? (ConversationMemberRole)role : null;
+    }
+
+    /// <summary>
+    /// P0-3：批量校验指定用户集合中哪些是群的活跃成员。
+    /// 使用 = ANY 单条 SQL，避免逐用户往返。返回输入集合中的活跃成员子集（升序）。
+    /// </summary>
+    public async Task<IReadOnlyList<long>> ValidateMembersAsync(
+        string conversationId,
+        IReadOnlyList<long> userIds,
+        CancellationToken ct = default)
+    {
+        if (userIds is null || userIds.Count == 0)
+            return Array.Empty<long>();
+
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT user_id
+             FROM {_databaseSchema.ConversationMembersTableSql}
+             WHERE conversation_id = @conversation_id
+               AND left_at_ms IS NULL
+               AND user_id = ANY(@user_ids)
+             ORDER BY user_id;
+             """,
+            connection);
+        command.Parameters.AddWithValue("conversation_id", conversationId);
+        command.Parameters.Add(new NpgsqlParameter("user_ids", NpgsqlDbType.Bigint | NpgsqlDbType.Array)
+        {
+            Value = userIds.ToArray()
+        });
+
+        var valid = new List<long>(userIds.Count);
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            valid.Add(reader.GetInt64(0));
+        return valid;
+    }
+
     private async Task<(string? Title, ConversationMemberRole? ActorRole, int MemberCount)> LoadGroupContextAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,

@@ -148,7 +148,7 @@ public sealed class NpgsqlAccountCleanupJobStore(
         await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
-    public async Task CompletePhaseAsync(
+    public async Task<bool> CompletePhaseAsync(
         long userId,
         string phase,
         string claimToken,
@@ -172,14 +172,16 @@ public sealed class NpgsqlAccountCleanupJobStore(
             .BeginTransactionAsync(ct)
             .ConfigureAwait(false);
 
-        // 当前 phase 标记 completed，并清空 lease 字段。
+        // P0-7：使用 UPDATE ... RETURNING 校验 claim_token。若 lease 已丢失（claim_token 不匹配
+        // 或状态非 running），UPDATE 0 行，不创建下一 phase，回滚并返回 false。
         await using var completeCommand = new NpgsqlCommand(
             $"""
             UPDATE {databaseSchema.AccountCleanupJobsTableSql}
             SET status = @completed, cursor = NULL, updated_at_ms = @now_ms,
                 claim_token = NULL, locked_by = NULL, locked_until_ms = NULL
             WHERE user_id = @user_id AND phase = @phase
-              AND claim_token = @claim_token AND status = @running;
+              AND claim_token = @claim_token AND status = @running
+            RETURNING user_id;
             """,
             connection,
             transaction);
@@ -189,7 +191,23 @@ public sealed class NpgsqlAccountCleanupJobStore(
         completeCommand.Parameters.AddWithValue("claim_token", claimToken);
         completeCommand.Parameters.AddWithValue("running", AccountCleanupJob.StatusRunning);
         completeCommand.Parameters.AddWithValue("now_ms", nowMs);
-        await completeCommand.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+
+        await using var reader = await completeCommand.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        var completed = await reader.ReadAsync(ct).ConfigureAwait(false);
+        if (!completed)
+        {
+            // claim_token 不匹配，lease 已丢失，不创建下一 phase。
+            await reader.CloseAsync().ConfigureAwait(false);
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            logger.LogWarning(
+                "账号清理阶段完成失败：lease 已丢失。用户={UserId}；阶段={Phase}",
+                userId,
+                phase);
+            return false;
+        }
+
+        // 必须在 commit 前关闭 reader，避免后续命令冲突。
+        await reader.CloseAsync().ConfigureAwait(false);
 
         // 下一 phase 置为 pending（若存在）。
         if (nextPhase is not null)
@@ -224,6 +242,56 @@ public sealed class NpgsqlAccountCleanupJobStore(
             userId,
             phase,
             nextPhase ?? "(none)");
+        return true;
+    }
+
+    public async Task<bool> ReleaseToPendingAsync(
+        long userId,
+        string phase,
+        string claimToken,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(phase);
+        ArgumentException.ThrowIfNullOrWhiteSpace(claimToken);
+
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        await using var connection = await databaseClient.GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+
+        // P0-7：达到单周期批次上限时主动释放为 pending（带 claim_token 校验），
+        // 使下一周期可重新认领继续处理。lease 字段清空，cursor 保留以便断点续跑。
+        await using var command = new NpgsqlCommand(
+            $"""
+            UPDATE {databaseSchema.AccountCleanupJobsTableSql}
+            SET status = @pending, claim_token = NULL, locked_by = NULL,
+                locked_until_ms = NULL, updated_at_ms = @now_ms
+            WHERE user_id = @user_id AND phase = @phase
+              AND claim_token = @claim_token AND status = @running;
+            """,
+            connection);
+        command.Parameters.AddWithValue("user_id", userId);
+        command.Parameters.AddWithValue("phase", phase);
+        command.Parameters.AddWithValue("claim_token", claimToken);
+        command.Parameters.AddWithValue("running", AccountCleanupJob.StatusRunning);
+        command.Parameters.AddWithValue("pending", AccountCleanupJob.StatusPending);
+        command.Parameters.AddWithValue("now_ms", nowMs);
+
+        var affected = await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        if (affected == 0)
+        {
+            logger.LogWarning(
+                "账号清理阶段回退 pending 失败：lease 已丢失。用户={UserId}；阶段={Phase}",
+                userId,
+                phase);
+            return false;
+        }
+
+        logger.LogDebug(
+            "账号清理阶段已回退 pending，等待下一周期认领。用户={UserId}；阶段={Phase}",
+            userId,
+            phase);
+        return true;
     }
 
     public async Task<AccountCleanupJob?> GetNextPendingAsync(

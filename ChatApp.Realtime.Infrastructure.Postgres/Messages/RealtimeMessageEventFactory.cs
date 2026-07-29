@@ -92,11 +92,16 @@ internal static class RealtimeMessageEventFactory
     /// <summary>
     /// 群消息聚合事件：单个事件携带全部群成员作为 <see cref="RealtimeEvent.TargetUserIds"/>，
     /// 避免对每个成员产生独立 Outbox 行（O(N²) → O(N)）。
+    /// <para>
+    /// P0-3：<paramref name="targetUserIds"/> 为 null 时表示群广播（AudienceKind=Conversation），
+    /// 由 <see cref="Projections.GroupProjectionDelta.AddBroadcast"/> 烙印 AudienceKind + ConversationId，
+    /// TargetUserIds 保持 null，Publisher 通过会话级路由目录投递。
+    /// </para>
     /// </summary>
     public static RealtimeEvent CreateGroupMessageAggregatedEvent(
         RealtimeEvent template,
         RealtimeMessageRecord message,
-        IReadOnlyList<long> targetUserIds)
+        IReadOnlyList<long>? targetUserIds)
     {
         return new RealtimeEvent
         {
@@ -113,7 +118,7 @@ internal static class RealtimeMessageEventFactory
             OccurredAtMs = template.OccurredAtMs,
             TraceParent = template.TraceParent,
             TraceState = template.TraceState,
-            TargetUserIds = targetUserIds.ToArray()
+            TargetUserIds = targetUserIds?.ToArray()
         };
     }
 

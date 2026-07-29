@@ -19,8 +19,9 @@ namespace ChatApp.Realtime.Infrastructure.Postgres.Outbox;
 /// <c>target_user_ids</c> 是每行的 <c>bigint[]</c>，Npgsql 不直接支持锯齿数组，
 /// 因此将其编码为逗号分隔文本，在 SQL 中用 <c>string_to_array</c> 解码。
 /// <para>
-/// 四-1/五：预序列化为 UTF-8 字节写入 <c>payload_utf8</c> 列（排除 <see cref="RealtimeEvent.TargetUserIds"/>
-/// 与 <see cref="RealtimeEvent.AudienceKind"/>，二者以数据库列为唯一权威）。
+/// 四-1/五：预序列化为 UTF-8 字节写入 <c>payload_utf8</c> 列。P0-5：wire payload 保留
+/// <see cref="RealtimeEvent.AudienceKind"/> 与 <see cref="RealtimeEvent.ConversationId"/>
+/// 供 Gateway 路由判断；仅排除 <see cref="RealtimeEvent.TargetUserIds"/>（O(N) 数组，数据库列为唯一权威）。
 /// <c>payload_json</c> 列写入 <c>NULL</c>，停止双写；Claim 路径仅读取列 + <c>payload_utf8</c>。
 /// </para>
 /// </remarks>
@@ -53,13 +54,17 @@ internal static class OutboxInsertHelper
         // Perf-2：会话级受众路由字段。audience_kind 默认 0=User，conversation_id 可空。
         var audienceKinds = new short[events.Count];
         var conversationIds = new string?[events.Count];
+        // P0-8：trace context 与事件时间戳持久化到独立列，Claim 路径零解析读取。
+        var traceParents = new string?[events.Count];
+        var traceStates = new string?[events.Count];
+        var occurredAtMsValues = new long[events.Count];
 
         for (var i = 0; i < events.Count; i++)
         {
             var evt = events[i];
             eventIds[i] = evt.EventId;
-            // 四-1：序列化 wire payload 时排除 TargetUserIds 与 AudienceKind，
-            // 二者以数据库列为唯一权威；账号删除只需 array_remove 修改列，无需重写 payload。
+            // 四-1：序列化 wire payload。P0-5：保留 AudienceKind 与 ConversationId 供 Gateway 路由，
+            // 仅排除 TargetUserIds（O(N) 数组，数据库列为唯一权威）。
             var wireEvt = CreateWirePayload(evt);
             payloadUtf8s[i] = JsonSerializer.SerializeToUtf8Bytes(
                 wireEvt,
@@ -73,6 +78,10 @@ internal static class OutboxInsertHelper
             // AudienceKind 为 null 时按 User(0) 持久化，兼容历史事件。
             audienceKinds[i] = (short)(evt.AudienceKind ?? 0);
             conversationIds[i] = evt.ConversationId;
+            // P0-8：trace context 写入独立列。
+            traceParents[i] = evt.TraceParent;
+            traceStates[i] = evt.TraceState;
+            occurredAtMsValues[i] = evt.OccurredAtMs;
         }
 
         await using var command = new NpgsqlCommand(
@@ -80,7 +89,7 @@ internal static class OutboxInsertHelper
              INSERT INTO {schema.OutboxTableSql} (
                  event_id, payload_json, payload_utf8, target_user_id, event_type, status,
                  created_at_ms, next_attempt_at_ms, attempt_count, target_user_ids,
-                 audience_kind, conversation_id
+                 audience_kind, conversation_id, trace_parent, trace_state, occurred_at_ms
              )
              SELECT
                  arr.event_id,
@@ -98,7 +107,10 @@ internal static class OutboxInsertHelper
                      ELSE string_to_array(arr.target_user_ids_text, ',')::bigint[]
                  END,
                  arr.audience_kind,
-                 arr.conversation_id
+                 arr.conversation_id,
+                 arr.trace_parent,
+                 arr.trace_state,
+                 arr.occurred_at_ms
              FROM UNNEST(
                  @event_ids,
                  @payload_utf8s,
@@ -106,8 +118,11 @@ internal static class OutboxInsertHelper
                  @event_types,
                  @target_user_ids_text,
                  @audience_kinds,
-                 @conversation_ids
-             ) AS arr(event_id, payload_utf8, target_user_id, event_type, target_user_ids_text, audience_kind, conversation_id)
+                 @conversation_ids,
+                 @trace_parents,
+                 @trace_states,
+                 @occurred_at_ms_values
+             ) AS arr(event_id, payload_utf8, target_user_id, event_type, target_user_ids_text, audience_kind, conversation_id, trace_parent, trace_state, occurred_at_ms)
              ON CONFLICT (event_id) DO NOTHING;
              """,
             connection,
@@ -131,14 +146,25 @@ internal static class OutboxInsertHelper
             "conversation_ids",
             NpgsqlDbType.Array | NpgsqlDbType.Text);
         conversationIdsParam.Value = conversationIds;
+        // P0-8：trace context 与 occurred_at_ms 列参数。
+        var traceParentsParam = command.Parameters.Add(
+            "trace_parents",
+            NpgsqlDbType.Array | NpgsqlDbType.Text);
+        traceParentsParam.Value = traceParents;
+        var traceStatesParam = command.Parameters.Add(
+            "trace_states",
+            NpgsqlDbType.Array | NpgsqlDbType.Text);
+        traceStatesParam.Value = traceStates;
+        command.Parameters.AddWithValue("occurred_at_ms_values", occurredAtMsValues);
         // ExecuteNonQueryAsync 返回受影响行数；ON CONFLICT DO NOTHING 跳过的行不计入。
         return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// 四-1：创建用于 wire payload 的副本，排除 <see cref="RealtimeEvent.TargetUserIds"/>
-    /// 与 <see cref="RealtimeEvent.AudienceKind"/>。二者以数据库列为唯一权威，
-    /// 账号删除只需 <c>array_remove</c> 修改列，无需逐行反序列化重写 payload。
+    /// 四-1：创建用于 wire payload 的副本。
+    /// P0-5：保留 <see cref="RealtimeEvent.AudienceKind"/> 与 <see cref="RealtimeEvent.ConversationId"/>
+    /// 在 wire payload 中，Gateway 需要这些字段判断投递语义（会话级受众 vs 普通用户事件）。
+    /// <see cref="RealtimeEvent.TargetUserIds"/> 仍排除：O(N) 数组不在 payload 中，数据库列是唯一权威。
     /// </summary>
     private static RealtimeEvent CreateWirePayload(RealtimeEvent evt)
     {
@@ -154,10 +180,14 @@ internal static class OutboxInsertHelper
             TraceParent = evt.TraceParent,
             TraceState = evt.TraceState,
             OccurredAtMs = evt.OccurredAtMs,
-            // TargetUserIds 排除：数据库列 target_user_ids 是唯一权威
-            // AudienceKind 排除：数据库列 audience_kind 是唯一权威
+            // P0-5：AudienceKind 和 ConversationId 保留在 wire payload 中，
+            // Gateway 需要这些字段判断投递语义。
+            AudienceKind = evt.AudienceKind,
             ConversationId = evt.ConversationId,
-            Payload = evt.Payload,
+            // TargetUserIds 仍排除：O(N) 数组不在 payload 中，数据库列是唯一权威。
+            TargetUserIds = null,
+            // Payload 是 [JsonIgnore] 的运行时引用，不参与序列化，置空避免携带。
+            Payload = null,
         };
     }
 

@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Text;
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
@@ -54,10 +53,11 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
 
     public async Task PublishWithPayloadAsync(RealtimeEvent evt, ReadOnlyMemory<byte>? payloadUtf8, CancellationToken ct = default)
     {
-        // Perf-4：优先使用预序列化的 UTF-8 字节，避免重新序列化；为空时回退到序列化路径。
-        var payload = payloadUtf8 is { Length: > 0 } bytes
-            ? Encoding.UTF8.GetString(bytes.Span)
-            : JsonSerializer.Serialize(evt, RealtimeJsonSerializerContext.Default.RealtimeEvent);
+        // P0-8：优先使用预序列化的 UTF-8 字节直接传给 NATS，避免 UTF-16 中间 string。
+        // 为空时回退到 SerializeToUtf8Bytes（仍是 UTF-8 字节，不经 string）。
+        ReadOnlyMemory<byte> payload = payloadUtf8 is { Length: > 0 } bytes
+            ? bytes
+            : JsonSerializer.SerializeToUtf8Bytes(evt, RealtimeJsonSerializerContext.Default.RealtimeEvent);
 
         // 账号清理事件始终广播（Server Saga 共享 durable consumer）。
         if (evt.Type is RealtimeEventType.UserAccountDeleted
@@ -135,10 +135,10 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
             return;
         }
 
-        // Perf-4：优先使用预序列化的 UTF-8 字节，避免重新序列化；为空时回退到序列化路径。
-        var payload = payloadUtf8 is { Length: > 0 } bytes
-            ? Encoding.UTF8.GetString(bytes.Span)
-            : JsonSerializer.Serialize(evt, RealtimeJsonSerializerContext.Default.RealtimeEvent);
+        // P0-8：优先使用预序列化的 UTF-8 字节直接传给 NATS，避免 UTF-16 中间 string。
+        ReadOnlyMemory<byte> payload = payloadUtf8 is { Length: > 0 } bytes
+            ? bytes
+            : JsonSerializer.SerializeToUtf8Bytes(evt, RealtimeJsonSerializerContext.Default.RealtimeEvent);
 
         // 非分片模式：广播单条消息，各 Gateway 自行遍历 TargetUserIds 投递本机会话。
         if (_shardSubjectPattern is null)
@@ -228,12 +228,12 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
     /// 若活跃 shards 为空（目录查询也失败），最终回退到广播 subject 保证不丢事件。
     /// </para>
     /// </summary>
-    /// <param name="payload">已序列化的事件载荷。</param>
+    /// <param name="payload">已序列化的事件载荷（UTF-8 字节）。</param>
     /// <param name="evt">原始事件（用于日志/subject 计算）。</param>
     /// <param name="reason">fallback 原因，用于指标标签。</param>
     /// <param name="ct">取消令牌。</param>
     private async Task PublishToAllShardsAsync(
-        string payload,
+        ReadOnlyMemory<byte> payload,
         RealtimeEvent evt,
         string reason,
         CancellationToken ct)
@@ -285,7 +285,7 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
     /// </summary>
     private async Task PublishToShardsParallelAsync(
         IEnumerable<string> instanceIds,
-        string payload,
+        ReadOnlyMemory<byte> payload,
         RealtimeEvent evt,
         CancellationToken ct)
     {
@@ -351,7 +351,7 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
 
     private async Task PublishSingleShardAsync(
         string instanceId,
-        string payload,
+        ReadOnlyMemory<byte> payload,
         RealtimeEvent evt,
         CancellationToken ct)
     {

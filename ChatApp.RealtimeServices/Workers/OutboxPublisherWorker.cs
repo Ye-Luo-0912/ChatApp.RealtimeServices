@@ -113,35 +113,64 @@ public sealed class OutboxPublisherWorker : BackgroundService
     }
 
     /// <summary>
-    /// P1-3：并行发布一批记录，收集结果后按状态分组批量更新，避免逐事件数据库往返。
+    /// P1-3/P0-9：并行发布一批记录，收集结果后按状态分组批量更新，避免逐事件数据库往返。
     /// 发布与状态更新解耦：发布失败但 lease 未过期的记录会在下一轮被原实例或其它实例重新认领。
-    /// 发布前若距认领已超过 lease 的一半，先续租避免发布期间 lease 过期导致其他实例重复认领。
+    /// <para>
+    /// P0-9：启动独立 renew loop 在发布期间周期性续租 lease（每 lease/3 检查一次），
+    /// 避免长批次发布超过 lease 后其他实例重复认领。续租部分失败时，丢失所有权的记录
+    /// 不标记 Published，让其他实例重新处理。
+    /// </para>
     /// </summary>
     private async Task PublishBatchAsync(
         IReadOnlyList<RealtimeOutboxRecord> records,
         DateTimeOffset claimedAt,
         CancellationToken ct)
     {
-        // P1-3：如果距认领已超过 lease 的一半，先续租避免发布期间 lease 过期。
         var lease = TimeSpan.FromSeconds(_options.LeaseSeconds);
-        if (DateTimeOffset.UtcNow - claimedAt > lease / 2)
-        {
-            try
-            {
-                await _outboxStore
-                    .ExtendLeaseBatchAsync(records, lease, ct)
-                    .ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Outbox lease 续租失败，继续尝试发布。");
-            }
-        }
+        var renewInterval = TimeSpan.FromTicks(lease.Ticks / 3);
 
+        // P0-9：启动独立续租 loop，在发布期间周期性续租 lease。
+        var lostOwnershipEventIds = new HashSet<string>(StringComparer.Ordinal);
+        using var renewCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var renewTask = Task.Run(async () =>
+        {
+            while (!renewCts.Token.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(renewInterval, renewCts.Token).ConfigureAwait(false);
+                    var renewed = await _outboxStore
+                        .ExtendLeaseBatchAsync(records, lease, renewCts.Token)
+                        .ConfigureAwait(false);
+                    if (renewed < records.Count)
+                    {
+                        _logger.LogWarning(
+                            "Outbox lease 续租部分失败：{Renewed}/{Total}，可能丢失部分记录所有权。",
+                            renewed,
+                            records.Count);
+                        // 续租数少于总数：无法确定哪些记录丢失所有权，
+                        // 保守地将所有记录标记为丢失，避免误 MarkPublished 他人认领的记录。
+                        // 已成功发布的记录依赖 JetStream MsgId 去重，重试时不产生重复投递。
+                        lock (lostOwnershipEventIds)
+                        {
+                            foreach (var r in records)
+                                lostOwnershipEventIds.Add(r.EventId);
+                        }
+                    }
+                }
+                catch (OperationCanceledException) when (renewCts.Token.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Outbox lease 续租失败，继续尝试。");
+                }
+            }
+        }, renewCts.Token);
+
+        try
+        {
         var published = new List<RealtimeOutboxRecord>(records.Count);
         var failed = new List<(RealtimeOutboxRecord Record, string Error, TimeSpan Delay)>(records.Count);
         var deadLetters = new List<(RealtimeOutboxRecord Record, string Error)>(records.Count);
@@ -157,6 +186,19 @@ public sealed class OutboxPublisherWorker : BackgroundService
             async (index, token) =>
             {
                 var record = records[index];
+
+                // P0-9：检查记录是否丢失所有权（续租失败），跳过发布。
+                bool lostOwnership;
+                lock (lostOwnershipEventIds)
+                {
+                    lostOwnership = lostOwnershipEventIds.Contains(record.EventId);
+                }
+                if (lostOwnership)
+                {
+                    results[index] = new PublishOutcome(record, Succeeded: false, Error: "lease_lost");
+                    return;
+                }
+
                 // 四-1：路由信息来自数据库列（唯一权威），不从反序列化 payload 读取。
                 // record.Event 为 null 时（新记录），构造最小 RealtimeEvent 供 Publisher 接口使用。
                 var routingEvent = record.Event ?? new RealtimeEvent
@@ -278,6 +320,20 @@ public sealed class OutboxPublisherWorker : BackgroundService
                         record.AttemptCount,
                         error);
                 }
+            }
+        }
+        }
+        finally
+        {
+            // P0-9：停止续租 loop 并等待退出。
+            renewCts.Cancel();
+            try
+            {
+                await renewTask.ConfigureAwait(false);
+            }
+            catch
+            {
+                // 续租 task 异常已在内层 catch 处理，此处忽略。
             }
         }
     }

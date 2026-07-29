@@ -28,26 +28,30 @@ namespace ChatApp.Realtime.Infrastructure.Postgres.Projections;
 /// </summary>
 internal sealed class GroupProjectionDelta
 {
-    private readonly long[] _memberUserIds;
+    private readonly long[]? _memberUserIds;
     private readonly List<RealtimeEvent> _events = new();
 
     /// <param name="conversationId">群会话编号。</param>
-    /// <param name="memberUserIds">群成员用户编号列表（已按 user_id 排序，来自 <c>ListActiveMemberUserIdsAsync</c>）。</param>
-    public GroupProjectionDelta(string conversationId, IReadOnlyList<long> memberUserIds)
+    /// <param name="memberUserIds">
+    /// 群成员用户编号列表（已按 user_id 排序，来自 <c>ListActiveMemberUserIdsAsync</c>）。
+    /// P0-3：传 null 表示群广播——<see cref="AddBroadcast"/> 烙印 AudienceKind=Conversation + ConversationId，
+    /// 但 TargetUserIds 保持 null，Publisher 通过会话级路由目录投递，不再物化成员数组。
+    /// </param>
+    public GroupProjectionDelta(string conversationId, IReadOnlyList<long>? memberUserIds = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(conversationId);
         ConversationId = conversationId;
-        _memberUserIds = memberUserIds.ToArray();
+        _memberUserIds = memberUserIds?.ToArray();
     }
 
     public string ConversationId { get; }
-    public IReadOnlyList<long> MemberUserIds => _memberUserIds;
-    public int MemberCount => _memberUserIds.Length;
+    public IReadOnlyList<long>? MemberUserIds => _memberUserIds;
+    public int MemberCount => _memberUserIds?.Length ?? 0;
 
     /// <summary>
     /// 添加一条聚合广播事件：同一 payload 投递给全体群成员。
-    /// <paramref name="template"/> 的 <see cref="RealtimeEvent.TargetUserIds"/> 会被覆盖为全体成员；
-    /// 其余字段（EventId / Type / PayloadJson / ...）原样保留。
+    /// <paramref name="template"/> 的 <see cref="RealtimeEvent.TargetUserIds"/> 会被覆盖为全体成员
+    /// （或 null，当构造时未传入 <paramref name="memberUserIds"/>）；其余字段原样保留。
     /// </summary>
     /// <remarks>调用方必须确保 <paramref name="template"/> 使用 target-independent EventId。</remarks>
     public GroupProjectionDelta AddBroadcast(RealtimeEvent template)
@@ -83,7 +87,7 @@ internal sealed class GroupProjectionDelta
     /// <summary>当前已收集的事件总数（广播 + 逐用户）。</summary>
     public int Count => _events.Count;
 
-    private static RealtimeEvent WithTargets(RealtimeEvent template, long[] targets, string? conversationId) => new()
+    private static RealtimeEvent WithTargets(RealtimeEvent template, long[]? targets, string? conversationId) => new()
     {
         EventId = template.EventId,
         Type = template.Type,
@@ -95,6 +99,7 @@ internal sealed class GroupProjectionDelta
         OccurredAtMs = template.OccurredAtMs,
         TraceParent = template.TraceParent,
         TraceState = template.TraceState,
+        // P0-3：targets 为 null 时 TargetUserIds=null（群广播），由 AudienceKind=Conversation 路由。
         TargetUserIds = targets,
         AudienceKind = conversationId is null ? null : AudienceKind.Conversation,
         ConversationId = conversationId

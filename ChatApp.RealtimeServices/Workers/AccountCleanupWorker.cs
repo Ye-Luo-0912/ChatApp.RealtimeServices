@@ -173,127 +173,197 @@ public sealed class AccountCleanupWorker : BackgroundService
     /// 六-2：EventId 使用稳定哈希（SHA256）保证跨进程幂等。
     /// 六-3：Outbox 入队 + 附件删除 + cursor 更新在同一事务中原子完成。
     /// 六-1：每批处理后续租 lease，过期则停止处理。
+    /// P0-7：一次认领中循环处理多个批次，每 lease/3 时间续租；达到单周期批次上限主动回退 pending。
     /// </summary>
     private async Task ProcessAttachmentsPhaseAsync(AccountCleanupJob job, TimeSpan leaseDuration, CancellationToken ct)
     {
         var batchSize = Math.Max(1, _options.AccountCleanupBatchSize);
+        var maxBatches = Math.Max(1, _options.AccountCleanupMaxBatchesPerCycle);
+        var currentCursor = job.Cursor;
 
-        // 通过 cursor（attachment_id）分页读取，内存有界。
-        var records = await _attachmentStore
-            .ListForUserExportAsync(job.UserId, job.Cursor, batchSize, ct)
-            .ConfigureAwait(false);
-
-        if (records.Count == 0)
+        for (var batch = 0; batch < maxBatches; batch++)
         {
-            // 附件全部清理完毕，进入 metadata 阶段。
-            _logger.LogInformation(
-                "账号清理 attachments 阶段完成。用户={UserId}",
-                job.UserId);
-            await _jobStore
-                .CompletePhaseAsync(job.UserId, AccountCleanupJob.PhaseAttachments, job.ClaimToken!, ct)
+            // 通过 cursor（attachment_id）分页读取，内存有界。
+            var records = await _attachmentStore
+                .ListForUserExportAsync(job.UserId, currentCursor, batchSize, ct)
                 .ConfigureAwait(false);
-            return;
-        }
 
-        var objectKeys = records.Select(r => r.ObjectKey).ToArray();
-        var attachmentIds = records.Select(r => r.AttachmentId).ToArray();
-        var lastAttachmentId = records[^1].AttachmentId;
-
-        // 六-2：purge EventId 基于 userId + 起始 cursor，使用稳定哈希（SHA256）保证幂等。
-        var cursorForEventId = job.Cursor ?? "start";
-        var purgeEventId = AttachmentEventIdFactory.CreateAttachmentBlobsPurgeEventId(
-            $"cleanup:{job.UserId}",
-            cursorForEventId);
-
-        var purgeEvent = new RealtimeEvent
-        {
-            EventId = purgeEventId,
-            Type = RealtimeEventType.AttachmentBlobsPurge,
-            TargetUserId = job.UserId,
-            OccurredAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-            PayloadJson = JsonSerializer.Serialize(
-                new AttachmentBlobsPurgePayload
+            if (records.Count == 0)
+            {
+                // 附件全部清理完毕，进入 metadata 阶段。
+                _logger.LogInformation(
+                    "账号清理 attachments 阶段完成。用户={UserId}",
+                    job.UserId);
+                var advanced = await _jobStore
+                    .CompletePhaseAsync(job.UserId, AccountCleanupJob.PhaseAttachments, job.ClaimToken!, ct)
+                    .ConfigureAwait(false);
+                if (!advanced)
                 {
-                    UserId = job.UserId,
-                    ObjectKeys = objectKeys,
-                    // Saga 模式下每批为独立 chunk，ChunkCount=1 表示无总片数信息。
-                    ChunkIndex = 0,
-                    ChunkCount = 1
-                },
-                RealtimeJsonSerializerContext.Default.AttachmentBlobsPurgePayload),
-        };
+                    _logger.LogWarning(
+                        "账号清理 attachments 阶段完成失败：lease 已丢失。用户={UserId}",
+                        job.UserId);
+                }
+                return;
+            }
 
-        // 六-3：在同一事务中原子完成 Outbox 入队 + 附件删除 + cursor 更新。
-        var advanced = await _jobStore
-            .ProcessAttachmentsBatchAtomicAsync(
+            var objectKeys = records.Select(r => r.ObjectKey).ToArray();
+            var attachmentIds = records.Select(r => r.AttachmentId).ToArray();
+            var lastAttachmentId = records[^1].AttachmentId;
+
+            // 六-2：purge EventId 基于 userId + 起始 cursor，使用稳定哈希（SHA256）保证幂等。
+            var cursorForEventId = currentCursor ?? "start";
+            var purgeEventId = AttachmentEventIdFactory.CreateAttachmentBlobsPurgeEventId(
+                $"cleanup:{job.UserId}",
+                cursorForEventId);
+
+            var purgeEvent = new RealtimeEvent
+            {
+                EventId = purgeEventId,
+                Type = RealtimeEventType.AttachmentBlobsPurge,
+                TargetUserId = job.UserId,
+                OccurredAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                PayloadJson = JsonSerializer.Serialize(
+                    new AttachmentBlobsPurgePayload
+                    {
+                        UserId = job.UserId,
+                        ObjectKeys = objectKeys,
+                        // Saga 模式下每批为独立 chunk，ChunkCount=1 表示无总片数信息。
+                        ChunkIndex = 0,
+                        ChunkCount = 1
+                    },
+                    RealtimeJsonSerializerContext.Default.AttachmentBlobsPurgePayload),
+            };
+
+            // 六-3：在同一事务中原子完成 Outbox 入队 + 附件删除 + cursor 更新。
+            var batchAdvanced = await _jobStore
+                .ProcessAttachmentsBatchAtomicAsync(
+                    job.UserId,
+                    job.ClaimToken!,
+                    lastAttachmentId,
+                    attachmentIds,
+                    purgeEvent,
+                    ct)
+                .ConfigureAwait(false);
+
+            if (!batchAdvanced)
+            {
+                // lease 已失效（被抢占或过期），停止处理本作业。
+                _logger.LogWarning(
+                    "账号清理 attachments 批次 lease 失效，停止处理。用户={UserId}",
+                    job.UserId);
+                return;
+            }
+
+            // 通知 Outbox Publisher 尽快发布 purge 事件。
+            _outboxSignal.Notify();
+
+            // 推进游标，继续下一批。
+            currentCursor = lastAttachmentId;
+
+            _logger.LogDebug(
+                "账号清理 attachments 批次完成。用户={UserId}；本批={Count}；游标={Cursor}",
                 job.UserId,
-                job.ClaimToken!,
-                lastAttachmentId,
-                attachmentIds,
-                purgeEvent,
-                ct)
-            .ConfigureAwait(false);
+                records.Count,
+                lastAttachmentId);
 
-        if (!advanced)
-        {
-            // lease 已失效（被抢占或过期），停止处理本作业。
-            _logger.LogWarning(
-                "账号清理 attachments 批次 lease 失效，停止处理。用户={UserId}",
-                job.UserId);
-            return;
+            // 六-1 / P0-7：每批处理后续租 lease，过期则停止处理。
+            var renewed = await _jobStore
+                .RenewLeaseAsync(job.UserId, job.Phase, job.ClaimToken!, leaseDuration, ct)
+                .ConfigureAwait(false);
+            if (!renewed)
+            {
+                _logger.LogWarning(
+                    "账号清理 attachments 批次续租失败，停止处理。用户={UserId}",
+                    job.UserId);
+                return;
+            }
         }
 
-        // 通知 Outbox Publisher 尽快发布 purge 事件。
-        _outboxSignal.Notify();
-
-        // 六-1：每批处理后续租 lease。
-        var renewed = await _jobStore
-            .RenewLeaseAsync(job.UserId, job.Phase, job.ClaimToken!, leaseDuration, ct)
-            .ConfigureAwait(false);
-        if (!renewed)
-        {
-            _logger.LogWarning(
-                "账号清理 attachments 批次续租失败，停止处理。用户={UserId}",
-                job.UserId);
-            return;
-        }
-
-        _logger.LogDebug(
-            "账号清理 attachments 批次完成。用户={UserId}；本批={Count}；游标={Cursor}",
+        // 达到单周期批次上限，主动回退为 pending，下一周期重新认领继续处理。
+        _logger.LogInformation(
+            "账号清理 attachments 阶段达到单周期批次上限，回退 pending。用户={UserId}；游标={Cursor}",
             job.UserId,
-            records.Count,
-            lastAttachmentId);
+            currentCursor);
+        await _jobStore
+            .ReleaseToPendingAsync(job.UserId, job.Phase, job.ClaimToken!, ct)
+            .ConfigureAwait(false);
     }
 
     /// <summary>
     /// metadata 阶段：清理设备游标 + 消息 + 反应 + membership periods，写 AccountCleanupCompleted Outbox。
     /// 六-4：扩展清理范围至 reactions / membership_periods / mentioned_user_ids / group_mutation_requests。
     /// 消息删除内部已分批（DELETE LIMIT 循环），mentioned_user_ids 与 group_mutation_requests 在其中清理。
+    /// P0-7：在每步之间增加续租检查点，防止单步耗时超过 lease 导致 lease 被抢占后仍推进。
     /// </summary>
     private async Task ProcessMetadataPhaseAsync(AccountCleanupJob job, TimeSpan leaseDuration, CancellationToken ct)
     {
-        // 清理设备同步游标。
+        // 步骤 1：清理设备同步游标。
         var cursorDeleted = await _deviceSyncCursorStore
             .DeleteByUserAsync(job.UserId, ct)
             .ConfigureAwait(false);
 
-        // 六-4：清理该用户的全部反应记录。
+        // P0-7：续租检查点，防止单步耗时超过 lease。
+        var renewed = await _jobStore
+            .RenewLeaseAsync(job.UserId, job.Phase, job.ClaimToken!, leaseDuration, ct)
+            .ConfigureAwait(false);
+        if (!renewed)
+        {
+            _logger.LogWarning(
+                "账号清理 metadata 阶段续租失败（步骤1后），作业将被其他实例重新认领。用户={UserId}",
+                job.UserId);
+            return;
+        }
+
+        // 步骤 2：六-4 清理该用户的全部反应记录。
         var reactionsDeleted = await _reactionStore
             .DeleteByUserAsync(job.UserId, ct)
             .ConfigureAwait(false);
 
-        // 六-4：清理该用户的全部 membership periods。
+        renewed = await _jobStore
+            .RenewLeaseAsync(job.UserId, job.Phase, job.ClaimToken!, leaseDuration, ct)
+            .ConfigureAwait(false);
+        if (!renewed)
+        {
+            _logger.LogWarning(
+                "账号清理 metadata 阶段续租失败（步骤2后），作业将被其他实例重新认领。用户={UserId}",
+                job.UserId);
+            return;
+        }
+
+        // 步骤 3：六-4 清理该用户的全部 membership periods。
         var membershipPeriodsDeleted = await _membershipPeriodStore
             .DeleteByUserAsync(job.UserId, ct)
             .ConfigureAwait(false);
 
-        // 清理该用户全部消息（内部已分批，直到无剩余行）。
+        renewed = await _jobStore
+            .RenewLeaseAsync(job.UserId, job.Phase, job.ClaimToken!, leaseDuration, ct)
+            .ConfigureAwait(false);
+        if (!renewed)
+        {
+            _logger.LogWarning(
+                "账号清理 metadata 阶段续租失败（步骤3后），作业将被其他实例重新认领。用户={UserId}",
+                job.UserId);
+            return;
+        }
+
+        // 步骤 4：清理该用户全部消息（内部已分批，直到无剩余行）。
         // 六-4：内部同时清理 mentioned_user_ids（array_remove）与 group_mutation_requests。
         var deleted = await _messageStore
             .DeleteByUserAsync(job.UserId, batchSize: 1000, ct)
             .ConfigureAwait(false);
 
-        // 写 AccountCleanupCompleted Outbox（幂等 EventId）。
+        renewed = await _jobStore
+            .RenewLeaseAsync(job.UserId, job.Phase, job.ClaimToken!, leaseDuration, ct)
+            .ConfigureAwait(false);
+        if (!renewed)
+        {
+            _logger.LogWarning(
+                "账号清理 metadata 阶段续租失败（步骤4后），作业将被其他实例重新认领。用户={UserId}",
+                job.UserId);
+            return;
+        }
+
+        // 步骤 5：写 AccountCleanupCompleted Outbox（幂等 EventId）。
         await _messageStore
             .EnqueueEventAsync(
                 new RealtimeEvent
@@ -317,22 +387,16 @@ public sealed class AccountCleanupWorker : BackgroundService
             reactionsDeleted,
             membershipPeriodsDeleted);
 
-        // 六-1：续租 lease 后完成 phase。
-        var renewed = await _jobStore
-            .RenewLeaseAsync(job.UserId, job.Phase, job.ClaimToken!, leaseDuration, ct)
-            .ConfigureAwait(false);
-        if (!renewed)
-        {
-            _logger.LogWarning(
-                "账号清理 metadata 阶段续租失败，作业将被其他实例重新认领。用户={UserId}",
-                job.UserId);
-            return;
-        }
-
-        // 进入 completed 阶段。
-        await _jobStore
+        // P0-7：完成 phase 时校验 claim_token，lease 丢失则不推进到 completed。
+        var advanced = await _jobStore
             .CompletePhaseAsync(job.UserId, AccountCleanupJob.PhaseMetadata, job.ClaimToken!, ct)
             .ConfigureAwait(false);
+        if (!advanced)
+        {
+            _logger.LogWarning(
+                "账号清理 metadata 阶段完成失败：lease 已丢失。用户={UserId}",
+                job.UserId);
+        }
     }
 
     /// <summary>

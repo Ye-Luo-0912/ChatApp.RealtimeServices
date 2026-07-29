@@ -140,6 +140,19 @@ public sealed class JetStreamContextManager
             ct).ConfigureAwait(false);
 
     /// <summary>
+    /// P0-8：bytes 重载，避免 UTF-8 → UTF-16 string → UTF-8 的冗余编码转换。
+    /// </summary>
+    public async Task PublishRealtimeEventAsync(
+        string eventId,
+        ReadOnlyMemory<byte> payload,
+        CancellationToken ct = default)
+        => await PublishToSubjectAsync(
+            _queueOptions.Topics.RealtimeEvents,
+            eventId,
+            payload,
+            ct).ConfigureAwait(false);
+
+    /// <summary>
     /// 将实时事件发布到指定 subject（用于分片投递）。
     /// </summary>
     public async Task PublishRealtimeEventToSubjectAsync(
@@ -150,9 +163,33 @@ public sealed class JetStreamContextManager
         => await PublishToSubjectAsync(subject, eventId, payload, ct)
             .ConfigureAwait(false);
 
+    /// <summary>
+    /// P0-8：bytes 重载，用于分片投递时直接传字节给 NATS。
+    /// </summary>
+    public async Task PublishRealtimeEventToSubjectAsync(
+        string subject,
+        string eventId,
+        ReadOnlyMemory<byte> payload,
+        CancellationToken ct = default)
+        => await PublishToSubjectAsync(subject, eventId, payload, ct)
+            .ConfigureAwait(false);
+
     public async Task PublishAccountCleanupEventAsync(
         string eventId,
         string payload,
+        CancellationToken ct = default)
+        => await PublishToSubjectAsync(
+            _queueOptions.Topics.AccountCleanup,
+            eventId,
+            payload,
+            ct).ConfigureAwait(false);
+
+    /// <summary>
+    /// P0-8：bytes 重载，账号清理事件直接传字节。
+    /// </summary>
+    public async Task PublishAccountCleanupEventAsync(
+        string eventId,
+        ReadOnlyMemory<byte> payload,
         CancellationToken ct = default)
         => await PublishToSubjectAsync(
             _queueOptions.Topics.AccountCleanup,
@@ -174,6 +211,29 @@ public sealed class JetStreamContextManager
         await Context.PublishAsync(
             subject,
             payload,
+            opts: CreatePublishOptions(eventId),
+            headers: NatsTraceContext.CreatePropagationHeaders(),
+            cancellationToken: ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// P0-8：bytes 路径，直接传 byte[] 给 NATS，避免 UTF-16 中间 string。
+    /// </summary>
+    private async Task PublishToSubjectAsync(
+        string subject,
+        string eventId,
+        ReadOnlyMemory<byte> payload,
+        CancellationToken ct)
+    {
+        await GetOrCreateStreamAsync(
+            _options.Streams.RealtimeEvents,
+            [_queueOptions.Topics.RealtimeEvents, _queueOptions.Topics.AccountCleanup],
+            _options.MaxAgeHours,
+            ct).ConfigureAwait(false);
+        // NATS 默认序列化器对 byte[] 使用 raw bytes 直写，无编码转换。
+        await Context.PublishAsync(
+            subject,
+            payload.ToArray(),
             opts: CreatePublishOptions(eventId),
             headers: NatsTraceContext.CreatePropagationHeaders(),
             cancellationToken: ct).ConfigureAwait(false);

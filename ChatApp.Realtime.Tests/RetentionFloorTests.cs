@@ -198,6 +198,136 @@ public sealed class RetentionFloorTests : IAsyncLifetime
         Assert.Equal("m-rw-4", item.LastMessageId);
     }
 
+    [Fact]
+    public async Task RetentionFloor_UpdatesSentCountAtRetentionFloor_AfterPurge()
+    {
+        // P0-2：验证 Retention 推进 floor 后，发送者的 sent_count_at_retention_floor 正确更新。
+        var (client, schema) = await CreateDatabaseAsync("realtime_retention_sent_floor");
+        var messageStore = new NpgsqlRealtimeMessageStore(
+            client,
+            schema,
+            TestMutationPolicy.Instance,
+            NullLogger<NpgsqlRealtimeMessageStore>.Instance);
+        var retentionStore = new NpgsqlRealtimeMessageRetentionStore(
+            client,
+            schema,
+            NullLogger<NpgsqlRealtimeMessageRetentionStore>.Instance);
+
+        var conversationId = ConversationId.CreateDirect(33001, 33002);
+        // 发送者 33001 发送 3 条消息：seq=1,2,3，sender_sequence=1,2,3
+        await messageStore.SaveAsync(
+            CreateMessage("m-sf-1", 33001, 33002, conversationId, "old-1", 1_000),
+            CreateMessageReceivedEvent("evt-sf-1", 33002, "m-sf-1", 1_000));
+        await messageStore.SaveAsync(
+            CreateMessage("m-sf-2", 33001, 33002, conversationId, "old-2", 2_000),
+            CreateMessageReceivedEvent("evt-sf-2", 33002, "m-sf-2", 2_000));
+        await messageStore.SaveAsync(
+            CreateMessage("m-sf-3", 33001, 33002, conversationId, "new-1", 100_000),
+            CreateMessageReceivedEvent("evt-sf-3", 33002, "m-sf-3", 100_000));
+
+        // 删除前：发送者 sent_count_at_retention_floor = sent_count_at_read（回填值，Migration045）
+        Assert.Equal(0, await GetSentCountAtRetentionFloorAsync(client, schema, conversationId, 33001));
+
+        // 删除 seq=1,2，floor 推进到 2
+        await retentionStore.TryPurgeBatchAsync(cutoffReceivedAtMs: 10_000, batchSize: 100);
+        Assert.Equal(2, await GetRetentionFloorSequenceAsync(client, schema, conversationId));
+
+        // 发送者在 floor=2 处的累计发送数 = 2（floor 之后第一条消息 sender_sequence=3，3-1=2）
+        Assert.Equal(2, await GetSentCountAtRetentionFloorAsync(client, schema, conversationId, 33001));
+        // 接收者从未发送，sent_count_at_retention_floor = 0
+        Assert.Equal(0, await GetSentCountAtRetentionFloorAsync(client, schema, conversationId, 33002));
+    }
+
+    [Fact]
+    public async Task ListUnread_FloorBeyondReadCursor_UsesSentCountAtRetentionFloor()
+    {
+        // P0-2：当 retention_floor_sequence > last_read_sequence 时，未读公式必须使用
+        // sent_count_at_retention_floor 而非 sent_count_at_read，否则已删除的自发送消息
+        // 会被多扣减，导致未读数偏低。
+        var (client, schema) = await CreateDatabaseAsync("realtime_retention_floor_beyond_read");
+        var messageStore = new NpgsqlRealtimeMessageStore(
+            client,
+            schema,
+            TestMutationPolicy.Instance,
+            NullLogger<NpgsqlRealtimeMessageStore>.Instance);
+        var conversationStore = new NpgsqlRealtimeConversationStore(client, schema);
+        var listProcessor = new DefaultConversationListQueryProcessor(conversationStore);
+        var markReadProcessor = new DefaultConversationMarkReadProcessor(
+            conversationStore,
+            new RecordingRealtimeOutboxSignal());
+        var retentionStore = new NpgsqlRealtimeMessageRetentionStore(
+            client,
+            schema,
+            NullLogger<NpgsqlRealtimeMessageRetentionStore>.Instance);
+
+        var conversationId = ConversationId.CreateDirect(34001, 34002);
+        // A(34001) 发送 seq=1,2,3，B(34002) 发送 seq=4,5,6
+        await messageStore.SaveAsync(
+            CreateMessage("m-fb-1", 34001, 34002, conversationId, "a-1", 1_000),
+            CreateMessageReceivedEvent("evt-fb-1", 34002, "m-fb-1", 1_000));
+        await messageStore.SaveAsync(
+            CreateMessage("m-fb-2", 34001, 34002, conversationId, "a-2", 2_000),
+            CreateMessageReceivedEvent("evt-fb-2", 34002, "m-fb-2", 2_000));
+        await messageStore.SaveAsync(
+            CreateMessage("m-fb-3", 34001, 34002, conversationId, "a-3", 3_000),
+            CreateMessageReceivedEvent("evt-fb-3", 34002, "m-fb-3", 3_000));
+        await messageStore.SaveAsync(
+            CreateMessage("m-fb-4", 34002, 34001, conversationId, "b-1", 4_000),
+            CreateMessageReceivedEvent("evt-fb-4", 34001, "m-fb-4", 4_000));
+        await messageStore.SaveAsync(
+            CreateMessage("m-fb-5", 34002, 34001, conversationId, "b-2", 5_000),
+            CreateMessageReceivedEvent("evt-fb-5", 34001, "m-fb-5", 5_000));
+        await messageStore.SaveAsync(
+            CreateMessage("m-fb-6", 34002, 34001, conversationId, "b-3", 6_000),
+            CreateMessageReceivedEvent("evt-fb-6", 34001, "m-fb-6", 6_000));
+
+        // A 读到 seq=1，sent_count_at_read=1（A 在 seq=1 前发了 1 条）
+        var read = await markReadProcessor.ProcessAsync(
+            new ConversationMarkReadCommand
+            {
+                RequestId = "read-fb-1",
+                UserId = 34001,
+                ConversationId = conversationId,
+                ReadMessageId = "m-fb-1"
+            });
+        Assert.True(read.Succeeded);
+        // 未读 = 6 - 1 - (3 - 1) = 3（seq 2,3 是 A 自己的，seq 4,5,6 来自 B，但 seq 2,3 仍计入未读
+        // 因为 sent_count - sent_count_at_read = 2 扣除了 A 自发送的 seq 2,3）
+        Assert.Equal(3, read.UnreadCount);
+
+        // Retention 删除 seq=1,2,3（A 的全部消息），floor=3
+        var purge = await retentionStore.TryPurgeBatchAsync(cutoffReceivedAtMs: 3_500, batchSize: 100);
+        Assert.Equal(3, purge.DeletedCount);
+        Assert.Equal(3, await GetRetentionFloorSequenceAsync(client, schema, conversationId));
+
+        // A 的 sent_count_at_retention_floor=3（无 floor 后存活消息 → sent_count=3）
+        Assert.Equal(3, await GetSentCountAtRetentionFloorAsync(client, schema, conversationId, 34001));
+
+        // A 的未读 = 6 - GREATEST(1, 3) - (3 - 3) = 6 - 3 - 0 = 3（seq 4,5,6 来自 B）
+        var listA = await listProcessor.ProcessAsync(
+            new ConversationListQuery
+            {
+                RequestId = "list-fb-a",
+                UserId = 34001,
+                Limit = 10
+            });
+        Assert.True(listA.Succeeded);
+        var itemA = Assert.Single(listA.Items);
+        Assert.Equal(3, itemA.UnreadCount);
+
+        // B 的未读 = 6 - GREATEST(0, 3) - (3 - 0) = 6 - 3 - 3 = 0（seq 4,5,6 是 B 自己发的）
+        var listB = await listProcessor.ProcessAsync(
+            new ConversationListQuery
+            {
+                RequestId = "list-fb-b",
+                UserId = 34002,
+                Limit = 10
+            });
+        Assert.True(listB.Succeeded);
+        var itemB = Assert.Single(listB.Items);
+        Assert.Equal(0, itemB.UnreadCount);
+    }
+
     private async Task<(RealtimeDatabaseClient Client, RealtimeDatabaseSchema Schema)> CreateDatabaseAsync(
         string schemaName)
     {
@@ -226,6 +356,25 @@ public sealed class RetentionFloorTests : IAsyncLifetime
              """,
             connection);
         cmd.Parameters.AddWithValue("cid", conversationId);
+        return Convert.ToInt64(await cmd.ExecuteScalarAsync());
+    }
+
+    private static async Task<long> GetSentCountAtRetentionFloorAsync(
+        RealtimeDatabaseClient client,
+        RealtimeDatabaseSchema schema,
+        string conversationId,
+        long userId)
+    {
+        await using var connection = await client.GetDataSource().OpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            $"""
+             SELECT sent_count_at_retention_floor
+             FROM {schema.ConversationMembersTableSql}
+             WHERE conversation_id = @cid AND user_id = @uid;
+             """,
+            connection);
+        cmd.Parameters.AddWithValue("cid", conversationId);
+        cmd.Parameters.AddWithValue("uid", userId);
         return Convert.ToInt64(await cmd.ExecuteScalarAsync());
     }
 

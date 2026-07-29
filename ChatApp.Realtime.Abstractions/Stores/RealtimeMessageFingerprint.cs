@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Buffers;
@@ -6,17 +7,26 @@ namespace ChatApp.Realtime.Abstractions.Stores;
 
 /// <summary>
 /// 稳定内容指纹：同 (sender, client_message_id) 下用于区分真重放与内容冲突。
-/// v3 起哈希输入覆盖会话、回复、转发、@提及用户与角色等字段；输出仍为 64 位十六进制（兼容 varchar(64)）。
+/// <para>
+/// v4 起使用长度前缀编码（<c>{byteCount}:{utf8}</c>）替代 <c>\n</c> 分隔符，消除字段内含
+/// <c>\n</c> 导致的哈希碰撞；并覆盖 Reply/Forward 的 sender 与 preview，防止仅引用元数据
+/// 变化而不触发冲突。输出仍为 64 位十六进制（兼容 varchar(64)）。
+/// </para>
+/// <para>
+/// P0-10：指纹应在 mentions sanitization 之前基于原始请求计算，避免 sanitization 结果
+/// 依赖当前成员/角色导致相同请求在不同时刻产生不同指纹（误判冲突）。
+/// </para>
 /// </summary>
 public static class RealtimeMessageFingerprint
 {
-    /// <summary>当前写入语义版本（哈希输入前缀 <c>v3:</c>）。</summary>
-    public const int CurrentVersion = 3;
+    /// <summary>当前写入语义版本（哈希输入前缀 <c>v4:</c>）。</summary>
+    public const int CurrentVersion = 4;
 
     /// <summary>
-    /// 计算 v3 指纹：receiver + conversation + content + 排序唯一附件 Id +
-    /// reply + forward + 排序去重 @提及用户与角色。
-    /// 同内容且同附件集合（任意顺序）→ 相同指纹；任意覆盖字段不同 → 不同指纹。
+    /// 计算 v4 指纹：receiver + conversation + content + 排序唯一附件 Id +
+    /// reply（含 sender/preview）+ forward（含 sender/preview）+ 排序去重 @提及用户与角色。
+    /// 每个字段以长度前缀编码，消除分隔符碰撞。同内容且同附件集合（任意顺序）→ 相同指纹；
+    /// 任意覆盖字段不同 → 不同指纹。
     /// </summary>
     public static string Compute(
         long receiverUserId,
@@ -26,36 +36,36 @@ public static class RealtimeMessageFingerprint
         string? replyToMessageId = null,
         string? forwardedFromMessageId = null,
         IReadOnlyList<long>? mentionedUserIds = null,
-        IReadOnlyList<string>? mentionedRoles = null)
+        IReadOnlyList<string>? mentionedRoles = null,
+        long? replyToSenderUserId = null,
+        string? replyToPreview = null,
+        long? forwardedFromSenderUserId = null,
+        string? forwardedFromPreview = null)
     {
         // P0-8：修复 Content=null 的 NRE，attachment-only 消息视为空字符串
         var safeContent = content ?? string.Empty;
 
-        Span<byte> hash = stackalloc byte[32];
-        using (var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
-        {
-            AppendUtf8(hasher, "v3:\n"u8);
-            AppendUserId(hasher, receiverUserId);
-            AppendUtf8(hasher, "\n"u8);
-            AppendUtf8String(hasher, conversationId ?? string.Empty);
-            AppendUtf8(hasher, "\n"u8);
-            AppendUtf8String(hasher, safeContent);
-            AppendUtf8(hasher, "\n"u8);
-            AppendNormalizedAttachmentIds(hasher, attachmentIds);
-            AppendUtf8(hasher, "\n"u8);
-            AppendUtf8String(hasher, replyToMessageId ?? string.Empty);
-            AppendUtf8(hasher, "\n"u8);
-            AppendUtf8String(hasher, forwardedFromMessageId ?? string.Empty);
-            AppendUtf8(hasher, "\n"u8);
-            AppendNormalizedMentionedUserIds(hasher, mentionedUserIds);
-            AppendUtf8(hasher, "\n"u8);
-            AppendNormalizedMentionedRoles(hasher, mentionedRoles);
+        // P0-10：长度前缀编码。每个字段写为 "{utf8字节长度}:{内容}"，
+        // 列表写为 "{count}:" 后跟 count 个长度前缀元素。
+        // 长度前缀保证字段内含 ':' 或 '\n' 时不产生碰撞。
+        var sb = new StringBuilder(256);
+        sb.Append("v4:");
+        AppendLengthPrefixed(sb, receiverUserId.ToString(CultureInfo.InvariantCulture));
+        AppendLengthPrefixed(sb, conversationId ?? string.Empty);
+        AppendLengthPrefixed(sb, safeContent);
+        AppendLengthPrefixedList(sb, NormalizeAttachmentIds(attachmentIds));
+        AppendLengthPrefixed(sb, replyToMessageId ?? string.Empty);
+        AppendLengthPrefixed(sb, forwardedFromMessageId ?? string.Empty);
+        // P0-10：覆盖 Reply/Forward 的 sender 与 preview
+        AppendLengthPrefixed(sb, (replyToSenderUserId ?? 0).ToString(CultureInfo.InvariantCulture));
+        AppendLengthPrefixed(sb, replyToPreview ?? string.Empty);
+        AppendLengthPrefixed(sb, (forwardedFromSenderUserId ?? 0).ToString(CultureInfo.InvariantCulture));
+        AppendLengthPrefixed(sb, forwardedFromPreview ?? string.Empty);
+        AppendLengthPrefixedLongList(sb, NormalizeMentionedUserIds(mentionedUserIds));
+        AppendLengthPrefixedList(sb, NormalizeMentionedRoles(mentionedRoles));
 
-            if (!hasher.TryGetHashAndReset(hash, out var written) || written != 32)
-                throw new CryptographicException("SHA-256 指纹计算失败。");
-        }
-
-        return Convert.ToHexStringLower(hash);
+        var bytes = Encoding.UTF8.GetBytes(sb.ToString());
+        return Convert.ToHexStringLower(SHA256.HashData(bytes));
     }
 
     /// <summary>
@@ -120,7 +130,7 @@ public static class RealtimeMessageFingerprint
     }
 
     /// <summary>
-    /// 与已有行比较：存储指纹可直接相等；NULL/旧版本则用已有行数据重算 v3。
+    /// 与已有行比较：存储指纹可直接相等；NULL/旧版本则用已有行数据重算 v4。
     /// 新增覆盖字段以可选参数传入，旧调用方（仅传基础字段）仍可兼容。
     /// </summary>
     public static bool MatchesExisting(
@@ -133,7 +143,11 @@ public static class RealtimeMessageFingerprint
         string? existingReplyToMessageId = null,
         string? existingForwardedFromMessageId = null,
         IReadOnlyList<long>? existingMentionedUserIds = null,
-        IReadOnlyList<string>? existingMentionedRoles = null)
+        IReadOnlyList<string>? existingMentionedRoles = null,
+        long? existingReplyToSenderUserId = null,
+        string? existingReplyToPreview = null,
+        long? existingForwardedFromSenderUserId = null,
+        string? existingForwardedFromPreview = null)
     {
         if (string.Equals(storedFingerprint, incomingFingerprint, StringComparison.Ordinal))
             return true;
@@ -146,7 +160,11 @@ public static class RealtimeMessageFingerprint
             existingReplyToMessageId,
             existingForwardedFromMessageId,
             existingMentionedUserIds,
-            existingMentionedRoles);
+            existingMentionedRoles,
+            existingReplyToSenderUserId,
+            existingReplyToPreview,
+            existingForwardedFromSenderUserId,
+            existingForwardedFromPreview);
         return string.Equals(recomputed, incomingFingerprint, StringComparison.Ordinal);
     }
 
@@ -211,46 +229,30 @@ public static class RealtimeMessageFingerprint
         return exact;
     }
 
-    private static void AppendNormalizedAttachmentIds(
-        IncrementalHash hasher,
-        IReadOnlyList<string>? attachmentIds)
+    // P0-10：长度前缀编码辅助方法。每个字段写为 "{utf8字节长度}:{内容}"，
+    // 列表写为 "{count}:" 后跟 count 个长度前缀元素。长度前缀消除分隔符碰撞。
+
+    private static void AppendLengthPrefixed(StringBuilder sb, string value)
     {
-        var normalized = NormalizeAttachmentIds(attachmentIds);
-        for (var i = 0; i < normalized.Length; i++)
-        {
-            if (i > 0)
-                AppendUtf8(hasher, ","u8);
-            AppendUtf8String(hasher, normalized[i]);
-        }
+        var byteCount = Encoding.UTF8.GetByteCount(value);
+        sb.Append(byteCount).Append(':').Append(value);
     }
 
-    // P0-8：@提及用户 Id 排序去重后写入哈希，保证任意顺序输入产生相同指纹
-    private static void AppendNormalizedMentionedUserIds(
-        IncrementalHash hasher,
-        IReadOnlyList<long>? mentionedUserIds)
+    private static void AppendLengthPrefixedList(StringBuilder sb, string[] items)
     {
-        var normalized = NormalizeMentionedUserIds(mentionedUserIds);
-        for (var i = 0; i < normalized.Length; i++)
-        {
-            if (i > 0)
-                AppendUtf8(hasher, ","u8);
-            AppendUserId(hasher, normalized[i]);
-        }
+        sb.Append(items.Length).Append(':');
+        for (var i = 0; i < items.Length; i++)
+            AppendLengthPrefixed(sb, items[i]);
     }
 
-    // P0-8：@提及角色排序去重后写入哈希，保证任意顺序输入产生相同指纹
-    private static void AppendNormalizedMentionedRoles(
-        IncrementalHash hasher,
-        IReadOnlyList<string>? mentionedRoles)
+    private static void AppendLengthPrefixedLongList(StringBuilder sb, long[] items)
     {
-        var normalized = NormalizeMentionedRoles(mentionedRoles);
-        for (var i = 0; i < normalized.Length; i++)
-        {
-            if (i > 0)
-                AppendUtf8(hasher, ","u8);
-            AppendUtf8String(hasher, normalized[i]);
-        }
+        sb.Append(items.Length).Append(':');
+        for (var i = 0; i < items.Length; i++)
+            AppendLengthPrefixed(sb, items[i].ToString(CultureInfo.InvariantCulture));
     }
+
+    // 以下 IncrementalHash 辅助方法仅供 ComputeV1 使用（旧版本兼容，不修改）。
 
     private static void AppendUserId(IncrementalHash hasher, long userId)
     {

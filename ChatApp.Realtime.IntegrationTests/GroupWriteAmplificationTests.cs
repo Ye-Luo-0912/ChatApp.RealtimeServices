@@ -1,6 +1,7 @@
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
@@ -86,31 +87,36 @@ public sealed class GroupWriteAmplificationTests : IAsyncLifetime
             outboxCount <= 2,
             $"群消息发送 Outbox 行数 {outboxCount} 超过目标 2（Perf-9：广播聚合后应为 ≤ 2）");
 
-        // 验证广播事件携带 target_user_ids 数组（覆盖全部群成员），而非 per-member 单独行
+        // P0-3：群消息广播使用会话级路由（audience_kind=Conversation，conversation_id=群会话，target_user_ids=NULL），
+        // 由 Publisher 通过 IConversationGatewayDirectory 一次查询会话在线 Gateway 实例集合完成投递，
+        // 不再在 Outbox 行中物化 N=200 的 target_user_ids 数组。
         await using var connection = await client.GetDataSource().OpenConnectionAsync();
         await using var cmd = new NpgsqlCommand(
             $"""
-             SELECT event_type, target_user_id, target_user_ids
+             SELECT event_type, audience_kind, conversation_id, target_user_ids
              FROM {schema.OutboxTableSql}
              ORDER BY event_type
              """,
             connection);
-        var rows = new List<(short EventType, long PrimaryTarget, long[]? AllTargets)>();
+        var rows = new List<(short EventType, AudienceKind Audience, string? ConversationId, long[]? AllTargets)>();
         await using var reader = await cmd.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
             var eventType = reader.GetInt16(0);
-            var primary = reader.GetInt64(1);
-            long[]? all = reader.IsDBNull(2) ? null : (long[])reader.GetValue(2);
-            rows.Add((eventType, primary, all));
+            var audience = (AudienceKind)reader.GetByte(1);
+            string? conversationIdCol = reader.IsDBNull(2) ? null : reader.GetString(2);
+            long[]? all = reader.IsDBNull(3) ? null : (long[])reader.GetValue(3);
+            rows.Add((eventType, audience, conversationIdCol, all));
         }
 
-        // 至少一行应是带 target_user_ids 的广播（MessageReceived 或 ConversationChanged）
+        // 至少一行应为会话级广播（audience_kind=Conversation、conversation_id=群会话、target_user_ids=NULL）
         var broadcastRow = rows.FirstOrDefault(r =>
-            r.AllTargets is not null && r.AllTargets.Length == GroupSize);
+            r.Audience == AudienceKind.Conversation
+            && r.ConversationId == conversationId
+            && r.AllTargets is null);
         Assert.True(
-            broadcastRow.AllTargets is not null,
-            "未找到覆盖全部群成员的广播行（target_user_ids 长度应为 " + GroupSize + "）");
+            broadcastRow.Audience == AudienceKind.Conversation,
+            "未找到会话级广播行（audience_kind=Conversation、conversation_id=群会话、target_user_ids=NULL）");
 
         _ = groupStore;
     }

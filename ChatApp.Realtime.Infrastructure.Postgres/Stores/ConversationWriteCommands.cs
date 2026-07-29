@@ -14,6 +14,34 @@ internal static class ConversationWriteCommands
 {
     public const int MaxTrackedUnreadCount = 10_000;
 
+    /// <summary>
+    /// P0-2：统一的未读数 SQL 表达式。基于序列公式派生，处理 retention floor 与自发送消息扣除。
+    /// <para>
+    /// 有效读水位 = GREATEST(last_read_sequence, retention_floor_sequence)，
+    /// 把已被 Retention 物理删除的区间从未读数中扣除。
+    /// 当 last_read_sequence &gt;= retention_floor_sequence 时，使用 sent_count_at_read 作为发送基线；
+    /// 否则使用 sent_count_at_retention_floor（Retention 推进 floor 时同步更新）。
+    /// </para>
+    /// <para>
+    /// 要求查询使用 c (conversations) 与 m (conversation_members) 别名。
+    /// </para>
+    /// </summary>
+    public static readonly string UnreadCountSqlExpression = $"""
+        LEAST(
+            GREATEST(
+                COALESCE(c.last_sequence, 0)
+                - GREATEST(COALESCE(m.last_read_sequence, 0), COALESCE(c.retention_floor_sequence, 0))
+                - (m.sent_count - CASE
+                    WHEN COALESCE(m.last_read_sequence, 0) >= COALESCE(c.retention_floor_sequence, 0)
+                    THEN m.sent_count_at_read
+                    ELSE m.sent_count_at_retention_floor
+                  END),
+                0
+            ),
+            {MaxTrackedUnreadCount}
+        )::int
+        """;
+
     public static async Task<IReadOnlyList<long>> ListActiveMemberUserIdsAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
@@ -494,16 +522,18 @@ internal static class ConversationWriteCommands
         long targetReceivedAtMs,
         CancellationToken ct)
     {
-        // 读取会话 last_sequence 与成员当前 sent_count / last_read_sequence
+        // 读取会话 last_sequence 与成员当前 sent_count / last_read_sequence / 统一未读公式快照
         long conversationLastSequence;
         long memberSentCount;
         long? currentReadSequence;
+        var currentUnread = 0;
 
         await using (var load = new NpgsqlCommand(
                          $"""
                           SELECT c.last_sequence,
                                  m.sent_count,
-                                 m.last_read_sequence
+                                 m.last_read_sequence,
+                                 {UnreadCountSqlExpression} AS unread_count
                           FROM {schema.ConversationsTableSql} AS c
                           INNER JOIN {schema.ConversationMembersTableSql} AS m
                               ON m.conversation_id = c.conversation_id
@@ -522,15 +552,17 @@ internal static class ConversationWriteCommands
             conversationLastSequence = reader.GetInt64(0);
             memberSentCount = reader.GetInt64(1);
             currentReadSequence = reader.IsDBNull(2) ? null : reader.GetInt64(2);
+            currentUnread = reader.GetInt32(3);
         }
 
-        // 已读到目标或更晚水位：无需推进
+        // 已读到目标或更晚水位：无需推进。
+        // P0-2：未读数使用统一序列公式（含 retention floor 与自发送消息扣除），
+        // 不再用 last_sequence - crs 的简化公式（会多扣自发送消息、忽略 retention floor）。
         if (currentReadSequence is long crs && crs >= targetSequence)
         {
-            var currentUnread = conversationLastSequence - crs;
             return new SequenceReadAdvanceResult(
                 Advanced: false,
-                UnreadCount: Math.Max(0, (int)currentUnread),
+                UnreadCount: currentUnread,
                 LastSequence: conversationLastSequence);
         }
 

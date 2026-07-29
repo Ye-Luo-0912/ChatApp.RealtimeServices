@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Text;
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
@@ -51,10 +50,11 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
 
     public async Task PublishWithPayloadAsync(RealtimeEvent evt, ReadOnlyMemory<byte>? payloadUtf8, CancellationToken ct = default)
     {
-        // Perf-4：优先使用预序列化的 UTF-8 字节，避免重新序列化；为空时回退到序列化路径。
-        var json = payloadUtf8 is { Length: > 0 } bytes
-            ? Encoding.UTF8.GetString(bytes.Span)
-            : JsonSerializer.Serialize(
+        // P0-8：优先使用预序列化的 UTF-8 字节直接传给 NATS，避免 UTF-16 中间 string。
+        // 为空时回退到 SerializeToUtf8Bytes（仍是 UTF-8 字节，不经 string）。
+        ReadOnlyMemory<byte> payload = payloadUtf8 is { Length: > 0 } bytes
+            ? bytes
+            : JsonSerializer.SerializeToUtf8Bytes(
                 evt,
                 RealtimeJsonSerializerContext.Default.RealtimeEvent);
 
@@ -66,7 +66,7 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
         if (isAccountCleanup)
         {
             _routingMetrics?.RecordBroadcastFallback("realtime", "account_cleanup");
-            await PublishToSubjectAsync(_options.Topics.AccountCleanup, json, evt, ct)
+            await PublishToSubjectAsync(_options.Topics.AccountCleanup, payload, evt, ct)
                 .ConfigureAwait(false);
             return;
         }
@@ -75,7 +75,7 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
         if (_shardSubjectPattern is null)
         {
             _routingMetrics?.RecordBroadcastFallback("realtime", "no_pattern");
-            await PublishToSubjectAsync(_options.Topics.RealtimeEvents, json, evt, ct)
+            await PublishToSubjectAsync(_options.Topics.RealtimeEvents, payload, evt, ct)
                 .ConfigureAwait(false);
             return;
         }
@@ -95,7 +95,7 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
         if (lookup.Kind is GatewayLookupResultKind.LookupFailure
             or GatewayLookupResultKind.PartialLookupFailure)
         {
-            await PublishToAllShardsAsync(json, evt, "lookup_failure", ct)
+            await PublishToAllShardsAsync(payload, evt, "lookup_failure", ct)
                 .ConfigureAwait(false);
             return;
         }
@@ -112,7 +112,7 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
         {
             // 兜底：理论上不应到达（UserOffline 已处理），保持原广播回退行为以容错。
             _routingMetrics?.RecordBroadcastFallback("realtime", "empty_directory");
-            await PublishToSubjectAsync(_options.Topics.RealtimeEvents, json, evt, ct)
+            await PublishToSubjectAsync(_options.Topics.RealtimeEvents, payload, evt, ct)
                 .ConfigureAwait(false);
             return;
         }
@@ -123,7 +123,7 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
                 continue;
 
             var subject = ShardedSubjectFormatter.Format(_shardSubjectPattern, instanceId);
-            await PublishToSubjectAsync(subject, json, evt, ct)
+            await PublishToSubjectAsync(subject, payload, evt, ct)
                 .ConfigureAwait(false);
         }
 
@@ -143,10 +143,10 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
             return;
         }
 
-        // Perf-4：优先使用预序列化的 UTF-8 字节，避免重新序列化；为空时回退到序列化路径。
-        var json = payloadUtf8 is { Length: > 0 } bytes
-            ? Encoding.UTF8.GetString(bytes.Span)
-            : JsonSerializer.Serialize(
+        // P0-8：优先使用预序列化的 UTF-8 字节直接传给 NATS，避免 UTF-16 中间 string。
+        ReadOnlyMemory<byte> payload = payloadUtf8 is { Length: > 0 } bytes
+            ? bytes
+            : JsonSerializer.SerializeToUtf8Bytes(
                 evt,
                 RealtimeJsonSerializerContext.Default.RealtimeEvent);
 
@@ -154,7 +154,7 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
         if (_shardSubjectPattern is null)
         {
             _routingMetrics?.RecordBroadcastFallback("realtime", "no_pattern");
-            await PublishToSubjectAsync(_options.Topics.RealtimeEvents, json, evt, ct)
+            await PublishToSubjectAsync(_options.Topics.RealtimeEvents, payload, evt, ct)
                 .ConfigureAwait(false);
             return;
         }
@@ -182,7 +182,7 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
         if (lookup.Kind is GatewayLookupResultKind.LookupFailure
             or GatewayLookupResultKind.PartialLookupFailure)
         {
-            await PublishToAllShardsAsync(json, evt, "partial_lookup_failure", ct)
+            await PublishToAllShardsAsync(payload, evt, "partial_lookup_failure", ct)
                 .ConfigureAwait(false);
             return;
         }
@@ -191,7 +191,7 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
         {
             // 路由目录为空（所有目标离线）：回退到广播，避免事件丢失。
             _routingMetrics?.RecordBroadcastFallback("realtime", "empty_directory");
-            await PublishToSubjectAsync(_options.Topics.RealtimeEvents, json, evt, ct)
+            await PublishToSubjectAsync(_options.Topics.RealtimeEvents, payload, evt, ct)
                 .ConfigureAwait(false);
             return;
         }
@@ -199,7 +199,7 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
         foreach (var instanceId in instances)
         {
             var subject = ShardedSubjectFormatter.Format(_shardSubjectPattern, instanceId);
-            await PublishToSubjectAsync(subject, json, evt, ct)
+            await PublishToSubjectAsync(subject, payload, evt, ct)
                 .ConfigureAwait(false);
         }
 
@@ -215,12 +215,12 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
     /// 若活跃 shards 为空（目录查询也失败），最终回退到广播 subject 保证不丢事件。
     /// </para>
     /// </summary>
-    /// <param name="json">已序列化的事件载荷。</param>
+    /// <param name="payload">已序列化的事件载荷（UTF-8 字节）。</param>
     /// <param name="evt">原始事件（用于日志/subject 计算）。</param>
     /// <param name="reason">fallback 原因，用于指标标签。</param>
     /// <param name="ct">取消令牌。</param>
     private async Task PublishToAllShardsAsync(
-        string json,
+        ReadOnlyMemory<byte> payload,
         RealtimeEvent evt,
         string reason,
         CancellationToken ct)
@@ -239,7 +239,7 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
                 evt.Type,
                 evt.EventId,
                 reason);
-            await PublishToSubjectAsync(_options.Topics.RealtimeEvents, json, evt, ct)
+            await PublishToSubjectAsync(_options.Topics.RealtimeEvents, payload, evt, ct)
                 .ConfigureAwait(false);
             return;
         }
@@ -258,23 +258,27 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
                 continue;
 
             var subject = ShardedSubjectFormatter.Format(_shardSubjectPattern!, instanceId);
-            await PublishToSubjectAsync(subject, json, evt, ct)
+            await PublishToSubjectAsync(subject, payload, evt, ct)
                 .ConfigureAwait(false);
         }
 
         _routingMetrics?.RecordShardPublish("realtime", "fallback", shards.Count);
     }
 
+    /// <summary>
+    /// P0-8：直接传 byte[] 给 NATS，避免 UTF-16 中间 string。
+    /// NATS 默认序列化器对 byte[] 使用 raw bytes 直写，无编码转换。
+    /// </summary>
     private async Task PublishToSubjectAsync(
         string subject,
-        string json,
+        ReadOnlyMemory<byte> payload,
         RealtimeEvent evt,
         CancellationToken ct)
     {
         await _connectionClient.Client
             .PublishAsync(
                 subject,
-                json,
+                payload.ToArray(),
                 headers: NatsTraceContext.CreatePropagationHeaders(),
                 cancellationToken: ct)
             .ConfigureAwait(false);

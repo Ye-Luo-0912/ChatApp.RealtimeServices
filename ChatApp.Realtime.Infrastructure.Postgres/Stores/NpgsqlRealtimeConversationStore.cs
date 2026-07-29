@@ -47,6 +47,8 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
 
         // 排序键与游标必须一致：置顶 → 置顶时间 → 最后消息时间 → ConversationId。
         // NULLS LAST 用 MinValue 哨兵，保证 keyset 比较与 ORDER BY 语义一致。
+        // P0-1：群消息热路径不再更新成员行的 last_message_at_ms，列表排序改用 conversations.last_message_at_ms，
+        // 避免群会话因成员行旧值不能及时排到顶部、keyset cursor 不一致。
         const long nullSortSentinel = long.MinValue;
         await using var command = new NpgsqlCommand(
             $"""
@@ -57,21 +59,10 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                  c.title,
                  c.last_message_id,
                  c.last_message_preview,
-                 COALESCE(m.last_message_at_ms, c.last_message_at_ms) AS last_message_at_ms,
+                 c.last_message_at_ms,
                  c.last_sender_user_id,
-                 -- Perf-1：群聊 unread_count 不再在消息写入时物化更新，改由序列列派生；
-                 -- 单聊 unread_count 仍在写入时维护，但此处统一用序列公式派生，保证两类会话一致。
-                 -- 三-3：有效读水位 = GREATEST(last_read_sequence, retention_floor_sequence)，
-                 -- 把已被 Retention 物理删除的区间从未读数中扣除。
-                 LEAST(
-                     GREATEST(
-                         COALESCE(c.last_sequence, 0)
-                         - GREATEST(COALESCE(m.last_read_sequence, 0), COALESCE(c.retention_floor_sequence, 0))
-                         - (m.sent_count - m.sent_count_at_read),
-                         0
-                     ),
-                     {ConversationWriteCommands.MaxTrackedUnreadCount}
-                 )::int AS unread_count,
+                 -- P0-2：统一未读公式，处理 retention floor 与自发送消息扣除。
+                 {ConversationWriteCommands.UnreadCountSqlExpression} AS unread_count,
                  m.last_read_message_id,
                  m.last_read_at_ms,
                  m.is_pinned,
@@ -89,7 +80,7 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                     OR (
                         m.is_pinned::int,
                         COALESCE(m.pinned_at_ms, {nullSortSentinel}),
-                        COALESCE(m.last_message_at_ms, c.last_message_at_ms, {nullSortSentinel}),
+                        COALESCE(c.last_message_at_ms, {nullSortSentinel}),
                         c.conversation_id
                     ) < (
                         @before_pinned::int,
@@ -101,7 +92,7 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
              ORDER BY
                  m.is_pinned DESC,
                  m.pinned_at_ms DESC NULLS LAST,
-                 COALESCE(m.last_message_at_ms, c.last_message_at_ms) DESC NULLS LAST,
+                 c.last_message_at_ms DESC NULLS LAST,
                  c.conversation_id DESC
              LIMIT @take;
              """,
@@ -452,17 +443,8 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                                 c.last_sequence,
                                 m.last_read_at_ms,
                                 m.last_read_message_id,
-                                -- P0-1：写入路径不再物化 unread_count，此处基于序列公式派生，
-                                -- 与列表查询一致。三-3：有效读水位 = GREATEST(last_read_sequence, retention_floor_sequence)。
-                                LEAST(
-                                    GREATEST(
-                                        c.last_sequence
-                                        - GREATEST(COALESCE(m.last_read_sequence, 0), COALESCE(c.retention_floor_sequence, 0))
-                                        - (m.sent_count - COALESCE(m.sent_count_at_read, 0)),
-                                        0
-                                    ),
-                                    @max_unread
-                                )::int AS unread_count
+                                -- P0-2：统一未读公式，与列表查询一致（含 retention floor 与自发送消息扣除）。
+                                {ConversationWriteCommands.UnreadCountSqlExpression} AS unread_count
                             FROM {session.Schema.ConversationMembersTableSql} AS m
                             INNER JOIN {session.Schema.ConversationsTableSql} AS c
                                 ON c.conversation_id = m.conversation_id
@@ -476,9 +458,6 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
         {
             load.Parameters.AddWithValue("conversation_id", conversationId);
             load.Parameters.AddWithValue("user_id", userId);
-            load.Parameters.AddWithValue(
-                "max_unread",
-                ConversationWriteCommands.MaxTrackedUnreadCount);
             await using var reader = await load.ExecuteReaderAsync(session.CancellationToken).ConfigureAwait(false);
             if (await reader.ReadAsync(session.CancellationToken).ConfigureAwait(false))
             {

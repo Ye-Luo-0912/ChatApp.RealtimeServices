@@ -364,5 +364,21 @@ public sealed class MentionRoundTripTests
             long userId,
             CancellationToken ct = default) =>
             Task.FromResult(_members.Any(m => m.UserId == userId));
+
+        public Task<ConversationMemberRole?> GetMemberRoleAsync(
+            long userId,
+            string conversationId,
+            CancellationToken ct = default) =>
+            Task.FromResult(_members.FirstOrDefault(m => m.UserId == userId)?.Role);
+
+        public Task<IReadOnlyList<long>> ValidateMembersAsync(
+            string conversationId,
+            IReadOnlyList<long> userIds,
+            CancellationToken ct = default)
+        {
+            var memberIds = new HashSet<long>(_members.Select(m => m.UserId));
+            var result = userIds.Where(id => memberIds.Contains(id)).OrderBy(id => id).ToArray();
+            return Task.FromResult<IReadOnlyList<long>>(result);
+        }
     }
 }

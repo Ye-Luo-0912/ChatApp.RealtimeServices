@@ -108,9 +108,23 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             isGroupMessage,
             ct).ConfigureAwait(false);
 
-        // Perf-3：移除事务外的 ledger.FindAsync（连接 #2）与 fingerprint 计算。
-        // 幂等账本查询与记录已下沉到 SaveAsync 事务内（NpgsqlRealtimeMessageStore），
-        // fingerprint 由 SaveAsync 内部计算，避免重复。
+        // P0-10：在 sanitization 之前基于原始请求计算 fingerprint。
+        // 使用 command 的原始 MentionedUserIds/MentionedRoles（未 sanitized），
+        // 避免相同请求因当前成员/角色变化导致 fingerprint 不同（误判冲突）。
+        // Reply/Forward 的 sender 与 preview 也纳入指纹，防止仅引用元数据变化不触发冲突。
+        var requestFingerprint = RealtimeMessageFingerprint.Compute(
+            receiverUserId,
+            command.Content,
+            command.AttachmentIds,
+            conversationId,
+            command.ReplyToMessageId,
+            command.ForwardedFromMessageId,
+            command.MentionedUserIds,
+            command.MentionedRoles,
+            command.ReplyToSenderUserId,
+            command.ReplyToPreview,
+            command.ForwardedFromSenderUserId,
+            command.ForwardedFromPreview);
 
         var record = new RealtimeMessageRecord
         {
@@ -130,6 +144,7 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             ForwardedFromPreview = command.ForwardedFromPreview,
             MentionedUserIds = sanitizedMentions.UserIds,
             MentionedRoles = sanitizedMentions.Roles,
+            RequestFingerprint = requestFingerprint,
             ReceivedAtMs = command.ServerReceivedAtMs
         };
 
@@ -257,8 +272,17 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
     }
 
     /// <summary>
-    /// 规范化 mention 字段。群聊场景下加载成员列表以做群成员校验与发送者角色判定。
+    /// 规范化 mention 字段。
+    /// <para>
+    /// P0-3：群聊场景不再无条件加载全量成员列表。
+    /// </para>
+    /// <list type="bullet">
+    /// <item>无 mention（MentionedUserIds 与 MentionedRoles 均空）：跳过所有群存储查询，直接返回空 + isManager=false。</item>
+    /// <item>有 mention：仅查询发送者角色（GetMemberRoleAsync，O(1)）+ 最多 50 个 mentioned users 的成员资格（ValidateMembersAsync，单条 SQL）。</item>
+    /// </list>
+    /// <para>
     /// 单聊场景下仅做基本去重 + 排除自身；mention 通常无意义但保留透传。
+    /// </para>
     /// </summary>
     private async Task<SanitizedMentions> SanitizeMentionsAsync(
         IncomingMessageCommand command,
@@ -277,15 +301,26 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             return new SanitizedMentions(directUserIds, directRoles);
         }
 
-        // 群聊：加载成员列表（含角色）。
-        // ListMembersAsync 要求 actor 是当前成员；若发送方不是成员则返回空列表，
-        // 此时按"无群上下文"处理——基本去重 + 排除自身 + 视为非管理员，
+        // P0-3：群聊无 mention 时跳过全部群存储查询，直接返回空 + isManager=false。
+        // 下游 SaveAsync 的 TryAdvanceGroupSequenceAsync 内嵌 EXISTS 权威成员校验，
+        // 无需在此预检查发送者成员资格。
+        var hasUserMentions = command.MentionedUserIds is { Count: > 0 };
+        var hasRoleMentions = command.MentionedRoles is { Count: > 0 };
+        if (!hasUserMentions && !hasRoleMentions)
+        {
+            return new SanitizedMentions(
+                MentionValidator.AsReadOnly((long[]?)null),
+                MentionValidator.AsReadOnly((string[]?)null));
+        }
+
+        // 群聊有 mention：查询发送者角色（O(1)）以判定 isManager。
+        // 若发送方不是活跃成员（role=null），退化为基本去重 + isManager=false，
         // 由下游 SaveAsync 的权威成员校验拒绝消息。
-        IReadOnlyList<ConversationMemberItem> members;
+        ConversationMemberRole? senderRole;
         try
         {
-            members = await _groupStore
-                .ListMembersAsync(command.SenderUserId, conversationId, ct)
+            senderRole = await _groupStore
+                .GetMemberRoleAsync(command.SenderUserId, conversationId, ct)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -297,7 +332,7 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             // 群存储异常不应阻塞消息写入；退化为基本去重，下游 SaveAsync 会做权威校验。
             _logger.LogWarning(
                 ex,
-                "群成员查询失败，退化为基本 mention 规范化。会话={ConversationId}；发送用户={SenderUserId}",
+                "群成员角色查询失败，退化为基本 mention 规范化。会话={ConversationId}；发送用户={SenderUserId}",
                 conversationId,
                 command.SenderUserId);
             var fallbackUserIds = MentionValidator.AsReadOnly(
@@ -307,7 +342,7 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             return new SanitizedMentions(fallbackUserIds, fallbackRoles);
         }
 
-        if (members.Count == 0)
+        if (senderRole is null)
         {
             // 发送方不是群成员：基本去重 + 视为非管理员。下游 SaveAsync 会拒绝。
             var nonMemberUserIds = MentionValidator.AsReadOnly(
@@ -317,16 +352,36 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             return new SanitizedMentions(nonMemberUserIds, nonMemberRoles);
         }
 
-        // 找到发送者的角色：Owner/Admin 视为管理员，可 @all/@admin。
-        var isManager = false;
-        var activeMemberUserIds = new HashSet<long>(members.Count);
-        foreach (var m in members)
+        var isManager = senderRole.Value == ConversationMemberRole.Owner
+                        || senderRole.Value == ConversationMemberRole.Admin;
+
+        // P0-3：仅当有 MentionedUserIds 时才查询 mentioned users 的成员资格（单条 SQL）。
+        // 将发送者加入成员集合保证 NormalizeUserIds 的过滤分支生效（集合非空），
+        // 发送者自身由 NormalizeUserIds 的"排除自身"规则移除。
+        HashSet<long>? memberSet = null;
+        if (hasUserMentions)
         {
-            activeMemberUserIds.Add(m.UserId);
-            if (m.UserId == command.SenderUserId
-                && (m.Role == ConversationMemberRole.Owner || m.Role == ConversationMemberRole.Admin))
+            try
             {
-                isManager = true;
+                var validMembers = await _groupStore
+                    .ValidateMembersAsync(conversationId, command.MentionedUserIds!, ct)
+                    .ConfigureAwait(false);
+                memberSet = new HashSet<long>(validMembers.Count + 1) { command.SenderUserId };
+                foreach (var id in validMembers)
+                    memberSet.Add(id);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // 校验失败不阻塞：退化为不做成员过滤（仅基本去重 + 排除自身）。
+                _logger.LogWarning(
+                    ex,
+                    "群成员资格批量校验失败，退化为不做成员过滤。会话={ConversationId}；发送用户={SenderUserId}",
+                    conversationId,
+                    command.SenderUserId);
             }
         }
 
@@ -334,7 +389,7 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             MentionValidator.NormalizeUserIds(
                 command.MentionedUserIds,
                 command.SenderUserId,
-                activeMemberUserIds));
+                memberSet));
         var sanitizedRoles = MentionValidator.AsReadOnly(
             MentionValidator.NormalizeRoles(command.MentionedRoles, isManager));
         return new SanitizedMentions(sanitizedUserIds, sanitizedRoles);

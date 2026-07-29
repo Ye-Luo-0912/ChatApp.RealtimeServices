@@ -152,6 +152,20 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 emoji);
         }
 
+        // P0-6：防御性 recalled 检查（CTE 内对 message_state.recalled_at_ms 二次校验）。
+        // 正常路径下 TryLockMessageAccessAsync 已在锁下读出 recalled_at_ms 并提前返回 AlreadyRecalled，
+        // 到达此处意味着并发窗口内撤回刚提交（持有同一 message_state FOR UPDATE 锁后不应发生，
+        // 此分支仅为深度防御，保持幂等返回 AlreadyRecalled）。
+        if (addStatus == ReactionAddStatus.Recalled)
+        {
+            await session.CommitAsync().ConfigureAwait(false);
+            return new MessageReactionPersistResult(
+                MessageReactionPersistStatus.AlreadyRecalled,
+                messageId,
+                access.ConversationId,
+                emoji);
+        }
+
         await InsertReactionEventsAsync(
                 session,
                 added: true,
@@ -380,12 +394,12 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         long? recalledAtMs;
         long? conversationSequence;
 
-        // 七-3：不再 FOR UPDATE 锁 messages 正文行（避免阻塞编辑/撤回等其他写入）。
-        // 1. 无锁读取 messages 行获取路由信息（不锁正文行）
+        // 七-3 / P0-6：不再 FOR UPDATE 锁 messages 正文行（避免阻塞编辑/撤回等其他写入）。
+        // 1. 无锁读取 messages 行获取路由信息（sender/receiver/conversation_id/conversation_sequence
+        //    均为消息创建后不可变字段，无锁读安全）。recalled_at_ms 改由 message_state 在锁下读取。
         await using (var command = new NpgsqlCommand(
                          $"""
-                          SELECT sender_user_id, receiver_user_id, conversation_id, recalled_at_ms,
-                                 conversation_sequence
+                          SELECT sender_user_id, receiver_user_id, conversation_id, conversation_sequence
                           FROM {_databaseSchema.MessagesTableSql}
                           WHERE message_id = @message_id
                           """,
@@ -400,11 +414,12 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
             senderUserId = reader.GetInt64(0);
             receiverUserId = reader.GetInt64(1);
             conversationId = reader.IsDBNull(2) ? null : reader.GetString(2);
-            recalledAtMs = reader.IsDBNull(3) ? null : reader.GetInt64(3);
-            conversationSequence = reader.IsDBNull(4) ? null : reader.GetInt64(4);
+            conversationSequence = reader.IsDBNull(3) ? null : reader.GetInt64(3);
         }
 
-        // 2. 确保状态行存在（Migration042 引入的 message_state 表）
+        // 2. 确保状态行存在（Migration042 引入的 message_state 表）。
+        // FK 为 DEFERRABLE（Migration047），若消息刚好被 retention 删除此 INSERT 仍成功，
+        // 后续提交时 FK 校验失败会回滚，调用方按异常处理。
         await using (var ensureCmd = new NpgsqlCommand(
                          $"""
                           INSERT INTO {_databaseSchema.MessageStateTableSql} ("message_id", "changed_at_ms")
@@ -418,10 +433,13 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
             await ensureCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
 
-        // 3. 锁独立状态行（不锁 messages 正文行），串行化同一消息上的 Reaction 操作
+        // 3. P0-6：锁独立状态行（不锁 messages 正文行），串行化同一消息上的 Reaction 操作。
+        // 同时在锁下读取 message_state.recalled_at_ms，消除"无锁读 messages.recalled_at_ms →
+        // 锁 message_state"两步间撤回提交的竞态。Recall 同样先锁 message_state 再锁 messages，
+        // 锁顺序一致（message_state → messages），无死锁。
         await using (var lockCmd = new NpgsqlCommand(
                          $"""
-                          SELECT 1 FROM {_databaseSchema.MessageStateTableSql}
+                          SELECT "recalled_at_ms" FROM {_databaseSchema.MessageStateTableSql}
                           WHERE message_id = @message_id
                           FOR UPDATE
                           """,
@@ -432,6 +450,7 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
             await using var lockReader = await lockCmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
             if (!await lockReader.ReadAsync(ct).ConfigureAwait(false))
                 return null;
+            recalledAtMs = lockReader.IsDBNull(0) ? null : lockReader.GetInt64(0);
         }
 
         return new MessageAccess(
@@ -465,6 +484,11 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         await using var command = new NpgsqlCommand(
             $"""
              WITH
+             recalled AS (
+                 SELECT 1 FROM {_databaseSchema.MessageStateTableSql}
+                 WHERE message_id = @message_id AND recalled_at_ms IS NOT NULL
+                 LIMIT 1
+             ),
              existing AS (
                  SELECT 1 FROM {_databaseSchema.MessageReactionsTableSql}
                  WHERE message_id = @message_id AND user_id = @user_id AND emoji = @emoji
@@ -489,6 +513,7 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
              ),
              decision AS (
                  SELECT CASE
+                     WHEN EXISTS(SELECT 1 FROM recalled) THEN 3
                      WHEN EXISTS(SELECT 1 FROM existing) THEN 0
                      WHEN (SELECT v FROM user_cnt) >= @max_per_user THEN 1
                      WHEN NOT EXISTS(SELECT 1 FROM emoji_exists_other)
@@ -538,6 +563,7 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         {
             0 => ReactionAddStatus.AlreadyExists,
             1 => ReactionAddStatus.LimitExceeded,
+            3 => ReactionAddStatus.Recalled,
             _ => ReactionAddStatus.Inserted
         }, count);
     }
@@ -557,6 +583,11 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         await using var command = new NpgsqlCommand(
             $"""
              WITH
+             recalled AS (
+                 SELECT 1 FROM {_databaseSchema.MessageStateTableSql}
+                 WHERE message_id = @message_id AND recalled_at_ms IS NOT NULL
+                 LIMIT 1
+             ),
              emoji_count_pre AS (
                  SELECT COUNT(*)::int AS v FROM {_databaseSchema.MessageReactionsTableSql}
                  WHERE message_id = @message_id AND emoji = @emoji
@@ -564,6 +595,7 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
              del AS (
                  DELETE FROM {_databaseSchema.MessageReactionsTableSql}
                  WHERE message_id = @message_id AND user_id = @user_id AND emoji = @emoji
+                   AND NOT EXISTS (SELECT 1 FROM recalled)
                  RETURNING 1
              ),
              bump AS (
@@ -743,6 +775,7 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
     {
         AlreadyExists,
         LimitExceeded,
-        Inserted
+        Inserted,
+        Recalled
     }
 }

@@ -57,7 +57,8 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
              WHERE item.event_id = candidates.event_id
              RETURNING item.event_id, item.event_type, item.target_user_id, item.target_user_ids,
                  item.audience_kind, item.conversation_id,
-                 item.payload_json, item.payload_utf8, item.attempt_count, item.locked_by, item.claim_token;
+                 item.payload_json, item.payload_utf8, item.attempt_count, item.locked_by, item.claim_token,
+                 item.trace_parent, item.trace_state;
              """,
             connection);
         command.Parameters.AddWithValue("now", now);
@@ -86,15 +87,18 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
             var attemptCount = reader.GetInt32(8);                                      // attempt_count
             var lockOwner = reader.GetString(9);                                        // locked_by
             var claimTokenFromRow = reader.GetString(10);                               // claim_token
+            // P0-8：trace context 从独立列读取，零 JSON 解析。
+            var traceParentCol = reader.IsDBNull(11) ? null : reader.GetString(11);     // trace_parent
+            var traceStateCol = reader.IsDBNull(12) ? null : reader.GetString(12);      // trace_state
 
             RealtimeEvent? evt = null;
-            string? traceParent = null;
-            string? traceState = null;
+            string? traceParent = traceParentCol;
+            string? traceState = traceStateCol;
 
-            if (payloadUtf8 is { Length: > 0 } utf8)
+            if (payloadUtf8 is { Length: > 0 })
             {
-                // 新记录：payload_utf8 已排除路由字段，用 JsonDocument 轻量提取 trace context。
-                (traceParent, traceState) = ExtractTraceContext(utf8);
+                // 新记录：trace context 已从列读取，无需解析 payload_utf8。
+                // P0-8：消除 JsonDocument.Parse(payload_utf8) 提取 trace 的开销。
             }
             else if (payloadJson is not null)
             {
@@ -109,9 +113,10 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
                         targetUserIds = evt.TargetUserIds;
                     if (audienceKindRaw == 0 && evt.AudienceKind is not null)
                         audienceKindRaw = (short)evt.AudienceKind.Value;
-                    traceParent = evt.TraceParent;
-                    traceState = evt.TraceState;
-                    // 旧记录无 payload_utf8，从 event 序列化生成 wire payload（排除路由字段）。
+                    // P0-8：trace 优先用列值；列为 NULL 时从 payload fallback（旧记录）。
+                    traceParent ??= evt.TraceParent;
+                    traceState ??= evt.TraceState;
+                    // 旧记录无 payload_utf8，从 event 序列化生成 wire payload。
                     payloadUtf8 = JsonSerializer.SerializeToUtf8Bytes(
                         CreateWirePayload(evt),
                         RealtimeJsonSerializerContext.Default.RealtimeEvent);
@@ -138,39 +143,8 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
     }
 
     /// <summary>
-    /// 四-1/五：从 wire payload（已排除路由字段）轻量提取 W3C trace context。
-    /// 使用 <see cref="JsonDocument"/> 做低分配 DOM 读取，不做完整反序列化。
-    /// </summary>
-    private static (string? TraceParent, string? TraceState) ExtractTraceContext(ReadOnlyMemory<byte> utf8Json)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(utf8Json);
-            if (!doc.RootElement.TryGetProperty("TraceParent", out var tp)
-                || tp.ValueKind != JsonValueKind.String)
-            {
-                return (null, null);
-            }
-
-            var traceParent = tp.GetString();
-            string? traceState = null;
-            if (doc.RootElement.TryGetProperty("TraceState", out var ts)
-                && ts.ValueKind == JsonValueKind.String)
-            {
-                traceState = ts.GetString();
-            }
-
-            return (traceParent, traceState);
-        }
-        catch (JsonException)
-        {
-            return (null, null);
-        }
-    }
-
-    /// <summary>
-    /// 四-1：创建 wire payload 副本，排除 <see cref="RealtimeEvent.TargetUserIds"/>
-    /// 与 <see cref="RealtimeEvent.AudienceKind"/>。用于旧记录回退时生成 payload_utf8。
+    /// 四-1：创建 wire payload 副本。P0-5：保留 AudienceKind 与 ConversationId，
+    /// 仅排除 TargetUserIds（O(N) 数组）。用于旧记录回退时生成 payload_utf8。
     /// </summary>
     private static RealtimeEvent CreateWirePayload(RealtimeEvent evt)
     {
@@ -186,8 +160,10 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
             TraceParent = evt.TraceParent,
             TraceState = evt.TraceState,
             OccurredAtMs = evt.OccurredAtMs,
+            AudienceKind = evt.AudienceKind,
             ConversationId = evt.ConversationId,
-            Payload = evt.Payload,
+            TargetUserIds = null,
+            Payload = null,
         };
     }
 

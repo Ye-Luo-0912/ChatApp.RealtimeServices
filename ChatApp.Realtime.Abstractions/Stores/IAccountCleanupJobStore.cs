@@ -39,8 +39,27 @@ public interface IAccountCleanupJobStore
     /// <para>
     /// attachments → metadata(pending)；metadata → completed(pending)。
     /// </para>
+    /// <para>
+    /// P0-7：使用 UPDATE ... RETURNING 校验 claim_token。返回 <c>false</c> 表示 lease 已丢失
+    /// （claim_token 不匹配或状态非 running），此时不创建下一 phase，调用方应停止处理。
+    /// </para>
     /// </summary>
-    Task CompletePhaseAsync(
+    /// <returns><c>true</c> 表示成功推进到下一阶段；<c>false</c> 表示 lease 已丢失。</returns>
+    Task<bool> CompletePhaseAsync(
+        long userId,
+        string phase,
+        string claimToken,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// P0-7：达到单周期批次上限时，主动将作业回退为 pending（带 claim_token 校验），
+    /// 以便下一周期重新认领继续处理。lease 字段清空。
+    /// <para>
+    /// 若 claim_token 不匹配（lease 已丢失），UPDATE 0 行，返回 <c>false</c>。
+    /// </para>
+    /// </summary>
+    /// <returns><c>true</c> 表示已成功回退 pending；<c>false</c> 表示 lease 已丢失。</returns>
+    Task<bool> ReleaseToPendingAsync(
         long userId,
         string phase,
         string claimToken,

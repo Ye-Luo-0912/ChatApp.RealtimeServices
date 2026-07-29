@@ -1,6 +1,7 @@
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Conversations;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
@@ -258,29 +259,32 @@ public sealed class GroupChatTests : IAsyncLifetime
         var persisted = await messageStore.SaveAsync(message, template);
         Assert.Equal(RealtimeMessagePersistKind.Created, persisted.Kind);
 
+        // P0-3：群消息不再走 O(N) 逐成员 TargetUserIds 扇出，改为会话级广播。
+        // audience_kind = Conversation(1)、conversation_id = 群会话、target_user_ids = NULL，
+        // 由 Publisher 通过 IConversationGatewayDirectory 一次查询会话在线 Gateway 实例集合完成投递。
         await using var connection = await client.GetDataSource().OpenConnectionAsync();
         await using var outbox = new NpgsqlCommand(
             $"""
-             SELECT target_user_ids
+             SELECT audience_kind, conversation_id, target_user_ids
              FROM {schema.OutboxTableSql}
              WHERE event_type = @type
              """,
             connection);
         outbox.Parameters.AddWithValue("type", (short)RealtimeEventType.MessageReceived);
         await using var reader = await outbox.ExecuteReaderAsync();
-        long[]? aggregated = null;
+        var hasBroadcast = false;
         while (await reader.ReadAsync())
         {
-            if (!reader.IsDBNull(0))
-            {
-                aggregated = (long[])reader.GetValue(0);
-                break;
-            }
+            var audienceKind = (AudienceKind)reader.GetByte(0);
+            if (audienceKind != AudienceKind.Conversation)
+                continue;
+            Assert.Equal(conversationId, reader.GetString(1));
+            Assert.True(reader.IsDBNull(2));
+            hasBroadcast = true;
+            break;
         }
 
-        Assert.NotNull(aggregated);
-        Array.Sort(aggregated!);
-        Assert.Equal([1L, 2L, 3L], aggregated);
+        Assert.True(hasBroadcast, "未找到会话级广播事件 (audience_kind=Conversation)");
     }
 
     [Fact]

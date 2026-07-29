@@ -35,8 +35,9 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
         RealtimeEvent eventToPublish,
         CancellationToken ct = default)
     {
-        // P0-8：v3 指纹覆盖会话、回复、转发、@提及等字段
-        var fingerprint = RealtimeMessageFingerprint.Compute(
+        // P0-10：优先使用 Processor 在 sanitization 之前基于原始请求计算的指纹；
+        // 未提供时回退到基于 sanitized mentions 重算（向后兼容）。
+        var fingerprint = message.RequestFingerprint ?? RealtimeMessageFingerprint.Compute(
             message.ReceiverUserId,
             message.Content,
             message.AttachmentIds,
@@ -44,7 +45,11 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
             message.ReplyToMessageId,
             message.ForwardedFromMessageId,
             message.MentionedUserIds,
-            message.MentionedRoles);
+            message.MentionedRoles,
+            message.ReplyToSenderUserId,
+            message.ReplyToPreview,
+            message.ForwardedFromSenderUserId,
+            message.ForwardedFromPreview);
 
         await using var dbContext = await _dbContextFactory
             .CreateDbContextAsync(ct)
@@ -65,7 +70,11 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
                 m.ReplyToMessageId,
                 m.ForwardedFromMessageId,
                 m.MentionedUserIds,
-                m.MentionedRoles
+                m.MentionedRoles,
+                m.ReplyToSenderUserId,
+                m.ReplyToPreview,
+                m.ForwardedFromSenderUserId,
+                m.ForwardedFromPreview
             })
             .SingleOrDefaultAsync(ct)
             .ConfigureAwait(false);
@@ -83,7 +92,11 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
                     existing.ReplyToMessageId,
                     existing.ForwardedFromMessageId,
                     existing.MentionedUserIds,
-                    existing.MentionedRoles))
+                    existing.MentionedRoles,
+                    existing.ReplyToSenderUserId,
+                    existing.ReplyToPreview,
+                    existing.ForwardedFromSenderUserId,
+                    existing.ForwardedFromPreview))
             {
                 await transaction.RollbackAsync(ct).ConfigureAwait(false);
                 _logger.LogWarning(
@@ -217,7 +230,11 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
                     m.ReplyToMessageId,
                     m.ForwardedFromMessageId,
                     m.MentionedUserIds,
-                    m.MentionedRoles
+                    m.MentionedRoles,
+                    m.ReplyToSenderUserId,
+                    m.ReplyToPreview,
+                    m.ForwardedFromSenderUserId,
+                    m.ForwardedFromPreview
                 })
                 .SingleOrDefaultAsync(ct)
                 .ConfigureAwait(false);
@@ -235,7 +252,11 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
                     concurrent.ReplyToMessageId,
                     concurrent.ForwardedFromMessageId,
                     concurrent.MentionedUserIds,
-                    concurrent.MentionedRoles))
+                    concurrent.MentionedRoles,
+                    concurrent.ReplyToSenderUserId,
+                    concurrent.ReplyToPreview,
+                    concurrent.ForwardedFromSenderUserId,
+                    concurrent.ForwardedFromPreview))
             {
                 _logger.LogWarning(
                     "入站消息幂等键内容冲突（并发写入检测）。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}",

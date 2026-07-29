@@ -338,5 +338,17 @@ public sealed class DefaultIncomingMessageProcessorTests
             long userId,
             CancellationToken ct = default) =>
             Task.FromResult(true);
+
+        public Task<ConversationMemberRole?> GetMemberRoleAsync(
+            long userId,
+            string conversationId,
+            CancellationToken ct = default) =>
+            Task.FromResult<ConversationMemberRole?>(ConversationMemberRole.Member);
+
+        public Task<IReadOnlyList<long>> ValidateMembersAsync(
+            string conversationId,
+            IReadOnlyList<long> userIds,
+            CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<long>>(userIds.ToArray());
     }
 }

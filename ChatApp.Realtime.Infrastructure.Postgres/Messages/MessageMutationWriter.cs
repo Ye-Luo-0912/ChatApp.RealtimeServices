@@ -149,9 +149,51 @@ internal sealed class MessageMutationWriter
             reader.IsDBNull(5) ? null : reader.GetInt64(5));
     }
 
+    /// <summary>
+    /// P0-6：在读取 messages（FOR UPDATE）之前，确保 message_state 行存在并持有其 FOR UPDATE 锁。
+    /// <para>
+    /// 锁顺序统一为 message_state → messages：Recall 与 Reaction 均先锁 message_state 再访问 messages，
+    /// 消除"Recall 持 messages 锁等 message_state，Reaction 持 message_state 锁等 messages"的死锁。
+    /// </para>
+    /// </summary>
+    public async Task EnsureMessageStateLockedAsync(string messageId)
+    {
+        var ct = _session.CancellationToken;
+        // 先确保状态行存在（新消息可能尚无 message_state 行）
+        await using (var ensureCmd = new NpgsqlCommand(
+                        $"""
+                        INSERT INTO {_session.Schema.MessageStateTableSql} ("message_id", "changed_at_ms")
+                        VALUES (@message_id, 0)
+                        ON CONFLICT ("message_id") DO NOTHING
+                        """,
+                        _session.Connection,
+                        _session.Transaction))
+        {
+            ensureCmd.Parameters.AddWithValue("message_id", messageId);
+            await ensureCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+
+        // 锁定 message_state 行，阻塞 Reaction 的 SELECT FOR UPDATE
+        await using (var lockCmd = new NpgsqlCommand(
+                        $"""
+                        SELECT 1 FROM {_session.Schema.MessageStateTableSql}
+                        WHERE message_id = @message_id
+                        FOR UPDATE
+                        """,
+                        _session.Connection,
+                        _session.Transaction))
+        {
+            lockCmd.Parameters.AddWithValue("message_id", messageId);
+            await using var lockReader = await lockCmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            await lockReader.ReadAsync(ct).ConfigureAwait(false);
+        }
+    }
+
     public async Task<int> ApplyRecallUpdateAsync(string messageId, long recalledAtMs)
     {
         var ct = _session.CancellationToken;
+        // P0-6：同步更新 message_state.recalled_at_ms，使 Reaction 在持有 message_state FOR UPDATE 锁后
+        // 能读到一致的撤回状态，消除"无锁读 messages → 锁 message_state"两步间的撤回竞态。
         await using var command = new NpgsqlCommand(
             $"""
              UPDATE {_session.Schema.MessagesTableSql}
@@ -165,7 +207,11 @@ internal sealed class MessageMutationWriter
                  forwarded_from_sender_user_id = NULL,
                  forwarded_from_preview = NULL
              WHERE message_id = @message_id
-               AND recalled_at_ms IS NULL
+               AND recalled_at_ms IS NULL;
+             UPDATE {_session.Schema.MessageStateTableSql}
+             SET "recalled_at_ms" = @recalled_at_ms
+             WHERE message_id = @message_id
+               AND "recalled_at_ms" IS NULL;
              """,
             _session.Connection,
             _session.Transaction);

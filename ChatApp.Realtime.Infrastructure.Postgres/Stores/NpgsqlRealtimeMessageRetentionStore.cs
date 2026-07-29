@@ -160,7 +160,6 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
                 .ConfigureAwait(false);
 
             var repaired = 0;
-            var unreadRepaired = 0;
             if (affectedConversations.Count > 0)
             {
                 repaired = await RepairConversationTipsAsync(
@@ -169,24 +168,20 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
                         affectedConversations,
                         ct)
                     .ConfigureAwait(false);
-                unreadRepaired = await RepairUnreadCountsAsync(
-                        connection,
-                        transaction,
-                        affectedConversations,
-                        ct)
-                    .ConfigureAwait(false);
+                // P0-2：不再调用 RepairUnreadCountsAsync——列表未读改由序列公式派生，
+                // 不依赖成员行的物化 unread_count 列。sent_count_at_retention_floor
+                // 已在 AdvanceRetentionFloorAsync 中同步更新。
             }
 
             await transaction.CommitAsync(ct).ConfigureAwait(false);
 
             logger.LogDebug(
                 "Message retention purged batch. Deleted={Deleted}; TipsRepaired={Repaired}; " +
-                "AttachmentsAbandoned={Abandoned}; PurgeEvents={PurgeEvents}; UnreadRepaired={Unread}; Cutoff={Cutoff}",
+                "AttachmentsAbandoned={Abandoned}; PurgeEvents={PurgeEvents}; Cutoff={Cutoff}",
                 deletedIds.Count,
                 repaired,
                 attachmentsAbandoned,
                 purgeEventsEnqueued,
-                unreadRepaired,
                 cutoffReceivedAtMs);
 
             return new MessageRetentionPurgeBatchResult(
@@ -194,8 +189,7 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
                 DeletedCount: deletedIds.Count,
                 ConversationsTipRepaired: repaired,
                 AttachmentsAbandoned: attachmentsAbandoned,
-                AttachmentPurgeEventsEnqueued: purgeEventsEnqueued,
-                MembersUnreadRepaired: unreadRepaired);
+                AttachmentPurgeEventsEnqueued: purgeEventsEnqueued);
         }
         finally
         {
@@ -336,6 +330,12 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
     /// 三-3：把每个受影响会话的 <c>retention_floor_sequence</c> 推进到本批被删除消息的
     /// 最大 <c>conversation_sequence</c>。GREATEST 保证 floor 只升不降，跨批乱序删除安全。
     /// 仅推进字典中存在非 NULL 序列号的会话；空字典时短路返回。
+    /// <para>
+    /// P0-2：同步更新活跃成员的 <c>sent_count_at_retention_floor</c>，使未读公式在
+    /// <c>last_read_sequence &lt; retention_floor_sequence</c> 时使用正确的发送基线。
+    /// 计算：发送者在 floor 之后的第一条消息的 <c>sender_sequence - 1</c>（即 floor 处的累计发送数）；
+    /// 若无 floor 之后的消息，则全部消息都在 floor 及之前，累计发送数 = <c>sent_count</c>。
+    /// </para>
     /// </summary>
     private async Task AdvanceRetentionFloorAsync(
         NpgsqlConnection connection,
@@ -364,19 +364,35 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
         command.Parameters.AddWithValue("conversation_ids", conversationIds);
         command.Parameters.AddWithValue("max_sequences", maxSequences);
         await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-    }
 
-    /// <summary>
-    /// Recounts <c>unread_count</c> from messages still present after the member's last-read
-    /// watermark (clamped to non-negative / max tracked). Silent — no UnreadCountChanged fanout.
-    /// </summary>
-    private async Task<int> RepairUnreadCountsAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        IReadOnlyCollection<string> conversationIds,
-        CancellationToken ct)
-        => await ConversationProjectionRepair.RepairUnreadCountsAsync(
-            connection, transaction, databaseSchema, conversationIds, ct).ConfigureAwait(false);
+        // P0-2：同步更新成员的 sent_count_at_retention_floor。
+        // 使用 c.retention_floor_sequence（刚更新后的值，GREATEST 后的一致 floor）。
+        // 子查询利用 ix_messages_sender_sequence_lookup 索引 O(log N) 查找 floor 之后的第一条消息。
+        await using var memberUpdate = new NpgsqlCommand(
+            $"""
+             UPDATE {databaseSchema.ConversationMembersTableSql} AS m
+             SET sent_count_at_retention_floor = COALESCE(
+                 (SELECT msg.sender_sequence - 1
+                  FROM {databaseSchema.MessagesTableSql} AS msg
+                  WHERE msg.conversation_id = m.conversation_id
+                    AND msg.sender_user_id = m.user_id
+                    AND msg.conversation_sequence IS NOT NULL
+                    AND msg.sender_sequence IS NOT NULL
+                    AND msg.conversation_sequence > c.retention_floor_sequence
+                  ORDER BY msg.conversation_sequence ASC
+                  LIMIT 1),
+                 m.sent_count
+             )
+             FROM {databaseSchema.ConversationsTableSql} AS c
+             WHERE m.conversation_id = c.conversation_id
+               AND m.conversation_id = ANY(@conversation_ids)
+               AND m.left_at_ms IS NULL;
+             """,
+            connection,
+            transaction);
+        memberUpdate.Parameters.AddWithValue("conversation_ids", conversationIds);
+        await memberUpdate.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
 
     private static async Task DeleteByMessageIdsAsync(
         NpgsqlConnection connection,

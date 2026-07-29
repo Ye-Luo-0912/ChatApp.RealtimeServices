@@ -71,8 +71,9 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         RealtimeEvent eventToPublish,
         CancellationToken ct = default)
     {
-        // P0-8：v3 指纹覆盖会话、回复、转发、@提及等字段
-        var fingerprint = RealtimeMessageFingerprint.Compute(
+        // P0-10：优先使用 Processor 在 sanitization 之前基于原始请求计算的指纹；
+        // 未提供时回退到基于 sanitized mentions 重算（向后兼容）。
+        var fingerprint = message.RequestFingerprint ?? RealtimeMessageFingerprint.Compute(
             message.ReceiverUserId,
             message.Content,
             message.AttachmentIds,
@@ -80,7 +81,11 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             message.ReplyToMessageId,
             message.ForwardedFromMessageId,
             message.MentionedUserIds,
-            message.MentionedRoles);
+            message.MentionedRoles,
+            message.ReplyToSenderUserId,
+            message.ReplyToPreview,
+            message.ForwardedFromSenderUserId,
+            message.ForwardedFromPreview);
 
         await using var session = await _sessionFactory.BeginAsync(ct).ConfigureAwait(false);
 
@@ -174,7 +179,11 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                     existing.ReplyToMessageId,
                     existing.ForwardedFromMessageId,
                     existing.MentionedUserIds,
-                    existing.MentionedRoles))
+                    existing.MentionedRoles,
+                    existing.ReplyToSenderUserId,
+                    existing.ReplyToPreview,
+                    existing.ForwardedFromSenderUserId,
+                    existing.ForwardedFromPreview))
             {
                 // Perf-3：messages 表冲突但账本未命中（迁移前数据），事务内回填账本 canonical。
                 // COMMIT 而非 ROLLBACK：消息 INSERT 是 0 行（无变更），仅持久化 ledger 行。
@@ -281,23 +290,9 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
 
         if (isGroup)
         {
-            var memberIds = await conversationWriter
-                .ListActiveMemberUserIdsAsync(message.ConversationId!)
-                .ConfigureAwait(false);
-
-            if (memberIds.Count == 0 || !memberIds.Contains(message.SenderUserId))
-            {
-                await session.RollbackAsync().ConfigureAwait(false);
-                _logger.LogWarning(
-                    "群消息写入拒绝：发送方不是成员。消息={MessageId}；会话={ConversationId}；发送用户={SenderUserId}",
-                    message.MessageId,
-                    message.ConversationId,
-                    message.SenderUserId);
-                return RealtimeMessagePersistResult.NotAllowed(message.MessageId);
-            }
-
-            // Perf-1：群消息走 O(1) 序列推进，不再更新成员的 unread_count / last_message_at_ms。
-            // 未读数由客户端根据广播中的 last_sequence 与本地 last_read_sequence 派生。
+            // P0-3：移除 ListActiveMemberUserIdsAsync 全量成员加载与预检查。
+            // TryAdvanceGroupSequenceAsync 的 advanced CTE 内嵌 EXISTS 权威成员资格检查，
+            // 消除预检查与 UPDATE 之间的 TOCTOU 竞态；返回 null 即权威拒绝。
             var newSequence = await conversationWriter
                 .TryAdvanceGroupSequenceAsync(
                     message.ConversationId!,
@@ -309,8 +304,6 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
 
             if (newSequence is null)
             {
-                // P0-3：TryAdvanceGroupSequenceAsync 的 advanced CTE 内嵌权威成员资格检查，
-                // 消除上方 ListActiveMemberUserIdsAsync 预检查与本 UPDATE 之间的 TOCTOU 竞态。
                 // 返回 null 可能因：会话不存在 / 非群 / 群已解散 / 发送者非活跃成员。
                 // 事务回滚会自动撤销同事务内的消息 INSERT 与附件绑定。
                 await session.RollbackAsync().ConfigureAwait(false);
@@ -330,13 +323,14 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 boundAttachmentRefs,
                 newSequence);
 
-            // Perf-1：群消息只产生 1 行广播 Outbox（ConversationChanged + last_sequence）。
-            // 不再生成 per-user UnreadCountChanged 事件，Outbox 行数从 1+N 降为 1。
-            var delta = new GroupProjectionDelta(message.ConversationId!, memberIds);
+            // P0-3：群广播事件 AudienceKind=Conversation + ConversationId，TargetUserIds=null。
+            // Publisher 通过 IConversationGatewayDirectory 一次查询会话在线 Gateway 实例集合投递，
+            // 不再物化成员数组。GroupProjectionDelta 构造时不传 memberUserIds 即为广播模式。
+            var delta = new GroupProjectionDelta(message.ConversationId!);
             delta.AddBroadcast(RealtimeMessageEventFactory.CreateGroupMessageAggregatedEvent(
                 createdEvent,
                 message,
-                memberIds));
+                targetUserIds: null));
 
             delta.AddBroadcast(GroupProjectionEventFactory.CreateGroupConversationChangedBroadcast(
                 message.ConversationId!,
@@ -661,6 +655,12 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                     RecalledAtMs: prior.RecalledAtMs)
                 : MessageMutationWriter.MapRecallFailure(prior.ErrorCode, messageId, prior.ConversationId);
         }
+
+        // P0-6：在读取 messages（FOR UPDATE）之前先锁定 message_state 行。
+        // 统一锁顺序为 message_state → messages，消除 Recall 与 Reaction 之间的死锁
+        // （Recall 持 messages 等 message_state，Reaction 持 message_state 等 messages）。
+        // FK 为 DEFERRABLE，若消息不存在此 INSERT 仍成功，后续 ReadMessageForRecallAsync 返回 null 时回滚即可。
+        await mutationWriter.EnsureMessageStateLockedAsync(messageId).ConfigureAwait(false);
 
         var target = await mutationWriter.ReadMessageForRecallAsync(messageId).ConfigureAwait(false);
         if (target is null)

@@ -82,7 +82,11 @@ public sealed class RealtimeSchemaMigrationRunner
         new Migration040_SenderSequenceAndRetentionFloor(),
         new Migration041_AccountCleanupJobLease(),
         new Migration042_MessageStateTable(),
-        new Migration043_OutboxPayloadJsonNullable()
+        new Migration043_OutboxPayloadJsonNullable(),
+        new Migration044_ConversationListIndexUpdate(),
+        new Migration045_SentCountAtRetentionFloor(),
+        new Migration046_OutboxTraceColumns(),
+        new Migration047_MessageStateFkAndRecall()
     ];
 
     public async Task MigrateAsync(
