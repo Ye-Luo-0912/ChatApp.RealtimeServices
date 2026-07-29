@@ -7,6 +7,7 @@ using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
+using ChatApp.Realtime.Infrastructure.Postgres.Outbox;
 using ChatApp.Realtime.Infrastructure.Postgres.Transactions;
 using Npgsql;
 using NpgsqlTypes;
@@ -110,11 +111,13 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         long occurredAtMs,
         CancellationToken ct = default)
     {
+        // 七-2：先规范化（排序 + 去重 + 过滤），再用规范化后的列表计算 fingerprint，
+        // 避免相同成员集合因输入顺序不同而产生不同指纹。
+        var members = NormalizeCreateMembers(creatorUserId, memberUserIds);
         var fingerprint = ComputeGroupFingerprint(
             1,
-            $"{title}\n{string.Join(',', memberUserIds)}");
+            $"{title}\n{string.Join(',', members)}");
 
-        var members = NormalizeCreateMembers(creatorUserId, memberUserIds);
         if (members.Count > MaxMembersPerGroup)
         {
             return GroupCreatePersistResult.Fail(
@@ -262,7 +265,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 traceState));
         }
 
-        await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
+        await OutboxInsertHelper.InsertManyAsync(connection, transaction, _databaseSchema, events, ct).ConfigureAwait(false);
         await InsertGroupMutationRequestAsync(
                 connection,
                 transaction,
@@ -295,11 +298,13 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         long occurredAtMs,
         CancellationToken ct = default)
     {
+        // 七-2：先规范化（排序 + 去重 + 过滤），再用规范化后的列表计算 fingerprint，
+        // 避免相同成员集合因输入顺序不同而产生不同指纹。
+        var toAdd = NormalizeDistinctPositive(memberUserIds);
         var fingerprint = ComputeGroupFingerprint(
             2,
-            $"{conversationId}\n{string.Join(',', memberUserIds)}");
+            $"{conversationId}\n{string.Join(',', toAdd)}");
 
-        var toAdd = NormalizeDistinctPositive(memberUserIds);
         if (toAdd.Count == 0)
             return GroupMutatePersistResult.Fail("invalid_members", "至少需要一名有效成员。");
         if (toAdd.Count > MaxAddMembersPerRequest)
@@ -448,7 +453,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             traceState,
             causeToken: $"join-batch:{occurredAtMs}"));
 
-        await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
+        await OutboxInsertHelper.InsertManyAsync(connection, transaction, _databaseSchema, events, ct).ConfigureAwait(false);
         await InsertGroupMutationRequestAsync(
                 connection,
                 transaction,
@@ -615,7 +620,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             traceParent,
             traceState);
 
-        await InsertOutboxManyAsync(connection, transaction, [evt], ct).ConfigureAwait(false);
+        await OutboxInsertHelper.InsertManyAsync(connection, transaction, _databaseSchema, [evt], ct).ConfigureAwait(false);
         await InsertGroupMutationRequestAsync(
                 connection,
                 transaction,
@@ -766,7 +771,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             traceParent,
             traceState);
 
-        await InsertOutboxManyAsync(connection, transaction, [evt], ct).ConfigureAwait(false);
+        await OutboxInsertHelper.InsertManyAsync(connection, transaction, _databaseSchema, [evt], ct).ConfigureAwait(false);
         await InsertGroupMutationRequestAsync(
                 connection,
                 transaction,
@@ -988,7 +993,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
                 traceState));
         }
 
-        await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
+        await OutboxInsertHelper.InsertManyAsync(connection, transaction, _databaseSchema, events, ct).ConfigureAwait(false);
         await InsertGroupMutationRequestAsync(
                 connection,
                 transaction,
@@ -1145,7 +1150,7 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             traceState,
             causeToken: $"group-dissolved:{occurredAtMs}");
 
-        await InsertOutboxManyAsync(connection, transaction, [evt], ct).ConfigureAwait(false);
+        await OutboxInsertHelper.InsertManyAsync(connection, transaction, _databaseSchema, [evt], ct).ConfigureAwait(false);
         await InsertGroupMutationRequestAsync(
                 connection,
                 transaction,
@@ -1709,78 +1714,6 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             TargetUserIds = targetUserIds
         };
 
-    private async Task InsertOutboxManyAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        IReadOnlyList<RealtimeEvent> events,
-        CancellationToken ct)
-    {
-        if (events.Count == 0)
-            return;
-
-        if (events.Count > RealtimeWireLimits.MaxEventsPerTransaction)
-        {
-            throw new InvalidOperationException(
-                $"单事务 Outbox 事件数 {events.Count} 超过上限 {RealtimeWireLimits.MaxEventsPerTransaction}。");
-        }
-
-        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        // 聚合后事件数大幅下降，可使用更大 chunk 减少往返。
-        const int chunkSize = 100;
-        for (var offset = 0; offset < events.Count; offset += chunkSize)
-        {
-            var count = Math.Min(chunkSize, events.Count - offset);
-            await using var command = new NpgsqlCommand
-            {
-                Connection = connection,
-                Transaction = transaction
-            };
-            var values = new List<string>(count);
-            for (var i = 0; i < count; i++)
-            {
-                var evt = events[offset + i];
-                var payloadJson = JsonSerializer.Serialize(
-                    evt,
-                    RealtimeJsonSerializerContext.Default.RealtimeEvent);
-
-                if (payloadJson.Length > RealtimeWireLimits.MaxOutboxPayloadBytes)
-                {
-                    throw new InvalidOperationException(
-                        $"Outbox payload 字节数 {payloadJson.Length} 超过上限 {RealtimeWireLimits.MaxOutboxPayloadBytes}；" +
-                        $"事件 {evt.EventId} 无法写入。");
-                }
-
-                var hasTargetUserIds = evt.TargetUserIds is { Length: > 0 };
-                values.Add(
-                    $"(@event_id_{i}, @payload_json_{i}, @target_user_id_{i}, @event_type_{i}, @status, @created_at_ms, @next_attempt_at_ms, 0, @target_user_ids_{i})");
-                command.Parameters.AddWithValue($"event_id_{i}", evt.EventId);
-                command.Parameters.AddWithValue($"payload_json_{i}", payloadJson);
-                command.Parameters.AddWithValue($"target_user_id_{i}", evt.TargetUserId);
-                command.Parameters.AddWithValue($"event_type_{i}", (short)evt.Type);
-                var targetIdsParam = new NpgsqlParameter(
-                    $"target_user_ids_{i}",
-                    NpgsqlDbType.Bigint | NpgsqlDbType.Array)
-                {
-                    Value = hasTargetUserIds ? (object)evt.TargetUserIds! : DBNull.Value
-                };
-                command.Parameters.Add(targetIdsParam);
-            }
-
-            command.Parameters.AddWithValue("status", (short)RealtimeOutboxStatus.Pending);
-            command.Parameters.AddWithValue("created_at_ms", now);
-            command.Parameters.AddWithValue("next_attempt_at_ms", now);
-            command.CommandText =
-                $"""
-                 INSERT INTO {_databaseSchema.OutboxTableSql} (
-                     event_id, payload_json, target_user_id, event_type, status,
-                     created_at_ms, next_attempt_at_ms, attempt_count, target_user_ids
-                 ) VALUES {string.Join(", ", values)}
-                 ON CONFLICT (event_id) DO NOTHING;
-                 """;
-            await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-        }
-    }
-
     private async Task<GroupMutationRequestRow?> TryReadGroupMutationRequestAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
@@ -1847,9 +1780,14 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
-    private static string ComputeGroupFingerprint(short operation, string keyData) =>
-        Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(
-            System.Text.Encoding.UTF8.GetBytes($"{operation}\n{keyData}")));
+    // 七-2：使用长度前缀编码计算指纹，避免不同 keyData 拼接产生相同哈希输入的歧义。
+    private static string ComputeGroupFingerprint(short operation, string keyData)
+    {
+        var payload = $"{operation}\n{keyData.Length}:{keyData}";
+        return Convert.ToHexStringLower(
+            System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(payload)));
+    }
 
     /// <summary>
     /// 审计 Outbox：在业务事务内写入群操作审计记录。

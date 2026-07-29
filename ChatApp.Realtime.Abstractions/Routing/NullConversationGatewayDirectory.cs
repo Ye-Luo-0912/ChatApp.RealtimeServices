@@ -21,4 +21,24 @@ public sealed class NullConversationGatewayDirectory : IConversationGatewayDirec
             GatewayLookupResultKind.LookupFailure,
             Empty));
     }
+
+    public Task RegisterConversationAsync(
+        string conversationId,
+        string gatewayInstanceId,
+        TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    public Task RenewConversationLeaseAsync(
+        string conversationId,
+        string gatewayInstanceId,
+        TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    public Task UnregisterConversationAsync(
+        string conversationId,
+        string gatewayInstanceId,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
 }

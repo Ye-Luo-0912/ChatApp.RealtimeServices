@@ -54,4 +54,21 @@ public sealed class NullWatcherGatewayDirectory : IWatcherGatewayDirectory
     {
         return Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
     }
+
+    /// <summary>
+    /// 四-4：空实现为无操作。
+    /// </summary>
+    public Task RegisterGatewayInstanceAsync(
+        string instanceId,
+        TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+
+    /// <summary>
+    /// 四-4：空实现为无操作。
+    /// </summary>
+    public Task UnregisterGatewayInstanceAsync(
+        string instanceId,
+        CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
 }

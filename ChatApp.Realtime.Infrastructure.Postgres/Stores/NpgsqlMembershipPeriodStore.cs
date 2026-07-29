@@ -165,4 +165,26 @@ public sealed class NpgsqlMembershipPeriodStore(
 
         return periods;
     }
+
+    /// <summary>
+    /// 六-4：账号清理时删除该用户的全部 membership periods。
+    /// </summary>
+    public async Task<int> DeleteByUserAsync(long userId, CancellationToken ct = default)
+    {
+        if (!databaseClient.IsConfigured)
+            return 0;
+
+        await using var connection = await databaseClient.GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+
+        await using var command = new NpgsqlCommand(
+            $"""
+             DELETE FROM {databaseSchema.MembershipPeriodsTableSql}
+             WHERE user_id = @user_id;
+             """,
+            connection);
+        command.Parameters.AddWithValue("user_id", userId);
+        return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
 }

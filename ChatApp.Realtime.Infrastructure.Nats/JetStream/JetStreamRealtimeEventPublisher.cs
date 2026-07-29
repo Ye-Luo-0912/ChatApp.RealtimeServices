@@ -278,8 +278,9 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
     /// 单 shard 走顺序 await 快速路径（无并发开销）；多 shard 使用
     /// <see cref="Parallel.ForEachAsync"/> 限制并发度为 <c>_maxShardParallelism</c>，
     /// 避免无界 <c>Task.WhenAll</c> 在大扇出场景下打爆 NATS 连接。
-    /// 单个 shard 发布失败仅记录日志，不中断其他 shard；仅当全部失败时向上抛出
-    /// <see cref="AggregateException"/>，让上游 outbox/重试逻辑处理整体故障。
+    /// 四-2：任意 shard 发布失败即向上抛出 <see cref="AggregateException"/>，让上游 Outbox
+    /// 整条重试。已成功 shard 依靠 JetStream MsgId（<c>eventId:instanceId</c>）去重，
+    /// 重试时不会重复投递。
     /// </para>
     /// </summary>
     private async Task PublishToShardsParallelAsync(
@@ -306,7 +307,8 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
             return;
         }
 
-        // 多 shard 有限并行：单个 shard 失败不中断其他 shard。
+        // 四-2：多 shard 有限并行——任意 shard 失败即向上抛出，让 Outbox 整条重试。
+        // 已成功 shard 依靠 JetStream MsgId（eventId:instanceId）去重，重试时不会重复投递。
         var failures = new ConcurrentQueue<Exception>();
         await Parallel.ForEachAsync(
             shards,
@@ -331,7 +333,7 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
                 {
                     failures.Enqueue(ex);
                     _logger?.LogWarning(
-                        "分片发布失败，跳过该 shard。事件类型={Type}；事件编号={EventId}；shard={InstanceId}；原因={Message}",
+                        "分片发布失败，将向上抛出触发整条重试。事件类型={Type}；事件编号={EventId}；shard={InstanceId}；原因={Message}",
                         evt.Type,
                         evt.EventId,
                         instanceId,
@@ -339,8 +341,9 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
                 }
             }).ConfigureAwait(false);
 
-        // 全部失败时向上抛出，让上游重试；部分成功则视为已投递（避免重复投递健康 shard）。
-        if (failures.Count == shards.Count)
+        // 四-2：任意 shard 失败即抛出，让上游 Outbox 重试整条记录。
+        // 已成功 shard 依靠 MsgId 去重，重试时不产生重复投递。
+        if (failures.Count > 0)
         {
             throw new AggregateException(failures);
         }

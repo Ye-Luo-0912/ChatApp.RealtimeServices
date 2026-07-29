@@ -41,4 +41,10 @@ public sealed class NoopRealtimeReactionStore(ILogger<NoopRealtimeReactionStore>
         ct.ThrowIfCancellationRequested();
         return Task.FromResult<IReadOnlyList<MessageReactionRecord>>([]);
     }
+
+    public Task<int> DeleteByUserAsync(long userId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(0);
+    }
 }

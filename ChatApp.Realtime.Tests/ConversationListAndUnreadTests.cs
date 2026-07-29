@@ -629,7 +629,7 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
         await using var connection = await client.GetDataSource().OpenConnectionAsync();
         await using var command = new Npgsql.NpgsqlCommand(
             $"""
-             SELECT event_id, payload_json
+             SELECT event_id, COALESCE(payload_json, convert_from(payload_utf8, 'UTF8'))
              FROM {schema.OutboxTableSql}
              WHERE event_type = @event_type
                AND target_user_id = 9002

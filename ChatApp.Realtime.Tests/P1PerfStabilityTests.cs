@@ -107,16 +107,16 @@ public sealed class P1PerfStabilityTests : IAsyncLifetime
         var result = await messageStore.SaveAsync(message, evt);
         Assert.Equal(RealtimeMessagePersistKind.Created, result.Kind);
 
-        // 直接从 Outbox 表读取 payload_json 验证物化结果
+        // 五：payload_json 已停止双写（NULL），从 payload_utf8 验证物化结果。
         await using var connection = await client.GetDataSource().OpenConnectionAsync();
         await using var cmd = new NpgsqlCommand(
-            $"SELECT payload_json FROM {schema.OutboxTableSql} WHERE event_id = @id",
+            $"SELECT payload_utf8 FROM {schema.OutboxTableSql} WHERE event_id = @id",
             connection);
         cmd.Parameters.AddWithValue("id", evt.EventId);
-        var payloadJson = (string)(await cmd.ExecuteScalarAsync())!;
+        var payloadUtf8 = (byte[])(await cmd.ExecuteScalarAsync())!;
 
         var outboxEvent = System.Text.Json.JsonSerializer.Deserialize(
-            payloadJson,
+            payloadUtf8,
             RealtimeJsonSerializerContext.Default.RealtimeEvent)!;
         Assert.NotNull(outboxEvent.PayloadJson);
         var chatPayload = System.Text.Json.JsonSerializer.Deserialize(

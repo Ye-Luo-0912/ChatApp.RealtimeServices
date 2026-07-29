@@ -347,6 +347,27 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         return rows;
     }
 
+    /// <summary>
+    /// 六-4：账号清理时删除该用户的全部反应记录。
+    /// </summary>
+    public async Task<int> DeleteByUserAsync(long userId, CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(userId);
+
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            $"""
+             DELETE FROM {_databaseSchema.MessageReactionsTableSql}
+             WHERE user_id = @user_id;
+             """,
+            connection);
+        command.Parameters.AddWithValue("user_id", userId);
+        return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
     private async Task<MessageAccess?> TryLockMessageAccessAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
@@ -359,13 +380,14 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         long? recalledAtMs;
         long? conversationSequence;
 
+        // 七-3：不再 FOR UPDATE 锁 messages 正文行（避免阻塞编辑/撤回等其他写入）。
+        // 1. 无锁读取 messages 行获取路由信息（不锁正文行）
         await using (var command = new NpgsqlCommand(
                          $"""
                           SELECT sender_user_id, receiver_user_id, conversation_id, recalled_at_ms,
                                  conversation_sequence
                           FROM {_databaseSchema.MessagesTableSql}
                           WHERE message_id = @message_id
-                          FOR UPDATE
                           """,
                          connection,
                          transaction))
@@ -380,6 +402,36 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
             conversationId = reader.IsDBNull(2) ? null : reader.GetString(2);
             recalledAtMs = reader.IsDBNull(3) ? null : reader.GetInt64(3);
             conversationSequence = reader.IsDBNull(4) ? null : reader.GetInt64(4);
+        }
+
+        // 2. 确保状态行存在（Migration042 引入的 message_state 表）
+        await using (var ensureCmd = new NpgsqlCommand(
+                         $"""
+                          INSERT INTO {_databaseSchema.MessageStateTableSql} ("message_id", "changed_at_ms")
+                          VALUES (@message_id, 0)
+                          ON CONFLICT ("message_id") DO NOTHING
+                          """,
+                         connection,
+                         transaction))
+        {
+            ensureCmd.Parameters.AddWithValue("message_id", messageId);
+            await ensureCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+
+        // 3. 锁独立状态行（不锁 messages 正文行），串行化同一消息上的 Reaction 操作
+        await using (var lockCmd = new NpgsqlCommand(
+                         $"""
+                          SELECT 1 FROM {_databaseSchema.MessageStateTableSql}
+                          WHERE message_id = @message_id
+                          FOR UPDATE
+                          """,
+                         connection,
+                         transaction))
+        {
+            lockCmd.Parameters.AddWithValue("message_id", messageId);
+            await using var lockReader = await lockCmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            if (!await lockReader.ReadAsync(ct).ConfigureAwait(false))
+                return null;
         }
 
         return new MessageAccess(

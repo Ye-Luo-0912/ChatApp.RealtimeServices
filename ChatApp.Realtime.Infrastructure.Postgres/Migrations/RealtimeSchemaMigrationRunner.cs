@@ -27,6 +27,17 @@ public sealed class RealtimeSchemaMigrationRunner
         ValidateMigrationVersions(_migrations);
     }
 
+    /// <summary>
+    /// 七-7：未来新增迁移的安全指南。
+    /// <para>
+    /// 1. 创建索引时必须使用 <c>CREATE INDEX CONCURRENTLY</c>（避免长事务锁表），
+    ///    设 <see cref="IRealtimeSchemaMigration.RequiresTransaction"/> 为 <c>false</c>，
+    ///    并通过 <see cref="ConcurrentIndexHelper.EnsureValidAsync"/> 处理 INVALID 索引。
+    /// 2. 大表回填须分批进行（参考 Migration032/Migration038 的分批窗口模式），
+    ///    不可一次性窗口回填。
+    /// 3. 历史迁移（Migration031/032/033）因已应用无法修改，仅作前车之鉴。
+    /// </para>
+    /// </summary>
     public static IReadOnlyList<IRealtimeSchemaMigration> DefaultMigrations() =>
     [
         new Migration001_BaselineSchema(),
@@ -68,7 +79,10 @@ public sealed class RealtimeSchemaMigrationRunner
         new Migration037_ArchiveSnapshotColumns(),
         new Migration038_MembershipPeriodsBackfillAndIndex(),
         new Migration039_UniqueConversationSequence(),
-        new Migration040_SenderSequenceAndRetentionFloor()
+        new Migration040_SenderSequenceAndRetentionFloor(),
+        new Migration041_AccountCleanupJobLease(),
+        new Migration042_MessageStateTable(),
+        new Migration043_OutboxPayloadJsonNullable()
     ];
 
     public async Task MigrateAsync(

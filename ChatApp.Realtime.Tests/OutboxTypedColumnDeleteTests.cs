@@ -249,7 +249,7 @@ public sealed class OutboxTypedColumnDeleteTests : IAsyncLifetime
                 reader.GetString(0),
                 reader.GetInt64(1),
                 reader.GetInt16(2),
-                reader.GetString(3)));
+                reader.IsDBNull(3) ? null : reader.GetString(3)));
         }
 
         return rows;
@@ -259,5 +259,5 @@ public sealed class OutboxTypedColumnDeleteTests : IAsyncLifetime
         string EventId,
         long TargetUserId,
         short EventType,
-        string PayloadJson);
+        string? PayloadJson);
 }

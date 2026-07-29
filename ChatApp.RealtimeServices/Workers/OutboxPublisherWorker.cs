@@ -1,5 +1,6 @@
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Health;
@@ -156,36 +157,52 @@ public sealed class OutboxPublisherWorker : BackgroundService
             async (index, token) =>
             {
                 var record = records[index];
+                // 四-1：路由信息来自数据库列（唯一权威），不从反序列化 payload 读取。
+                // record.Event 为 null 时（新记录），构造最小 RealtimeEvent 供 Publisher 接口使用。
+                var routingEvent = record.Event ?? new RealtimeEvent
+                {
+                    EventId = record.EventId,
+                    Type = record.EventType,
+                    TargetUserId = record.TargetUserId,
+                    TargetUserIds = record.TargetUserIds,
+                    AudienceKind = record.AudienceKind,
+                    ConversationId = record.ConversationId,
+                    OccurredAtMs = 0,
+                    TraceParent = record.TraceParent,
+                    TraceState = record.TraceState,
+                };
                 var parentContext = RealtimeTraceContext.Parse(
-                    record.Event.TraceParent,
-                    record.Event.TraceState);
+                    record.TraceParent,
+                    record.TraceState);
                 using var activity = RealtimeTelemetry.StartOutboxPublish(parentContext);
-                activity?.SetTag("chat.event.type", record.Event.Type.ToString());
+                activity?.SetTag("chat.event.type", record.EventType.ToString());
                 try
                 {
-                    // Perf-4：如果 Outbox 行携带预序列化的 UTF-8 payload，直接发送避免重新序列化；
-                    // 否则回退到 PublishAsync/PublishToManyAsync（内部会序列化）。
+                    // 四-1：路由判断使用列字段。会话级受众（Conversation）也走多目标路径。
+                    var isMultiTarget = record.TargetUserIds is { Length: > 0 }
+                        || record.AudienceKind == AudienceKind.Conversation;
+                    // 五：优先直接发送预序列化的 UTF-8 字节，避免重新序列化。
                     var payload = record.PayloadUtf8;
-                    if (record.Event.TargetUserIds is { Length: > 0 })
+                    if (isMultiTarget)
                     {
                         if (payload is { Length: > 0 })
                         {
-                            await _publisher.PublishToManyWithPayloadAsync(record.Event, payload, token).ConfigureAwait(false);
+                            await _publisher.PublishToManyWithPayloadAsync(routingEvent, payload, token).ConfigureAwait(false);
                         }
                         else
                         {
-                            await _publisher.PublishToManyAsync(record.Event, token).ConfigureAwait(false);
+                            await _publisher.PublishToManyAsync(routingEvent, token).ConfigureAwait(false);
                         }
                     }
                     else
                     {
                         if (payload is { Length: > 0 })
                         {
-                            await _publisher.PublishWithPayloadAsync(record.Event, payload, token).ConfigureAwait(false);
+                            await _publisher.PublishWithPayloadAsync(routingEvent, payload, token).ConfigureAwait(false);
                         }
                         else
                         {
-                            await _publisher.PublishAsync(record.Event, token).ConfigureAwait(false);
+                            await _publisher.PublishAsync(routingEvent, token).ConfigureAwait(false);
                         }
                     }
                     results[index] = new PublishOutcome(record, Succeeded: true, Error: null);

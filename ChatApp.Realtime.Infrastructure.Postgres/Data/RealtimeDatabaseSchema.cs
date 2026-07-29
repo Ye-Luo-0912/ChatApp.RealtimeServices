@@ -12,6 +12,7 @@ public sealed class RealtimeDatabaseSchema
     public string QuotedSchema => QuoteIdentifier(Schema);
 
     public string MessagesTableSql => $"{QuotedSchema}.\"messages\"";
+    public string MessageStateTableSql => $"{QuotedSchema}.\"message_state\"";
     public string AttachmentsTableSql => $"{QuotedSchema}.\"attachments\"";
     public string MessageReactionsTableSql => $"{QuotedSchema}.\"message_reactions\"";
     public string ConversationsTableSql => $"{QuotedSchema}.\"conversations\"";

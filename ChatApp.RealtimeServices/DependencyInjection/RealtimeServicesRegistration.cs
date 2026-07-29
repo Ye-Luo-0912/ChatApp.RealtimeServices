@@ -179,6 +179,10 @@ public static class RealtimeServicesRegistration
                 MaxSinglePayloadBytes = options.MaxSinglePayloadBytes,
                 DeadLetterPayloadLimitBytes = options.DeadLetterPayloadLimitBytes,
                 HistoryQueryConcurrency = options.HistoryQueryConcurrency,
+                // Perf-6：分离查询池配置，避免 InstanceId=auto 时回退为默认值。
+                ReadQueryConcurrency = options.ReadQueryConcurrency,
+                InteractiveQueryConcurrency = options.InteractiveQueryConcurrency,
+                MutationQueryConcurrency = options.MutationQueryConcurrency,
                 HistoryQueryQueueCapacity = options.HistoryQueryQueueCapacity,
                 HistoryQueryWorkerSlots = options.HistoryQueryWorkerSlots,
                 TransientRetryDelayMs = options.TransientRetryDelayMs,
@@ -186,7 +190,13 @@ public static class RealtimeServicesRegistration
                 ReadinessHeartbeatTimeoutMs = options.ReadinessHeartbeatTimeoutMs,
                 OverloadEnqueueTimeoutMs = options.OverloadEnqueueTimeoutMs,
                 OverloadGateTimeoutMs = options.OverloadGateTimeoutMs,
-                OverloadRetryAfterMs = options.OverloadRetryAfterMs
+                OverloadRetryAfterMs = options.OverloadRetryAfterMs,
+                // LongTerm-2 / 六-1：账号清理 Saga 配置，避免 InstanceId=auto 时回退为默认值。
+                AccountCleanupBatchSize = options.AccountCleanupBatchSize,
+                AccountCleanupMaxRetries = options.AccountCleanupMaxRetries,
+                AccountCleanupPollIntervalMs = options.AccountCleanupPollIntervalMs,
+                AccountCleanupMaxBatchesPerCycle = options.AccountCleanupMaxBatchesPerCycle,
+                AccountCleanupLeaseMs = options.AccountCleanupLeaseMs
             }
             : options;
     }

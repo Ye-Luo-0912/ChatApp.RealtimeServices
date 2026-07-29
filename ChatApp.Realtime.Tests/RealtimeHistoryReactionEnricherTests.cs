@@ -115,5 +115,8 @@ public sealed class RealtimeHistoryReactionEnricherTests
             return Task.FromResult<IReadOnlyList<MessageReactionRecord>>(
                 rows.Where(r => set.Contains(r.MessageId)).ToArray());
         }
+
+        public Task<int> DeleteByUserAsync(long userId, CancellationToken ct = default) =>
+            Task.FromResult(0);
     }
 }

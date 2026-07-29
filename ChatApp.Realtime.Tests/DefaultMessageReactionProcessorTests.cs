@@ -227,5 +227,8 @@ public sealed class DefaultMessageReactionProcessorTests
             IReadOnlyList<string> messageIds,
             CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<MessageReactionRecord>>([]);
+
+        public Task<int> DeleteByUserAsync(long userId, CancellationToken ct = default) =>
+            Task.FromResult(0);
     }
 }

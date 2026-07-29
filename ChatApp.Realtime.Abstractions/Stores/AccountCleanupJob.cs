@@ -9,13 +9,19 @@ namespace ChatApp.Realtime.Abstractions.Stores;
 /// <param name="Status">作业状态：<c>pending</c>、<c>running</c>、<c>completed</c>、<c>failed</c>。</param>
 /// <param name="RetryCount">已重试次数。</param>
 /// <param name="UpdatedAtMs">最近更新时间（Unix 毫秒）。</param>
+/// <param name="ClaimToken">六-1：租约令牌，认领时生成；后续操作须校验此值防止旧 lease 误操作。</param>
+/// <param name="LockedBy">六-1：持有租约的实例 ID。</param>
+/// <param name="LockedUntilMs">六-1：租约到期时间（Unix 毫秒），过期后 running 作业可被重新认领。</param>
 public sealed record AccountCleanupJob(
     long UserId,
     string Phase,
     string? Cursor,
     string Status,
     int RetryCount,
-    long UpdatedAtMs)
+    long UpdatedAtMs,
+    string? ClaimToken = null,
+    string? LockedBy = null,
+    long? LockedUntilMs = null)
 {
     public const string PhaseAttachments = "attachments";
     public const string PhaseMetadata = "metadata";

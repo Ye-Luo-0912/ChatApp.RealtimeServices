@@ -374,7 +374,7 @@ public sealed class MessageRetentionStoreTests : IAsyncLifetime
         await connection.OpenAsync();
         await using var cmd = new NpgsqlCommand(
             $"""
-             SELECT event_type, payload_json
+             SELECT event_type, COALESCE(payload_json, convert_from(payload_utf8, 'UTF8'))
              FROM {schema.OutboxTableSql}
              WHERE event_type = @type
              ORDER BY created_at_ms, event_id;

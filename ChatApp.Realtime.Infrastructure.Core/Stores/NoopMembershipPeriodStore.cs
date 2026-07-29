@@ -54,4 +54,10 @@ public sealed class NoopMembershipPeriodStore : IMembershipPeriodStore
         ct.ThrowIfCancellationRequested();
         return Task.FromResult<IReadOnlyList<MembershipPeriod>>(Array.Empty<MembershipPeriod>());
     }
+
+    public Task<int> DeleteByUserAsync(long userId, CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(0);
+    }
 }

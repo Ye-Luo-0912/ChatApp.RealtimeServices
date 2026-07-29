@@ -107,4 +107,10 @@ public sealed class RealtimeOptions
     /// LongTerm-2：账号清理 Saga 单周期最大处理的作业数。防止长时间占用 Worker。
     /// </summary>
     public int AccountCleanupMaxBatchesPerCycle { get; init; } = 10;
+
+    /// <summary>
+    /// 六-1：账号清理 Saga 作业租约时长（毫秒）。认领后在此时间内其他实例不会抢占；
+    /// 到期后 running 作业可被重新认领。每批处理后会续租。
+    /// </summary>
+    public int AccountCleanupLeaseMs { get; init; } = 60_000;
 }

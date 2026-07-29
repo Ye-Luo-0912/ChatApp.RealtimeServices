@@ -34,4 +34,30 @@ public interface IConversationGatewayDirectory
     Task<GatewayLookupResult> GetConversationGatewaysAsync(
         string conversationId,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Gateway 在用户加入会话 audience 时注册本实例。
+    /// </summary>
+    Task RegisterConversationAsync(
+        string conversationId,
+        string gatewayInstanceId,
+        TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Gateway 定期续租会话 audience 成员资格。
+    /// </summary>
+    Task RenewConversationLeaseAsync(
+        string conversationId,
+        string gatewayInstanceId,
+        TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Gateway 在用户离开会话 audience 时注销本实例。
+    /// </summary>
+    Task UnregisterConversationAsync(
+        string conversationId,
+        string gatewayInstanceId,
+        CancellationToken cancellationToken = default);
 }

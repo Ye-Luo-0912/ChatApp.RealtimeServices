@@ -112,7 +112,7 @@ public sealed class GroupConversationReadTests : IAsyncLifetime
         // 携带 target_user_ids 数组 [501, 503]（排除读者 502）。
         await using var readCmd = new NpgsqlCommand(
             $"""
-             SELECT target_user_id, target_user_ids, payload_json
+             SELECT target_user_id, target_user_ids, COALESCE(payload_json, convert_from(payload_utf8, 'UTF8'))
              FROM {schema.OutboxTableSql}
              WHERE event_type = @type
              """,
@@ -228,7 +228,7 @@ public sealed class GroupConversationReadTests : IAsyncLifetime
 
         await using var readCmd = new NpgsqlCommand(
             $"""
-             SELECT target_user_id, payload_json
+             SELECT target_user_id, COALESCE(payload_json, convert_from(payload_utf8, 'UTF8'))
              FROM {schema.OutboxTableSql}
              WHERE event_type = @type
              """,

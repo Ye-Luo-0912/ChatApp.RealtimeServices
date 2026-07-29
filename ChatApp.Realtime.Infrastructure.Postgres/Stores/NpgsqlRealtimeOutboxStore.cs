@@ -1,5 +1,6 @@
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
@@ -54,8 +55,9 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
                  attempt_count = item.attempt_count + 1
              FROM candidates
              WHERE item.event_id = candidates.event_id
-             RETURNING item.event_id, item.payload_json, item.attempt_count, item.locked_by, item.claim_token,
-                 item.audience_kind, item.conversation_id, item.payload_utf8;
+             RETURNING item.event_id, item.event_type, item.target_user_id, item.target_user_ids,
+                 item.audience_kind, item.conversation_id,
+                 item.payload_json, item.payload_utf8, item.attempt_count, item.locked_by, item.claim_token;
              """,
             connection);
         command.Parameters.AddWithValue("now", now);
@@ -68,30 +70,125 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
         await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await reader.ReadAsync(ct).ConfigureAwait(false))
         {
-            // Perf-2：AudienceKind / ConversationId 作为 RealtimeEvent 的 init 属性，
-            // 已在此处随 payload_json 反序列化一并填充，Publisher 直接从 evt 读取即可路由。
-            // RETURNING 同时带回 audience_kind(5) / conversation_id(6) 列，保证读写字段对齐，
-            // 并为后续按会话批量扫描/重放提供 SQL 级可用性。
-            var evt = JsonSerializer.Deserialize(
-                          reader.GetString(1),
-                          RealtimeJsonSerializerContext.Default.RealtimeEvent)
-                      ?? throw new JsonException("Outbox 事件反序列化结果为空。");
-            // Perf-4：payload_utf8 可为 NULL（旧数据），NULL 时 Publisher 回退到序列化路径。
+            // 四-1/五：数据库列是投递目标的唯一权威，不再从 payload 反序列化路由信息。
+            var eventId = reader.GetString(0);                                          // event_id
+            var eventType = (RealtimeEventType)reader.GetInt16(1);                      // event_type
+            var targetUserId = reader.GetInt64(2);                                      // target_user_id
+            long[]? targetUserIds = null;
+            if (!reader.IsDBNull(3))
+                targetUserIds = reader.GetFieldValue<long[]>(3);                        // target_user_ids
+            var audienceKindRaw = reader.IsDBNull(4) ? (short)0 : reader.GetInt16(4);   // audience_kind
+            var conversationId = reader.IsDBNull(5) ? null : reader.GetString(5);       // conversation_id
+            var payloadJson = reader.IsDBNull(6) ? null : reader.GetString(6);          // payload_json (新记录为 NULL)
             ReadOnlyMemory<byte>? payloadUtf8 = null;
             if (!reader.IsDBNull(7))
+                payloadUtf8 = reader.GetFieldValue<byte[]>(7);                          // payload_utf8
+            var attemptCount = reader.GetInt32(8);                                      // attempt_count
+            var lockOwner = reader.GetString(9);                                        // locked_by
+            var claimTokenFromRow = reader.GetString(10);                               // claim_token
+
+            RealtimeEvent? evt = null;
+            string? traceParent = null;
+            string? traceState = null;
+
+            if (payloadUtf8 is { Length: > 0 } utf8)
             {
-                payloadUtf8 = reader.GetFieldValue<byte[]>(7);
+                // 新记录：payload_utf8 已排除路由字段，用 JsonDocument 轻量提取 trace context。
+                (traceParent, traceState) = ExtractTraceContext(utf8);
             }
+            else if (payloadJson is not null)
+            {
+                // 旧记录：payload_utf8 为 NULL，反序列化 payload_json 获取路由与 trace 信息。
+                evt = JsonSerializer.Deserialize(
+                          payloadJson,
+                          RealtimeJsonSerializerContext.Default.RealtimeEvent);
+                if (evt is not null)
+                {
+                    // 旧记录的列可能为空，从反序列化的 event 补充路由信息。
+                    if (targetUserIds is null && evt.TargetUserIds is { Length: > 0 })
+                        targetUserIds = evt.TargetUserIds;
+                    if (audienceKindRaw == 0 && evt.AudienceKind is not null)
+                        audienceKindRaw = (short)evt.AudienceKind.Value;
+                    traceParent = evt.TraceParent;
+                    traceState = evt.TraceState;
+                    // 旧记录无 payload_utf8，从 event 序列化生成 wire payload（排除路由字段）。
+                    payloadUtf8 = JsonSerializer.SerializeToUtf8Bytes(
+                        CreateWirePayload(evt),
+                        RealtimeJsonSerializerContext.Default.RealtimeEvent);
+                }
+            }
+
             records.Add(new RealtimeOutboxRecord(
-                reader.GetString(0),
+                eventId,
+                eventType,
+                targetUserId,
+                targetUserIds,
+                audienceKindRaw == 0 ? null : (AudienceKind)audienceKindRaw,
+                conversationId,
+                traceParent,
+                traceState,
                 evt,
-                reader.GetInt32(2),
-                reader.GetString(3),
-                reader.GetString(4),
+                attemptCount,
+                lockOwner,
+                claimTokenFromRow,
                 payloadUtf8));
         }
 
         return records;
+    }
+
+    /// <summary>
+    /// 四-1/五：从 wire payload（已排除路由字段）轻量提取 W3C trace context。
+    /// 使用 <see cref="JsonDocument"/> 做低分配 DOM 读取，不做完整反序列化。
+    /// </summary>
+    private static (string? TraceParent, string? TraceState) ExtractTraceContext(ReadOnlyMemory<byte> utf8Json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(utf8Json);
+            if (!doc.RootElement.TryGetProperty("TraceParent", out var tp)
+                || tp.ValueKind != JsonValueKind.String)
+            {
+                return (null, null);
+            }
+
+            var traceParent = tp.GetString();
+            string? traceState = null;
+            if (doc.RootElement.TryGetProperty("TraceState", out var ts)
+                && ts.ValueKind == JsonValueKind.String)
+            {
+                traceState = ts.GetString();
+            }
+
+            return (traceParent, traceState);
+        }
+        catch (JsonException)
+        {
+            return (null, null);
+        }
+    }
+
+    /// <summary>
+    /// 四-1：创建 wire payload 副本，排除 <see cref="RealtimeEvent.TargetUserIds"/>
+    /// 与 <see cref="RealtimeEvent.AudienceKind"/>。用于旧记录回退时生成 payload_utf8。
+    /// </summary>
+    private static RealtimeEvent CreateWirePayload(RealtimeEvent evt)
+    {
+        return new RealtimeEvent
+        {
+            EventId = evt.EventId,
+            Type = evt.Type,
+            TargetUserId = evt.TargetUserId,
+            ActorUserId = evt.ActorUserId,
+            MessageId = evt.MessageId,
+            SessionId = evt.SessionId,
+            PayloadJson = evt.PayloadJson,
+            TraceParent = evt.TraceParent,
+            TraceState = evt.TraceState,
+            OccurredAtMs = evt.OccurredAtMs,
+            ConversationId = evt.ConversationId,
+            Payload = evt.Payload,
+        };
     }
 
     public Task MarkPublishedAsync(RealtimeOutboxRecord record, CancellationToken ct = default) =>

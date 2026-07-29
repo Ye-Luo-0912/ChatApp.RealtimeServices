@@ -76,13 +76,7 @@ public sealed class OutboxLeaseExpiryTests : IAsyncLifetime
         Assert.Equal("token-mismatch-1", record.EventId);
 
         // 构造一个 claim_token 不匹配的 record（模拟旧 lease 残留任务误完成新 lease）
-        var forgedRecord = new RealtimeOutboxRecord(
-            record.EventId,
-            record.Event,
-            record.AttemptCount,
-            record.LockOwner,
-            ClaimToken: "forged-token-not-matching",
-            record.PayloadUtf8);
+        var forgedRecord = record with { ClaimToken = "forged-token-not-matching" };
 
         await store.MarkPublishedAsync(forgedRecord);
 
@@ -108,13 +102,7 @@ public sealed class OutboxLeaseExpiryTests : IAsyncLifetime
         var claimed = await store.ClaimBatchAsync("instance-y", 10, TimeSpan.FromSeconds(30));
         var record = Assert.Single(claimed);
 
-        var forgedRecord = new RealtimeOutboxRecord(
-            record.EventId,
-            record.Event,
-            record.AttemptCount,
-            record.LockOwner,
-            ClaimToken: "wrong-token",
-            record.PayloadUtf8);
+        var forgedRecord = record with { ClaimToken = "wrong-token" };
 
         await store.MarkFailedAsync(forgedRecord, "fake-error", TimeSpan.FromSeconds(5));
 
@@ -146,13 +134,7 @@ public sealed class OutboxLeaseExpiryTests : IAsyncLifetime
         // 为 extend-1 构造错误 token，extend-2 保留正确 token
         var record1 = claimed.Single(r => r.EventId == "extend-1");
         var record2 = claimed.Single(r => r.EventId == "extend-2");
-        var forgedRecord1 = new RealtimeOutboxRecord(
-            record1.EventId,
-            record1.Event,
-            record1.AttemptCount,
-            record1.LockOwner,
-            ClaimToken: "wrong-token",
-            record1.PayloadUtf8);
+        var forgedRecord1 = record1 with { ClaimToken = "wrong-token" };
 
         var extended = await store.ExtendLeaseBatchAsync(
             [forgedRecord1, record2],
@@ -201,13 +183,7 @@ public sealed class OutboxLeaseExpiryTests : IAsyncLifetime
 
         // 全部使用错误 token
         var forged = claimed
-            .Select(r => new RealtimeOutboxRecord(
-                r.EventId,
-                r.Event,
-                r.AttemptCount,
-                r.LockOwner,
-                ClaimToken: "all-wrong",
-                r.PayloadUtf8))
+            .Select(r => r with { ClaimToken = "all-wrong" })
             .ToArray();
 
         var affected = await store.MarkPublishedBatchAsync(forged);

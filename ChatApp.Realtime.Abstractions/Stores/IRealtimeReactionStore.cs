@@ -24,4 +24,9 @@ public interface IRealtimeReactionStore
     Task<IReadOnlyList<MessageReactionRecord>> ListByMessageIdsAsync(
         IReadOnlyList<string> messageIds,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// 六-4：账号清理时删除该用户的全部反应记录，返回已删除行数。
+    /// </summary>
+    Task<int> DeleteByUserAsync(long userId, CancellationToken ct = default);
 }

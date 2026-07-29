@@ -67,7 +67,7 @@ public sealed class ConversationProjectionTests : IAsyncLifetime
 
         await using (var outbox = new NpgsqlCommand(
                            $"""
-                            SELECT event_type, target_user_id, payload_json
+                            SELECT event_type, target_user_id, COALESCE(payload_json, convert_from(payload_utf8, 'UTF8'))
                             FROM {schema.OutboxTableSql}
                             WHERE event_type = @event_type
                             ORDER BY target_user_id

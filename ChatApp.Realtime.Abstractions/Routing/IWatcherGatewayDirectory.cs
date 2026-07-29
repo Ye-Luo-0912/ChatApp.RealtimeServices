@@ -84,4 +84,36 @@ public interface IWatcherGatewayDirectory
     /// <returns>活跃 Gateway 实例 ID 集合；无活跃实例或查询失败时返回空集合。</returns>
     Task<IReadOnlyList<string>> ListActiveShardsAsync(
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Gateway 实例注册自身活跃状态。
+    /// <para>
+    /// 四-4：独立于 watcher 关系，确保承载在线用户但无 watcher 活动的 Gateway
+    /// 不会从 fallback 列表（<see cref="ListActiveShardsAsync"/>）过期。
+    /// </para>
+    /// <para>
+    /// 实现应以幂等方式记录 (instanceId, leaseDuration) 租约，定期续期；
+    /// 未续期的实例在租约过期后从活跃集合自动移除。
+    /// </para>
+    /// </summary>
+    /// <param name="instanceId">Gateway 实例 ID。</param>
+    /// <param name="leaseDuration">租约时长，到期前需重新注册续期。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    Task RegisterGatewayInstanceAsync(
+        string instanceId,
+        TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Gateway 实例注销自身活跃状态。
+    /// <para>
+    /// 四-4：与 <see cref="RegisterGatewayInstanceAsync"/> 配对，Gateway 优雅关闭时主动移除自身。
+    /// 实现必须幂等：注销不存在的实例应为无操作。
+    /// </para>
+    /// </summary>
+    /// <param name="instanceId">Gateway 实例 ID。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    Task UnregisterGatewayInstanceAsync(
+        string instanceId,
+        CancellationToken cancellationToken = default);
 }

@@ -139,17 +139,28 @@ public sealed class DefaultUserAccountDeletedProcessorTests
             Task.FromResult<AccountCleanupJob?>(null);
 
         public Task UpdateProgressAsync(
-            long userId, string phase, string? cursor, string status, CancellationToken ct = default) =>
+            long userId, string phase, string? cursor, string status, string claimToken, CancellationToken ct = default) =>
             Task.CompletedTask;
 
-        public Task CompletePhaseAsync(long userId, string phase, CancellationToken ct = default) =>
+        public Task CompletePhaseAsync(long userId, string phase, string claimToken, CancellationToken ct = default) =>
             Task.CompletedTask;
 
-        public Task<AccountCleanupJob?> GetNextPendingAsync(CancellationToken ct = default) =>
+        public Task<AccountCleanupJob?> GetNextPendingAsync(
+            string instanceId, TimeSpan leaseDuration, CancellationToken ct = default) =>
             Task.FromResult<AccountCleanupJob?>(null);
 
+        public Task<bool> RenewLeaseAsync(
+            long userId, string phase, string claimToken, TimeSpan leaseExtension, CancellationToken ct = default) =>
+            Task.FromResult(true);
+
+        public Task<bool> ProcessAttachmentsBatchAtomicAsync(
+            long userId, string claimToken, string lastAttachmentId,
+            IReadOnlyList<string> attachmentIds, ChatApp.Realtime.Abstractions.Events.RealtimeEvent purgeEvent,
+            CancellationToken ct = default) =>
+            Task.FromResult(true);
+
         public Task RecordFailureAsync(
-            long userId, string phase, int maxRetryCount, CancellationToken ct = default) =>
+            long userId, string phase, string claimToken, int maxRetryCount, CancellationToken ct = default) =>
             Task.CompletedTask;
     }
 

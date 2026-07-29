@@ -9,6 +9,7 @@ using ChatApp.Realtime.Infrastructure.Core.Messaging;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
+using ChatApp.Realtime.Infrastructure.Postgres.Outbox;
 using Microsoft.Extensions.Logging;
 using Npgsql;
 
@@ -319,7 +320,7 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
             }
         }
 
-        await InsertOutboxManyAsync(connection, transaction, events, ct).ConfigureAwait(false);
+        await OutboxInsertHelper.InsertManyAsync(connection, transaction, databaseSchema, events, ct).ConfigureAwait(false);
         return (abandoned.Count, events.Count);
     }
 
@@ -376,46 +377,6 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
         CancellationToken ct)
         => await ConversationProjectionRepair.RepairUnreadCountsAsync(
             connection, transaction, databaseSchema, conversationIds, ct).ConfigureAwait(false);
-
-    private async Task InsertOutboxManyAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        IReadOnlyList<RealtimeEvent> events,
-        CancellationToken ct)
-    {
-        if (events.Count == 0)
-            return;
-
-        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        await using var command = new NpgsqlCommand { Connection = connection, Transaction = transaction };
-        var values = new List<string>(events.Count);
-        for (var i = 0; i < events.Count; i++)
-        {
-            var evt = events[i];
-            values.Add(
-                $"(@event_id_{i}, @payload_json_{i}, @target_user_id_{i}, @event_type_{i}, @status, @created_at_ms, @next_attempt_at_ms, 0)");
-            command.Parameters.AddWithValue($"event_id_{i}", evt.EventId);
-            command.Parameters.AddWithValue(
-                $"payload_json_{i}",
-                JsonSerializer.Serialize(evt, RealtimeJsonSerializerContext.Default.RealtimeEvent));
-            command.Parameters.AddWithValue($"target_user_id_{i}", evt.TargetUserId);
-            command.Parameters.AddWithValue($"event_type_{i}", (short)evt.Type);
-        }
-
-        command.Parameters.AddWithValue("status", (short)RealtimeOutboxStatus.Pending);
-        command.Parameters.AddWithValue("created_at_ms", now);
-        command.Parameters.AddWithValue("next_attempt_at_ms", now);
-        command.CommandText =
-            $"""
-             INSERT INTO {databaseSchema.OutboxTableSql} (
-                 event_id, payload_json, target_user_id, event_type, status,
-                 created_at_ms, next_attempt_at_ms, attempt_count
-             ) VALUES
-                 {string.Join(",\n                 ", values)}
-             ON CONFLICT (event_id) DO NOTHING;
-             """;
-        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-    }
 
     private static async Task DeleteByMessageIdsAsync(
         NpgsqlConnection connection,

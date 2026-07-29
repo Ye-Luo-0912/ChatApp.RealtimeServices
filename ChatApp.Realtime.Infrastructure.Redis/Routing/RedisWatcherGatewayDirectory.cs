@@ -63,6 +63,17 @@ public sealed class RedisWatcherGatewayDirectory : IWatcherGatewayDirectory
     private const string ActiveShardsKey = "watchers:__active_shards__";
 
     /// <summary>
+    /// 四-4：独立 Gateway 实例活跃 ZSET 的 key。
+    /// <para>
+    /// member = instanceId，score = 该实例自身心跳租约到期 Unix 毫秒。
+    /// 与 <see cref="ActiveShardsKey"/>（watcher 注册续租）独立维护，确保承载在线用户
+    /// 但无 watcher 活动的 Gateway 不会从 fallback 列表过期。
+    /// <see cref="ListActiveShardsAsync"/> 取两者的并集作为全局活跃 shard 集合。
+    /// </para>
+    /// </summary>
+    private const string GatewayInstancesKey = "gateway_instances:__active__";
+
+    /// <summary>
     /// 添加 watcher 的 Lua 脚本：原子执行 ZADD 关系明细 + SADD 路由聚合。
     /// <para>
     /// KEYS[1] = watchers:{watchedUserId}:instances (ZSET)
@@ -277,7 +288,11 @@ return result";
     /// <summary>
     /// P0-9：列出当前所有已知活跃的 Gateway shard ID。
     /// <para>
-    /// 读取 <see cref="ActiveShardsKey"/> ZSET，清理过期成员后返回存活 instanceId 集合。
+    /// 四-4：取 <see cref="ActiveShardsKey"/>（watcher 注册续租）与
+    /// <see cref="GatewayInstancesKey"/>（Gateway 实例自身心跳）两个 ZSET 的并集，
+    /// 确保承载在线用户但无 watcher 活动的 Gateway 不会从 fallback 列表过期。
+    /// </para>
+    /// <para>
     /// 查询失败时返回空集合（不抛异常），调用方据此再次回退到广播。
     /// </para>
     /// </summary>
@@ -289,7 +304,7 @@ return result";
             var db = _client.GetDatabase();
             var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-            // 先清理过期成员，保持 ZSET 紧凑；失败不阻塞查询。
+            // 先清理两个 ZSET 的过期成员，保持紧凑；失败不阻塞查询。
             try
             {
                 await db.SortedSetRemoveRangeByScoreAsync(ActiveShardsKey, start: -1, stop: nowMs)
@@ -304,17 +319,38 @@ return result";
                 // 清理失败不影响读取。
             }
 
-            var members = await db.SortedSetRangeByScoreAsync(
+            try
+            {
+                await db.SortedSetRemoveRangeByScoreAsync(GatewayInstancesKey, start: -1, stop: nowMs)
+                    .WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                // 清理失败不影响读取。
+            }
+
+            // 分别读取两个 ZSET 的存活成员，取并集。
+            var watcherMembers = await db.SortedSetRangeByScoreAsync(
                 ActiveShardsKey,
                 start: nowMs + 1,
                 stop: double.PositiveInfinity)
                 .WaitAsync(cancellationToken).ConfigureAwait(false);
 
-            if (members.Length == 0)
+            var gatewayMembers = await db.SortedSetRangeByScoreAsync(
+                GatewayInstancesKey,
+                start: nowMs + 1,
+                stop: double.PositiveInfinity)
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+
+            if (watcherMembers.Length == 0 && gatewayMembers.Length == 0)
                 return Array.Empty<string>();
 
-            var result = new List<string>(members.Length);
-            foreach (var member in members)
+            var result = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var member in watcherMembers)
             {
                 if (member.HasValue)
                 {
@@ -324,7 +360,17 @@ return result";
                 }
             }
 
-            return result;
+            foreach (var member in gatewayMembers)
+            {
+                if (member.HasValue)
+                {
+                    var instanceId = (string?)member;
+                    if (!string.IsNullOrWhiteSpace(instanceId))
+                        result.Add(instanceId);
+                }
+            }
+
+            return result.ToList();
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -337,6 +383,76 @@ return result";
                 ex,
                 "Redis 活跃 shard 列表查询失败，回退到空集合。");
             return Array.Empty<string>();
+        }
+    }
+
+    /// <summary>
+    /// 四-4：Gateway 实例注册自身活跃状态。
+    /// <para>
+    /// ZADD <see cref="GatewayInstancesKey"/>：member = instanceId，score = 租约到期 Unix 毫秒。
+    /// 独立于 watcher 关系，确保承载在线用户但无 watcher 活动的 Gateway 不会从 fallback 列表过期。
+    /// </para>
+    /// </summary>
+    public async Task RegisterGatewayInstanceAsync(
+        string instanceId,
+        TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(instanceId);
+
+        try
+        {
+            var db = _client.GetDatabase();
+            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var expiryMs = nowMs + (long)leaseDuration.TotalMilliseconds;
+
+            await db.SortedSetAddAsync(GatewayInstancesKey, instanceId, expiryMs)
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _metrics.RecordDirectoryLookupFailed("watcher", "register_gateway_instance");
+            _logger.LogWarning(
+                ex,
+                "Redis Gateway 实例活跃注册失败。实例={InstanceId}",
+                instanceId);
+        }
+    }
+
+    /// <summary>
+    /// 四-4：Gateway 实例注销自身活跃状态。
+    /// <para>
+    /// ZREM <see cref="GatewayInstancesKey"/> 中的 instanceId。Gateway 优雅关闭时主动调用。
+    /// </para>
+    /// </summary>
+    public async Task UnregisterGatewayInstanceAsync(
+        string instanceId,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(instanceId);
+
+        try
+        {
+            var db = _client.GetDatabase();
+
+            await db.SortedSetRemoveAsync(GatewayInstancesKey, instanceId)
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _metrics.RecordDirectoryLookupFailed("watcher", "unregister_gateway_instance");
+            _logger.LogWarning(
+                ex,
+                "Redis Gateway 实例活跃注销失败。实例={InstanceId}",
+                instanceId);
         }
     }
 

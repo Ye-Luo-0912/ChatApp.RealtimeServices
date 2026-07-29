@@ -71,4 +71,9 @@ public interface IMembershipPeriodStore
         string conversationId,
         long userId,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// 六-4：账号清理时删除该用户的全部 membership periods，返回已删除行数。
+    /// </summary>
+    Task<int> DeleteByUserAsync(long userId, CancellationToken ct = default);
 }

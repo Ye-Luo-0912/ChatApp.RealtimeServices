@@ -148,6 +148,27 @@ public sealed class IncomingMessageWorker : BackgroundService
 
     private async Task ProcessOneAsync(IncomingMessageEnvelope envelope, CancellationToken ct)
     {
+        // 毒丸检查：超过阈值的消息立即进 DLQ，不应持续 progress-ack。
+        if (envelope.DeliveryCount is not null
+            && envelope.DeliveryCount >= (ulong)_options.PoisonDeliveryThreshold)
+        {
+            await DeadLetterAndAckAsync(
+                envelope,
+                "max_deliveries",
+                "消息投递次数达到毒丸阈值。",
+                ct).ConfigureAwait(false);
+            return;
+        }
+
+        // Reliability-4：长时处理期间定期发送 In-Progress ACK，重置 JetStream AckWait 计时器。
+        // 在出队后尽早启动（毒丸检查之后、其他处理之前），覆盖排队等待时间，防止
+        // 队列等待 + 数据库处理 > AckWait 时合法消息被重投。
+        await using var progressGuard = ProgressAckGuard.Start(
+            envelope.ProgressAckAsync,
+            _ackWait,
+            ct,
+            _logger);
+
         // Perf-6：超大合法消息提前拒绝，避免单条消息占满字节预算。
         var payloadBytes = EnvelopeByteSizer(envelope);
         if (payloadBytes > _options.MaxSinglePayloadBytes)
@@ -156,17 +177,6 @@ public sealed class IncomingMessageWorker : BackgroundService
                 envelope,
                 "payload_too_large",
                 $"消息 payload 字节数 {payloadBytes} 超过单条上限 {_options.MaxSinglePayloadBytes}。",
-                ct).ConfigureAwait(false);
-            return;
-        }
-
-        if (envelope.DeliveryCount is not null
-            && envelope.DeliveryCount >= (ulong)_options.PoisonDeliveryThreshold)
-        {
-            await DeadLetterAndAckAsync(
-                envelope,
-                "max_deliveries",
-                "消息投递次数达到毒丸阈值。",
                 ct).ConfigureAwait(false);
             return;
         }
@@ -187,13 +197,6 @@ public sealed class IncomingMessageWorker : BackgroundService
             return;
         }
 
-        // Reliability-4：长时处理期间定期发送 In-Progress ACK，重置 JetStream AckWait 计时器。
-        // 防止 队列等待 + 数据库处理 > AckWait 时合法消息被重投。
-        await using var progressGuard = ProgressAckGuard.Start(
-            envelope.ProgressAckAsync,
-            _ackWait,
-            ct,
-            _logger);
         var result = await _processor.ProcessAsync(envelope.Command, ct).ConfigureAwait(false);
         if (result.Succeeded)
         {

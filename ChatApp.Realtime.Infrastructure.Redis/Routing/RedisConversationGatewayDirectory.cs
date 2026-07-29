@@ -118,6 +118,97 @@ public sealed class RedisConversationGatewayDirectory : IConversationGatewayDire
         }
     }
 
+    /// <summary>
+    /// Gateway 在用户加入会话 audience 时注册本实例。
+    /// <para>
+    /// 四-3：ZADD <c>conversation_audience:{conversationId}:instances</c>，
+    /// member = gatewayInstanceId，score = 租约到期 Unix 毫秒。
+    /// </para>
+    /// </summary>
+    public async Task RegisterConversationAsync(
+        string conversationId,
+        string gatewayInstanceId,
+        TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(conversationId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(gatewayInstanceId);
+
+        try
+        {
+            var db = _client.GetDatabase();
+            var key = FormatKey(conversationId);
+            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var expiryMs = nowMs + (long)leaseDuration.TotalMilliseconds;
+
+            await db.SortedSetAddAsync(key, gatewayInstanceId, expiryMs)
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _metrics.RecordDirectoryLookupFailed("gateway", "conversation_register");
+            _logger.LogWarning(
+                ex,
+                "Redis 会话受众目录注册失败。会话={ConversationId}；实例={InstanceId}",
+                conversationId,
+                gatewayInstanceId);
+        }
+    }
+
+    /// <summary>
+    /// Gateway 定期续租会话 audience 成员资格。
+    /// <para>
+    /// 实现与 <see cref="RegisterConversationAsync"/> 相同：ZADD 会更新既有 member 的 score。
+    /// </para>
+    /// </summary>
+    public Task RenewConversationLeaseAsync(
+        string conversationId,
+        string gatewayInstanceId,
+        TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default)
+        => RegisterConversationAsync(conversationId, gatewayInstanceId, leaseDuration, cancellationToken);
+
+    /// <summary>
+    /// Gateway 在用户离开会话 audience 时注销本实例。
+    /// <para>
+    /// ZREM <c>conversation_audience:{conversationId}:instances</c> 中的 gatewayInstanceId。
+    /// </para>
+    /// </summary>
+    public async Task UnregisterConversationAsync(
+        string conversationId,
+        string gatewayInstanceId,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(conversationId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(gatewayInstanceId);
+
+        try
+        {
+            var db = _client.GetDatabase();
+            var key = FormatKey(conversationId);
+
+            await db.SortedSetRemoveAsync(key, gatewayInstanceId)
+                .WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _metrics.RecordDirectoryLookupFailed("gateway", "conversation_unregister");
+            _logger.LogWarning(
+                ex,
+                "Redis 会话受众目录注销失败。会话={ConversationId}；实例={InstanceId}",
+                conversationId,
+                gatewayInstanceId);
+        }
+    }
+
     private static string FormatKey(string conversationId) =>
         string.Concat(KeyPrefix, conversationId, KeySuffix);
 }
