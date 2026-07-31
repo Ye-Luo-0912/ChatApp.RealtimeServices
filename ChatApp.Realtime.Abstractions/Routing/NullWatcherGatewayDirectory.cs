@@ -71,4 +71,14 @@ public sealed class NullWatcherGatewayDirectory : IWatcherGatewayDirectory
         string instanceId,
         CancellationToken cancellationToken = default)
         => Task.CompletedTask;
+
+    /// <summary>
+    /// 五-1：空实现为无操作。
+    /// </summary>
+    public Task PurgeUserRoutingAsync(
+        long watchedUserId,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.CompletedTask;
+    }
 }

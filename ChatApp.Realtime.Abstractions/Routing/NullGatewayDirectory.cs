@@ -52,4 +52,14 @@ public sealed class NullGatewayDirectory : IGatewayDirectory
             GatewayLookupResultKind.LookupFailure,
             EmptyDict));
     }
+
+    /// <summary>
+    /// 五-1：空实现为无操作。
+    /// </summary>
+    public Task PurgeUserRoutingAsync(
+        long userId,
+        CancellationToken cancellationToken = default)
+    {
+        return Task.CompletedTask;
+    }
 }

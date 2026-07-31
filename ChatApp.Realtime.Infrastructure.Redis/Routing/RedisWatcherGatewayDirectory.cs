@@ -502,6 +502,43 @@ return result";
         }
     }
 
+    /// <summary>
+    /// 五-1：账号删除时显式清理该用户作为"被观察者"的全部 watcher 路由。
+    /// <para>
+    /// DEL <c>watchers:{watchedUserId}:instances</c>（ZSET）和
+    /// <c>watchers:{watchedUserId}:gateways</c>（SET），使该用户立即从 watcher 路由中消失。
+    /// 失败仅记录日志，不抛异常，不阻塞账号清理 Saga。
+    /// </para>
+    /// </summary>
+    public async Task PurgeUserRoutingAsync(
+        long watchedUserId,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var db = _client.GetDatabase();
+            var instancesKey = FormatInstancesKey(watchedUserId);
+            var gatewaysKey = FormatGatewaysKey(watchedUserId);
+            // 批量删除两个 key，减少 RTT。
+            var batch = db.CreateBatch();
+            var task1 = batch.KeyDeleteAsync(instancesKey);
+            var task2 = batch.KeyDeleteAsync(gatewaysKey);
+            batch.Execute();
+            await Task.WhenAll(task1, task2).WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Redis watcher 目录用户路由清理失败，不阻塞清理流程。被观察用户={WatchedUserId}",
+                watchedUserId);
+        }
+    }
+
     private static string FormatInstancesKey(long watchedUserId) =>
         string.Concat(KeyPrefix, watchedUserId.ToString(CultureInfo.InvariantCulture), InstancesKeySuffix);
 

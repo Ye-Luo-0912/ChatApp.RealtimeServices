@@ -116,4 +116,26 @@ public interface IWatcherGatewayDirectory
     Task UnregisterGatewayInstanceAsync(
         string instanceId,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 五-1：账号删除时显式清理该用户作为"被观察者"的全部 watcher 路由数据。
+    /// <para>
+    /// 删除 <c>watchers:{watchedUserId}:instances</c>（ZSET）和
+    /// <c>watchers:{watchedUserId}:gateways</c>（SET），使该用户立即从 watcher 路由中消失，
+    /// 不再等待租约 TTL（默认 5 分钟）自然过期。
+    /// </para>
+    /// <para>
+    /// 注意：此方法仅清理该用户作为"被观察者"的路由。该用户作为"观察者"的 watcher 关系
+    /// 由 Gateway 在连接断开时通过 <see cref="UnregisterWatchersAsync"/> 清理。
+    /// </para>
+    /// <para>
+    /// 实现应幂等：清理不存在的 key 为无操作。实现不应抛异常（失败仅记录日志），
+    /// 避免阻塞账号清理 Saga 的后续步骤。
+    /// </para>
+    /// </summary>
+    /// <param name="watchedUserId">被删除用户（作为被观察者）的 ID。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    Task PurgeUserRoutingAsync(
+        long watchedUserId,
+        CancellationToken cancellationToken = default);
 }

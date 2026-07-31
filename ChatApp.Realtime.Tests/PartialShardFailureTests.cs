@@ -190,6 +190,11 @@ public sealed class PartialShardFailureTests : IAsyncDisposable
             return Task.FromResult(
                 new GatewayLookupManyResult(GatewayLookupResultKind.Success, map));
         }
+
+        public Task PurgeUserRoutingAsync(
+            long userId,
+            CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
     }
 
     private sealed class OptionsWrapper<T>(T value) : IOptions<T> where T : class

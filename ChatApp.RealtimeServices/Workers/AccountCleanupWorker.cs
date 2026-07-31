@@ -1,6 +1,7 @@
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.RealtimeServices.Options;
@@ -29,6 +30,11 @@ namespace ChatApp.RealtimeServices.Workers;
 /// 六-3：attachments 批次三项操作（Outbox + DELETE + cursor）在同一事务中原子完成。
 /// 六-4：metadata 阶段额外清理 reactions / membership_periods。
 /// </para>
+/// <para>
+/// 五-1：completed 阶段显式清理 Redis 路由（presence + watcher），不依赖 TTL。
+/// 五-2：metadata 阶段匿名化群聊 created_by_user_id。
+/// 五-3：trace 随数据行清理；历史日志不回溯；审计/防重放表保留至 GC cutoff。
+/// </para>
 /// </summary>
 public sealed class AccountCleanupWorker : BackgroundService
 {
@@ -42,6 +48,8 @@ public sealed class AccountCleanupWorker : BackgroundService
     private readonly IMembershipPeriodStore _membershipPeriodStore;
     private readonly IUserDeletionTombstoneStore _tombstoneStore;
     private readonly IRealtimeOutboxSignal _outboxSignal;
+    private readonly IGatewayDirectory _gatewayDirectory;
+    private readonly IWatcherGatewayDirectory _watcherGatewayDirectory;
     private readonly RealtimeOptions _options;
     private readonly ILogger<AccountCleanupWorker> _logger;
 
@@ -53,6 +61,8 @@ public sealed class AccountCleanupWorker : BackgroundService
         IRealtimeReactionStore reactionStore,
         IMembershipPeriodStore membershipPeriodStore,
         IUserDeletionTombstoneStore tombstoneStore,
+        IGatewayDirectory gatewayDirectory,
+        IWatcherGatewayDirectory watcherGatewayDirectory,
         IRealtimeOutboxSignal outboxSignal,
         IOptions<RealtimeOptions> options,
         ILogger<AccountCleanupWorker> logger)
@@ -64,6 +74,8 @@ public sealed class AccountCleanupWorker : BackgroundService
         _reactionStore = reactionStore;
         _membershipPeriodStore = membershipPeriodStore;
         _tombstoneStore = tombstoneStore;
+        _gatewayDirectory = gatewayDirectory;
+        _watcherGatewayDirectory = watcherGatewayDirectory;
         _outboxSignal = outboxSignal;
         _options = options.Value;
         _logger = logger;
@@ -404,6 +416,41 @@ public sealed class AccountCleanupWorker : BackgroundService
     /// </summary>
     private async Task ProcessCompletedPhaseAsync(AccountCleanupJob job, CancellationToken ct)
     {
+        // 五-1：显式清理 Redis 中的用户路由数据，不依赖租约 TTL 自然过期。
+        // presence:{userId}:instances — 用户级在线状态
+        // watchers:{userId}:instances / :gateways — 被观察关系
+        // 注意：conversation_audience:{conversationId} 的引用计数按 Gateway 实例维护（非按用户），
+        // 由 Gateway 在用户断开连接时通过 UnregisterConversationAsync 清理，加上 5 分钟 TTL 自然过期，
+        // 不在此处显式清理。
+        try
+        {
+            await _gatewayDirectory
+                .PurgeUserRoutingAsync(job.UserId, ct)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // 清理失败不阻塞完成流程，TTL 会兜底。
+            _logger.LogWarning(
+                ex,
+                "账号清理 Redis 网关路由清理失败，TTL 将兜底。用户={UserId}",
+                job.UserId);
+        }
+
+        try
+        {
+            await _watcherGatewayDirectory
+                .PurgeUserRoutingAsync(job.UserId, ct)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "账号清理 Redis watcher 路由清理失败，TTL 将兜底。用户={UserId}",
+                job.UserId);
+        }
+
         await _tombstoneStore
             .RecordDeletionCompletedAsync(job.UserId, ct)
             .ConfigureAwait(false);
@@ -419,6 +466,9 @@ public sealed class AccountCleanupWorker : BackgroundService
                 ct)
             .ConfigureAwait(false);
 
+        // 五-3：日志和 trace 策略——trace 随数据行清理（Outbox 行删除时 trace_parent/trace_state 一并删除）；
+        // 历史日志不回溯清理（日志系统有自己的保留期，不因账号删除而回溯清理日志中的 userId）。
+        // 审计表（group_operation_audit）与防重放表（tombstone/idempotency_ledger）有意保留至 GC cutoff。
         _logger.LogInformation(
             "账号清理 Saga 全部完成。用户={UserId}",
             job.UserId);

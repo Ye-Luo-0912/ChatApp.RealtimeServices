@@ -1655,6 +1655,24 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 .ConfigureAwait(false);
         }
 
+        // 五-2：匿名化群聊会话的 created_by_user_id。
+        // 单聊会话已在上方被直接删除，此处仅影响群聊（type = Group）。
+        // 将已删除用户创建的群聊的 created_by_user_id 设为 NULL，表示创建者已注销。
+        // 保留会话本身（仍有其他成员），仅清除创建者身份引用。
+        await using (var anonymizeCreatedByCmd = new NpgsqlCommand(
+                         $"""
+                          UPDATE {_databaseSchema.ConversationsTableSql}
+                          SET created_by_user_id = NULL
+                          WHERE created_by_user_id = @user_id
+                            AND type <> @direct_type;
+                          """,
+                         connection))
+        {
+            anonymizeCreatedByCmd.Parameters.AddWithValue("user_id", userId);
+            anonymizeCreatedByCmd.Parameters.AddWithValue("direct_type", (short)ConversationType.Direct);
+            await anonymizeCreatedByCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+
         await using (var orphanConversationsCmd = new NpgsqlCommand(
                            $"""
                             DELETE FROM {_databaseSchema.ConversationsTableSql} AS c

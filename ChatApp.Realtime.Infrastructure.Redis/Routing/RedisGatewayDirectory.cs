@@ -260,6 +260,36 @@ public sealed class RedisGatewayDirectory : IGatewayDirectory
         return result;
     }
 
+    /// <summary>
+    /// 五-1：账号删除时显式清理该用户的在线路由 ZSET。
+    /// <para>
+    /// DEL <c>presence:{userId}:instances</c>，使该用户立即从 Gateway 路由中消失。
+    /// 失败仅记录日志，不抛异常，不阻塞账号清理 Saga。
+    /// </para>
+    /// </summary>
+    public async Task PurgeUserRoutingAsync(
+        long userId,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var db = _client.GetDatabase();
+            var key = FormatKey(userId);
+            await db.KeyDeleteAsync(key).WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Redis 网关目录用户路由清理失败，不阻塞清理流程。用户={UserId}",
+                userId);
+        }
+    }
+
     private static string FormatKey(long userId) =>
         string.Concat(KeyPrefix, userId.ToString(CultureInfo.InvariantCulture), KeySuffix);
 }

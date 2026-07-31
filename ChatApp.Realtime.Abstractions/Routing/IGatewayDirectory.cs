@@ -70,4 +70,21 @@ public interface IGatewayDirectory
     Task<GatewayLookupManyResult> GetOnlineGatewaysManyWithStatusAsync(
         IReadOnlyList<long> userIds,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 五-1：账号删除时显式清理该用户在 Redis 中的在线路由数据。
+    /// <para>
+    /// 删除 <c>presence:{userId}:instances</c> ZSET，使该用户立即从 Gateway 路由中消失，
+    /// 不再等待租约 TTL（默认 5 分钟）自然过期。避免已删除用户的消息在 TTL 窗口内仍被投递。
+    /// </para>
+    /// <para>
+    /// 实现应幂等：清理不存在的 key 为无操作。实现不应抛异常（失败仅记录日志），
+    /// 避免阻塞账号清理 Saga 的后续步骤。
+    /// </para>
+    /// </summary>
+    /// <param name="userId">被删除用户的 ID。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    Task PurgeUserRoutingAsync(
+        long userId,
+        CancellationToken cancellationToken = default);
 }
