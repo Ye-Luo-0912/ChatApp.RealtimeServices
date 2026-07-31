@@ -158,8 +158,64 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         var conversationWriter = new ConversationProjectionWriter(session);
         var outboxWriter = new PostgresOutboxWriter(session);
 
+        // 极限-2：序列分配前置。在 INSERT messages 之前调用 TryAllocate...Async 取得
+        // (conversation_sequence, sender_sequence)，传入 INSERT 直接填入对应列，
+        // 消除旧流程"INSERT NULL → UPDATE 回写"产生的第二个 tuple 与额外 WAL/索引写入。
+        // 群路径授权失败（会话不存在/非群/已解散/发送者非活跃成员）时 allocation 返回 null，
+        // 此时直接返回 NotAllowed，不再走"INSERT → 回滚"的弯路。
+        var isGroup = !string.IsNullOrWhiteSpace(message.ConversationId)
+                      && ConversationId.IsGroup(message.ConversationId);
+
+        long? conversationSequence = null;
+        long? senderSequence = null;
+
+        if (isGroup)
+        {
+            var allocation = await conversationWriter
+                .TryAllocateGroupSequenceAsync(
+                    message.ConversationId!,
+                    message.SenderUserId,
+                    message.MessageId,
+                    ConversationId.CreatePreview(message.Content),
+                    message.ReceivedAtMs)
+                .ConfigureAwait(false);
+
+            if (allocation is null)
+            {
+                // 授权失败：会话不存在、非群、已解散或发送者非活跃成员。无 INSERT 需回滚。
+                await session.RollbackAsync().ConfigureAwait(false);
+                _logger.LogWarning(
+                    "群消息写入拒绝：会话不存在、非群、已解散或发送者非活跃成员。消息={MessageId}；会话={ConversationId}；发送用户={SenderUserId}",
+                    message.MessageId,
+                    message.ConversationId,
+                    message.SenderUserId);
+                return RealtimeMessagePersistResult.NotAllowed(message.MessageId);
+            }
+
+            conversationSequence = allocation.ConversationSequence;
+            senderSequence = allocation.SenderSequence;
+        }
+        else if (!string.IsNullOrWhiteSpace(message.ConversationId))
+        {
+            // 单聊路径：allocation 通常不会失败（UPSERT 语义），失败回退到 NULL 序列。
+            var allocation = await conversationWriter
+                .TryAllocateDirectSequenceAsync(
+                    message.ConversationId!,
+                    message.SenderUserId,
+                    message.ReceiverUserId,
+                    message.MessageId,
+                    ConversationId.CreatePreview(message.Content),
+                    message.ReceivedAtMs)
+                .ConfigureAwait(false);
+            if (allocation is not null)
+            {
+                conversationSequence = allocation.ConversationSequence;
+                senderSequence = allocation.SenderSequence;
+            }
+        }
+
         var affectedRows = await messageWriter
-            .InsertAsync(message, fingerprint)
+            .InsertAsync(message, fingerprint, conversationSequence, senderSequence)
             .ConfigureAwait(false);
         if (affectedRows == 0)
         {
@@ -281,47 +337,15 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             }
         }
 
-        // 三-1：序列进入消息协议。先推进会话序列（O(1)），再用得到的序列号物化
-        // RealtimeChatMessagePayload，确保 Outbox 行的 PayloadJson 携带 ConversationSequence。
-        var isGroup = !string.IsNullOrWhiteSpace(message.ConversationId)
-                      && ConversationId.IsGroup(message.ConversationId);
-
-        long? conversationSequence = null;
-
+        // 极限-2：序列已在 INSERT 前分配并写入 messages 行。此处仅构造 Outbox 事件。
         if (isGroup)
         {
-            // P0-3：移除 ListActiveMemberUserIdsAsync 全量成员加载与预检查。
-            // TryAdvanceGroupSequenceAsync 的 advanced CTE 内嵌 EXISTS 权威成员资格检查，
-            // 消除预检查与 UPDATE 之间的 TOCTOU 竞态；返回 null 即权威拒绝。
-            var newSequence = await conversationWriter
-                .TryAdvanceGroupSequenceAsync(
-                    message.ConversationId!,
-                    message.SenderUserId,
-                    message.MessageId,
-                    ConversationId.CreatePreview(message.Content),
-                    message.ReceivedAtMs)
-                .ConfigureAwait(false);
-
-            if (newSequence is null)
-            {
-                // 返回 null 可能因：会话不存在 / 非群 / 群已解散 / 发送者非活跃成员。
-                // 事务回滚会自动撤销同事务内的消息 INSERT 与附件绑定。
-                await session.RollbackAsync().ConfigureAwait(false);
-                _logger.LogWarning(
-                    "群消息写入拒绝：会话不存在、非群、已解散或发送者非活跃成员。消息={MessageId}；会话={ConversationId}；发送用户={SenderUserId}",
-                    message.MessageId,
-                    message.ConversationId,
-                    message.SenderUserId);
-                return RealtimeMessagePersistResult.NotAllowed(message.MessageId);
-            }
-
-            conversationSequence = newSequence;
-
-            // 序列号已知后再物化 payload，使 PayloadJson 携带 ConversationSequence。
+            // 序列号已知后物化 payload，使 PayloadJson 携带 ConversationSequence。
             var createdEvent = RealtimeMessageEventFactory.EnrichChatMessagePayload(
                 RealtimeMessageEventFactory.CopyWithMessageId(eventToPublish, message.MessageId),
                 boundAttachmentRefs,
-                newSequence);
+                conversationSequence,
+                ConversationType.Group);
 
             // P0-3：群广播事件 AudienceKind=Conversation + ConversationId，TargetUserIds=null。
             // Publisher 通过 IConversationGatewayDirectory 一次查询会话在线 Gateway 实例集合投递，
@@ -332,84 +356,30 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 message,
                 targetUserIds: null));
 
-            delta.AddBroadcast(GroupProjectionEventFactory.CreateGroupConversationChangedBroadcast(
-                message.ConversationId!,
-                message.MessageId,
-                ConversationId.CreatePreview(message.Content),
-                message.ReceivedAtMs,
-                message.SenderUserId,
-                causeToken: null,
-                createdEvent.TraceParent,
-                createdEvent.TraceState,
-                newSequence));
-
+            // 极限-1：不再生成单独的 ConversationListChanged 广播行——payload 已携带
+            // ConversationType + ConversationSequence，客户端从单条 MessageReceived 即可更新会话列表。
             await outboxWriter.InsertManyAsync(delta.Build()).ConfigureAwait(false);
         }
         else
         {
-            // Perf-1：单聊也走 O(1) 序列推进。
             // P0-1：写入路径不再物化接收方 unread_count，也不再发送 per-user UnreadCountChanged 事件。
-            // 与群聊行为一致：客户端通过 MessageReceived / ConversationChanged 中的 last_sequence
-            // 自行推导未读数变化。unread_count 列仍由 MarkRead 路径维护。
-            if (!string.IsNullOrWhiteSpace(message.ConversationId))
-            {
-                conversationSequence = await conversationWriter
-                    .TryAdvanceDirectSequenceAsync(
-                        message.ConversationId!,
-                        message.SenderUserId,
-                        message.ReceiverUserId,
-                        message.MessageId,
-                        ConversationId.CreatePreview(message.Content),
-                        message.ReceivedAtMs)
-                    .ConfigureAwait(false);
-            }
+            // 客户端通过 MessageReceived / ConversationChanged 中的 last_sequence 自行推导未读数变化。
 
-            // 序列号已知后再物化 payload，使 PayloadJson 携带 ConversationSequence。
+            // 序列号已知后物化 payload，使 PayloadJson 携带 ConversationSequence。
             var createdEvent = RealtimeMessageEventFactory.EnrichChatMessagePayload(
                 RealtimeMessageEventFactory.CopyWithMessageId(eventToPublish, message.MessageId),
                 boundAttachmentRefs,
-                conversationSequence);
+                conversationSequence,
+                ConversationType.Direct);
 
-            var outboxEvents = new List<RealtimeEvent>(8) { createdEvent };
+            // 极限-1：单聊 4 行 → 2 行。payload 已携带 ConversationType + ConversationSequence，
+            // 客户端从 MessageReceived 即可更新会话列表，不再生成双方 ConversationChanged 行。
+            // 保留 receiver MessageReceived + sender echo：单聊投递必须按 TargetUserId 精确路由（隐私边界）。
+            var outboxEvents = new List<RealtimeEvent>(2) { createdEvent };
 
             // 发送方其他在线设备回声：同事务写入；Gateway 会跳过来源 SessionId。
             if (message.SenderUserId != message.ReceiverUserId)
                 outboxEvents.Add(RealtimeMessageEventFactory.CreateSenderEchoEvent(createdEvent, message.SenderUserId));
-
-            if (conversationSequence is not null)
-            {
-                // 接收方：ConversationChanged（含 last_sequence）。
-                outboxEvents.Add(ConversationWriteCommands.CreateConversationChangedEvent(
-                    message.ConversationId!,
-                    message.ReceiverUserId,
-                    message.SenderUserId,
-                    message.MessageId,
-                    ConversationId.CreatePreview(message.Content),
-                    message.ReceivedAtMs,
-                    message.SenderUserId,
-                    createdEvent.TraceParent,
-                    createdEvent.TraceState,
-                    eventIdCause: null,
-                    ConversationType.Direct,
-                    title: null,
-                    lastSequence: conversationSequence));
-
-                // 发送方：ConversationChanged（含 last_sequence），发送方自身不产生未读事件。
-                outboxEvents.Add(ConversationWriteCommands.CreateConversationChangedEvent(
-                    message.ConversationId!,
-                    message.SenderUserId,
-                    message.ReceiverUserId,
-                    message.MessageId,
-                    ConversationId.CreatePreview(message.Content),
-                    message.ReceivedAtMs,
-                    message.SenderUserId,
-                    createdEvent.TraceParent,
-                    createdEvent.TraceState,
-                    eventIdCause: null,
-                    ConversationType.Direct,
-                    title: null,
-                    lastSequence: conversationSequence));
-            }
 
             await outboxWriter.InsertManyAsync(outboxEvents).ConfigureAwait(false);
         }

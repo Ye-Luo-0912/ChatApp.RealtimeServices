@@ -38,6 +38,7 @@ public sealed class ConversationProjectionTests : IAsyncLifetime
             CreateMessageReceivedEvent("evt-1", 1002, "msg-1", 100));
 
         Assert.Equal(RealtimeMessagePersistKind.Created, result.Kind);
+        Assert.NotNull(result.ConversationSequence);
 
         await using var connection = await client.GetDataSource().OpenConnectionAsync();
         await using (var command = new NpgsqlCommand(
@@ -67,27 +68,29 @@ public sealed class ConversationProjectionTests : IAsyncLifetime
 
         await using (var outbox = new NpgsqlCommand(
                            $"""
-                            SELECT event_type, target_user_id, COALESCE(payload_json, convert_from(payload_utf8, 'UTF8'))
+                            SELECT event_type, target_user_id
                             FROM {schema.OutboxTableSql}
                             WHERE event_type = @event_type
                             ORDER BY target_user_id
                             """,
                            connection))
         {
-            outbox.Parameters.AddWithValue("event_type", (short)RealtimeEventType.ConversationListChanged);
+            outbox.Parameters.AddWithValue("event_type", (short)RealtimeEventType.MessageReceived);
             await using var reader = await outbox.ExecuteReaderAsync();
             Assert.True(await reader.ReadAsync());
-            Assert.Equal(1001, reader.GetInt64(1));
-            var evtA = RealtimeWireSerializer.DeserializeEvent(reader.GetString(2));
-            Assert.NotNull(evtA);
-            var payloadA = RealtimeWireSerializer.DeserializeConversationChanged(evtA.PayloadJson!);
-            Assert.NotNull(payloadA);
-            Assert.Equal(conversationId, payloadA.ConversationId);
-            Assert.Equal(1002, payloadA.PeerUserId);
-
+            Assert.Equal(1001, reader.GetInt64(1)); // sender echo
             Assert.True(await reader.ReadAsync());
-            Assert.Equal(1002, reader.GetInt64(1));
+            Assert.Equal(1002, reader.GetInt64(1)); // receiver
             Assert.False(await reader.ReadAsync());
+        }
+
+        // 极限-1：不再生成 ConversationListChanged 事件。
+        await using (var changed = new NpgsqlCommand(
+                           $"SELECT COUNT(*) FROM {schema.OutboxTableSql} WHERE event_type = @event_type",
+                           connection))
+        {
+            changed.Parameters.AddWithValue("event_type", (short)RealtimeEventType.ConversationListChanged);
+            Assert.Equal(0, Convert.ToInt32(await changed.ExecuteScalarAsync()));
         }
     }
 

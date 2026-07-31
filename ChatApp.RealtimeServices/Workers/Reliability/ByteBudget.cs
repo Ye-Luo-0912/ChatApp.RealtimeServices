@@ -204,11 +204,17 @@ internal readonly struct LeasedEnvelope<T>
 {
     public T Envelope { get; }
     public ByteBudgetLease? Lease { get; }
+    /// <summary>
+    /// Reliability-4：ACK lease，在 envelope 从 NATS 收到后立即创建（ProduceAsync），
+    /// 覆盖排队等待 + 处理全周期。processor finally 块 Dispose 停止 progress-ack 计时器。
+    /// </summary>
+    public ProgressAckGuard? AckGuard { get; }
 
-    public LeasedEnvelope(T envelope, ByteBudgetLease? lease)
+    public LeasedEnvelope(T envelope, ByteBudgetLease? lease, ProgressAckGuard? ackGuard = null)
     {
         Envelope = envelope;
         Lease = lease;
+        AckGuard = ackGuard;
     }
 }
 

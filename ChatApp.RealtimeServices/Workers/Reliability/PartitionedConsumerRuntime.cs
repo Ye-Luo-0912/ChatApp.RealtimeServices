@@ -20,6 +20,8 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
     private readonly Func<TEnvelope, long>? _byteSizer;
     private readonly long _maxQueueBytes;
     private readonly long _maxSinglePayloadBytes;
+    private readonly TimeSpan _ackWait;
+    private readonly Func<TEnvelope, Func<CancellationToken, ValueTask>?>? _progressAckSelector;
 
     public PartitionedConsumerRuntime(
         string workerName,
@@ -30,7 +32,9 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
         ILogger logger,
         Func<TEnvelope, long>? byteSizer = null,
         long maxQueueBytes = 0,
-        long maxSinglePayloadBytes = 0)
+        long maxSinglePayloadBytes = 0,
+        TimeSpan ackWait = default,
+        Func<TEnvelope, Func<CancellationToken, ValueTask>?>? progressAckSelector = null)
     {
         _workerName = workerName;
         _partitionCount = partitionCount;
@@ -41,6 +45,8 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
         _byteSizer = byteSizer;
         _maxQueueBytes = maxQueueBytes;
         _maxSinglePayloadBytes = maxSinglePayloadBytes;
+        _ackWait = ackWait;
+        _progressAckSelector = progressAckSelector;
     }
 
     /// <summary>
@@ -175,6 +181,16 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
                     _readinessState.RecordMessageConsumed(_workerName);
                     var partition = getPartition(envelope);
 
+                    // Reliability-4：在 envelope 从 NATS 收到后、入 Channel 前立即启动 ack lease，
+                    // 覆盖排队等待 + 处理全周期，防止队列等待 > AckWait 时合法消息被重投。
+                    ProgressAckGuard? ackGuard = null;
+                    if (_progressAckSelector is not null && _ackWait > TimeSpan.Zero)
+                    {
+                        var progressAck = _progressAckSelector(envelope);
+                        if (progressAck is not null)
+                            ackGuard = ProgressAckGuard.Start(progressAck, _ackWait, ct, _logger);
+                    }
+
                     // P0-6：入队前按 payload 字节长度计费，返回 lease。
                     // lease 在 processor finally 块 Dispose，预算覆盖 queued + processing。
                     // 单条消息超过 MaxSinglePayloadBytes 时永久拒绝（不获取 lease，直接入队让 processor 死信）。
@@ -194,7 +210,7 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
                         }
                     }
 
-                    var leased = new LeasedEnvelope<TEnvelope>(envelope, lease);
+                    var leased = new LeasedEnvelope<TEnvelope>(envelope, lease, ackGuard);
                     await channels[partition].Writer.WriteAsync(leased, ct).ConfigureAwait(false);
 
                     // Reliability-2：报告队列深度，满队列持续过久会被 GetSnapshot 判定为不就绪。

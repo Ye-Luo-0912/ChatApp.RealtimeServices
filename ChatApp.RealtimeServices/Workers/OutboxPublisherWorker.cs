@@ -209,6 +209,8 @@ public sealed class OutboxPublisherWorker : BackgroundService
                     TargetUserIds = record.TargetUserIds,
                     AudienceKind = record.AudienceKind,
                     ConversationId = record.ConversationId,
+                    // 极限-3：会话级广播排除用户，Publisher/Gateway 据此跳过排除用户。
+                    ExcludeUserId = record.ExcludeUserId,
                     OccurredAtMs = 0,
                     TraceParent = record.TraceParent,
                     TraceState = record.TraceState,

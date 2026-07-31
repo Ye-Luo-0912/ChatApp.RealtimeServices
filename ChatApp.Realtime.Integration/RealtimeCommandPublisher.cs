@@ -1,12 +1,14 @@
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.JetStream;
+using ChatApp.Realtime.Integration.Push;
 using ChatApp.Realtime.Integration.Serialization;
 
 namespace ChatApp.Realtime.Integration;
@@ -202,9 +204,47 @@ internal sealed class RealtimeCommandPublisher
         }
     }
 
+    /// <summary>
+    /// 发布离线推送投递命令到 JetStream（RealtimeServices 调用，Gateway 消费后执行实际推送）。
+    /// <para>
+    /// 使用 <c>{TargetUserId}:{MessageId}</c> 作为 MsgId 实现服务端去重。
+    /// </para>
+    /// </summary>
+    public async Task PublishPushDeliveryAsync(PushDeliveryCommand command, CancellationToken ct = default)
+    {
+        using var activity = RealtimeIntegrationTelemetry.StartProducer(
+            "push_delivery.publish",
+            _options.PushDeliveriesSubject);
+        try
+        {
+            await _topology.EnsureStreamAsync(
+                _options.PushDeliveriesStream,
+                _options.PushDeliveriesSubject,
+                _options.PushMaxAgeHours,
+                ct).ConfigureAwait(false);
+            await _topology.PublishJetStreamWithReconnectRetryAsync(
+                _options.PushDeliveriesSubject,
+                JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.PushDeliveryCommand),
+                CreatePushMessageId(command),
+                RealtimeIntegrationTelemetry.CreatePropagationHeaders(),
+                ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            RealtimeIntegrationTelemetry.RecordException(activity, ex);
+            throw;
+        }
+    }
+
     private static string CreateMessageId(long senderUserId, string clientMessageId)
     {
         var bytes = Encoding.UTF8.GetBytes($"{senderUserId}:{clientMessageId}");
         return Convert.ToHexStringLower(SHA256.HashData(bytes));
     }
+
+    /// <summary>
+    /// 推送投递去重 MsgId：按目标用户与消息 Id 确定性生成。
+    /// </summary>
+    private static string CreatePushMessageId(PushDeliveryCommand command)
+        => $"{command.TargetUserId}:{command.MessageId}";
 }

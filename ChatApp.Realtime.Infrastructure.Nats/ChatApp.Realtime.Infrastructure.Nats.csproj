@@ -13,6 +13,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\ChatApp.Realtime.Infrastructure.Core\ChatApp.Realtime.Infrastructure.Core.csproj" />
+    <ProjectReference Include="..\ChatApp.Realtime.Integration\ChatApp.Realtime.Integration.csproj" />
   </ItemGroup>
 
 </Project>

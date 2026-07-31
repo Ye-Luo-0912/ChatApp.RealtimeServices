@@ -20,8 +20,15 @@ internal sealed class MessageWriter
 
     /// <summary>
     /// 写入消息行；返回受影响行数（0 表示命中 sender+client_message_id 幂等键）。
+    /// 极限-2：接受可选的 (conversation_sequence, sender_sequence)，在 INSERT 时直接填入，
+    /// 避免 INSERT NULL 后再 UPDATE 产生第二个 tuple 与额外 WAL/索引写入。
+    /// 序列由调用方在 INSERT 前通过 ConversationProjectionWriter.TryAllocate...Async 分配。
     /// </summary>
-    public async Task<int> InsertAsync(RealtimeMessageRecord message, string fingerprint)
+    public async Task<int> InsertAsync(
+        RealtimeMessageRecord message,
+        string fingerprint,
+        long? conversationSequence = null,
+        long? senderSequence = null)
     {
         var ct = _session.CancellationToken;
         await using var command = new NpgsqlCommand(
@@ -46,7 +53,9 @@ internal sealed class MessageWriter
                 mentioned_user_ids,
                 mentioned_roles,
                 edit_version,
-                changed_at_ms
+                changed_at_ms,
+                conversation_sequence,
+                sender_sequence
             )
             VALUES (
                 @message_id,
@@ -68,7 +77,9 @@ internal sealed class MessageWriter
                 @mentioned_user_ids,
                 @mentioned_roles,
                 1,
-                @received_at_ms
+                @received_at_ms,
+                @conversation_sequence,
+                @sender_sequence
             )
             ON CONFLICT (sender_user_id, client_message_id) DO NOTHING;
             """,
@@ -119,6 +130,13 @@ internal sealed class MessageWriter
             message.MentionedRoles is { Count: > 0 }
                 ? (object)message.MentionedRoles.ToArray()
                 : DBNull.Value);
+        // 极限-2：序列由调用方前置分配；未提供时写 NULL（向后兼容旧调用方）。
+        command.Parameters.AddWithValue(
+            "conversation_sequence",
+            conversationSequence.HasValue ? (object)conversationSequence.Value : DBNull.Value);
+        command.Parameters.AddWithValue(
+            "sender_sequence",
+            senderSequence.HasValue ? (object)senderSequence.Value : DBNull.Value);
 
         return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }

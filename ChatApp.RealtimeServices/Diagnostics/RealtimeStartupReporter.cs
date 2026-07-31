@@ -55,6 +55,7 @@ public sealed class RealtimeStartupReporter : IHostedService
     private readonly IOptions<RealtimeDatabaseOptions> _databaseOptions;
     private readonly IOptions<RealtimeConnectionOptions> _connectionOptions;
     private readonly IOptions<IdempotencyOptions> _idempotencyOptions;
+    private readonly IOptions<OutboxOptions> _outboxOptions;
     private readonly RealtimeConfigurationWarnings _warnings;
     private readonly RealtimeReadinessState _readinessState;
     private readonly IServiceProvider _services;
@@ -67,6 +68,7 @@ public sealed class RealtimeStartupReporter : IHostedService
         IOptions<RealtimeDatabaseOptions> databaseOptions,
         IOptions<RealtimeConnectionOptions> connectionOptions,
         IOptions<IdempotencyOptions> idempotencyOptions,
+        IOptions<OutboxOptions> outboxOptions,
         RealtimeConfigurationWarnings warnings,
         RealtimeReadinessState readinessState,
         IServiceProvider services,
@@ -78,6 +80,7 @@ public sealed class RealtimeStartupReporter : IHostedService
         _databaseOptions = databaseOptions;
         _connectionOptions = connectionOptions;
         _idempotencyOptions = idempotencyOptions;
+        _outboxOptions = outboxOptions;
         _warnings = warnings;
         _readinessState = readinessState;
         _services = services;
@@ -183,6 +186,34 @@ public sealed class RealtimeStartupReporter : IHostedService
             idempotencyHorizonMs,
             jetStreamMaxAgeMs,
             _idempotencyOptions.Value.Enabled);
+
+        // Reliability-4：校验 JetStream DuplicateWindow >= Outbox 最坏重试周期。
+        // Outbox "发布成功但 MarkPublished 失败"后重试时，依赖 JetStream MsgId 去重防止重复投递。
+        // 若去重窗口短于重试周期，窗口过期后的重试会产生重复消息。
+        var outboxOpts = _outboxOptions.Value;
+        var maxAttempts = outboxOpts.MaxAttempts;
+        var maxRetryDelaySec = outboxOpts.MaxRetryDelaySeconds;
+        long worstCaseRetrySec = 0;
+        for (var i = 1; i < maxAttempts; i++)
+        {
+            // CalculateRetryDelay: min(MaxRetryDelay, 2^attempt) + jitter(0-500ms), round up to 1s
+            worstCaseRetrySec += Math.Min(maxRetryDelaySec, (long)Math.Pow(2, Math.Min(i, 10))) + 1;
+        }
+        var duplicateWindowSec = (long)(nats.JetStream?.DuplicateWindowMinutes ?? 15) * 60;
+        if (duplicateWindowSec < worstCaseRetrySec)
+        {
+            throw new InvalidOperationException(
+                $"JetStream DuplicateWindowMinutes（{nats.JetStream?.DuplicateWindowMinutes ?? 15}）" +
+                $"小于 Outbox 最坏重试周期（{worstCaseRetrySec} 秒 = {worstCaseRetrySec / 60.0:F1} 分钟）。" +
+                $"配置：MaxAttempts={maxAttempts}, MaxRetryDelaySeconds={maxRetryDelaySec}。" +
+                "请增大 Nats:JetStream:DuplicateWindowMinutes，确保去重窗口覆盖整个重试周期，" +
+                "防止\"发布成功但 MarkPublished 失败\"场景下重试产生重复投递。");
+        }
+
+        _logger.LogInformation(
+            "Outbox 重试去重窗口配置。DuplicateWindow 秒={DuplicateWindowSec}；最坏重试周期秒={WorstCaseRetrySec}",
+            duplicateWindowSec,
+            worstCaseRetrySec);
 
         var snapshot = _readinessState.GetSnapshot();
         _logger.LogInformation(

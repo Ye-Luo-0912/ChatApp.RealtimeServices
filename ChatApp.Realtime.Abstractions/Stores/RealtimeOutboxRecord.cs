@@ -5,8 +5,8 @@ namespace ChatApp.Realtime.Abstractions.Stores;
 
 /// <summary>
 /// Outbox 认领记录。四-1/五：投递目标（<see cref="TargetUserId"/>、<see cref="TargetUserIds"/>、
-/// <see cref="AudienceKind"/>、<see cref="ConversationId"/>）以数据库列为唯一权威，
-/// 不再从业务 payload 反序列化。Publisher 直接发送 <see cref="PayloadUtf8"/> 字节。
+/// <see cref="AudienceKind"/>、<see cref="ConversationId"/>、<see cref="ExcludeUserId"/>）
+/// 以数据库列为唯一权威，不再从业务 payload 反序列化。Publisher 直接发送 <see cref="PayloadUtf8"/> 字节。
 /// </summary>
 /// <param name="Event"><c>null</c> 表示新记录（仅列权威）；非空表示旧记录回退路径。</param>
 public sealed record RealtimeOutboxRecord(
@@ -16,6 +16,7 @@ public sealed record RealtimeOutboxRecord(
     long[]? TargetUserIds,
     AudienceKind? AudienceKind,
     string? ConversationId,
+    long? ExcludeUserId,
     string? TraceParent,
     string? TraceState,
     RealtimeEvent? Event,

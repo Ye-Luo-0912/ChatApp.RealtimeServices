@@ -576,56 +576,89 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
             traceParent,
             traceState);
 
-        var memberIds = await ConversationWriteCommands.ListActiveMemberUserIdsAsync(
-                session.Connection,
-                session.Transaction,
-                session.Schema,
-                conversationId,
-                session.CancellationToken)
-            .ConfigureAwait(false);
-
-        // Perf-9：群已读走统一 GroupProjectionDelta 协议，ConversationRead 广播聚合为单行 Outbox。
+        // 极限-3：群 MarkRead 不再物化成员列表。会话级广播使用 Conversation 受众 + ExcludeUserId=读者，
+        // Publisher 通过 IConversationGatewayDirectory 一次查询会话在线 Gateway 集合投递，
+        // Gateway 跳过 ExcludeUserId 的会话。单聊仍需成员列表做 per-target 路由。
         if (ConversationId.IsGroup(conversationId))
         {
-            var delta = new GroupProjectionDelta(conversationId, memberIds);
+            // 极限-3：debounce 判定——仅在首次广播、超出时间窗、或读水位推进超过序列阈值时广播。
+            // 抑制期间的 MarkRead 仍立即写读者自身未读变更（即时反馈），仅跳过向其余成员的广播，
+            // 避免大群 O(N²) 网络投递。
+            var shouldBroadcast = readResult.LastReadBroadcastAtMs is null
+                || (now - readResult.LastReadBroadcastAtMs.Value) >= ConversationWriteCommands.GroupReadBroadcastDebounceMs
+                || (targetSequence - (readResult.LastReadBroadcastSequence ?? 0)) >= ConversationWriteCommands.GroupReadBroadcastSequenceThreshold;
 
-            // 排除读者本人：读者不需要再收到自己的已读水位通知。
-            var others = new List<long>(memberIds.Count);
-            foreach (var memberId in memberIds)
+            int groupInserted;
+            if (shouldBroadcast)
             {
-                if (memberId != userId)
-                    others.Add(memberId);
+                var delta = new GroupProjectionDelta(conversationId);
+                // 会话级广播 + ExcludeUserId=读者：无需物化 N-1 成员数组，跳过 ListActiveMemberUserIdsAsync。
+                delta.AddBroadcastExcept(
+                    GroupProjectionEventFactory.CreateGroupConversationReadBroadcast(
+                        conversationId,
+                        userId,
+                        targetMessageId,
+                        targetAtMs,
+                        now,
+                        targetSequence,
+                        traceParent,
+                        traceState),
+                    userId);
+                // 读者自身的未读数变更保持逐用户。
+                delta.AddPerUser(readerUnreadEvent);
+
+                // DEBUG-极限3: trace events before insert
+                var debugEvents = delta.Build();
+                foreach (var de in debugEvents)
+                {
+                    Console.WriteLine($"[DEBUG-极限3-Store] EventId={de.EventId}, Type={de.Type}, AudienceKind={de.AudienceKind}, ConversationId={de.ConversationId}, ExcludeUserId={de.ExcludeUserId}, TargetUserIds={(de.TargetUserIds is null ? "null" : de.TargetUserIds.Length.ToString())}");
+                }
+
+                groupInserted = await OutboxInsertHelper.InsertManyAsync(
+                        session.Connection,
+                        session.Transaction,
+                        session.Schema,
+                        delta.Build(),
+                        session.CancellationToken)
+                    .ConfigureAwait(false);
+
+                // 广播水位同事务更新，供下次 MarkRead debounce 判定。
+                await ConversationWriteCommands.UpdateReadBroadcastWatermarksAsync(
+                        session.Connection,
+                        session.Transaction,
+                        session.Schema,
+                        conversationId,
+                        userId,
+                        targetSequence,
+                        now,
+                        session.CancellationToken)
+                    .ConfigureAwait(false);
             }
-
-            // 通知群内其他成员某用户已读到某水位：单一 payload 适合广播。
-            delta.AddBroadcastTo(
-                GroupProjectionEventFactory.CreateGroupConversationReadBroadcast(
-                    conversationId,
-                    userId,
-                    targetMessageId,
-                    targetAtMs,
-                    now,
-                    targetSequence,
-                    traceParent,
-                    traceState),
-                others);
-
-            // 读者自身的未读数变更保持逐用户。
-            delta.AddPerUser(readerUnreadEvent);
-
-            var groupInserted = await OutboxInsertHelper.InsertManyAsync(
-                    session.Connection,
-                    session.Transaction,
-                    session.Schema,
-                    delta.Build(),
-                    session.CancellationToken)
-                .ConfigureAwait(false);
+            else
+            {
+                // debounce 抑制：仅写读者自身未读变更，不向其余成员广播。
+                groupInserted = await OutboxInsertHelper.InsertManyAsync(
+                        session.Connection,
+                        session.Transaction,
+                        session.Schema,
+                        [readerUnreadEvent],
+                        session.CancellationToken)
+                    .ConfigureAwait(false);
+            }
             // Reliability-4：累计到 session，由 CommitAsync 在事务提交成功后统一记录到 metrics。
             session.RecordOutboxInsert(groupInserted);
         }
         else
         {
-            // 单聊路径：保持 per-target ConversationRead 事件 + 读者未读变更。
+            // 单聊路径：仍需成员列表做 per-target ConversationRead 路由（单聊按 TargetUserId 精确路由）。
+            var memberIds = await ConversationWriteCommands.ListActiveMemberUserIdsAsync(
+                    session.Connection,
+                    session.Transaction,
+                    session.Schema,
+                    conversationId,
+                    session.CancellationToken)
+                .ConfigureAwait(false);
+
             var events = new List<RealtimeEvent>(memberIds.Count + 1) { readerUnreadEvent };
             foreach (var memberId in memberIds)
             {

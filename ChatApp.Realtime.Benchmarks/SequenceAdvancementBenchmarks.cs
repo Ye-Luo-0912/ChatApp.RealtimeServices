@@ -87,6 +87,46 @@ public class SequenceAdvancementBenchmarks
     }
 
     /// <summary>
+    /// 极限-2：群消息序列分配（前置）。仅 UPDATE conversations + 发送者 sent_count，
+    /// 不回写 messages 行。与 AdvanceGroupSequence 对比可量化"INSERT NULL → UPDATE 回写"
+    /// 路径产生的额外 tuple/WAL/索引写入开销。
+    /// </summary>
+    [Benchmark(Description = "Group sequence allocate (pre-INSERT, no messages UPDATE)")]
+    public async Task AllocateGroupSequence()
+    {
+        await using var tx = await _connection.BeginTransactionAsync();
+        await ConversationWriteCommands.TryAllocateGroupSequenceAsync(
+            _connection, tx, _schema,
+            conversationId: "bench-group",
+            senderUserId: 2001,
+            messageId: "bench-msg-group",
+            preview: "p",
+            receivedAtMs: 1_700_000_000_000L,
+            CancellationToken.None);
+        await tx.CommitAsync();
+    }
+
+    /// <summary>
+    /// 极限-2：单聊消息序列分配（前置）。仅 UPSERT conversations + 发送者 sent_count，
+    /// 不回写 messages 行。
+    /// </summary>
+    [Benchmark(Description = "Direct sequence allocate (pre-INSERT, no messages UPDATE)")]
+    public async Task AllocateDirectSequence()
+    {
+        await using var tx = await _connection.BeginTransactionAsync();
+        await ConversationWriteCommands.TryAllocateDirectSequenceAsync(
+            _connection, tx, _schema,
+            conversationId: "bench-direct",
+            senderUserId: 3001,
+            receiverUserId: 3002,
+            messageId: "bench-msg-direct",
+            preview: "p",
+            receivedAtMs: 1_700_000_000_000L,
+            CancellationToken.None);
+        await tx.CommitAsync();
+    }
+
+    /// <summary>
     /// MarkRead 的 sender_sequence 索引查找（O(log N)）。
     /// 利用 ix_messages_sender_sequence_lookup 替代 O(N) COUNT(*) 扫描。
     /// </summary>

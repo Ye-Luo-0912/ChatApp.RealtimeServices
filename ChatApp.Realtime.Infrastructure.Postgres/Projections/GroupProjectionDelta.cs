@@ -72,6 +72,28 @@ internal sealed class GroupProjectionDelta
     }
 
     /// <summary>
+    /// 极限-3：添加一条会话级广播事件，并在 Gateway 投递时排除指定用户。
+    /// <para>
+    /// 烙印 <see cref="AudienceKind.Conversation"/> + <see cref="ConversationId"/>，
+    /// <see cref="RealtimeEvent.TargetUserIds"/> 保持 null——Publisher 通过
+    /// <c>IConversationGatewayDirectory</c> 一次查询会话在线 Gateway 实例集合投递，
+    /// 不再物化 N-1 个排除读者后的成员数组。
+    /// </para>
+    /// <para>
+    /// 典型场景：群 MarkRead 广播——读者本人不需要再收到自己的已读水位通知，
+    /// 通过 <paramref name="excludeUserId"/> 让 Gateway 在投递时跳过该用户的所有会话。
+    /// 调用方因此可跳过 <c>ListActiveMemberUserIdsAsync</c>，省去一次成员表扫描。
+    /// </para>
+    /// </summary>
+    /// <param name="template">target-independent 事件模板（EventId 不纳入 target）。</param>
+    /// <param name="excludeUserId">需要排除的用户编号（通常为读者本人）。</param>
+    public GroupProjectionDelta AddBroadcastExcept(RealtimeEvent template, long excludeUserId)
+    {
+        _events.Add(WithConversationAudience(template, ConversationId, excludeUserId));
+        return this;
+    }
+
+    /// <summary>
     /// 添加一条逐用户事件（payload 因用户而异，如绝对未读数）。
     /// 调用方需为每个目标用户单独构造事件并逐条添加。
     /// </summary>
@@ -103,5 +125,32 @@ internal sealed class GroupProjectionDelta
         TargetUserIds = targets,
         AudienceKind = conversationId is null ? null : AudienceKind.Conversation,
         ConversationId = conversationId
+    };
+
+    /// <summary>
+    /// 极限-3：构造会话级广播事件（排除指定用户）。TargetUserIds=null，由会话级路由目录投递；
+    /// ExcludeUserId 让 Gateway 跳过排除用户（如群 MarkRead 的读者本人）。
+    /// </summary>
+    private static RealtimeEvent WithConversationAudience(
+        RealtimeEvent template,
+        string conversationId,
+        long excludeUserId) => new()
+    {
+        EventId = template.EventId,
+        Type = template.Type,
+        TargetUserId = template.TargetUserId,
+        ActorUserId = template.ActorUserId,
+        MessageId = template.MessageId,
+        SessionId = template.SessionId,
+        PayloadJson = template.PayloadJson,
+        OccurredAtMs = template.OccurredAtMs,
+        TraceParent = template.TraceParent,
+        TraceState = template.TraceState,
+        // 会话级广播：不物化成员数组，由 IConversationGatewayDirectory 投递。
+        TargetUserIds = null,
+        AudienceKind = AudienceKind.Conversation,
+        ConversationId = conversationId,
+        // 排除用户（读者本人）：Gateway 投递时跳过该用户的所有会话。
+        ExcludeUserId = excludeUserId
     };
 }

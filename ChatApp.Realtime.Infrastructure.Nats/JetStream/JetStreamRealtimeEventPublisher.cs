@@ -3,9 +3,12 @@ using System.Diagnostics;
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
+using ChatApp.Realtime.Integration;
+using ChatApp.Realtime.Integration.Push;
 using Microsoft.Extensions.Logging;
 
 namespace ChatApp.Realtime.Infrastructure.Nats.JetStream;
@@ -21,6 +24,7 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
     private readonly RoutingMetrics? _routingMetrics;
     private readonly RealtimeMetrics? _realtimeMetrics;
     private readonly ILogger<JetStreamRealtimeEventPublisher>? _logger;
+    private readonly IRealtimeMessageBus? _messageBus;
 
     public JetStreamRealtimeEventPublisher(
         JetStreamContextManager contextManager,
@@ -30,6 +34,7 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
         IWatcherGatewayDirectory? watcherGatewayDirectory = null,
         RealtimeMetrics? realtimeMetrics = null,
         IConversationGatewayDirectory? conversationGatewayDirectory = null,
+        IRealtimeMessageBus? messageBus = null,
         ILogger<JetStreamRealtimeEventPublisher>? logger = null,
         int maxShardParallelism = 4)
     {
@@ -45,6 +50,7 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
         _routingMetrics = routingMetrics;
         _realtimeMetrics = realtimeMetrics;
         _logger = logger;
+        _messageBus = messageBus;
     }
 
     /// <summary>Perf-4：旧入口，回退到序列化路径。实际逻辑在 <see cref="PublishWithPayloadAsync"/>。</summary>
@@ -100,8 +106,9 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
 
         if (lookup.Kind == GatewayLookupResultKind.UserOffline)
         {
-            // 查询成功但用户离线：正常不投递。
+            // 查询成功但用户离线：触发离线推送。
             _routingMetrics?.RecordBroadcastFallback("realtime", "user_offline");
+            await TriggerPushDeliveryAsync(evt, evt.TargetUserId, ct).ConfigureAwait(false);
             return;
         }
 
@@ -128,19 +135,12 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
 
     public async Task PublishToManyWithPayloadAsync(RealtimeEvent evt, ReadOnlyMemory<byte>? payloadUtf8, CancellationToken ct = default)
     {
-        // 未携带多目标列表时回退到单目标发布路径。
-        if (evt.TargetUserIds is null || evt.TargetUserIds.Length == 0)
-        {
-            await PublishWithPayloadAsync(evt, payloadUtf8, ct).ConfigureAwait(false);
-            return;
-        }
-
         // P0-8：优先使用预序列化的 UTF-8 字节直接传给 NATS，避免 UTF-16 中间 string。
         ReadOnlyMemory<byte> payload = payloadUtf8 is { Length: > 0 } bytes
             ? bytes
             : JsonSerializer.SerializeToUtf8Bytes(evt, RealtimeJsonSerializerContext.Default.RealtimeEvent);
 
-        // 非分片模式：广播单条消息，各 Gateway 自行遍历 TargetUserIds 投递本机会话。
+        // 非分片模式：广播单条消息，各 Gateway 自行遍历 TargetUserIds / 按 ExcludeUserId 过滤投递本机会话。
         if (_shardSubjectPattern is null)
         {
             _routingMetrics?.RecordBroadcastFallback("realtime", "no_pattern");
@@ -150,8 +150,10 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
             return;
         }
 
-        // Perf-2：会话级受众路由——一次查询返回该会话所有在线成员所在的 Gateway 实例集合，
-        // 替代逐用户查询 N 个 Redis keys。失败时回退到 per-user 路由。
+        // Perf-2：会话级受众路由优先——一次查询返回该会话所有在线成员所在的 Gateway 实例集合，
+        // 替代逐用户查询 N 个 Redis keys。
+        // 极限-3：TargetUserIds 可能为 null（群 MarkRead 广播携带 ExcludeUserId），
+        // 会话级路由不依赖 TargetUserIds，必须在 null 检查之前处理，否则会被单目标回退吞掉。
         if (evt.AudienceKind == AudienceKind.Conversation && !string.IsNullOrWhiteSpace(evt.ConversationId))
         {
             var convSw = Stopwatch.StartNew();
@@ -167,12 +169,29 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
                     .ConfigureAwait(false);
 
                 _routingMetrics?.RecordShardPublish("realtime", "conversation", convLookup.Gateways.Count);
-                _routingMetrics?.RecordFanout(evt.TargetUserIds!.Length, convLookup.Gateways.Count);
+                // 极限-3：TargetUserIds 可能为 null（会话级广播），fanout 输入用 Gateway 实例数近似。
+                _routingMetrics?.RecordFanout(evt.TargetUserIds?.Length ?? convLookup.Gateways.Count, convLookup.Gateways.Count);
                 return;
             }
 
-            // LookupFailure 或无在线实例：回退到 per-user 路由（下方逻辑）。
+            // LookupFailure 或无在线实例：若 TargetUserIds 为空（纯会话级广播，如群 MarkRead），
+            // 无法回退到 per-user 路由，广播到所有活跃 shards，各 Gateway 按 ExcludeUserId 自行过滤。
+            if (evt.TargetUserIds is null || evt.TargetUserIds.Length == 0)
+            {
+                await PublishToAllShardsAsync(payload, evt, "conversation_lookup_failure", ct)
+                    .ConfigureAwait(false);
+                return;
+            }
+
+            // 有 TargetUserIds：回退到 per-user 路由（下方逻辑）。
             _routingMetrics?.RecordBroadcastFallback("realtime", "conversation_fallback");
+        }
+
+        // 未携带多目标列表时回退到单目标发布路径。
+        if (evt.TargetUserIds is null || evt.TargetUserIds.Length == 0)
+        {
+            await PublishWithPayloadAsync(evt, payloadUtf8, ct).ConfigureAwait(false);
+            return;
         }
 
         // 分片模式：批量查询所有目标用户的在线 Gateway 集合，按实例聚合投递。
@@ -201,6 +220,18 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
             await PublishToAllShardsAsync(payload, evt, "partial_lookup_failure", ct)
                 .ConfigureAwait(false);
             return;
+        }
+
+        // 离线用户触发推送（群消息场景）：Gateway 列表为空表示该用户当前无在线会话。
+        if (_messageBus is not null && evt.Type == RealtimeEventType.MessageReceived)
+        {
+            foreach (var kvp in lookup.GatewayMap)
+            {
+                if (kvp.Value is null || kvp.Value.Count == 0)
+                {
+                    await TriggerPushDeliveryAsync(evt, kvp.Key, ct).ConfigureAwait(false);
+                }
+            }
         }
 
         if (instances.Count == 0)
@@ -361,5 +392,81 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
         await _contextManager
             .PublishRealtimeEventToSubjectAsync(subject, msgId, payload, ct)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 离线推送触发：目标用户离线时构造 <see cref="PushDeliveryCommand"/> 并通过
+    /// <see cref="IRealtimeMessageBus.PublishPushDeliveryAsync"/> 发布到 NATS，由 Push 投递方消费执行实际推送。
+    /// <para>仅对 <see cref="RealtimeEventType.MessageReceived"/> 触发；回执/编辑/撤回等事件不推送。</para>
+    /// <para>fire-and-forget：推送失败仅记录日志，不影响主消息投递流程。</para>
+    /// </summary>
+    private async Task TriggerPushDeliveryAsync(RealtimeEvent evt, long targetUserId, CancellationToken ct)
+    {
+        if (_messageBus is null)
+            return;
+
+        // 仅对聊天消息触发推送（收据/编辑/撤回等不推送）。
+        if (evt.Type != RealtimeEventType.MessageReceived)
+            return;
+
+        try
+        {
+            var command = BuildPushCommand(evt, targetUserId);
+            await _messageBus.PublishPushDeliveryAsync(command, ct).ConfigureAwait(false);
+            _realtimeMetrics?.RecordPushTriggered(command.IsMention);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // 推送失败不影响主流程
+            _logger?.LogWarning(ex, "Failed to publish push delivery for user {TargetUserId}", targetUserId);
+        }
+    }
+
+    /// <summary>
+    /// 从 <see cref="RealtimeEvent"/> 构造 <see cref="PushDeliveryCommand"/>。
+    /// 反序列化 <see cref="RealtimeEvent.PayloadJson"/> 为 <see cref="RealtimeChatMessagePayload"/>
+    /// 提取消息正文与 @mention 信息；解析失败回退到默认文案。
+    /// </summary>
+    private static PushDeliveryCommand BuildPushCommand(RealtimeEvent evt, long targetUserId)
+    {
+        const string defaultTitle = "New Message";
+        const string defaultBody = "You have a new message";
+        string title = defaultTitle;
+        string body = defaultBody;
+        bool isMention = false;
+
+        if (!string.IsNullOrEmpty(evt.PayloadJson))
+        {
+            try
+            {
+                var payload = JsonSerializer.Deserialize(
+                    evt.PayloadJson, RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload);
+                if (payload is not null)
+                {
+                    body = payload.Content;
+                    // Check if target user is mentioned
+                    if (payload.MentionedUserIds is not null && payload.MentionedUserIds.Count > 0)
+                    {
+                        isMention = payload.MentionedUserIds.Contains(targetUserId);
+                    }
+                }
+            }
+            catch (JsonException)
+            {
+                // Fall back to defaults
+            }
+        }
+
+        return new PushDeliveryCommand
+        {
+            TargetUserId = targetUserId,
+            Title = title,
+            Body = body,
+            ConversationId = evt.ConversationId,
+            MessageId = evt.MessageId,
+            SenderDisplayName = null,
+            IsMention = isMention,
+            OccurredAtMs = evt.OccurredAtMs
+        };
     }
 }

@@ -68,7 +68,9 @@ public sealed class MessageReceiptWorker : BackgroundService
             _options.ProcessingQueueCapacity,
             _options.WorkerIntervalMs,
             _readinessState,
-            _logger);
+            _logger,
+            ackWait: _ackWait,
+            progressAckSelector: env => env.ProgressAckAsync);
         await runtime.RunAsync(
             consume: ct => _consumer.ConsumeAsync(ct),
             getPartition: env => GetPartition(env.Command.MessageId, _options.ProcessingConcurrency),
@@ -117,6 +119,9 @@ public sealed class MessageReceiptWorker : BackgroundService
                 // P0-6：lease 在处理完成时释放。MessageReceiptWorker 未启用字节预算，lease 始终为 null。
                 if (leased.Lease is not null)
                     await leased.Lease.DisposeAsync().ConfigureAwait(false);
+                // Reliability-4：ack lease 覆盖排队等待 + 处理全周期，处理完成时停止。
+                if (leased.AckGuard is not null)
+                    await leased.AckGuard.DisposeAsync().ConfigureAwait(false);
                 _readinessState.MarkHeartbeat(WorkerName);
                 _metrics.RecordProcessingDuration(
                     Stopwatch.GetElapsedTime(started));
@@ -154,12 +159,6 @@ public sealed class MessageReceiptWorker : BackgroundService
             return;
         }
 
-        // Reliability-4：长时处理期间定期发送 In-Progress ACK，重置 JetStream AckWait 计时器。
-        await using var progressGuard = ProgressAckGuard.Start(
-            envelope.ProgressAckAsync,
-            _ackWait,
-            ct,
-            _logger);
         var result = await _processor
             .ProcessAsync(envelope.Command, ct)
             .ConfigureAwait(false);

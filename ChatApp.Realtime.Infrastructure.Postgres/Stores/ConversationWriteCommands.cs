@@ -15,6 +15,20 @@ internal static class ConversationWriteCommands
     public const int MaxTrackedUnreadCount = 10_000;
 
     /// <summary>
+    /// 极限-3：群 MarkRead 广播 debounce 时间窗（毫秒）。
+    /// 读者在窗口内的连续 MarkRead 只更新自身未读数，不向其余成员广播 ConversationRead，
+    /// 避免大群 O(N²) 网络投递。窗口过期后或读水位推进超过序列阈值时再次广播。
+    /// </summary>
+    public const int GroupReadBroadcastDebounceMs = 2_000;
+
+    /// <summary>
+    /// 极限-3：群 MarkRead 广播序列阈值。
+    /// 即使在 debounce 时间窗内，读水位自上次广播推进超过此阈值也立即广播，
+    /// 保证其余成员能在合理延迟内感知读者进度，避免水位长期滞后。
+    /// </summary>
+    public const int GroupReadBroadcastSequenceThreshold = 10;
+
+    /// <summary>
     /// P0-2：统一的未读数 SQL 表达式。基于序列公式派生，处理 retention floor 与自发送消息扣除。
     /// <para>
     /// 有效读水位 = GREATEST(last_read_sequence, retention_floor_sequence)，
@@ -65,6 +79,41 @@ internal static class ConversationWriteCommands
         while (await reader.ReadAsync(ct).ConfigureAwait(false))
             ids.Add(reader.GetInt64(0));
         return ids;
+    }
+
+    /// <summary>
+    /// 极限-3：更新成员的 ConversationRead 广播水位。
+    /// <para>
+    /// 仅在群 MarkRead 实际向其余成员广播后调用，记录本次广播的读序列与时间，
+    /// 供后续 MarkRead 做 debounce 判定。未广播（被 debounce 抑制）时不调用，
+    /// 保持原水位不变。
+    /// </para>
+    /// </summary>
+    public static async Task UpdateReadBroadcastWatermarksAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        RealtimeDatabaseSchema schema,
+        string conversationId,
+        long userId,
+        long broadcastSequence,
+        long broadcastAtMs,
+        CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand(
+            $"""
+             UPDATE {schema.ConversationMembersTableSql}
+             SET last_read_broadcast_sequence = @broadcast_sequence,
+                 last_read_broadcast_at_ms = @broadcast_at_ms
+             WHERE conversation_id = @conversation_id
+               AND user_id = @user_id;
+             """,
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("broadcast_sequence", broadcastSequence);
+        command.Parameters.AddWithValue("broadcast_at_ms", broadcastAtMs);
+        command.Parameters.AddWithValue("conversation_id", conversationId);
+        command.Parameters.AddWithValue("user_id", userId);
+        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
     public static RealtimeEvent CreateUnreadCountChangedEvent(
@@ -499,6 +548,198 @@ internal static class ConversationWriteCommands
     }
 
     /// <summary>
+    /// 极限-2：序列分配结果。供 TryAllocateGroupSequenceAsync / TryAllocateDirectSequenceAsync 返回，
+    /// 调用方据此填充 messages 行的 conversation_sequence / sender_sequence 列，避免 INSERT 后再 UPDATE
+    /// 产生第二个 tuple 与额外 WAL/索引写入。
+    /// </summary>
+    public sealed record SequenceAllocationResult(long ConversationSequence, long SenderSequence);
+
+    /// <summary>
+    /// 极限-2：群消息序列分配（前置）。原子递增 conversations.last_sequence 与发送者 sent_count，
+    /// 返回 (conversation_sequence, sender_sequence) 供调用方在 INSERT messages 时直接填入。
+    /// 与 TryAdvanceGroupSequenceAsync 的差异：不依赖 message_id 做 UPDATE messages 回写。
+    /// 仍包含会话 tip 字段更新，因 tip 必须在序列分配同事务内推进，避免乱序消息回退 tip。
+    /// P0-3：授权检查嵌入 UPDATE 谓词，失败时返回 null。
+    /// 极限-2权衡：若调用方后续 INSERT 命中幂等键，已分配的序列号会形成 gap（可接受）。
+    /// </summary>
+    public static async Task<SequenceAllocationResult?> TryAllocateGroupSequenceAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        RealtimeDatabaseSchema schema,
+        string conversationId,
+        long senderUserId,
+        string messageId,
+        string preview,
+        long receivedAtMs,
+        CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand(
+            $"""
+            WITH advanced AS (
+                UPDATE {schema.ConversationsTableSql}
+                SET last_sequence = last_sequence + 1,
+                    last_message_id = @message_id,
+                    last_message_preview = @preview,
+                    last_message_at_ms = @received_at_ms,
+                    last_sender_user_id = @sender_user_id,
+                    updated_at_ms = @received_at_ms
+                WHERE conversation_id = @conversation_id
+                  AND type = @group_type
+                  AND dissolved_at_ms IS NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM {schema.ConversationMembersTableSql}
+                      WHERE conversation_id = @conversation_id
+                        AND user_id = @sender_user_id
+                        AND left_at_ms IS NULL
+                  )
+                RETURNING last_sequence
+            ),
+            sender_bump AS (
+                UPDATE {schema.ConversationMembersTableSql}
+                SET sent_count = sent_count + 1
+                WHERE conversation_id = @conversation_id
+                  AND user_id = @sender_user_id
+                  AND left_at_ms IS NULL
+                  AND EXISTS (SELECT 1 FROM advanced)
+                RETURNING sent_count
+            )
+            SELECT
+                (SELECT last_sequence FROM advanced) AS conversation_sequence,
+                (SELECT sent_count FROM sender_bump) AS sender_sequence;
+            """,
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("conversation_id", conversationId);
+        command.Parameters.AddWithValue("group_type", (short)ConversationType.Group);
+        command.Parameters.AddWithValue("received_at_ms", receivedAtMs);
+        command.Parameters.AddWithValue("message_id", messageId);
+        command.Parameters.AddWithValue("preview", preview);
+        command.Parameters.AddWithValue("sender_user_id", senderUserId);
+
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+            return null;
+
+        if (reader.IsDBNull(0))
+            return null;
+
+        var conversationSequence = reader.GetInt64(0);
+        var senderSequence = reader.IsDBNull(1) ? 0L : reader.GetInt64(1);
+        return new SequenceAllocationResult(conversationSequence, senderSequence);
+    }
+
+    /// <summary>
+    /// 极限-2：单聊消息序列分配（前置）。UPSERT 会话 + 递增 last_sequence + 发送者 sent_count。
+    /// 与 TryAdvanceDirectSequenceAsync 的差异：不回写 messages 行。
+    /// P0-1：不再物化接收方 unread_count，列表查询基于序列公式派生。
+    /// </summary>
+    public static async Task<SequenceAllocationResult?> TryAllocateDirectSequenceAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        RealtimeDatabaseSchema schema,
+        string conversationId,
+        long senderUserId,
+        long receiverUserId,
+        string messageId,
+        string preview,
+        long receivedAtMs,
+        CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand(
+            $"""
+            WITH upsert_conversation AS (
+                INSERT INTO {schema.ConversationsTableSql} (
+                    conversation_id, type, created_at_ms, updated_at_ms,
+                    last_message_id, last_message_preview, last_message_at_ms,
+                    last_sender_user_id, last_sequence
+                ) VALUES (
+                    @conversation_id, @type, @received_at_ms, @received_at_ms,
+                    @message_id, @preview, @received_at_ms,
+                    @sender_user_id, 1
+                )
+                ON CONFLICT (conversation_id) DO UPDATE SET
+                    last_sequence = {schema.ConversationsTableSql}.last_sequence + 1,
+                    last_message_id = CASE
+                        WHEN {schema.ConversationsTableSql}.last_message_at_ms IS NULL
+                             OR ({schema.ConversationsTableSql}.last_message_at_ms,
+                                 {schema.ConversationsTableSql}.last_message_id)
+                                < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
+                        THEN EXCLUDED.last_message_id
+                        ELSE {schema.ConversationsTableSql}.last_message_id
+                    END,
+                    last_message_preview = CASE
+                        WHEN {schema.ConversationsTableSql}.last_message_at_ms IS NULL
+                             OR ({schema.ConversationsTableSql}.last_message_at_ms,
+                                 {schema.ConversationsTableSql}.last_message_id)
+                                < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
+                        THEN EXCLUDED.last_message_preview
+                        ELSE {schema.ConversationsTableSql}.last_message_preview
+                    END,
+                    last_message_at_ms = CASE
+                        WHEN {schema.ConversationsTableSql}.last_message_at_ms IS NULL
+                             OR ({schema.ConversationsTableSql}.last_message_at_ms,
+                                 {schema.ConversationsTableSql}.last_message_id)
+                                < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
+                        THEN EXCLUDED.last_message_at_ms
+                        ELSE {schema.ConversationsTableSql}.last_message_at_ms
+                    END,
+                    last_sender_user_id = CASE
+                        WHEN {schema.ConversationsTableSql}.last_message_at_ms IS NULL
+                             OR ({schema.ConversationsTableSql}.last_message_at_ms,
+                                 {schema.ConversationsTableSql}.last_message_id)
+                                < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
+                        THEN EXCLUDED.last_sender_user_id
+                        ELSE {schema.ConversationsTableSql}.last_sender_user_id
+                    END,
+                    updated_at_ms = EXCLUDED.updated_at_ms
+                RETURNING last_sequence
+            ),
+            ensure_receiver AS (
+                INSERT INTO {schema.ConversationMembersTableSql} (
+                    conversation_id, user_id, peer_user_id, joined_at_ms, last_message_at_ms
+                ) VALUES
+                    (@conversation_id, @receiver_user_id, @sender_user_id, @received_at_ms, @received_at_ms)
+                ON CONFLICT (conversation_id, user_id) DO NOTHING
+            ),
+            sender_upsert AS (
+                INSERT INTO {schema.ConversationMembersTableSql} (
+                    conversation_id, user_id, peer_user_id, joined_at_ms, last_message_at_ms, sent_count
+                ) VALUES
+                    (@conversation_id, @sender_user_id, @receiver_user_id, @received_at_ms, @received_at_ms, 1)
+                ON CONFLICT (conversation_id, user_id) DO UPDATE SET
+                    sent_count = {schema.ConversationMembersTableSql}.sent_count + 1,
+                    last_message_at_ms = @received_at_ms
+                WHERE EXISTS (SELECT 1 FROM upsert_conversation)
+                RETURNING sent_count
+            )
+            SELECT
+                (SELECT last_sequence FROM upsert_conversation) AS conversation_sequence,
+                (SELECT sent_count FROM sender_upsert) AS sender_sequence;
+            """,
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("conversation_id", conversationId);
+        command.Parameters.AddWithValue("type", (short)ConversationType.Direct);
+        command.Parameters.AddWithValue("received_at_ms", receivedAtMs);
+        command.Parameters.AddWithValue("message_id", messageId);
+        command.Parameters.AddWithValue("preview", preview);
+        command.Parameters.AddWithValue("sender_user_id", senderUserId);
+        command.Parameters.AddWithValue("receiver_user_id", receiverUserId);
+
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+            return null;
+
+        if (reader.IsDBNull(0))
+            return null;
+
+        var directConversationSequence = reader.GetInt64(0);
+        var directSenderSequence = reader.IsDBNull(1) ? 0L : reader.GetInt64(1);
+        return new SequenceAllocationResult(directConversationSequence, directSenderSequence);
+    }
+
+    /// <summary>
     /// Perf-1：基于序列的 MarkRead。使用索引查询 + 单行 UPDATE。
     /// <para>
     /// unread = last_sequence - target_sequence - (sent_count - sent_upto_target)
@@ -523,9 +764,12 @@ internal static class ConversationWriteCommands
         CancellationToken ct)
     {
         // 读取会话 last_sequence 与成员当前 sent_count / last_read_sequence / 统一未读公式快照
+        // 极限-3：同时读取广播水位 last_read_broadcast_sequence / last_read_broadcast_at_ms 供 debounce。
         long conversationLastSequence;
         long memberSentCount;
         long? currentReadSequence;
+        long? lastReadBroadcastSequence;
+        long? lastReadBroadcastAtMs;
         var currentUnread = 0;
 
         await using (var load = new NpgsqlCommand(
@@ -533,7 +777,9 @@ internal static class ConversationWriteCommands
                           SELECT c.last_sequence,
                                  m.sent_count,
                                  m.last_read_sequence,
-                                 {UnreadCountSqlExpression} AS unread_count
+                                 {UnreadCountSqlExpression} AS unread_count,
+                                 m.last_read_broadcast_sequence,
+                                 m.last_read_broadcast_at_ms
                           FROM {schema.ConversationsTableSql} AS c
                           INNER JOIN {schema.ConversationMembersTableSql} AS m
                               ON m.conversation_id = c.conversation_id
@@ -553,6 +799,8 @@ internal static class ConversationWriteCommands
             memberSentCount = reader.GetInt64(1);
             currentReadSequence = reader.IsDBNull(2) ? null : reader.GetInt64(2);
             currentUnread = reader.GetInt32(3);
+            lastReadBroadcastSequence = reader.IsDBNull(4) ? null : reader.GetInt64(4);
+            lastReadBroadcastAtMs = reader.IsDBNull(5) ? null : reader.GetInt64(5);
         }
 
         // 已读到目标或更晚水位：无需推进。
@@ -563,7 +811,9 @@ internal static class ConversationWriteCommands
             return new SequenceReadAdvanceResult(
                 Advanced: false,
                 UnreadCount: currentUnread,
-                LastSequence: conversationLastSequence);
+                LastSequence: conversationLastSequence,
+                LastReadBroadcastSequence: lastReadBroadcastSequence,
+                LastReadBroadcastAtMs: lastReadBroadcastAtMs);
         }
 
         // 索引查询：用户在 target_sequence 之前（含）发送的最后一条消息的 sender_sequence，
@@ -622,18 +872,26 @@ internal static class ConversationWriteCommands
         return new SequenceReadAdvanceResult(
             Advanced: true,
             UnreadCount: unreadInt,
-            LastSequence: conversationLastSequence);
+            LastSequence: conversationLastSequence,
+            LastReadBroadcastSequence: lastReadBroadcastSequence,
+            LastReadBroadcastAtMs: lastReadBroadcastAtMs);
     }
 }
 
 /// <summary>
 /// Perf-1：序列化 MarkRead 结果。
+/// 极限-3：<see cref="LastReadBroadcastSequence"/> / <see cref="LastReadBroadcastAtMs"/>
+/// 携带该成员当前的 ConversationRead 广播水位，供调用方做 debounce 判定。
+/// <see cref="TryAdvanceReadBySequenceAsync"/> 仅读取这两列，不更新——是否广播由调用方决定，
+/// 广播时由调用方单独 UPDATE 水位，避免 receipt 路径（不广播）误升水位抑制后续 MarkRead。
 /// </summary>
 internal sealed record SequenceReadAdvanceResult(
     bool Advanced,
     int UnreadCount,
-    long LastSequence)
+    long LastSequence,
+    long? LastReadBroadcastSequence,
+    long? LastReadBroadcastAtMs)
 {
     public static SequenceReadAdvanceResult NotMember { get; } =
-        new(false, 0, 0);
+        new(false, 0, 0, null, null);
 }

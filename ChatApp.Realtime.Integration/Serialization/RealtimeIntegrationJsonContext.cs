@@ -5,6 +5,7 @@ using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration.Ephemeral;
+using ChatApp.Realtime.Integration.Push;
 
 namespace ChatApp.Realtime.Integration.Serialization;
 
@@ -71,6 +72,7 @@ namespace ChatApp.Realtime.Integration.Serialization;
 [JsonSerializable(typeof(PresenceAuthorizeQuery))]
 [JsonSerializable(typeof(PresenceAuthorizeResponse))]
 [JsonSerializable(typeof(List<long>))]
+[JsonSerializable(typeof(PushDeliveryCommand))]
 internal sealed partial class RealtimeIntegrationJsonContext : JsonSerializerContext
 {
 }

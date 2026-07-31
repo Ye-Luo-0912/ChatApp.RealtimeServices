@@ -43,6 +43,51 @@ internal sealed class ConversationProjectionWriter
             _session.CancellationToken);
 
     /// <summary>
+    /// 极限-2：群消息序列分配（前置）。返回 (conversation_sequence, sender_sequence) 供
+    /// MessageWriter.InsertAsync 直接填入 messages 行，避免 INSERT 后再 UPDATE 产生第二个 tuple。
+    /// 失败（授权检查未通过）返回 null，调用方应跳过 INSERT 并返回 NotAllowed。
+    /// </summary>
+    public Task<ConversationWriteCommands.SequenceAllocationResult?> TryAllocateGroupSequenceAsync(
+        string conversationId,
+        long senderUserId,
+        string messageId,
+        string preview,
+        long receivedAtMs) =>
+        ConversationWriteCommands.TryAllocateGroupSequenceAsync(
+            _session.Connection,
+            _session.Transaction,
+            _session.Schema,
+            conversationId,
+            senderUserId,
+            messageId,
+            preview,
+            receivedAtMs,
+            _session.CancellationToken);
+
+    /// <summary>
+    /// 极限-2：单聊消息序列分配（前置）。返回 (conversation_sequence, sender_sequence) 供
+    /// MessageWriter.InsertAsync 直接填入 messages 行。
+    /// </summary>
+    public Task<ConversationWriteCommands.SequenceAllocationResult?> TryAllocateDirectSequenceAsync(
+        string conversationId,
+        long senderUserId,
+        long receiverUserId,
+        string messageId,
+        string preview,
+        long receivedAtMs) =>
+        ConversationWriteCommands.TryAllocateDirectSequenceAsync(
+            _session.Connection,
+            _session.Transaction,
+            _session.Schema,
+            conversationId,
+            senderUserId,
+            receiverUserId,
+            messageId,
+            preview,
+            receivedAtMs,
+            _session.CancellationToken);
+
+    /// <summary>
     /// Perf-1：单聊消息序列推进 O(1)。返回新序列号。
     /// P0-1：不再返回接收方未读数；写入路径不再物化 unread_count。
     /// </summary>

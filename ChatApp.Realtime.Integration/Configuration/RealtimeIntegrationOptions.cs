@@ -23,6 +23,9 @@ public sealed class RealtimeIntegrationOptions
     public string GroupConversationsSubject { get; set; } = "chat.group-conversation";
     public string DeadLettersSubject { get; set; } = "chat.dead-letters";
 
+    /// <summary>推送投递命令 subject（RealtimeServices 发布，Gateway 消费后执行实际推送）。</summary>
+    public string PushDeliveriesSubject { get; set; } = "chat.push-deliveries";
+
     /// <summary>NATS Core ephemeral Typing（非 JetStream，每实例全量订阅）。</summary>
     public string EphemeralTypingSubject { get; set; } = "chat.ephemeral.typing";
 
@@ -42,6 +45,27 @@ public sealed class RealtimeIntegrationOptions
     /// 留空则回退为 GatewayConsumerPrefix + InstanceId。
     /// </summary>
     public string AccountCleanupConsumerName { get; set; } = "chatapp-server-account-cleanup-saga";
+
+    /// <summary>推送投递命令 JetStream 流名称。</summary>
+    public string PushDeliveriesStream { get; set; } = "PUSH_DELIVERIES";
+
+    /// <summary>
+    /// 推送投递共享 durable consumer 名称（Gateway 消费）。
+    /// </summary>
+    public string PushConsumerName { get; set; } = "chatapp-tcp-gateway-push";
+
+    /// <summary>推送投递流的最大保留时长（小时）。</summary>
+    public int PushMaxAgeHours { get; set; } = 24;
+
+    /// <summary>推送投递 consumer 的 ACK 等待时长（秒）。</summary>
+    public int PushAckWaitSeconds { get; set; } = 30;
+
+    /// <summary>推送投递 consumer 的最大投递次数（超过则终止）。</summary>
+    public int PushMaxDeliver { get; set; } = 3;
+
+    /// <summary>推送投递 consumer 的最大待 ACK 消息数。</summary>
+    public int PushMaxAckPending { get; set; } = 256;
+
     public bool ManageStreams { get; set; }
     /// <summary>
     /// 新建 consumer 时是否从流头回放（默认仅投递新建后的消息）。

@@ -57,6 +57,20 @@ public sealed class RealtimeEvent
     public string? ConversationId { get; init; }
 
     /// <summary>
+    /// 极限-3：会话级广播时排除的用户编号。
+    /// <para>
+    /// 仅当 <see cref="AudienceKind"/> = <see cref="Routing.AudienceKind.Conversation"/> 时有效。
+    /// 典型场景：群 MarkRead 广播——读者本人不需要再收到自己的已读水位通知，
+    /// 通过本字段让 Gateway 在投递时跳过该用户的所有会话，无需物化 N-1 个 TargetUserIds。
+    /// </para>
+    /// <para>
+    /// Gateway 收到事件后检查本地会话所属用户是否等于 <see cref="ExcludeUserId"/>，
+    /// 若是则跳过该会话投递。其余成员正常投递。
+    /// </para>
+    /// </summary>
+    public long? ExcludeUserId { get; init; }
+
+    /// <summary>
     /// P1-4：应用层（如 <c>DefaultIncomingMessageProcessor</c>）可将已构造的 payload 对象通过此属性
     /// 直接传给 <c>IRealtimeMessageStore</c>，避免在 Processor 中先序列化、Store 又反序列化回对象
     /// 才能绑定附件。Store 在最终写入 Outbox 前会调用 <c>EnrichChatMessagePayload</c> 物化一次得到

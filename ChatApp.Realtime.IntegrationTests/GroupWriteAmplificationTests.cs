@@ -185,27 +185,33 @@ public sealed class GroupWriteAmplificationTests : IAsyncLifetime
         await using var connection = await client.GetDataSource().OpenConnectionAsync();
         await using var cmd = new NpgsqlCommand(
             $"""
-             SELECT event_type, target_user_id, target_user_ids
+             SELECT event_type, target_user_id, target_user_ids, audience_kind, conversation_id, exclude_user_id
              FROM {schema.OutboxTableSql}
              ORDER BY event_type
              """,
             connection);
-        var rows = new List<(short EventType, long PrimaryTarget, long[]? AllTargets)>();
+        var rows = new List<(short EventType, long PrimaryTarget, long[]? AllTargets, short AudienceKind, string? ConversationId, long? ExcludeUserId)>();
         await using var reader = await cmd.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
             rows.Add((
                 reader.GetInt16(0),
                 reader.GetInt64(1),
-                reader.IsDBNull(2) ? null : (long[])reader.GetValue(2)));
+                reader.IsDBNull(2) ? null : (long[])reader.GetValue(2),
+                reader.IsDBNull(3) ? (short)0 : reader.GetInt16(3),
+                reader.IsDBNull(4) ? null : reader.GetString(4),
+                reader.IsDBNull(5) ? null : reader.GetInt64(5)));
         }
 
-        // ConversationRead 广播行：target_user_ids 应排除读者 ReaderUserId
+        // 极限-3：ConversationRead 会话级广播行——audience_kind=Conversation、
+        // target_user_ids=NULL、exclude_user_id=读者 ReaderUserId。
+        // 不再物化 N-1 成员数组，由 Publisher 通过 IConversationGatewayDirectory 投递。
         var readBroadcast = rows.SingleOrDefault(r =>
             r.EventType == (short)RealtimeEventType.ConversationRead);
-        Assert.NotNull(readBroadcast.AllTargets);
-        Assert.Contains(OwnerUserId, readBroadcast.AllTargets!);
-        Assert.DoesNotContain(ReaderUserId, readBroadcast.AllTargets!);
+        Assert.Equal((short)AudienceKind.Conversation, readBroadcast.AudienceKind);
+        Assert.Equal(conversationId, readBroadcast.ConversationId);
+        Assert.Null(readBroadcast.AllTargets);
+        Assert.Equal(ReaderUserId, readBroadcast.ExcludeUserId);
 
         // UnreadCountChanged 行：target_user_id 应为读者本人
         var unreadRow = rows.SingleOrDefault(r =>

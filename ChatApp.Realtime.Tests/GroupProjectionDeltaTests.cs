@@ -1,4 +1,5 @@
 using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Infrastructure.Postgres.Projections;
 
 namespace ChatApp.Realtime.Tests;
@@ -69,6 +70,61 @@ public sealed class GroupProjectionDeltaTests
 
         Assert.Empty(delta.Build());
         Assert.Equal(0, delta.Count);
+    }
+
+    [Fact]
+    public void AddBroadcastExcept_SetsConversationAudience_AndExcludeUserId()
+    {
+        // 极限-3：群 MarkRead 会话级广播——不物化 N-1 成员数组，
+        // 烙印 AudienceKind=Conversation + ConversationId + ExcludeUserId=读者。
+        var delta = new GroupProjectionDelta(ConversationId, Members);
+        const long readerUserId = 202L;
+
+        delta.AddBroadcastExcept(Template(eventId: "read-broadcast"), readerUserId);
+
+        var events = delta.Build();
+        var evt = Assert.Single(events);
+        Assert.Equal(AudienceKind.Conversation, evt.AudienceKind);
+        Assert.Equal(ConversationId, evt.ConversationId);
+        Assert.Null(evt.TargetUserIds);
+        Assert.Equal(readerUserId, evt.ExcludeUserId);
+        // 模板的其他字段保留。
+        Assert.Equal("read-broadcast", evt.EventId);
+        Assert.Equal(RealtimeEventType.MessageRecalled, evt.Type);
+    }
+
+    [Fact]
+    public void AddBroadcastExcept_DoesNotRequireMemberSnapshot()
+    {
+        // 极限-3：AddBroadcastExcept 不依赖成员列表，构造 delta 时可不传 members。
+        // 这是群 MarkRead 跳过 ListActiveMemberUserIdsAsync 的关键前提。
+        var delta = new GroupProjectionDelta(ConversationId);
+        Assert.Equal(0, delta.MemberCount);
+
+        delta.AddBroadcastExcept(Template(), 101L);
+
+        var evt = Assert.Single(delta.Build());
+        Assert.Equal(AudienceKind.Conversation, evt.AudienceKind);
+        Assert.Null(evt.TargetUserIds);
+        Assert.Equal(101L, evt.ExcludeUserId);
+    }
+
+    [Fact]
+    public void AddBroadcastExcept_DoesNotMutateTemplate()
+    {
+        var delta = new GroupProjectionDelta(ConversationId, Members);
+        var template = Template();
+
+        delta.AddBroadcastExcept(template, 303L);
+
+        // 模板自身不应被修改。
+        Assert.Null(template.AudienceKind);
+        Assert.Null(template.ConversationId);
+        Assert.Null(template.ExcludeUserId);
+        // delta 内的拷贝烙印会话级受众。
+        var evt = Assert.Single(delta.Build());
+        Assert.Equal(AudienceKind.Conversation, evt.AudienceKind);
+        Assert.Equal(303L, evt.ExcludeUserId);
     }
 
     [Fact]

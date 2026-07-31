@@ -4,6 +4,7 @@ using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration.Ephemeral;
+using ChatApp.Realtime.Integration.Push;
 
 namespace ChatApp.Realtime.Integration;
 
@@ -54,6 +55,16 @@ public interface IRealtimeMessageBus
     /// </summary>
     IAsyncEnumerable<RealtimeEventDelivery> ConsumeAccountCleanupEventsAsync(
         CancellationToken ct = default);
+
+    /// <summary>
+    /// 发布离线推送投递命令到 NATS（RealtimeServices 调用，Gateway 消费后执行实际推送）。
+    /// </summary>
+    Task PublishPushDeliveryAsync(PushDeliveryCommand command, CancellationToken ct = default);
+
+    /// <summary>
+    /// 订阅推送投递命令 subject（共享 durable consumer，Gateway 消费）。
+    /// </summary>
+    IAsyncEnumerable<PushDelivery> ConsumePushDeliveriesAsync(CancellationToken ct = default);
 
     /// <summary>NATS Core 发布 Typing（非 JetStream / 非 Outbox）。</summary>
     Task PublishEphemeralTypingAsync(EphemeralTypingEvent evt, CancellationToken ct = default);

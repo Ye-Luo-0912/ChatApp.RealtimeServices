@@ -58,7 +58,7 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
              RETURNING item.event_id, item.event_type, item.target_user_id, item.target_user_ids,
                  item.audience_kind, item.conversation_id,
                  item.payload_json, item.payload_utf8, item.attempt_count, item.locked_by, item.claim_token,
-                 item.trace_parent, item.trace_state;
+                 item.trace_parent, item.trace_state, item.exclude_user_id;
              """,
             connection);
         command.Parameters.AddWithValue("now", now);
@@ -90,6 +90,8 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
             // P0-8：trace context 从独立列读取，零 JSON 解析。
             var traceParentCol = reader.IsDBNull(11) ? null : reader.GetString(11);     // trace_parent
             var traceStateCol = reader.IsDBNull(12) ? null : reader.GetString(12);      // trace_state
+            // 极限-3：会话级广播排除用户（群 MarkRead 读者本人）。
+            long? excludeUserId = reader.IsDBNull(13) ? null : reader.GetInt64(13);     // exclude_user_id
 
             RealtimeEvent? evt = null;
             string? traceParent = traceParentCol;
@@ -113,6 +115,8 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
                         targetUserIds = evt.TargetUserIds;
                     if (audienceKindRaw == 0 && evt.AudienceKind is not null)
                         audienceKindRaw = (short)evt.AudienceKind.Value;
+                    // 极限-3：列为 NULL 时从 payload fallback（旧记录）。
+                    excludeUserId ??= evt.ExcludeUserId;
                     // P0-8：trace 优先用列值；列为 NULL 时从 payload fallback（旧记录）。
                     traceParent ??= evt.TraceParent;
                     traceState ??= evt.TraceState;
@@ -130,6 +134,7 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
                 targetUserIds,
                 audienceKindRaw == 0 ? null : (AudienceKind)audienceKindRaw,
                 conversationId,
+                excludeUserId,
                 traceParent,
                 traceState,
                 evt,
@@ -162,6 +167,8 @@ public sealed class NpgsqlRealtimeOutboxStore : IRealtimeOutboxStore
             OccurredAtMs = evt.OccurredAtMs,
             AudienceKind = evt.AudienceKind,
             ConversationId = evt.ConversationId,
+            // 极限-3：ExcludeUserId 保留在 wire payload 中，Gateway 据此跳过排除用户。
+            ExcludeUserId = evt.ExcludeUserId,
             TargetUserIds = null,
             Payload = null,
         };

@@ -83,6 +83,23 @@ public sealed class RealtimeEventWorker : BackgroundService
 
                         try
                         {
+                            // Reliability-4：毒丸阈值检查，与 Incoming/Receipt Worker 对齐。
+                            // 持续 transient 失败最终达到阈值时主动进 DLQ，不依赖 JetStream MaxDeliver 兜底。
+                            if (envelope.DeliveryCount is not null
+                                && envelope.DeliveryCount >= (ulong)_options.PoisonDeliveryThreshold)
+                            {
+                                _logger.LogWarning(
+                                    "实时事件投递次数达到毒丸阈值，转入 DLQ。事件={EventId}；投递次数={DeliveryCount}",
+                                    evt.EventId,
+                                    envelope.DeliveryCount);
+                                await DeadLetterAndAckAsync(
+                                    envelope,
+                                    "max_event_deliveries",
+                                    "实时事件投递次数达到毒丸阈值。",
+                                    stoppingToken).ConfigureAwait(false);
+                                continue;
+                            }
+
                             if (evt.Type == RealtimeEventType.UserAccountDeleted)
                             {
                                 // LongTerm-2：调用处理器写入 tombstone + 入队清理作业，立即返回。

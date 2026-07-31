@@ -1,9 +1,11 @@
+using ChatApp.Realtime.Abstractions.Conversations;
+
 namespace ChatApp.Realtime.Abstractions.Messaging;
 
 public sealed class RealtimeChatMessagePayload
 {
-    /// <summary>v5：新增 MentionedUserIds / MentionedRoles 字段。</summary>
-    public const int CurrentPayloadVersion = 5;
+    /// <summary>v6：新增 ConversationType，使 MessageReceived 单事件可同时驱动会话列表更新（极限-1）。</summary>
+    public const int CurrentPayloadVersion = 6;
 
     public int PayloadVersion { get; init; } = CurrentPayloadVersion;
 
@@ -21,6 +23,13 @@ public sealed class RealtimeChatMessagePayload
     /// 服务端分配的会话内单调递增序列号。客户端据此重排、检测缺口、保存 last_read_sequence。
     /// </summary>
     public long? ConversationSequence { get; init; }
+
+    /// <summary>
+    /// 极限-1：会话类型。携带后客户端从单条 MessageReceived 事件即可更新会话列表
+    /// （lastMessageId / preview / lastSenderUserId / lastSequence 均可由本 payload 字段派生），
+    /// 不再需要额外的 ConversationListChanged 行。旧事件缺省为 null，客户端按旧路径处理。
+    /// </summary>
+    public ConversationType? ConversationType { get; init; }
 
     public long ReceivedAtMs { get; init; }
 

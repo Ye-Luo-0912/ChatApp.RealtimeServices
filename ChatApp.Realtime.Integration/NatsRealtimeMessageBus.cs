@@ -8,6 +8,7 @@ using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.Ephemeral;
 using ChatApp.Realtime.Integration.JetStream;
+using ChatApp.Realtime.Integration.Push;
 using Microsoft.Extensions.Logging;
 
 namespace ChatApp.Realtime.Integration;
@@ -186,6 +187,12 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
     public IAsyncEnumerable<RealtimeEventDelivery> ConsumeAccountCleanupEventsAsync(
         CancellationToken ct = default)
         => _eventSubscriber.ConsumeAccountCleanupEventsAsync(ct);
+
+    public Task PublishPushDeliveryAsync(PushDeliveryCommand command, CancellationToken ct = default)
+        => _commandPublisher.PublishPushDeliveryAsync(command, ct);
+
+    public IAsyncEnumerable<PushDelivery> ConsumePushDeliveriesAsync(CancellationToken ct = default)
+        => _eventSubscriber.ConsumePushDeliveriesAsync(ct);
 
     public Task PublishEphemeralTypingAsync(EphemeralTypingEvent evt, CancellationToken ct = default)
         => _ephemeralEventBus.PublishEphemeralTypingAsync(evt, ct);

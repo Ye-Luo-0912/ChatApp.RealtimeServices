@@ -17,7 +17,8 @@ internal static class RealtimeMessageEventFactory
     public static RealtimeEvent EnrichChatMessagePayload(
         RealtimeEvent evt,
         IReadOnlyList<AttachmentRef>? attachments,
-        long? conversationSequence = null)
+        long? conversationSequence = null,
+        ConversationType? conversationType = null)
     {
         // P1-4：优先使用应用层传入的 Payload 对象，省去一次 deserialize + reserialize。
         // 仅当 Payload 缺失（如旧调用方/测试）且 PayloadJson 存在时，才回退到反序列化路径。
@@ -55,6 +56,8 @@ internal static class RealtimeMessageEventFactory
             ConversationId = payload.ConversationId,
             // 三-1：序列进入消息协议。优先用传入的序列号；缺省时回退到 payload 已有值。
             ConversationSequence = conversationSequence ?? payload.ConversationSequence,
+            // 极限-1：会话类型进入消息协议，单事件即可驱动会话列表更新。
+            ConversationType = conversationType ?? payload.ConversationType,
             ReceivedAtMs = payload.ReceivedAtMs,
             Attachments = attachments is { Count: > 0 } ? attachments : payload.Attachments,
             ReplyToMessageId = payload.ReplyToMessageId,

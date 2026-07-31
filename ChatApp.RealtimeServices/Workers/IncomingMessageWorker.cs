@@ -74,7 +74,9 @@ public sealed class IncomingMessageWorker : BackgroundService
             _logger,
             byteSizer: EnvelopeByteSizer,
             maxQueueBytes: _options.ProcessingQueueByteBudget,
-            maxSinglePayloadBytes: _options.MaxSinglePayloadBytes);
+            maxSinglePayloadBytes: _options.MaxSinglePayloadBytes,
+            ackWait: _ackWait,
+            progressAckSelector: env => env.ProgressAckAsync);
         await runtime.RunAsync(
             consume: ct => _consumer.ConsumeAsync(ct),
             getPartition: env => GetPartition(env.Command, _options.ProcessingConcurrency),
@@ -140,6 +142,9 @@ public sealed class IncomingMessageWorker : BackgroundService
                 // 不再在 Channel dequeue 时释放，确保正在执行的大消息始终计入内存预算。
                 if (leased.Lease is not null)
                     await leased.Lease.DisposeAsync().ConfigureAwait(false);
+                // Reliability-4：ack lease 覆盖排队等待 + 处理全周期，处理完成时停止。
+                if (leased.AckGuard is not null)
+                    await leased.AckGuard.DisposeAsync().ConfigureAwait(false);
                 _readinessState.MarkHeartbeat(WorkerName);
                 _metrics.RecordProcessingDuration(Stopwatch.GetElapsedTime(started));
             }
@@ -159,15 +164,6 @@ public sealed class IncomingMessageWorker : BackgroundService
                 ct).ConfigureAwait(false);
             return;
         }
-
-        // Reliability-4：长时处理期间定期发送 In-Progress ACK，重置 JetStream AckWait 计时器。
-        // 在出队后尽早启动（毒丸检查之后、其他处理之前），覆盖排队等待时间，防止
-        // 队列等待 + 数据库处理 > AckWait 时合法消息被重投。
-        await using var progressGuard = ProgressAckGuard.Start(
-            envelope.ProgressAckAsync,
-            _ackWait,
-            ct,
-            _logger);
 
         // Perf-6：超大合法消息提前拒绝，避免单条消息占满字节预算。
         var payloadBytes = EnvelopeByteSizer(envelope);

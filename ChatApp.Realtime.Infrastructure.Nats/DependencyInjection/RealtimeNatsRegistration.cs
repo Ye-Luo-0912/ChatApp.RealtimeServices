@@ -11,6 +11,7 @@ using ChatApp.Realtime.Infrastructure.Nats.Configuration;
 using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Nats.JetStream;
 using ChatApp.Realtime.Infrastructure.Nats.Queueing;
+using ChatApp.Realtime.Integration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
@@ -56,13 +57,14 @@ public static class RealtimeNatsRegistration
         services.RemoveAll<ISyncBootstrapQueryConsumer>();
         services.AddSingleton<ISyncBootstrapQueryConsumer, NatsSyncBootstrapQueryConsumer>();
 
+        // Reliability-4：Null* 目录始终注册（查询路径的 IGatewayDirectory 依赖注入需要）。
+        // Null* 仅暴露私有构造函数 + 静态 Instance（单例），不能用 TryAddSingleton<TImpl>
+        // 让 DI 容器构造；直接注册实例，避免 ValidateOnBuild 失败。
+        services.TryAddSingleton<IGatewayDirectory>(NullGatewayDirectory.Instance);
+        services.TryAddSingleton<IWatcherGatewayDirectory>(NullWatcherGatewayDirectory.Instance);
+
         if (IsJetStream(queueOptions))
         {
-            // Reliability-4：已在上方 TryAddSingleton 注册，此处不再重复。
-            // Null* 仅暴露私有构造函数 + 静态 Instance（单例），不能用 TryAddSingleton<TImpl>
-            // 让 DI 容器构造；直接注册实例，避免 ValidateOnBuild 失败。
-            services.TryAddSingleton<IGatewayDirectory>(NullGatewayDirectory.Instance);
-            services.TryAddSingleton<IWatcherGatewayDirectory>(NullWatcherGatewayDirectory.Instance);
             services.AddSingleton<JetStreamContextManager>(static sp =>
             {
                 var shardPattern = sp.GetRequiredService<RealtimeQueueOptions>()
@@ -87,6 +89,7 @@ public static class RealtimeNatsRegistration
                     sp.GetService<IWatcherGatewayDirectory>(),
                     sp.GetService<RealtimeMetrics>(),
                     sp.GetService<IConversationGatewayDirectory>(),
+                    sp.GetService<IRealtimeMessageBus>(),
                     sp.GetService<ILogger<JetStreamRealtimeEventPublisher>>(),
                     queueOptions.ShardPublishParallelism);
             });
@@ -101,30 +104,16 @@ public static class RealtimeNatsRegistration
         }
         else
         {
-            // Null* 仅暴露私有构造函数 + 静态 Instance（单例），不能用 TryAddSingleton<TImpl>
-            // 让 DI 容器构造；直接注册实例，避免 ValidateOnBuild 失败。
-            services.TryAddSingleton<IGatewayDirectory>(NullGatewayDirectory.Instance);
-            services.TryAddSingleton<IWatcherGatewayDirectory>(NullWatcherGatewayDirectory.Instance);
-            services.RemoveAll<IRealtimeEventPublisher>();
-            services.AddSingleton<IRealtimeEventPublisher>(static sp =>
-            {
-                var queueOptions = sp.GetRequiredService<RealtimeQueueOptions>();
-                return new NatsRealtimeEventPublisher(
-                    queueOptions,
-                    sp.GetRequiredService<NatsConnectionClient>(),
-                    sp.GetRequiredService<ILogger<NatsRealtimeEventPublisher>>(),
-                    sp.GetService<IGatewayDirectory>(),
-                    queueOptions.RealtimeEventsShardSubjectPattern,
-                    sp.GetService<RoutingMetrics>(),
-                    sp.GetService<IWatcherGatewayDirectory>(),
-                    sp.GetService<RealtimeMetrics>());
-            });
-            services.RemoveAll<IRealtimeEventConsumer>();
-            services.AddSingleton<IRealtimeEventConsumer, NatsRealtimeEventConsumer>();
-            services.RemoveAll<IIncomingMessageConsumer>();
-            services.AddSingleton<IIncomingMessageConsumer, NatsIncomingMessageConsumer>();
-            services.RemoveAll<IMessageReceiptConsumer>();
-            services.AddSingleton<IMessageReceiptConsumer, NatsMessageReceiptConsumer>();
+            // Reliability-4：durable 命令（入站消息、回执、实时事件、死信）禁止使用 Core NATS。
+            // Core NATS 无持久化、无重试、无 DLQ 语义，durable 命令在此模式下会静默丢失数据。
+            // Mode=Core 时仅注册查询 Consumer（Core NATS request/reply，ephemeral 语义），
+            // durable 接口保持 Noop（由 RealtimeCoreRegistration 注册的默认实现）。
+            // 如需启用 durable 命令，必须配置 Nats:Mode=JetStream。
+            throw new InvalidOperationException(
+                "Nats:Mode=Core 不再支持 durable 命令（入站消息/回执/实时事件/死信）。" +
+                "durable 命令必须使用 JetStream（Nats:Mode=JetStream）。" +
+                "Core NATS 仅用于查询 request/reply（ephemeral 语义）。" +
+                "如不需要 durable 命令，请留空 Nats:Url 使队列回退为 Noop。");
         }
 
         return services;

@@ -39,6 +39,7 @@ public sealed class RealtimeMetrics : IDisposable
     private readonly Histogram<double> _historyQueryDuration;
     private readonly Counter<long> _overloadReplyCounter;
     private readonly Counter<long> _shardFallbackCounter;
+    private readonly Counter<long> _pushTriggeredCounter;
 
     private long _persisted;
     private long _duplicates;
@@ -118,6 +119,7 @@ public sealed class RealtimeMetrics : IDisposable
         _historyQueryDuration = _meter.CreateHistogram<double>("realtime.history.duration", "ms");
         _overloadReplyCounter = _meter.CreateCounter<long>("realtime.overload.replies");
         _shardFallbackCounter = _meter.CreateCounter<long>("realtime.routing.shard_fallback");
+        _pushTriggeredCounter = _meter.CreateCounter<long>("realtime.push.triggered");
     }
 
     public void RecordPersisted()
@@ -349,6 +351,17 @@ public sealed class RealtimeMetrics : IDisposable
             1,
             new KeyValuePair<string, object?>("reason", reason),
             new KeyValuePair<string, object?>("shard_count", Math.Max(0, shardCount)));
+    }
+
+    /// <summary>
+    /// 离线推送触发计数：检测到目标用户离线并发布 <c>PushDeliveryCommand</c> 时记录。
+    /// <paramref name="isMention"/> 作为低基数标签区分 @mention 推送与普通推送。
+    /// </summary>
+    public void RecordPushTriggered(bool isMention)
+    {
+        _pushTriggeredCounter.Add(
+            1,
+            new KeyValuePair<string, object?>("is_mention", isMention.ToString()));
     }
 
     public RealtimeMetricsSnapshot GetSnapshot() => new(

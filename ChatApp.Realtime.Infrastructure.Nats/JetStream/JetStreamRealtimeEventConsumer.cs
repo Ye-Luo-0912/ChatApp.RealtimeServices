@@ -4,6 +4,7 @@ using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Nats.Configuration;
+using ChatApp.Realtime.Abstractions.Messaging;
 using Microsoft.Extensions.Logging;
 using NATS.Client.JetStream;
 
@@ -17,17 +18,20 @@ public sealed class JetStreamRealtimeEventConsumer : IRealtimeEventConsumer
     private readonly RealtimeQueueOptions _options;
     private readonly JetStreamContextManager _contextManager;
     private readonly JetStreamOptions _jetStreamOptions;
+    private readonly IDeadLetterPublisher _deadLetterPublisher;
     private readonly ILogger<JetStreamRealtimeEventConsumer> _logger;
 
     public JetStreamRealtimeEventConsumer(
         RealtimeQueueOptions options,
         JetStreamContextManager contextManager,
         JetStreamOptions jetStreamOptions,
+        IDeadLetterPublisher deadLetterPublisher,
         ILogger<JetStreamRealtimeEventConsumer> logger)
     {
         _options = options;
         _contextManager = contextManager;
         _jetStreamOptions = jetStreamOptions;
+        _deadLetterPublisher = deadLetterPublisher;
         _logger = logger;
     }
 
@@ -76,14 +80,14 @@ public sealed class JetStreamRealtimeEventConsumer : IRealtimeEventConsumer
             }
             catch (JsonException ex)
             {
-                _logger.LogError(ex, "JetStream 实时事件反序列化失败，已终止。Subject={Subject}", msg.Subject);
-                await msg.AckAsync(cancellationToken: ct).ConfigureAwait(false);
+                _logger.LogError(ex, "JetStream 实时事件反序列化失败，已终止并转入 DLQ。Subject={Subject}", msg.Subject);
+                await DeadLetterAndTerminateAsync(msg, "invalid_event_json", ex.Message, ct).ConfigureAwait(false);
                 continue;
             }
 
             if (evt is null)
             {
-                await msg.AckAsync(cancellationToken: ct).ConfigureAwait(false);
+                await DeadLetterAndTerminateAsync(msg, "null_event_payload", "JetStream 实时事件反序列化结果为 null。", ct).ConfigureAwait(false);
                 continue;
             }
 
@@ -95,4 +99,25 @@ public sealed class JetStreamRealtimeEventConsumer : IRealtimeEventConsumer
                 deliveryCount: jsMsg.Metadata?.NumDelivered);
         }
     }
-}
+
+    private async Task DeadLetterAndTerminateAsync(
+            INatsJSMsg<string> msg,
+            string reasonCode,
+            string reason,
+            CancellationToken ct)
+        {
+            var deadLetterId = $"event-{msg.Metadata?.Sequence.Stream ?? 0}-{reasonCode}";
+            await _deadLetterPublisher.PublishAsync(
+                new DeadLetterMessage
+                {
+                    DeadLetterId = deadLetterId,
+                    SourceSubject = msg.Subject,
+                    ReasonCode = reasonCode,
+                    Reason = reason,
+                    Payload = msg.Data,
+                    DeliveryCount = msg.Metadata?.NumDelivered
+                },
+                ct).ConfigureAwait(false);
+            await msg.AckTerminateAsync(cancellationToken: ct).ConfigureAwait(false);
+        }
+    }

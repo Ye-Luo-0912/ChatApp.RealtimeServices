@@ -5,6 +5,18 @@ namespace ChatApp.Realtime.Infrastructure.Nats.Configuration;
 public sealed class NatsOptions
 {
     public string? Url { get; init; }
+    /// <summary>
+    /// NATS 传输模式。JetStream（默认）或 Core。
+    /// <para>
+    /// <b>JetStream</b>：durable 命令（入站消息、回执、实时事件、死信）走 JetStream 持久化流，
+    /// 查询走 Core NATS request/reply。生产环境必须使用此模式。
+    /// </para>
+    /// <para>
+    /// <b>Core</b>：仅注册查询 Consumer（Core NATS request/reply，ephemeral 语义）。
+    /// durable 接口保持 Noop——Core NATS 无持久化/重试/DLQ 语义，durable 命令在此模式下会静默丢失数据。
+    /// 如需 durable 命令，必须配置 JetStream。如不需要任何 NATS 命令，留空 <see cref="Url"/> 使队列回退为 Noop。
+    /// </para>
+    /// </summary>
     public string Mode { get; init; } = "JetStream";
     public required string QueueGroup { get; init; }
     public required NatsSubjectOptions Subjects { get; init; }
@@ -101,7 +113,13 @@ public sealed class JetStreamOptions
     public int MaxMessageSize { get; init; } = 1024 * 1024;
     public int MaxAgeHours { get; init; } = 168;
     public int DeadLetterMaxAgeHours { get; init; } = 720;
-    public int DuplicateWindowMinutes { get; init; } = 10;
+    /// <summary>
+    /// JetStream 消息去重窗口（分钟）。
+    /// Reliability-4：必须覆盖 Outbox 最坏情况重试周期（MaxAttempts=10, MaxRetryDelay=300s
+    /// 时约 815 秒）。默认 15 分钟（900 秒），留有余量。
+    /// 启动时 RealtimeStartupReporter 校验此值 >= Outbox 最坏重试周期。
+    /// </summary>
+    public int DuplicateWindowMinutes { get; init; } = 15;
 }
 
 public sealed class JetStreamStreamOptions
