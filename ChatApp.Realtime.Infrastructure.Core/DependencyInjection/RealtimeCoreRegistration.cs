@@ -62,6 +62,7 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IMessageReactionConsumer, NoopMessageReactionConsumer>();
         services.TryAddSingleton<ISyncBootstrapQueryConsumer, NoopSyncBootstrapQueryConsumer>();
         services.TryAddSingleton<IRealtimeMessageStore, NoopRealtimeMessageStore>();
+        services.TryAddSingleton<IRealtimeReadReceiptStore>(NoopRealtimeReadReceiptStore.Instance);
         services.TryAddSingleton<IRealtimeAttachmentStore, NoopRealtimeAttachmentStore>();
         services.TryAddSingleton<IRealtimeReactionStore, NoopRealtimeReactionStore>();
         services.TryAddSingleton<IRealtimeMessageHistoryStore, NoopRealtimeMessageHistoryStore>();

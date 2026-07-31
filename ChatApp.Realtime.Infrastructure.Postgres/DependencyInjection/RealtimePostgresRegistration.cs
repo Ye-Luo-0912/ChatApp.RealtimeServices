@@ -91,6 +91,8 @@ public static class RealtimePostgresRegistration
                 sp.GetService<RealtimeMetrics>()));
             services.RemoveAll<IRealtimeMessageRetentionStore>();
             services.AddSingleton<IRealtimeMessageRetentionStore, NpgsqlRealtimeMessageRetentionStore>();
+            services.RemoveAll<IRealtimeReadReceiptStore>();
+            services.AddSingleton<IRealtimeReadReceiptStore, NpgsqlRealtimeReadReceiptStore>();
             // LongTerm-1：用户删除 tombstone + 独立命令幂等账本。
             services.RemoveAll<IUserDeletionTombstoneStore>();
             services.AddSingleton<IUserDeletionTombstoneStore, NpgsqlUserDeletionTombstoneStore>();
