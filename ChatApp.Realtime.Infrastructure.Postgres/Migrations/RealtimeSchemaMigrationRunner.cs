@@ -87,7 +87,8 @@ public sealed class RealtimeSchemaMigrationRunner
         new Migration045_SentCountAtRetentionFloor(),
         new Migration046_OutboxTraceColumns(),
         new Migration047_MessageStateFkAndRecall(),
-        new Migration048_ReadBroadcastExclude()
+        new Migration048_ReadBroadcastExclude(),
+        new Migration049_ConversationAudienceVersion()
     ];
 
     public async Task MigrateAsync(

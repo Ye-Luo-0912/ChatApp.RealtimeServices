@@ -1,3 +1,5 @@
+using ChatApp.Realtime.Abstractions.Events;
+
 namespace ChatApp.RealtimeServices.Options;
 
 public sealed class RealtimeOptions
@@ -113,4 +115,10 @@ public sealed class RealtimeOptions
     /// 到期后 running 作业可被重新认领。每批处理后会续租。
     /// </summary>
     public int AccountCleanupLeaseMs { get; init; } = 60_000;
+
+    /// <summary>
+    /// 四-2：服务端最大支持的线协议版本。默认为 <see cref="RealtimeProtocolVersions.Current"/>。
+    /// 入站事件 ProtocolVersion 超过此值的将被拒绝。
+    /// </summary>
+    public int MaxProtocolVersion { get; init; } = RealtimeProtocolVersions.Current;
 }

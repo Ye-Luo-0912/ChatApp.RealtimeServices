@@ -1,3 +1,4 @@
+using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Stores;
@@ -214,6 +215,14 @@ public sealed class RealtimeStartupReporter : IHostedService
             "Outbox 重试去重窗口配置。DuplicateWindow 秒={DuplicateWindowSec}；最坏重试周期秒={WorstCaseRetrySec}",
             duplicateWindowSec,
             worstCaseRetrySec);
+
+        // 四-2：校验协议版本配置。
+        var maxProtocolVersion = _realtimeOptions.Value.MaxProtocolVersion;
+        if (maxProtocolVersion < RealtimeProtocolVersions.MinSupported)
+        {
+            throw new InvalidOperationException(
+                $"MaxProtocolVersion ({maxProtocolVersion}) 低于最小支持版本 ({RealtimeProtocolVersions.MinSupported})。");
+        }
 
         var snapshot = _readinessState.GetSnapshot();
         _logger.LogInformation(

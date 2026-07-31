@@ -71,6 +71,34 @@ public sealed class RealtimeEvent
     public long? ExcludeUserId { get; init; }
 
     /// <summary>
+    /// 四-2：线协议版本号。
+    /// <para>
+    /// null 表示 v1（历史事件），新事件默认为 <see cref="RealtimeProtocolVersions.Current"/>。
+    /// Gateway 据此判断客户端是否支持该事件的字段，实现滚动兼容（四-3）。
+    /// </para>
+    /// </summary>
+    public int? ProtocolVersion { get; init; }
+
+    /// <summary>
+    /// 四-1：会话受众版本号。
+    /// <para>
+    /// 仅当 <see cref="AudienceKind"/> = <see cref="Routing.AudienceKind.Conversation"/> 时有效。
+    /// 每次群成员变更（加人/踢人/离群/解散）时递增，Gateway 据此判断本地 audience 缓存是否过期。
+    /// 版本号不匹配时 Gateway 重新拉取 audience 列表。
+    /// </para>
+    /// </summary>
+    public long? AudienceVersion { get; init; }
+
+    /// <summary>
+    /// 四-3：该事件所需的最小协议版本。
+    /// <para>
+    /// null 表示 v1（所有客户端均可处理）。用于标记引入新字段或新语义的事件类型，
+    /// Gateway 在投递时检查客户端协议版本，低于此版本时优雅跳过（不投递）。
+    /// </para>
+    /// </summary>
+    public int? MinProtocolVersion { get; init; }
+
+    /// <summary>
     /// P1-4：应用层（如 <c>DefaultIncomingMessageProcessor</c>）可将已构造的 payload 对象通过此属性
     /// 直接传给 <c>IRealtimeMessageStore</c>，避免在 Processor 中先序列化、Store 又反序列化回对象
     /// 才能绑定附件。Store 在最终写入 Outbox 前会调用 <c>EnrichChatMessagePayload</c> 物化一次得到

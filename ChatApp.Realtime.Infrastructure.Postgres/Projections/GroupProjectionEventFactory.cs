@@ -58,7 +58,8 @@ internal static class GroupProjectionEventFactory
                 RealtimeJsonSerializerContext.Default.RealtimeMessageRecalledPayload),
             OccurredAtMs = recalledAtMs,
             TraceParent = traceParent,
-            TraceState = traceState
+            TraceState = traceState,
+            ProtocolVersion = RealtimeProtocolVersions.Current
         };
     }
 
@@ -112,7 +113,8 @@ internal static class GroupProjectionEventFactory
                 RealtimeJsonSerializerContext.Default.RealtimeMessageEditedPayload),
             OccurredAtMs = editedAtMs,
             TraceParent = traceParent,
-            TraceState = traceState
+            TraceState = traceState,
+            ProtocolVersion = RealtimeProtocolVersions.Current
         };
     }
 
@@ -190,7 +192,8 @@ internal static class GroupProjectionEventFactory
             PayloadJson = payloadJson,
             OccurredAtMs = occurredAtMs,
             TraceParent = traceParent,
-            TraceState = traceState
+            TraceState = traceState,
+            ProtocolVersion = RealtimeProtocolVersions.Current
         };
     }
 
@@ -236,7 +239,8 @@ internal static class GroupProjectionEventFactory
                 RealtimeJsonSerializerContext.Default.RealtimeConversationChangedPayload),
             OccurredAtMs = receivedAtMs,
             TraceParent = traceParent,
-            TraceState = traceState
+            TraceState = traceState,
+            ProtocolVersion = RealtimeProtocolVersions.Current
         };
     }
 
@@ -279,7 +283,8 @@ internal static class GroupProjectionEventFactory
                 RealtimeJsonSerializerContext.Default.RealtimeConversationReadPayload),
             OccurredAtMs = occurredAtMs,
             TraceParent = traceParent,
-            TraceState = traceState
+            TraceState = traceState,
+            ProtocolVersion = RealtimeProtocolVersions.Current
         };
     }
 }

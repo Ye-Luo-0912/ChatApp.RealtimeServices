@@ -402,6 +402,20 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             return GroupMutatePersistResult.Ok(conversationId, title);
         }
 
+        // 四-1：成员变更后递增会话受众版本号，Gateway 据此失效本地 audience 缓存。
+        await using (var bumpAudienceVersion = new NpgsqlCommand(
+                         $"""
+                          UPDATE {_databaseSchema.ConversationsTableSql}
+                          SET audience_version = audience_version + 1
+                          WHERE conversation_id = @conversation_id;
+                          """,
+                         connection,
+                         transaction))
+        {
+            bumpAudienceVersion.Parameters.AddWithValue("conversation_id", conversationId);
+            await bumpAudienceVersion.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+
         // Membership periods：记录新入群成员（与加成员同事务）。
         await RecordMembershipJoinsInTransactionAsync(
                 connection, transaction, conversationId, insertedUserIds, occurredAtMs, ct)
@@ -603,6 +617,20 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             await softDelete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
 
+        // 四-1：成员变更后递增会话受众版本号，Gateway 据此失效本地 audience 缓存。
+        await using (var bumpAudienceVersion = new NpgsqlCommand(
+                         $"""
+                          UPDATE {_databaseSchema.ConversationsTableSql}
+                          SET audience_version = audience_version + 1
+                          WHERE conversation_id = @conversation_id;
+                          """,
+                         connection,
+                         transaction))
+        {
+            bumpAudienceVersion.Parameters.AddWithValue("conversation_id", conversationId);
+            await bumpAudienceVersion.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+
         // Membership periods：记录被移除成员离群（与移除操作同事务）。
         await RecordMembershipLeaveInTransactionAsync(
                 connection, transaction, conversationId, targetUserId,
@@ -753,6 +781,20 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             softDelete.Parameters.AddWithValue("user_id", actorUserId);
             softDelete.Parameters.AddWithValue("occurred_at_ms", occurredAtMs);
             await softDelete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+
+        // 四-1：成员变更后递增会话受众版本号，Gateway 据此失效本地 audience 缓存。
+        await using (var bumpAudienceVersion = new NpgsqlCommand(
+                         $"""
+                          UPDATE {_databaseSchema.ConversationsTableSql}
+                          SET audience_version = audience_version + 1
+                          WHERE conversation_id = @conversation_id;
+                          """,
+                         connection,
+                         transaction))
+        {
+            bumpAudienceVersion.Parameters.AddWithValue("conversation_id", conversationId);
+            await bumpAudienceVersion.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
 
         // Membership periods：记录主动退群成员离群（与退群操作同事务）。
@@ -1127,7 +1169,8 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         await using (var dissolveConv = new NpgsqlCommand(
                          $"""
                           UPDATE {_databaseSchema.ConversationsTableSql}
-                          SET dissolved_at_ms = @occurred_at_ms
+                          SET dissolved_at_ms = @occurred_at_ms,
+                              audience_version = audience_version + 1
                           WHERE conversation_id = @conversation_id AND dissolved_at_ms IS NULL;
                           """,
                          connection,
