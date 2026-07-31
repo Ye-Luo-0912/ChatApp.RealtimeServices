@@ -21,6 +21,16 @@ namespace ChatApp.Realtime.Infrastructure.Postgres.Transactions;
 /// 避免与 migration（0x5245_414C_5449_4D45）和 retention GC（0x4D53_4752_4554_4E01）冲突。
 /// </para>
 /// </summary>
+/// <summary>
+/// 二-6：生命周期检查结果。区分"已注销"和"已冻结"以返回不同错误码。
+/// </summary>
+internal readonly record struct LifecycleGateResult(bool IsActive, string? ErrorCode)
+{
+    public static readonly LifecycleGateResult Active = new(true, null);
+    public static readonly LifecycleGateResult Deleted = new(false, "user_deleted");
+    public static readonly LifecycleGateResult Frozen = new(false, "user_frozen");
+}
+
 internal static class UserLifecycleAdvisoryLock
 {
     /// <summary>
@@ -99,14 +109,15 @@ internal static class UserLifecycleAdvisoryLock
         {
             1 => UserLifecycleState.Deleting,
             2 => UserLifecycleState.Deleted,
+            3 => UserLifecycleState.Frozen,
             _ => UserLifecycleState.Active
         };
     }
 
     /// <summary>
-    /// 获取共享锁并检查用户是否活跃。返回 false 表示用户正在删除或已删除，写入应被拒绝。
+    /// 获取共享锁并检查用户是否活跃。返回 IsActive 为 false 时表示用户正在删除、已删除或已冻结，写入应被拒绝。
     /// </summary>
-    public static async Task<bool> AcquireSharedAndCheckActiveAsync(
+    public static async Task<LifecycleGateResult> AcquireSharedAndCheckActiveAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
         RealtimeDatabaseSchema schema,
@@ -116,7 +127,12 @@ internal static class UserLifecycleAdvisoryLock
         await AcquireSharedAsync(connection, transaction, userId, ct).ConfigureAwait(false);
         var state = await GetStateInTxAsync(connection, transaction, schema, userId, ct)
             .ConfigureAwait(false);
-        return state == UserLifecycleState.Active;
+        return state switch
+        {
+            UserLifecycleState.Frozen => LifecycleGateResult.Frozen,
+            UserLifecycleState.Active => LifecycleGateResult.Active,
+            _ => LifecycleGateResult.Deleted
+        };
     }
 
     /// <summary>
@@ -126,10 +142,10 @@ internal static class UserLifecycleAdvisoryLock
     /// 用一条 SQL（UNNEST）获取全部 advisory locks，一条 SQL 批量查询 tombstone。
     /// </para>
     /// <para>
-    /// 返回 false 时，锁已在事务级别获取（事务回滚会自动释放），调用方应中止操作。
+    /// 返回 IsActive 为 false 时，锁已在事务级别获取（事务回滚会自动释放），调用方应中止操作。
     /// </para>
     /// </summary>
-    public static async Task<bool> AcquireSharedAndCheckActiveManyAsync(
+    public static async Task<LifecycleGateResult> AcquireSharedAndCheckActiveManyAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
         RealtimeDatabaseSchema schema,
@@ -137,7 +153,7 @@ internal static class UserLifecycleAdvisoryLock
         CancellationToken ct)
     {
         if (userIds.Count == 0)
-            return true;
+            return LifecycleGateResult.Active;
 
         // 去重 + 按 userId 升序排序（避免死锁）
         var sortedIds = userIds.Distinct().OrderBy(id => id).ToArray();
@@ -177,9 +193,11 @@ internal static class UserLifecycleAdvisoryLock
         while (await reader.ReadAsync(ct).ConfigureAwait(false))
         {
             var stateByte = reader.GetByte(1);
+            if (stateByte == (byte)UserLifecycleState.Frozen)
+                return LifecycleGateResult.Frozen;
             if (stateByte != (byte)UserLifecycleState.Active)
-                return false;
+                return LifecycleGateResult.Deleted;
         }
-        return true;
+        return LifecycleGateResult.Active;
     }
 }

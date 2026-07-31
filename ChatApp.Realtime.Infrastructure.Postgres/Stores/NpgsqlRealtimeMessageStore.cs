@@ -96,12 +96,12 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         var lifecycleUserIds = message.ReceiverUserId > 0
             ? new[] { message.SenderUserId, message.ReceiverUserId }
             : new[] { message.SenderUserId };
-        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveManyAsync(
+        if (!(await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveManyAsync(
                 session.Connection,
                 session.Transaction,
                 session.Schema,
                 lifecycleUserIds,
-                ct).ConfigureAwait(false))
+                ct).ConfigureAwait(false)).IsActive)
         {
             await session.RollbackAsync().ConfigureAwait(false);
             _logger.LogWarning(
@@ -421,9 +421,9 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         await using var session = await _sessionFactory.BeginAsync(ct).ConfigureAwait(false);
 
         // P0-2：事务内检查接收方生命周期，防止已注销用户更新已读/已送达状态。
-        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
+        if (!(await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
                 session.Connection, session.Transaction, session.Schema,
-                receipt.ReceiverUserId, ct).ConfigureAwait(false))
+                receipt.ReceiverUserId, ct).ConfigureAwait(false)).IsActive)
         {
             await session.RollbackAsync().ConfigureAwait(false);
             return new MessageReceiptPersistResult(
@@ -588,9 +588,9 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         await using var session = await _sessionFactory.BeginAsync(ct).ConfigureAwait(false);
 
         // P0-2：事务内检查发送方生命周期，防止已注销用户撤回消息。
-        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
+        if (!(await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
                 session.Connection, session.Transaction, session.Schema,
-                senderUserId, ct).ConfigureAwait(false))
+                senderUserId, ct).ConfigureAwait(false)).IsActive)
         {
             await session.RollbackAsync().ConfigureAwait(false);
             return new MessageRecallPersistResult(
@@ -972,9 +972,9 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         await using var session = await _sessionFactory.BeginAsync(ct).ConfigureAwait(false);
 
         // P0-2：事务内检查发送方生命周期，防止已注销用户编辑消息。
-        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
+        if (!(await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
                 session.Connection, session.Transaction, session.Schema,
-                senderUserId, ct).ConfigureAwait(false))
+                senderUserId, ct).ConfigureAwait(false)).IsActive)
         {
             await session.RollbackAsync().ConfigureAwait(false);
             return new MessageEditPersistResult(

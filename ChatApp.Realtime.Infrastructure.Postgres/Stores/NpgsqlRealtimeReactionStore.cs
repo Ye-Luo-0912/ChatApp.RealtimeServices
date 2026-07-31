@@ -58,9 +58,9 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         await using var session = await _sessionFactory.BeginAsync(ct).ConfigureAwait(false);
 
         // P0-2：事务内检查 actor 生命周期，防止已注销用户添加 reaction。
-        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
+        if (!(await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
                 session.Connection, session.Transaction, session.Schema, actorUserId, session.CancellationToken)
-            .ConfigureAwait(false))
+            .ConfigureAwait(false)).IsActive)
         {
             await session.RollbackAsync().ConfigureAwait(false);
             return new MessageReactionPersistResult(
@@ -210,9 +210,9 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         await using var session = await _sessionFactory.BeginAsync(ct).ConfigureAwait(false);
 
         // P0-2：事务内检查 actor 生命周期，防止已注销用户移除 reaction。
-        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
+        if (!(await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
                 session.Connection, session.Transaction, session.Schema, actorUserId, session.CancellationToken)
-            .ConfigureAwait(false))
+            .ConfigureAwait(false)).IsActive)
         {
             await session.RollbackAsync().ConfigureAwait(false);
             return new MessageReactionPersistResult(

@@ -6,6 +6,7 @@ using ChatApp.Realtime.Abstractions.Protocol;
 using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
+using ChatApp.Realtime.Infrastructure.Core.Stores;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using ChatApp.Realtime.Infrastructure.Postgres.Outbox;
@@ -24,12 +25,14 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
     private readonly RealtimeDatabaseSchema _databaseSchema;
     private readonly IGroupOperationAuditStore? _auditStore;
     private readonly IMembershipPeriodStore? _membershipPeriodStore;
+    private readonly IUserExistenceChecker _existenceChecker;
 
     public NpgsqlRealtimeGroupStore(
         RealtimeDatabaseClient databaseClient,
         RealtimeDatabaseSchema databaseSchema,
         IGroupOperationAuditStore? auditStore = null,
-        IMembershipPeriodStore? membershipPeriodStore = null)
+        IMembershipPeriodStore? membershipPeriodStore = null,
+        IUserExistenceChecker? existenceChecker = null)
     {
         _databaseClient = databaseClient;
         _databaseSchema = databaseSchema;
@@ -39,6 +42,8 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         // Membership periods：可选注入。生产 DI 路径由 RealtimePostgresRegistration 注入
         // NpgsqlMembershipPeriodStore；未注入时（测试场景）跳过 membership period 记录。
         _membershipPeriodStore = membershipPeriodStore;
+        // 二-1：用户存在性校验。可选注入，未注入时使用 Noop（不校验）。
+        _existenceChecker = existenceChecker ?? NoopUserExistenceChecker.Instance;
     }
 
     /// <summary>
@@ -51,11 +56,10 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         long actorUserId,
         CancellationToken ct)
     {
-        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
+        var lifecycle = await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
                 connection, transaction, _databaseSchema, actorUserId, ct)
-            .ConfigureAwait(false))
-            return "user_deleted";
-        return null;
+            .ConfigureAwait(false);
+        return lifecycle.ErrorCode;
     }
 
     /// <summary>
@@ -157,17 +161,31 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             return GroupCreatePersistResult.Ok(existing.ConversationId!, null, null);
         }
 
+        // 二-1：用户存在性校验（Noop 默认不校验，外部系统接入后拦截不存在的用户）。
+        var nonExistent = await _existenceChecker
+            .FilterNonExistentAsync(members, ct)
+            .ConfigureAwait(false);
+        if (nonExistent.Count > 0)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return GroupCreatePersistResult.Fail(
+                "user_not_found",
+                $"用户不存在：{string.Join(',', nonExistent)}。");
+        }
+
         // P0-2 / P0-4：事务内一次性获取 actor + 全部目标用户的共享 advisory lock 并检查生命周期状态。
         // 按 userId 升序获取锁，避免死锁。防止已注销用户建群或被加入群，同时消除目标用户
         // 在检查后开始删除的 TOCTOU 竞态。
-        // TODO: 用户存在性验证需要 users 表（当前 realtime schema 无独立 users 表，仅依赖 tombstone 检查删除状态）。
         var createLifecycleIds = new List<long>(members.Count + 1) { creatorUserId };
         createLifecycleIds.AddRange(members);
-        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveManyAsync(
-                connection, transaction, _databaseSchema, createLifecycleIds, ct).ConfigureAwait(false))
+        var createLifecycle = await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveManyAsync(
+                connection, transaction, _databaseSchema, createLifecycleIds, ct).ConfigureAwait(false);
+        if (!createLifecycle.IsActive)
         {
             await transaction.RollbackAsync(ct).ConfigureAwait(false);
-            return GroupCreatePersistResult.Fail("user_deleted", "用户已注销，操作被拒绝。");
+            var errCode = createLifecycle.ErrorCode ?? "user_deleted";
+            var errMsg = errCode == "user_frozen" ? "用户已冻结，操作被拒绝。" : "用户已注销，操作被拒绝。";
+            return GroupCreatePersistResult.Fail(errCode, errMsg);
         }
 
         await using (var insertConv = new NpgsqlCommand(
@@ -346,16 +364,30 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
             return GroupMutatePersistResult.Ok(existing.ConversationId!, null, null);
         }
 
-        // P0-2 / P0-4：事务内一次性获取 actor + 全部目标用户的共享 advisory lock 并检查生命周期状态。
-        // 按 userId 升序获取锁，避免死锁。消除目标用户在检查后开始删除的 TOCTOU 竞态。
-        // TODO: 用户存在性验证需要 users 表（当前 realtime schema 无独立 users 表，仅依赖 tombstone 检查删除状态）。
-        var addLifecycleIds = new List<long>(toAdd.Count + 1) { actorUserId };
-        addLifecycleIds.AddRange(toAdd);
-        if (!await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveManyAsync(
-                connection, transaction, _databaseSchema, addLifecycleIds, ct).ConfigureAwait(false))
+        // 二-1：用户存在性校验（Noop 默认不校验，外部系统接入后拦截不存在的用户）。
+        var nonExistentMembers = await _existenceChecker
+            .FilterNonExistentAsync(toAdd, ct)
+            .ConfigureAwait(false);
+        if (nonExistentMembers.Count > 0)
         {
             await transaction.RollbackAsync(ct).ConfigureAwait(false);
-            return GroupMutatePersistResult.Fail("user_deleted", "用户已注销，操作被拒绝。");
+            return GroupMutatePersistResult.Fail(
+                "user_not_found",
+                $"用户不存在：{string.Join(',', nonExistentMembers)}。");
+        }
+
+        // P0-2 / P0-4：事务内一次性获取 actor + 全部目标用户的共享 advisory lock 并检查生命周期状态。
+        // 按 userId 升序获取锁，避免死锁。消除目标用户在检查后开始删除的 TOCTOU 竞态。
+        var addLifecycleIds = new List<long>(toAdd.Count + 1) { actorUserId };
+        addLifecycleIds.AddRange(toAdd);
+        var addLifecycle = await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveManyAsync(
+                connection, transaction, _databaseSchema, addLifecycleIds, ct).ConfigureAwait(false);
+        if (!addLifecycle.IsActive)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            var errCode = addLifecycle.ErrorCode ?? "user_deleted";
+            var errMsg = errCode == "user_frozen" ? "用户已冻结，操作被拒绝。" : "用户已注销，操作被拒绝。";
+            return GroupMutatePersistResult.Fail(errCode, errMsg);
         }
 
         var (title, actorRole, existingCount) = await LoadGroupContextAsync(

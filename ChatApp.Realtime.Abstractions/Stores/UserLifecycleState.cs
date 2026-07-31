@@ -18,5 +18,11 @@ public enum UserLifecycleState : byte
     Deleting = 1,
 
     /// <summary>账号删除清理已完成 — 拒绝旧命令回放。</summary>
-    Deleted = 2
+    Deleted = 2,
+
+    /// <summary>
+    /// 二-6：账号被冻结（管理员操作）。冻结用户不能发送消息、创建群或加群，
+    /// 但可以查看历史。与 Deleting/Deleted 不同，Frozen 可被解冻恢复为 Active。
+    /// </summary>
+    Frozen = 3,
 }

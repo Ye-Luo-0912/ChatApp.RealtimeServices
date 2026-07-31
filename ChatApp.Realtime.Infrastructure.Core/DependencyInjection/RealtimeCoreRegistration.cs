@@ -72,10 +72,15 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IRealtimeOutboxStore, NoopRealtimeOutboxStore>();
         services.TryAddSingleton<IRealtimeMessageRetentionStore, NoopRealtimeMessageRetentionStore>();
         services.TryAddSingleton<IUserDeletionTombstoneStore, NoopUserDeletionTombstoneStore>();
+        services.TryAddSingleton<IUserExistenceChecker>(NoopUserExistenceChecker.Instance);
         services.TryAddSingleton<ICommandIdempotencyLedger, NoopCommandIdempotencyLedger>();
         services.TryAddSingleton<IGroupOperationAuditStore, NoopGroupOperationAuditStore>();
         services.TryAddSingleton<IMembershipPeriodStore, NoopMembershipPeriodStore>();
         services.TryAddSingleton<IDeadLetterPublisher, NoopDeadLetterPublisher>();
+        services.TryAddSingleton<IBlockListStore>(NoopBlockListStore.Instance);
+        services.TryAddSingleton<IDirectMessagePolicy>(NoopDirectMessagePolicy.Instance);
+        services.TryAddSingleton<IPrivacySettingStore>(NoopPrivacySettingStore.Instance);
+        services.TryAddSingleton<IMessageRateLimiter>(NoopMessageRateLimiter.Instance);
 
         return services;
     }
