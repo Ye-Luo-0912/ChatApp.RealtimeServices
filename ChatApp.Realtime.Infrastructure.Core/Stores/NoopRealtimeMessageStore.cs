@@ -99,6 +99,32 @@ public sealed class NoopRealtimeMessageStore : IRealtimeMessageStore
         return Task.FromResult(0L);
     }
 
+    /// <summary>
+    /// 一-1：Noop 实现返回 null（源消息不存在），与未配置真实存储时的一致语义。
+    /// </summary>
+    public Task<(long SenderUserId, string Preview)?> GetReplySourceAsync(
+        string messageId,
+        string conversationId,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(messageId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(conversationId);
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult<(long SenderUserId, string Preview)?>(null);
+    }
+
+    /// <summary>
+    /// 一-3：Noop 实现返回空集合（无已撤回消息），与未配置真实存储时的一致语义。
+    /// </summary>
+    public Task<IReadOnlyList<string>> BatchGetRecalledMessageIdsAsync(
+        IReadOnlyCollection<string> messageIds,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(messageIds);
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
+    }
+
     public Task EnqueueEventAsync(
         Abstractions.Events.RealtimeEvent eventToPublish,
         CancellationToken ct = default)

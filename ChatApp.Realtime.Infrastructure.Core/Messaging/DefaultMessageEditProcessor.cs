@@ -87,7 +87,9 @@ public sealed class DefaultMessageEditProcessor : IMessageEditProcessor
                     result.ConversationId,
                     result.Content ?? command.Content,
                     result.EditVersion ?? 1,
-                    result.EditedAtMs ?? serverMutationAtMs);
+                    result.EditedAtMs ?? serverMutationAtMs,
+                    result.AddedMentionedUserIds,
+                    result.RemovedMentionedUserIds);
 
             case MessageEditPersistStatus.Unchanged:
                 return MessageEditResult.Success(

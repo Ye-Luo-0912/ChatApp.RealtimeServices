@@ -252,13 +252,14 @@ internal sealed class MessageMutationWriter
             reader.IsDBNull(9) ? null : reader.GetInt64(9));
     }
 
-    public async Task<int> ApplyEditUpdateAsync(
+    public async Task<EditUpdateResult> ApplyEditUpdateAsync(
         string messageId,
         string content,
         int editVersion,
         long editedAtMs,
         long[]? mentionedUserIds,
-        string[]? mentionedRoles)
+        string[]? mentionedRoles,
+        long[]? previousMentionedUserIds)
     {
         var ct = _session.CancellationToken;
         // mentions 为 null 时保留原值（COALESCE 语义：NULL 输入 → 不修改该列）；
@@ -299,7 +300,43 @@ internal sealed class MessageMutationWriter
                 : mentionedRoles.Length == 0
                     ? DBNull.Value
                     : mentionedRoles);
-        return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        var affected = await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+
+        // 一-4：计算 mention 增减 diff，供 Edit 结果与事件 payload 携带。
+        // mentionedUserIds 为 null（未修改 mentions）时 diff 为 null；
+        // 非 null（含空数组，表示清空）时与 previousMentionedUserIds 求差集。
+        var (addedMentionedUserIds, removedMentionedUserIds) = ComputeMentionDiff(
+            previousMentionedUserIds, mentionedUserIds);
+        return new EditUpdateResult(affected, addedMentionedUserIds, removedMentionedUserIds);
+    }
+
+    /// <summary>
+    /// 一-4：计算 Edit 操作的 mention 增减 diff。
+    /// </summary>
+    /// <param name="previous">编辑前的 mentioned_user_ids（来自 ReadMessageForEditAsync）。</param>
+    /// <param name="current">编辑写入的新 mentioned_user_ids；<c>null</c> 表示未修改 mentions。</param>
+    /// <returns>
+    /// added/removed：当 <paramref name="current"/> 为 <c>null</c>（未修改）时均为 <c>null</c>；
+    /// 否则为非空列表（可能为空列表，表示无新增 / 无移除）。
+    /// </returns>
+    internal static (IReadOnlyList<long>? Added, IReadOnlyList<long>? Removed) ComputeMentionDiff(
+        long[]? previous,
+        long[]? current)
+    {
+        if (current is null)
+        {
+            return (null, null);
+        }
+
+        var previousSet = previous is null || previous.Length == 0
+            ? new HashSet<long>()
+            : new HashSet<long>(previous);
+        var currentSet = new HashSet<long>(current);
+
+        var added = currentSet.Except(previousSet).ToArray();
+        var removed = previousSet.Except(currentSet).ToArray();
+
+        return (added, removed);
     }
 
     public static string ComputeMutationFingerprint(
@@ -404,4 +441,12 @@ internal sealed class MessageMutationWriter
         long[]? MentionedUserIds,
         string[]? MentionedRoles,
         long? ConversationSequence);
+
+    /// <summary>
+    /// 一-4：ApplyEditUpdateAsync 的返回结果，包含受影响行数与 mention 增减 diff。
+    /// </summary>
+    public sealed record EditUpdateResult(
+        int Affected,
+        IReadOnlyList<long>? AddedMentionedUserIds,
+        IReadOnlyList<long>? RemovedMentionedUserIds);
 }

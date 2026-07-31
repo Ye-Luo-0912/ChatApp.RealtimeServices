@@ -17,15 +17,19 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
     private readonly IRealtimeMessageHistoryStore _store;
     private readonly IRealtimeAttachmentStore _attachmentStore;
     private readonly IRealtimeReactionStore _reactionStore;
+    // 一-3：用于 Reply 源消息撤回降级。可选（默认 null）以兼容旧测试构造。
+    private readonly IRealtimeMessageStore? _messageStore;
 
     public DefaultMessageHistoryQueryProcessor(
         IRealtimeMessageHistoryStore store,
         IRealtimeAttachmentStore attachmentStore,
-        IRealtimeReactionStore reactionStore)
+        IRealtimeReactionStore reactionStore,
+        IRealtimeMessageStore? messageStore = null)
     {
         _store = store;
         _attachmentStore = attachmentStore;
         _reactionStore = reactionStore;
+        _messageStore = messageStore;
     }
 
     public async Task<MessageHistoryPage> ProcessAsync(
@@ -53,6 +57,12 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
             enrichedSingle = await RealtimeHistoryReactionEnricher
                 .EnrichAsync(_reactionStore, enrichedSingle, query.UserId, ct)
                 .ConfigureAwait(false);
+            // 一-3：Reply 源消息撤回降级。
+            if (_messageStore is not null)
+            {
+                enrichedSingle = await RealtimeHistoryReplySourceEnricher
+                    .EnrichAsync(_messageStore, enrichedSingle, ct).ConfigureAwait(false);
+            }
             var single = MessageHistoryPage.Success(query.RequestId, enrichedSingle, null, false);
             // Perf-4：直接序列化为 UTF-8 字节，避免中间 string 分配。
             if (MeasureUtf8JsonBytes(single) > MaximumResponseBytes)
@@ -122,6 +132,12 @@ public sealed class DefaultMessageHistoryQueryProcessor : IMessageHistoryQueryPr
         rows = await RealtimeHistoryReactionEnricher
             .EnrichAsync(_reactionStore, rows, query.UserId, ct)
             .ConfigureAwait(false);
+        // 一-3：Reply 源消息撤回降级。
+        if (_messageStore is not null)
+        {
+            rows = await RealtimeHistoryReplySourceEnricher
+                .EnrichAsync(_messageStore, rows, ct).ConfigureAwait(false);
+        }
 
         return PackByActualUtf8Json(query.RequestId, rows, pageSize, hasAfter);
     }

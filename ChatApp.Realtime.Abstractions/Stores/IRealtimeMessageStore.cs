@@ -69,6 +69,37 @@ public interface IRealtimeMessageStore
         CancellationToken ct = default);
 
     /// <summary>
+    /// 一-1：查询 Reply 源消息的权威 snapshot（sender_user_id + content 截断为 preview）。
+    /// <para>
+    /// 用于服务端生成 Reply snapshot，替代客户端上行的值。
+    /// 仅查询同会话内、未撤回的源消息。
+    /// </para>
+    /// </summary>
+    /// <param name="messageId">源消息编号。</param>
+    /// <param name="conversationId">当前消息所属会话编号（用于校验同会话）。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    /// <returns>
+    /// 源消息存在且未撤回时返回 (senderUserId, preview)；不存在或已撤回时返回 null。
+    /// </returns>
+    Task<(long SenderUserId, string Preview)?> GetReplySourceAsync(
+        string messageId,
+        string conversationId,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult<(long SenderUserId, string Preview)?>(null);
+
+    /// <summary>
+    /// 一-3：批量查询指定消息编号中已被撤回的消息编号集合。
+    /// 用于历史消息 Reply 源消息撤回降级。
+    /// </summary>
+    /// <param name="messageIds">待查询的消息编号集合。</param>
+    /// <param name="cancellationToken">取消令牌。</param>
+    /// <returns>已被撤回的消息编号列表。</returns>
+    Task<IReadOnlyList<string>> BatchGetRecalledMessageIdsAsync(
+        IReadOnlyCollection<string> messageIds,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
+
+    /// <summary>
     /// 将事件写入事务 Outbox（<c>ON CONFLICT DO NOTHING</c> / 幂等 EventId），
     /// 供 Outbox Worker 持久发布；不直接走 best-effort 总线。
     /// </summary>

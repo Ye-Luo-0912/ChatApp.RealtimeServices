@@ -1221,15 +1221,20 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             payloadMentionRoles = MentionValidator.AsReadOnly(dbMentionRoles);
         }
 
-        var affected = await mutationWriter
+        var updateResult = await mutationWriter
             .ApplyEditUpdateAsync(
                 messageId,
                 content,
                 nextVersion,
                 editedAtMs,
                 dbMentionUserIds,
-                dbMentionRoles)
+                dbMentionRoles,
+                target.MentionedUserIds)
             .ConfigureAwait(false);
+        var affected = updateResult.Affected;
+        // 一-4：本次 Edit 的 mention 增减 diff，供 MessageEditPersistResult 与事件 payload 携带。
+        var addedMentionedUserIds = updateResult.AddedMentionedUserIds;
+        var removedMentionedUserIds = updateResult.RemovedMentionedUserIds;
         if (affected == 0)
         {
             await mutationWriter.InsertMutationRequestAsync(
@@ -1326,7 +1331,9 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                     EditedAtMs = editedAtMs,
                     ConversationSequence = target.ConversationSequence,
                     MentionedUserIds = payloadMentionUserIds,
-                    MentionedRoles = payloadMentionRoles
+                    MentionedRoles = payloadMentionRoles,
+                    AddedMentionedUserIds = addedMentionedUserIds,
+                    RemovedMentionedUserIds = removedMentionedUserIds
                 },
                 RealtimeJsonSerializerContext.Default.RealtimeMessageEditedPayload);
 
@@ -1419,7 +1426,11 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             target.ConversationId,
             content,
             nextVersion,
-            editedAtMs);
+            editedAtMs)
+        {
+            AddedMentionedUserIds = addedMentionedUserIds,
+            RemovedMentionedUserIds = removedMentionedUserIds
+        };
     }
 
     public async Task<long> DeleteByUserAsync(
@@ -1686,6 +1697,89 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         {
             await orphanConversationsCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// 一-1：查询 Reply 源消息的权威 snapshot。
+    /// </summary>
+    public async Task<(long SenderUserId, string Preview)?> GetReplySourceAsync(
+        string messageId,
+        string conversationId,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(messageId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(conversationId);
+
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT sender_user_id,
+                    CASE
+                        WHEN recalled_at_ms IS NOT NULL THEN NULL
+                        WHEN LENGTH(content) > 256 THEN LEFT(content, 256)
+                        ELSE content
+                    END AS preview
+             FROM {_databaseSchema.MessagesTableSql}
+             WHERE message_id = @message_id
+               AND conversation_id = @conversation_id
+               AND recalled_at_ms IS NULL;
+             """,
+            connection);
+        command.Parameters.AddWithValue("message_id", messageId);
+        command.Parameters.AddWithValue("conversation_id", conversationId);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            return null;
+
+        var senderUserId = reader.GetInt64(0);
+        if (reader.IsDBNull(1))
+            return null; // 源消息已撤回（recalled_at_ms IS NOT NULL 时 preview 为 NULL）
+
+        var preview = reader.GetString(1);
+        return (senderUserId, preview);
+    }
+
+    /// <summary>
+    /// 一-3：批量查询已被撤回的消息编号。
+    /// </summary>
+    public async Task<IReadOnlyList<string>> BatchGetRecalledMessageIdsAsync(
+        IReadOnlyCollection<string> messageIds,
+        CancellationToken cancellationToken = default)
+    {
+        if (messageIds is null || messageIds.Count == 0)
+            return Array.Empty<string>();
+
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var ids = messageIds.ToArray();
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT message_id
+             FROM {_databaseSchema.MessagesTableSql}
+             WHERE recalled_at_ms IS NOT NULL
+               AND message_id = ANY(@message_ids);
+             """,
+            connection);
+        command.Parameters.AddWithValue("message_ids", ids);
+
+        var result = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken)
+            .ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            result.Add(reader.GetString(0));
+        }
+
+        return result;
     }
 
     public async Task EnqueueEventAsync(RealtimeEvent eventToPublish, CancellationToken ct = default)

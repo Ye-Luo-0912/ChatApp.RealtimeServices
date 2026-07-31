@@ -29,4 +29,16 @@ public sealed class RealtimeMessageEditedPayload
 
     /// <summary>编辑后替换的 @提及角色列表。语义同 <see cref="MentionedUserIds"/>。</summary>
     public IReadOnlyList<string>? MentionedRoles { get; init; }
+
+    /// <summary>
+    /// 一-4：本次 Edit 新增的 @提及用户 Id 列表（增量，非全量）。
+    /// <para><c>null</c> 表示本次编辑未修改 mentions，客户端应忽略 diff。</para>
+    /// </summary>
+    public IReadOnlyList<long>? AddedMentionedUserIds { get; init; }
+
+    /// <summary>
+    /// 一-4：本次 Edit 移除的 @提及用户 Id 列表（增量，非全量）。
+    /// <para><c>null</c> 表示本次编辑未修改 mentions，客户端应忽略 diff。</para>
+    /// </summary>
+    public IReadOnlyList<long>? RemovedMentionedUserIds { get; init; }
 }

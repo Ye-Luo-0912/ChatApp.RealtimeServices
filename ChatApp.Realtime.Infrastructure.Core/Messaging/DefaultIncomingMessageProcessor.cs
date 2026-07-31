@@ -98,6 +98,32 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             receiverUserId = command.ReceiverUserId;
         }
 
+        // 一-1：Reply 源消息访问校验 + 服务端生成 snapshot。
+        // 查 DB 验证源消息存在、在同一会话内、未被撤回，用服务端权威值覆盖客户端上行值。
+        // Forward 保持展示性引用不校验存在性（见上方 Validate 中 forwarded_from_* 校验注释）。
+        if (!string.IsNullOrWhiteSpace(command.ReplyToMessageId))
+        {
+            var replySource = await _messageStore
+                .GetReplySourceAsync(command.ReplyToMessageId, conversationId, ct)
+                .ConfigureAwait(false);
+            if (replySource is null)
+            {
+                _metrics.RecordProcessingFailure("reply_source_not_found");
+                return MessageProcessResult.Failed(
+                    "reply_source_not_found",
+                    "回复源消息不存在、不在当前会话内或已被撤回。",
+                    MessageFailureKind.Permanent);
+            }
+
+            var (sourceSenderUserId, sourcePreview) = replySource.Value;
+            // 用服务端权威值覆盖客户端上行值。
+            command = command with
+            {
+                ReplyToSenderUserId = sourceSenderUserId,
+                ReplyToPreview = sourcePreview
+            };
+        }
+
         // Mentions 业务闭环：去重 / 排除自身 / 截断 / 群成员校验 / @all|@admin 权限校验。
         // 所有违规一律静默过滤——不拒绝整条消息，符合 Realtime"消息必达"语义。
         // 单聊场景下：仅做基本去重与排除自身（mention 通常无意义但保留透传）。

@@ -14,13 +14,25 @@ public sealed class MessageEditResult
     public int? EditVersion { get; init; }
     public long? EditedAtMs { get; init; }
 
+    /// <summary>
+    /// 一-4：本次 Edit 新增的 @提及用户 Id 列表。
+    /// </summary>
+    public IReadOnlyList<long>? AddedMentionedUserIds { get; init; }
+
+    /// <summary>
+    /// 一-4：本次 Edit 移除的 @提及用户 Id 列表。
+    /// </summary>
+    public IReadOnlyList<long>? RemovedMentionedUserIds { get; init; }
+
     public static MessageEditResult Success(
         string requestId,
         string messageId,
         string? conversationId,
         string content,
         int editVersion,
-        long editedAtMs) =>
+        long editedAtMs,
+        IReadOnlyList<long>? addedMentionedUserIds = null,
+        IReadOnlyList<long>? removedMentionedUserIds = null) =>
         new()
         {
             RequestId = requestId,
@@ -29,7 +41,9 @@ public sealed class MessageEditResult
             ConversationId = conversationId,
             Content = content,
             EditVersion = editVersion,
-            EditedAtMs = editedAtMs
+            EditedAtMs = editedAtMs,
+            AddedMentionedUserIds = addedMentionedUserIds,
+            RemovedMentionedUserIds = removedMentionedUserIds
         };
 
     public static MessageEditResult Failed(

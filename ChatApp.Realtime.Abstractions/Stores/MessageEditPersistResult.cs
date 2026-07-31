@@ -18,4 +18,17 @@ public sealed record MessageEditPersistResult(
     string? ConversationId = null,
     string? Content = null,
     int? EditVersion = null,
-    long? EditedAtMs = null);
+    long? EditedAtMs = null)
+{
+    /// <summary>
+    /// 一-4：本次 Edit 新增的 @提及用户 Id 列表。
+    /// <para><c>null</c> 表示本次编辑未修改 mentions，客户端应忽略 diff。</para>
+    /// </summary>
+    public IReadOnlyList<long>? AddedMentionedUserIds { get; init; }
+
+    /// <summary>
+    /// 一-4：本次 Edit 移除的 @提及用户 Id 列表。
+    /// <para><c>null</c> 表示本次编辑未修改 mentions，客户端应忽略 diff。</para>
+    /// </summary>
+    public IReadOnlyList<long>? RemovedMentionedUserIds { get; init; }
+}
