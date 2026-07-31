@@ -1,7 +1,11 @@
 using BenchmarkDotNet.Attributes;
+using ChatApp.Realtime.Abstractions.Messaging;
+using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
+using ChatApp.Realtime.Infrastructure.Postgres.Messaging;
 using ChatApp.Realtime.Infrastructure.Postgres.Migrations;
+using ChatApp.Realtime.Infrastructure.Postgres.Stores;
 using Microsoft.Extensions.Logging.Abstractions;
 using Npgsql;
 using Testcontainers.PostgreSql;
@@ -9,9 +13,9 @@ using Testcontainers.PostgreSql;
 namespace ChatApp.Realtime.Benchmarks;
 
 /// <summary>
-/// Reaction 操作基准：验证单条 CTE 完成存在性检查/计数/插入/水位推进，
-/// 且仅更新 messages.changed_at_ms 轻量列，不锁 messages 正文行。
-/// 每次迭代用递增 user_id 触发真实 INSERT（避免 AlreadyExists 短路）。
+/// Reaction 操作基准：纯 CTE 路径与端到端 Store 路径对比。
+/// 端到端路径覆盖 advisory lock → tombstone 检查 → message_state 锁 → 权限校验 → CTE → Outbox 写入 → commit。
+/// 六-1：方法返回值为单次操作的 SQL 命令数，用于性能门禁的 SQL 往返次数基线。
 /// </summary>
 [MemoryDiagnoser]
 [SimpleJob(warmupCount: 3, iterationCount: 5)]
@@ -21,7 +25,9 @@ public class ReactionBenchmarks
     private RealtimeDatabaseClient _client = null!;
     private RealtimeDatabaseSchema _schema = null!;
     private NpgsqlConnection _connection = null!;
+    private NpgsqlRealtimeReactionStore _store = null!;
     private long _nextUserId = 6000;
+    private long _nextEmojiSeq = 0;
 
     [GlobalSetup]
     public async Task InitializeAsync()
@@ -41,6 +47,10 @@ public class ReactionBenchmarks
         _connection = new NpgsqlConnection(_container.GetConnectionString());
         await _connection.OpenAsync();
 
+        var policy = new PostgresConversationMessageMutationPolicy(
+            NullLogger<PostgresConversationMessageMutationPolicy>.Instance);
+        _store = new NpgsqlRealtimeReactionStore(_client, _schema, policy);
+
         await SeedMessageAsync();
     }
 
@@ -52,22 +62,31 @@ public class ReactionBenchmarks
         await _container.DisposeAsync();
     }
 
-    /// <summary>每次迭代前清空 reactions 表并重置 user_id 计数器。</summary>
+    /// <summary>每次迭代前清空 reactions + outbox 表并重置计数器。</summary>
     [IterationSetup]
-    public async Task SetupIteration()
+    public void SetupIteration()
+    {
+        SetupIterationCore().GetAwaiter().GetResult();
+    }
+
+    private async Task SetupIterationCore()
     {
         _nextUserId = 6000;
+        _nextEmojiSeq = 0;
         await using var truncate = new NpgsqlCommand(
-            $"TRUNCATE {_schema.MessageReactionsTableSql};", _connection);
+            $"TRUNCATE {_schema.MessageReactionsTableSql}; TRUNCATE {_schema.OutboxTableSql};",
+            _connection);
         await truncate.ExecuteNonQueryAsync();
     }
 
     /// <summary>
-    /// Reaction 添加 CTE：7 次往返压成 1 次，bump 仅更新 changed_at_ms 不触碰 content。
+    /// 纯 CTE 路径：7 次往返压成 1 次，bump 仅更新 changed_at_ms 不触碰 content。
+    /// 返回 SQL 命令数（应为 1，若回退到多往返则说明 CTE 被拆分）。
     /// </summary>
-    [Benchmark(Description = "Reaction add CTE (no message body lock)")]
-    public async Task AddReaction()
+    [Benchmark(Description = "Reaction add CTE only (1 SQL roundtrip)")]
+    public async Task<int> AddReactionCte()
     {
+        using var scope = NpgsqlSqlCommandCounter.BeginScope();
         var userId = Interlocked.Increment(ref _nextUserId);
 
         await using var command = new NpgsqlCommand(
@@ -133,6 +152,32 @@ public class ReactionBenchmarks
         command.Parameters.AddWithValue("max_distinct", 100);
 
         await command.ExecuteScalarAsync();
+        return NpgsqlSqlCommandCounter.GetCommandCount();
+    }
+
+    /// <summary>
+    /// 六-4：端到端 Store 路径。通过真实 NpgsqlRealtimeReactionStore.AddAsync 执行，
+    /// 覆盖 advisory lock → tombstone 检查 → message_state 锁 → 权限校验 → CTE → Outbox 写入 → commit。
+    /// 用递增 emoji 触发真实 INSERT（避免 AlreadyExists 短路），actor 为 sender。
+    /// 返回 SQL 命令数（应约 7-8 次：advisory_lock + tombstone + messages 读 + state ensure + state lock + CTE + outbox + commit）。
+    /// </summary>
+    [Benchmark(Description = "Reaction add E2E via Store (full path)")]
+    public async Task<int> AddReactionViaStore()
+    {
+        using var scope = NpgsqlSqlCommandCounter.BeginScope();
+        var emojiSeq = Interlocked.Increment(ref _nextEmojiSeq);
+        var emoji = "+e" + emojiSeq;
+
+        await _store.AddAsync(
+            messageId: "bench-react-msg",
+            actorUserId: 6001,
+            actorSessionId: "bench-session",
+            emoji: emoji,
+            occurredAtMs: 1_700_000_000_000L,
+            options: new MessageReactionOptions(),
+            CancellationToken.None);
+
+        return NpgsqlSqlCommandCounter.GetCommandCount();
     }
 
     private async Task SeedMessageAsync()

@@ -18,6 +18,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\ChatApp.Realtime.Abstractions\ChatApp.Realtime.Abstractions.csproj" />
+    <ProjectReference Include="..\ChatApp.Realtime.Infrastructure.Core\ChatApp.Realtime.Infrastructure.Core.csproj" />
     <ProjectReference Include="..\ChatApp.Realtime.Infrastructure.Postgres\ChatApp.Realtime.Infrastructure.Postgres.csproj" />
   </ItemGroup>
 

@@ -36,6 +36,11 @@ coverage/
 *.coverage
 *.coveragexml
 
+# Benchmark artifacts (本地基线/产物，CI 通过 artifact 下载)
+benchmark-baselines/
+benchmark-smoke/
+BenchmarkDotNet.Artifacts/
+
 # Env / secrets
 .env
 .env.*

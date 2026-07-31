@@ -1,4 +1,5 @@
 using BenchmarkDotNet.Attributes;
+using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using ChatApp.Realtime.Infrastructure.Postgres.Migrations;
@@ -12,6 +13,7 @@ namespace ChatApp.Realtime.Benchmarks;
 /// <summary>
 /// 会话序列推进基准：群聊 O(1) 推进、单聊 UPSERT 推进、MarkRead 索引查找。
 /// 序列推进方法天然可重复（每次 +1），无需逐迭代重置。
+/// 六-1：方法返回值为单次操作的 SQL 命令数，用于性能门禁的 SQL 往返次数基线。
 /// </summary>
 [MemoryDiagnoser]
 [SimpleJob(warmupCount: 3, iterationCount: 5)]
@@ -53,10 +55,11 @@ public class SequenceAdvancementBenchmarks
         await _container.DisposeAsync();
     }
 
-    /// <summary>群消息序列推进：原子递增 conversations.last_sequence 并回写 message 序列。</summary>
+    /// <summary>群消息序列推进：原子递增 conversations.last_sequence 并回写 message 序列。返回 SQL 命令数。</summary>
     [Benchmark(Description = "Group sequence advance (O(1))")]
-    public async Task AdvanceGroupSequence()
+    public async Task<int> AdvanceGroupSequence()
     {
+        using var scope = NpgsqlSqlCommandCounter.BeginScope();
         await using var tx = await _connection.BeginTransactionAsync();
         await ConversationWriteCommands.TryAdvanceGroupSequenceAsync(
             _connection, tx, _schema,
@@ -67,12 +70,14 @@ public class SequenceAdvancementBenchmarks
             receivedAtMs: 1_700_000_000_000L,
             CancellationToken.None);
         await tx.CommitAsync();
+        return NpgsqlSqlCommandCounter.GetCommandCount();
     }
 
-    /// <summary>单聊消息序列推进：UPSERT 会话 + 递增 last_sequence + 回写 message 序列。</summary>
+    /// <summary>单聊消息序列推进：UPSERT 会话 + 递增 last_sequence + 回写 message 序列。返回 SQL 命令数。</summary>
     [Benchmark(Description = "Direct sequence advance (UPSERT)")]
-    public async Task AdvanceDirectSequence()
+    public async Task<int> AdvanceDirectSequence()
     {
+        using var scope = NpgsqlSqlCommandCounter.BeginScope();
         await using var tx = await _connection.BeginTransactionAsync();
         await ConversationWriteCommands.TryAdvanceDirectSequenceAsync(
             _connection, tx, _schema,
@@ -84,16 +89,18 @@ public class SequenceAdvancementBenchmarks
             receivedAtMs: 1_700_000_000_000L,
             CancellationToken.None);
         await tx.CommitAsync();
+        return NpgsqlSqlCommandCounter.GetCommandCount();
     }
 
     /// <summary>
     /// 极限-2：群消息序列分配（前置）。仅 UPDATE conversations + 发送者 sent_count，
     /// 不回写 messages 行。与 AdvanceGroupSequence 对比可量化"INSERT NULL → UPDATE 回写"
-    /// 路径产生的额外 tuple/WAL/索引写入开销。
+    /// 路径产生的额外 tuple/WAL/索引写入开销。返回 SQL 命令数。
     /// </summary>
     [Benchmark(Description = "Group sequence allocate (pre-INSERT, no messages UPDATE)")]
-    public async Task AllocateGroupSequence()
+    public async Task<int> AllocateGroupSequence()
     {
+        using var scope = NpgsqlSqlCommandCounter.BeginScope();
         await using var tx = await _connection.BeginTransactionAsync();
         await ConversationWriteCommands.TryAllocateGroupSequenceAsync(
             _connection, tx, _schema,
@@ -104,15 +111,17 @@ public class SequenceAdvancementBenchmarks
             receivedAtMs: 1_700_000_000_000L,
             CancellationToken.None);
         await tx.CommitAsync();
+        return NpgsqlSqlCommandCounter.GetCommandCount();
     }
 
     /// <summary>
     /// 极限-2：单聊消息序列分配（前置）。仅 UPSERT conversations + 发送者 sent_count，
-    /// 不回写 messages 行。
+    /// 不回写 messages 行。返回 SQL 命令数。
     /// </summary>
     [Benchmark(Description = "Direct sequence allocate (pre-INSERT, no messages UPDATE)")]
-    public async Task AllocateDirectSequence()
+    public async Task<int> AllocateDirectSequence()
     {
+        using var scope = NpgsqlSqlCommandCounter.BeginScope();
         await using var tx = await _connection.BeginTransactionAsync();
         await ConversationWriteCommands.TryAllocateDirectSequenceAsync(
             _connection, tx, _schema,
@@ -124,15 +133,17 @@ public class SequenceAdvancementBenchmarks
             receivedAtMs: 1_700_000_000_000L,
             CancellationToken.None);
         await tx.CommitAsync();
+        return NpgsqlSqlCommandCounter.GetCommandCount();
     }
 
     /// <summary>
     /// MarkRead 的 sender_sequence 索引查找（O(log N)）。
-    /// 利用 ix_messages_sender_sequence_lookup 替代 O(N) COUNT(*) 扫描。
+    /// 利用 ix_messages_sender_sequence_lookup 替代 O(N) COUNT(*) 扫描。返回 SQL 命令数。
     /// </summary>
     [Benchmark(Description = "MarkRead sender_sequence lookup (O(log N))")]
-    public async Task MarkReadIndexQuery()
+    public async Task<int> MarkReadIndexQuery()
     {
+        using var scope = NpgsqlSqlCommandCounter.BeginScope();
         await using var command = new NpgsqlCommand(
             $"""
              SELECT sender_sequence
@@ -149,6 +160,7 @@ public class SequenceAdvancementBenchmarks
         command.Parameters.AddWithValue("user_id", 5001L);
         command.Parameters.AddWithValue("target_sequence", 50L);
         await command.ExecuteScalarAsync();
+        return NpgsqlSqlCommandCounter.GetCommandCount();
     }
 
     private async Task SeedGroupConversationAsync()
@@ -230,7 +242,7 @@ public class SequenceAdvancementBenchmarks
                  receiver_user_id, conversation_id, content, received_at_ms, created_at_ms,
                  conversation_sequence, sender_sequence
              )
-             SELECT 'bench-read-' || g, 'c', 5001, 's', 5002, 'bench-read-idx', 'm', g, g, g, g
+             SELECT 'bench-read-' || g, 'c-' || g, 5001, 's', 5002, 'bench-read-idx', 'm', g, g, g, g
              FROM generate_series(1, 100) AS g
              ON CONFLICT (message_id) DO NOTHING;
              """,
