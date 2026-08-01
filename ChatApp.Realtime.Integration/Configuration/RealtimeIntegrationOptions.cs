@@ -71,6 +71,15 @@ public sealed class RealtimeIntegrationOptions
     /// 新建 consumer 时是否从流头回放（默认仅投递新建后的消息）。
     /// </summary>
     public bool ReplayRetainedEventsOnConsumerCreation { get; set; }
+    /// <summary>
+    /// P0-5：新建 Push consumer 时是否从流头回放（DeliverPolicy.All，默认 true）。
+    /// <para>
+    /// Push 投递命令是关键业务消息——关闭 Push Consumer 后再次启用应从流头回放历史投递命令，
+    /// 避免未来 Worker 永远消费不到历史 Push（DeliverPolicy.New 会跳过流头至 consumer 创建之间的消息）。
+    /// 与全局 <see cref="ReplayRetainedEventsOnConsumerCreation"/>（默认 false）解耦。
+    /// </para>
+    /// </summary>
+    public bool PushReplayRetainedEventsOnConsumerCreation { get; set; } = true;
     public int Replicas { get; set; } = 1;
     public long MaxBytes { get; set; } = 10L * 1024 * 1024 * 1024;
     public int MaxMessageSize { get; set; } = 1024 * 1024;

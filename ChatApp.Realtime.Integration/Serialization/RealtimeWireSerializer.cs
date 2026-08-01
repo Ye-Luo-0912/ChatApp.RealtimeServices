@@ -136,6 +136,9 @@ public static class RealtimeWireSerializer
     public static RealtimeMembersAddedPayload? DeserializeMembersAdded(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeMembersAddedPayload);
 
+    public static RealtimeConversationDissolvedPayload? DeserializeConversationDissolved(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeConversationDissolvedPayload);
+
     public static RealtimeMemberLeftPayload? DeserializeMemberLeft(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeMemberLeftPayload);
 

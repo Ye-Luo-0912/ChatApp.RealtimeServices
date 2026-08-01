@@ -193,7 +193,7 @@ internal sealed class RealtimeEventSubscriber
                 MaxDeliver = _options.PushMaxDeliver,
                 MaxAckPending = _options.PushMaxAckPending,
                 Backoff = _options.BackoffSeconds.Select(seconds => TimeSpan.FromSeconds(seconds)).ToArray(),
-                DeliverPolicy = _options.ReplayRetainedEventsOnConsumerCreation
+                DeliverPolicy = _options.PushReplayRetainedEventsOnConsumerCreation
                     ? ConsumerConfigDeliverPolicy.All
                     : ConsumerConfigDeliverPolicy.New
             },
@@ -218,6 +218,30 @@ internal sealed class RealtimeEventSubscriber
                     _metrics,
                     msg.Metadata,
                     consumerName);
+                // P0-5：MaxDeliver 耗尽检测——投递次数达到上限时发 DLQ 并终止，
+                // 避免消息在 JetStream 中达到 MaxDeliver 后被 NATS 静默丢弃（NATS 不自动 DLQ）。
+                var pushDeliveryCount = msg.Metadata?.NumDelivered ?? 0UL;
+                if (_options.PushMaxDeliver > 0 && pushDeliveryCount >= (ulong)_options.PushMaxDeliver)
+                {
+                    await _deadLetterPublisher.PublishDeadLetterAsync(
+                        new DeadLetterMessage
+                        {
+                            DeadLetterId = $"gateway-push-{msg.Metadata?.Sequence.Stream ?? 0}-max-deliver-exceeded",
+                            SourceSubject = msg.Subject,
+                            ReasonCode = "push_max_deliver_exceeded",
+                            Reason = $"Push delivery exceeded MaxDeliver ({_options.PushMaxDeliver}) after {pushDeliveryCount} attempts.",
+                            Payload = msg.Data,
+                            DeliveryCount = msg.Metadata?.NumDelivered
+                        },
+                        ct).ConfigureAwait(false);
+                    await IntegrationJetStreamMetricAck.TerminateAsync(
+                        msg,
+                        _metrics,
+                        observation,
+                        "push_max_deliver_exceeded",
+                        ct).ConfigureAwait(false);
+                    continue;
+                }
                 PushDeliveryCommand? command;
                 try
                 {

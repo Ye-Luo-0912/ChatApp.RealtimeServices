@@ -47,8 +47,17 @@ public sealed class PushDeliveryResult
     /// <summary>应被注销的无效令牌指纹列表（调用方据此调用 IPushTokenStore.UnregisterByTokenAsync）。</summary>
     public IReadOnlyList<string> InvalidTokenFingerprints { get; init; } = Array.Empty<string>();
 
-    /// <summary>可重试的失败数（provider_unavailable / rate_limited）。</summary>
+    /// <summary>可重试的失败数（provider_unavailable / rate_limited / unknown）。</summary>
     public int RetryableFailureCount { get; init; }
+
+    /// <summary>
+    /// 所有可重试 outcome 中最大的 <see cref="PushDeliveryOutcome.RetryAfter"/>（无值时为 null）。
+    /// <para>
+    /// P0-4：Consumer 侧 NAK 重投时使用此值作为延迟，尊重 Provider 返回的限流建议；
+    /// 为 null 时由 Consumer 回退到固定延迟。
+    /// </para>
+    /// </summary>
+    public TimeSpan? MaxRetryAfter { get; init; }
 
     /// <summary>用户无注册令牌时为 true（调用方可记录跳过指标）。</summary>
     public bool NoTokensRegistered => AttemptedCount == 0;
@@ -63,6 +72,7 @@ public sealed class PushDeliveryResult
         var succeeded = 0;
         var retryable = 0;
         var invalid = new List<string>();
+        TimeSpan? maxRetryAfter = null;
         foreach (var o in outcomes)
         {
             if (o.Succeeded)
@@ -73,9 +83,13 @@ public sealed class PushDeliveryResult
             {
                 invalid.Add(o.TokenFingerprint);
             }
-            else if (o.ErrorCode is "provider_unavailable" or "rate_limited")
+            // P0-4：防御性编程——即使 PushDispatcher 已改为返回 provider_unavailable，
+            // unknown 也计为 retryable，避免任何路径的 unknown 被永久丢失。
+            else if (IsRetryableErrorCode(o.ErrorCode))
             {
                 retryable++;
+                if (o.RetryAfter is { } retryAfter && (maxRetryAfter is null || retryAfter > maxRetryAfter))
+                    maxRetryAfter = retryAfter;
             }
         }
 
@@ -85,7 +99,19 @@ public sealed class PushDeliveryResult
             AttemptedCount = outcomes.Count,
             SucceededCount = succeeded,
             InvalidTokenFingerprints = invalid,
-            RetryableFailureCount = retryable
+            RetryableFailureCount = retryable,
+            MaxRetryAfter = maxRetryAfter
         };
     }
+
+    /// <summary>
+    /// P0-4：判断错误码是否计为可重试。
+    /// <para>
+    /// provider_unavailable / rate_limited / unknown 均计为可重试。
+    /// unknown 计为可重试是防御性兜底——PushDispatcher 异常路径已改为返回 provider_unavailable，
+    /// 但任何其他路径产生的 unknown 也不应被 ACK 永久丢失。
+    /// </para>
+    /// </summary>
+    private static bool IsRetryableErrorCode(string? errorCode) =>
+        errorCode is "provider_unavailable" or "rate_limited" or "unknown";
 }
