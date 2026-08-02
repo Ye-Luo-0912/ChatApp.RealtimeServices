@@ -4,6 +4,7 @@ using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Messaging;
+using ChatApp.Realtime.Infrastructure.Core.Stores;
 using ChatApp.Realtime.Tests.TestDoubles;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -34,6 +35,11 @@ public sealed class MentionRoundTripTests
             metrics,
             NoopTombstoneAndLedger.Tombstone,
             new FakeGroupStore(members),
+            NoopUserExistenceChecker.Instance,
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var command = ValidGroupCommand() with
@@ -77,6 +83,11 @@ public sealed class MentionRoundTripTests
             metrics,
             NoopTombstoneAndLedger.Tombstone,
             new FakeGroupStore(members),
+            NoopUserExistenceChecker.Instance,
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var command = ValidGroupCommand() with
@@ -118,6 +129,11 @@ public sealed class MentionRoundTripTests
             metrics,
             NoopTombstoneAndLedger.Tombstone,
             new FakeGroupStore(members),
+            NoopUserExistenceChecker.Instance,
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var command = ValidGroupCommand() with
@@ -150,6 +166,11 @@ public sealed class MentionRoundTripTests
             metrics,
             NoopTombstoneAndLedger.Tombstone,
             new FakeGroupStore(members),
+            NoopUserExistenceChecker.Instance,
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var result = await processor.ProcessAsync(ValidGroupCommand());
@@ -176,6 +197,11 @@ public sealed class MentionRoundTripTests
             metrics,
             NoopTombstoneAndLedger.Tombstone,
             new FakeGroupStore([]),
+            NoopUserExistenceChecker.Instance,
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         // 单聊场景下 mention 仍然透传（Gateway 侧已规整为 null，但 Realtime 侧不二次过滤）

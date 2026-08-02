@@ -68,12 +68,7 @@ public sealed class NpgsqlUserDeletionTombstoneStore(
             return UserLifecycleState.Active;
 
         var stateByte = reader.GetByte(0);
-        return stateByte switch
-        {
-            1 => UserLifecycleState.Deleting,
-            2 => UserLifecycleState.Deleted,
-            _ => UserLifecycleState.Active
-        };
+        return MapStateByte(stateByte);
     }
 
     public async Task<IReadOnlyDictionary<long, UserLifecycleState>> BatchGetUserLifecycleStateAsync(
@@ -114,12 +109,7 @@ public sealed class NpgsqlUserDeletionTombstoneStore(
         {
             var userId = reader.GetInt64(0);
             var stateByte = reader.GetByte(1);
-            result[userId] = stateByte switch
-            {
-                1 => UserLifecycleState.Deleting,
-                2 => UserLifecycleState.Deleted,
-                _ => UserLifecycleState.Active
-            };
+            result[userId] = MapStateByte(stateByte);
         }
 
         return result;
@@ -249,4 +239,21 @@ public sealed class NpgsqlUserDeletionTombstoneStore(
         }
         return deleted;
     }
+
+    /// <summary>
+    /// 三-1：将数据库 state 字节映射为 <see cref="UserLifecycleState"/>。
+    /// <para>
+    /// Frozen=3 必须显式映射，否则会被默认分支误判为 Active，
+    /// 导致冻结用户通过 lifecycle 预检查（advisory lock 路径已正确处理，
+    /// 但 IsUserDeletedAsync/GetLifecycleStateAsync 预检查路径会漏判）。
+    /// </para>
+    /// </summary>
+    private static UserLifecycleState MapStateByte(byte stateByte) =>
+        stateByte switch
+        {
+            1 => UserLifecycleState.Deleting,
+            2 => UserLifecycleState.Deleted,
+            3 => UserLifecycleState.Frozen,
+            _ => UserLifecycleState.Active
+        };
 }

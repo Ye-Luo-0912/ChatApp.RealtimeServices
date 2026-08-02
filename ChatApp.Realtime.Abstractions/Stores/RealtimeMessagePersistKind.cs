@@ -22,5 +22,10 @@ public enum RealtimeMessagePersistKind : byte
     /// <summary>
     /// P0-2：发送方或接收方用户已注销（Deleting / Deleted）。事务已回滚。
     /// </summary>
-    UserDeleted = 5
+    UserDeleted = 5,
+
+    /// <summary>
+    /// 三-3：发送方或接收方用户已冻结（Frozen）。事务已回滚。
+    /// </summary>
+    UserFrozen = 6
 }

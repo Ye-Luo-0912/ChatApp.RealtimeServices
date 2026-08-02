@@ -96,20 +96,26 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         var lifecycleUserIds = message.ReceiverUserId > 0
             ? new[] { message.SenderUserId, message.ReceiverUserId }
             : new[] { message.SenderUserId };
-        if (!(await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveManyAsync(
+        var lifecycleGate = await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveManyAsync(
                 session.Connection,
                 session.Transaction,
                 session.Schema,
                 lifecycleUserIds,
-                ct).ConfigureAwait(false)).IsActive)
+                ct).ConfigureAwait(false);
+        if (!lifecycleGate.IsActive)
         {
             await session.RollbackAsync().ConfigureAwait(false);
+            // 三-3：区分 Frozen 与 Deleted 返回不同错误码，使 Processor 能映射 user_frozen。
+            var isFrozen = lifecycleGate.ErrorCode == "user_frozen";
             _logger.LogWarning(
-                "入站消息被拒绝：发送或接收用户已注销。发送用户={SenderUserId}；接收用户={ReceiverUserId}；消息={MessageId}",
+                "入站消息被拒绝：发送或接收用户{Reason}。发送用户={SenderUserId}；接收用户={ReceiverUserId}；消息={MessageId}",
+                isFrozen ? "已冻结" : "已注销",
                 message.SenderUserId,
                 message.ReceiverUserId,
                 message.MessageId);
-            return RealtimeMessagePersistResult.UserDeleted(message.MessageId);
+            return isFrozen
+                ? RealtimeMessagePersistResult.UserFrozen(message.MessageId)
+                : RealtimeMessagePersistResult.UserDeleted(message.MessageId);
         }
 
         // Perf-3：在事务内查询独立幂等账本，消除 Processor 中事务外的 FindAsync 连接获取。

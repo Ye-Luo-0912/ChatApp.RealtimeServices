@@ -171,6 +171,11 @@ public sealed class GroupChatTests : IAsyncLifetime
             metrics,
             NoopTombstoneAndLedger.Tombstone,
             groupStore,
+            NoopUserExistenceChecker.Instance,
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var rejected = await processor.ProcessAsync(new IncomingMessageCommand

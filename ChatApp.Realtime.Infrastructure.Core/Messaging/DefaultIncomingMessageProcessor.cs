@@ -17,6 +17,12 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
     // 字段保留：构造签名兼容，且未来其他 Processor 复用同一依赖图。
     private readonly IUserDeletionTombstoneStore _tombstoneStore;
     private readonly IRealtimeGroupStore _groupStore;
+    // 三-4：授权策略链接口。默认 Noop 不阻塞；真实实现接入后生效。
+    private readonly IUserExistenceChecker _existenceChecker;
+    private readonly IBlockListStore _blockListStore;
+    private readonly IPrivacySettingStore _privacySettingStore;
+    private readonly IDirectMessagePolicy _directMessagePolicy;
+    private readonly IMessageRateLimiter _messageRateLimiter;
     private readonly ILogger<DefaultIncomingMessageProcessor> _logger;
 
     public DefaultIncomingMessageProcessor(
@@ -25,6 +31,11 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
         RealtimeMetrics metrics,
         IUserDeletionTombstoneStore tombstoneStore,
         IRealtimeGroupStore groupStore,
+        IUserExistenceChecker existenceChecker,
+        IBlockListStore blockListStore,
+        IPrivacySettingStore privacySettingStore,
+        IDirectMessagePolicy directMessagePolicy,
+        IMessageRateLimiter messageRateLimiter,
         ILogger<DefaultIncomingMessageProcessor> logger)
     {
         _messageStore = messageStore;
@@ -32,6 +43,11 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
         _metrics = metrics;
         _tombstoneStore = tombstoneStore;
         _groupStore = groupStore;
+        _existenceChecker = existenceChecker;
+        _blockListStore = blockListStore;
+        _privacySettingStore = privacySettingStore;
+        _directMessagePolicy = directMessagePolicy;
+        _messageRateLimiter = messageRateLimiter;
         _logger = logger;
     }
 
@@ -96,6 +112,22 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                 command.SenderUserId,
                 command.ReceiverUserId);
             receiverUserId = command.ReceiverUserId;
+        }
+
+        // 三-4：授权策略链预检查（existence/block/privacy/policy/ratelimit）。
+        // Lifecycle/Frozen 由 SaveAsync 事务内 advisory lock 权威检查，此处不预检查避免 TOCTOU。
+        var authError = await ValidateAuthorizationAsync(
+            command.SenderUserId,
+            receiverUserId,
+            isGroupMessage,
+            ct).ConfigureAwait(false);
+        if (authError is not null)
+        {
+            _metrics.RecordProcessingFailure(authError.Value.ErrorCode);
+            return MessageProcessResult.Failed(
+                authError.Value.ErrorCode,
+                authError.Value.ErrorMessage,
+                MessageFailureKind.Permanent);
         }
 
         // 一-1：Reply 源消息访问校验 + 服务端生成 snapshot。
@@ -270,6 +302,16 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                 MessageFailureKind.Permanent);
         }
 
+        if (persisted.IsUserFrozen)
+        {
+            _metrics.RecordProcessingFailure("user_frozen");
+            // 三-3：事务内 advisory lock 检测到用户已冻结，不记录账本。
+            return MessageProcessResult.Failed(
+                "user_frozen",
+                "用户已冻结，消息未写入。",
+                MessageFailureKind.Permanent);
+        }
+
         _outboxSignal.Notify();
 
         if (!persisted.IsNew)
@@ -419,6 +461,106 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
         var sanitizedRoles = MentionValidator.AsReadOnly(
             MentionValidator.NormalizeRoles(command.MentionedRoles, isManager));
         return new SanitizedMentions(sanitizedUserIds, sanitizedRoles);
+    }
+
+    /// <summary>
+    /// 三-4：授权策略链预检查。
+    /// <para>
+    /// 顺序：User existence → Block relationship → Privacy settings → Direct-message policy → Rate limit。
+    /// 仅单聊检查 Block/Privacy/Policy；群聊由 SaveAsync 事务内成员校验权威处理。
+    /// </para>
+    /// <para>
+    /// 查询故障策略：
+    /// <list type="bullet">
+    /// <item>Existence/Block：fail-closed（安全优先，拒绝）。</item>
+    /// <item>Privacy/Policy/RateLimit：fail-open（可用性优先，记日志放行）。</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// Lifecycle/Frozen 不在此预检查，由 SaveAsync 事务内 advisory lock 权威处理，避免 TOCTOU。
+    /// </para>
+    /// </summary>
+    private async Task<(string ErrorCode, string ErrorMessage)?> ValidateAuthorizationAsync(
+        long senderUserId,
+        long receiverUserId,
+        bool isGroupMessage,
+        CancellationToken ct)
+    {
+        // 1. User existence（发送方必须存在；单聊接收方也必须存在）
+        try
+        {
+            if (!await _existenceChecker.ExistsAsync(senderUserId, ct).ConfigureAwait(false))
+                return ("user_not_found", "发送方用户不存在。");
+
+            if (!isGroupMessage && receiverUserId > 0)
+            {
+                if (!await _existenceChecker.ExistsAsync(receiverUserId, ct).ConfigureAwait(false))
+                    return ("user_not_found", "接收方用户不存在。");
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "用户存在性查询失败，fail-closed 拒绝。发送用户={SenderUserId}", senderUserId);
+            return ("existence_check_failed", "用户存在性校验暂时不可用。");
+        }
+
+        // 2-4. 单聊专用策略：Block / Privacy / Policy
+        if (!isGroupMessage && receiverUserId > 0)
+        {
+            // 2. Block relationship（fail-closed）
+            try
+            {
+                if (await _blockListStore.IsBlockedAsync(receiverUserId, senderUserId, ct).ConfigureAwait(false))
+                    return ("blocked", "已被对方屏蔽。");
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "屏蔽关系查询失败，fail-closed 拒绝。发送用户={SenderUserId}；接收用户={ReceiverUserId}", senderUserId, receiverUserId);
+                return ("block_check_failed", "屏蔽关系校验暂时不可用。");
+            }
+
+            // 3. Privacy settings（fail-open）
+            try
+            {
+                if (!await _privacySettingStore.AllowsDirectMessageAsync(receiverUserId, senderUserId, ct).ConfigureAwait(false))
+                    return ("privacy_rejected", "对方隐私设置不允许接收你的消息。");
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "隐私设置查询失败，fail-open 放行。发送用户={SenderUserId}；接收用户={ReceiverUserId}", senderUserId, receiverUserId);
+            }
+
+            // 4. Direct-message policy（fail-open）
+            try
+            {
+                var policyResult = await _directMessagePolicy.CheckAsync(senderUserId, receiverUserId, ct).ConfigureAwait(false);
+                if (!policyResult.Allowed)
+                    return (policyResult.ErrorCode ?? "dm_policy_rejected", policyResult.ErrorMessage ?? "单聊策略拒绝。");
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "单聊策略查询失败，fail-open 放行。发送用户={SenderUserId}；接收用户={ReceiverUserId}", senderUserId, receiverUserId);
+            }
+        }
+
+        // 5. User rate limit（fail-open）
+        try
+        {
+            var rateLimitResult = await _messageRateLimiter.TryAcquireAsync(senderUserId, ct).ConfigureAwait(false);
+            if (!rateLimitResult.Allowed)
+                return ("rate_limited", "发送频率超限，请稍后重试。");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "速率限制查询失败，fail-open 放行。发送用户={SenderUserId}", senderUserId);
+        }
+
+        return null;
     }
 
     private static MessageProcessResult? Validate(IncomingMessageCommand command)

@@ -5,6 +5,7 @@ using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Messaging;
+using ChatApp.Realtime.Infrastructure.Core.Stores;
 using ChatApp.Realtime.Tests.TestDoubles;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -24,6 +25,11 @@ public sealed class DefaultIncomingMessageProcessorTests
             metrics,
             NoopTombstoneAndLedger.Tombstone,
             new AlwaysMemberGroupStore(),
+            NoopUserExistenceChecker.Instance,
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
         var command = ValidCommand();
 
@@ -61,6 +67,11 @@ public sealed class DefaultIncomingMessageProcessorTests
             metrics,
             NoopTombstoneAndLedger.Tombstone,
             new AlwaysMemberGroupStore(),
+            NoopUserExistenceChecker.Instance,
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         await processor.ProcessAsync(ValidCommand());
@@ -84,6 +95,11 @@ public sealed class DefaultIncomingMessageProcessorTests
             firstMetrics,
             NoopTombstoneAndLedger.Tombstone,
             new AlwaysMemberGroupStore(),
+            NoopUserExistenceChecker.Instance,
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
             NullLogger<DefaultIncomingMessageProcessor>.Instance).ProcessAsync(command);
         await new DefaultIncomingMessageProcessor(
             secondStore,
@@ -91,6 +107,11 @@ public sealed class DefaultIncomingMessageProcessorTests
             secondMetrics,
             NoopTombstoneAndLedger.Tombstone,
             new AlwaysMemberGroupStore(),
+            NoopUserExistenceChecker.Instance,
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
             NullLogger<DefaultIncomingMessageProcessor>.Instance).ProcessAsync(command);
 
         Assert.Equal(firstStore.Event!.EventId, secondStore.Event!.EventId);
@@ -109,6 +130,11 @@ public sealed class DefaultIncomingMessageProcessorTests
             metrics,
             NoopTombstoneAndLedger.Tombstone,
             new AlwaysMemberGroupStore(),
+            NoopUserExistenceChecker.Instance,
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var result = await processor.ProcessAsync(ValidCommand());
@@ -129,6 +155,11 @@ public sealed class DefaultIncomingMessageProcessorTests
             metrics,
             NoopTombstoneAndLedger.Tombstone,
             new AlwaysMemberGroupStore(),
+            NoopUserExistenceChecker.Instance,
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
         var command = ValidCommand() with { Content = " " };
 
@@ -153,6 +184,11 @@ public sealed class DefaultIncomingMessageProcessorTests
             metrics,
             NoopTombstoneAndLedger.Tombstone,
             new AlwaysMemberGroupStore(),
+            NoopUserExistenceChecker.Instance,
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
 
         var result = await processor.ProcessAsync(ValidCommand());
@@ -175,6 +211,11 @@ public sealed class DefaultIncomingMessageProcessorTests
             metrics,
             NoopTombstoneAndLedger.Tombstone,
             new AlwaysMemberGroupStore(),
+            NoopUserExistenceChecker.Instance,
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
             NullLogger<DefaultIncomingMessageProcessor>.Instance);
         var command = ValidCommand() with { ReceiverUserId = 1001 };
 

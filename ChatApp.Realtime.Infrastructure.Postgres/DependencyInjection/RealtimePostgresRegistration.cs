@@ -75,7 +75,8 @@ public static class RealtimePostgresRegistration
                 sp.GetRequiredService<RealtimeDatabaseClient>(),
                 sp.GetRequiredService<RealtimeDatabaseSchema>(),
                 sp.GetRequiredService<IGroupOperationAuditStore>(),
-                sp.GetRequiredService<IMembershipPeriodStore>()));
+                sp.GetRequiredService<IMembershipPeriodStore>(),
+                sp.GetRequiredService<IUserExistenceChecker>()));
             services.RemoveAll<IRealtimeDeviceSyncCursorStore>();
             services.AddSingleton<IRealtimeDeviceSyncCursorStore, NpgsqlRealtimeDeviceSyncCursorStore>();
             services.RemoveAll<IRealtimeOutboxStore>();
