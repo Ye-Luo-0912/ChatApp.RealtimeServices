@@ -1,9 +1,13 @@
 using System.Text;
 using System.Text.Json;
+using ChatApp.Realtime.Abstractions.Diagnostics;
+using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Stores;
+using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
+using ChatApp.Realtime.Infrastructure.Postgres.Outbox;
 using Npgsql;
 
 namespace ChatApp.Realtime.Infrastructure.Postgres.Stores;
@@ -18,6 +22,13 @@ namespace ChatApp.Realtime.Infrastructure.Postgres.Stores;
 /// 幂等：relationship_mutation_requests 表按 (actor_user_id, request_id) 去重，
 /// 仅记录成功结果（失败不记录，重复失败无害）。
 /// </para>
+/// <para>
+/// 事件发布：每次成功 mutation 在同一事务内通过 <see cref="OutboxInsertHelper"/>
+/// 写入 realtime.outbox 表，由 <c>OutboxPublisherWorker</c> 异步发布到 NATS。
+/// 事件类型：<see cref="RealtimeEventType.FriendRequestListChanged"/> /
+/// <see cref="RealtimeEventType.FriendListChanged"/> /
+/// <see cref="RealtimeEventType.BlockedListChanged"/>。
+/// </para>
 /// </summary>
 public sealed class NpgsqlRelationshipStore : IRelationshipStore
 {
@@ -26,6 +37,10 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
     private const int FriendRequestStatusDeclined = 2;
     private const int DefaultPageSize = 50;
     private const int MaxPageSize = 200;
+
+    private const string ResourceFriendRequest = "friend-request";
+    private const string ResourceFriendship = "friendship";
+    private const string ResourceBlockedUser = "blocked-user";
 
     private readonly RealtimeDatabaseClient _databaseClient;
     private readonly RealtimeDatabaseSchema _schema;
@@ -100,6 +115,24 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
                 insert.Parameters.AddWithValue("created_at_ms", occurredAtMs);
                 await insert.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             }
+
+            // 事件发布：通知双方好友请求列表变更
+            var events = new List<RealtimeEvent>(2)
+            {
+                CreateRelationshipEvent(
+                    RealtimeEventType.FriendRequestListChanged,
+                    targetUserId, actorUserId, actorSessionId, occurredAtMs,
+                    ResourceFriendRequest, "Pending", requestId, message,
+                    RelationshipEventIdFactory.CreateFriendRequestListChangedEventId(
+                        targetUserId, actorUserId, requestId, occurredAtMs)),
+                CreateRelationshipEvent(
+                    RealtimeEventType.FriendRequestListChanged,
+                    actorUserId, actorUserId, actorSessionId, occurredAtMs,
+                    ResourceFriendRequest, "Pending", requestId, message,
+                    RelationshipEventIdFactory.CreateFriendRequestListChangedEventId(
+                        actorUserId, actorUserId, requestId, occurredAtMs)),
+            };
+            await OutboxInsertHelper.InsertManyAsync(connection, transaction, _schema, events, ct).ConfigureAwait(false);
 
             await RecordIdempotencyAsync(connection, transaction, actorUserId, requestId,
                 (int)RelationshipOperation.SendFriendRequest, fingerprint, requestId, true, null, occurredAtMs, ct).ConfigureAwait(false);
@@ -184,6 +217,40 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
                 await insertFriendship.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             }
 
+            // 事件发布：好友请求状态变更通知双方 + 好友列表变更通知双方
+            var events = new List<RealtimeEvent>(4)
+            {
+                // 好友请求列表：请求者收到 Accepted
+                CreateRelationshipEvent(
+                    RealtimeEventType.FriendRequestListChanged,
+                    requesterId, actorUserId, actorSessionId, occurredAtMs,
+                    ResourceFriendRequest, "Accepted", requestIdToRespond, null,
+                    RelationshipEventIdFactory.CreateFriendRequestListChangedEventId(
+                        requesterId, actorUserId, requestIdToRespond, occurredAtMs)),
+                // 好友请求列表：接受者收到 Accepted
+                CreateRelationshipEvent(
+                    RealtimeEventType.FriendRequestListChanged,
+                    actorUserId, actorUserId, actorSessionId, occurredAtMs,
+                    ResourceFriendRequest, "Accepted", requestIdToRespond, null,
+                    RelationshipEventIdFactory.CreateFriendRequestListChangedEventId(
+                        actorUserId, actorUserId, requestIdToRespond, occurredAtMs)),
+                // 好友列表：请求者新增好友
+                CreateRelationshipEvent(
+                    RealtimeEventType.FriendListChanged,
+                    requesterId, actorUserId, actorSessionId, occurredAtMs,
+                    ResourceFriendship, "changed", friendshipId, null,
+                    RelationshipEventIdFactory.CreateFriendListChangedEventId(
+                        requesterId, actorUserId, friendshipId, occurredAtMs)),
+                // 好友列表：接受者新增好友
+                CreateRelationshipEvent(
+                    RealtimeEventType.FriendListChanged,
+                    actorUserId, actorUserId, actorSessionId, occurredAtMs,
+                    ResourceFriendship, "changed", friendshipId, null,
+                    RelationshipEventIdFactory.CreateFriendListChangedEventId(
+                        actorUserId, actorUserId, friendshipId, occurredAtMs)),
+            };
+            await OutboxInsertHelper.InsertManyAsync(connection, transaction, _schema, events, ct).ConfigureAwait(false);
+
             await RecordIdempotencyAsync(connection, transaction, actorUserId, requestId,
                 (int)RelationshipOperation.AcceptFriendRequest, fingerprint, friendshipId, true, null, occurredAtMs, ct).ConfigureAwait(false);
 
@@ -212,9 +279,10 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
 
         try
         {
+            long requesterId;
             long targetId;
             await using (var load = new NpgsqlCommand(
-                $"SELECT \"target_id\", \"status\" FROM {_schema.FriendRequestsTableSql} " +
+                $"SELECT \"requester_id\", \"target_id\", \"status\" FROM {_schema.FriendRequestsTableSql} " +
                 $"WHERE \"request_id\" = @request_id FOR UPDATE",
                 connection, transaction))
             {
@@ -225,8 +293,9 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
                     await transaction.RollbackAsync(ct).ConfigureAwait(false);
                     return RelationshipMutatePersistResult.Fail("request_not_found", "好友请求不存在。");
                 }
-                targetId = reader.GetInt64(0);
-                var status = reader.GetInt16(1);
+                requesterId = reader.GetInt64(0);
+                targetId = reader.GetInt64(1);
+                var status = reader.GetInt16(2);
                 if (status != FriendRequestStatusPending)
                 {
                     await transaction.RollbackAsync(ct).ConfigureAwait(false);
@@ -250,6 +319,24 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
                 update.Parameters.AddWithValue("request_id", requestIdToRespond);
                 await update.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             }
+
+            // 事件发布：通知双方好友请求被拒绝
+            var events = new List<RealtimeEvent>(2)
+            {
+                CreateRelationshipEvent(
+                    RealtimeEventType.FriendRequestListChanged,
+                    requesterId, actorUserId, actorSessionId, occurredAtMs,
+                    ResourceFriendRequest, "Declined", requestIdToRespond, null,
+                    RelationshipEventIdFactory.CreateFriendRequestListChangedEventId(
+                        requesterId, actorUserId, requestIdToRespond, occurredAtMs)),
+                CreateRelationshipEvent(
+                    RealtimeEventType.FriendRequestListChanged,
+                    actorUserId, actorUserId, actorSessionId, occurredAtMs,
+                    ResourceFriendRequest, "Declined", requestIdToRespond, null,
+                    RelationshipEventIdFactory.CreateFriendRequestListChangedEventId(
+                        actorUserId, actorUserId, requestIdToRespond, occurredAtMs)),
+            };
+            await OutboxInsertHelper.InsertManyAsync(connection, transaction, _schema, events, ct).ConfigureAwait(false);
 
             await RecordIdempotencyAsync(connection, transaction, actorUserId, requestId,
                 (int)RelationshipOperation.DeclineFriendRequest, fingerprint, requestIdToRespond, true, null, occurredAtMs, ct).ConfigureAwait(false);
@@ -294,6 +381,24 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
                 }
             }
 
+            // 事件发布：通知双方好友列表变更（删除）
+            var events = new List<RealtimeEvent>(2)
+            {
+                CreateRelationshipEvent(
+                    RealtimeEventType.FriendListChanged,
+                    actorUserId, actorUserId, actorSessionId, occurredAtMs,
+                    ResourceFriendship, "deleted", null, null,
+                    RelationshipEventIdFactory.CreateFriendListChangedEventId(
+                        actorUserId, actorUserId, null, occurredAtMs)),
+                CreateRelationshipEvent(
+                    RealtimeEventType.FriendListChanged,
+                    targetUserId, actorUserId, actorSessionId, occurredAtMs,
+                    ResourceFriendship, "deleted", null, null,
+                    RelationshipEventIdFactory.CreateFriendListChangedEventId(
+                        targetUserId, actorUserId, null, occurredAtMs)),
+            };
+            await OutboxInsertHelper.InsertManyAsync(connection, transaction, _schema, events, ct).ConfigureAwait(false);
+
             await RecordIdempotencyAsync(connection, transaction, actorUserId, requestId,
                 (int)RelationshipOperation.RemoveFriend, fingerprint, null, true, null, occurredAtMs, ct).ConfigureAwait(false);
 
@@ -334,6 +439,18 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
                 await insert.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             }
 
+            // 事件发布：通知操作者黑名单变更（不通知被拉黑方）
+            var events = new List<RealtimeEvent>(1)
+            {
+                CreateRelationshipEvent(
+                    RealtimeEventType.BlockedListChanged,
+                    actorUserId, actorUserId, actorSessionId, occurredAtMs,
+                    ResourceBlockedUser, "blocked", targetUserId.ToString(), null,
+                    RelationshipEventIdFactory.CreateBlockedListChangedEventId(
+                        actorUserId, targetUserId, "blocked", occurredAtMs)),
+            };
+            await OutboxInsertHelper.InsertManyAsync(connection, transaction, _schema, events, ct).ConfigureAwait(false);
+
             await RecordIdempotencyAsync(connection, transaction, actorUserId, requestId,
                 (int)RelationshipOperation.BlockUser, fingerprint, null, true, null, occurredAtMs, ct).ConfigureAwait(false);
 
@@ -371,6 +488,18 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
                 await delete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             }
 
+            // 事件发布：通知操作者黑名单变更（不通知被取消拉黑方）
+            var events = new List<RealtimeEvent>(1)
+            {
+                CreateRelationshipEvent(
+                    RealtimeEventType.BlockedListChanged,
+                    actorUserId, actorUserId, actorSessionId, occurredAtMs,
+                    ResourceBlockedUser, "unblocked", targetUserId.ToString(), null,
+                    RelationshipEventIdFactory.CreateBlockedListChangedEventId(
+                        actorUserId, targetUserId, "unblocked", occurredAtMs)),
+            };
+            await OutboxInsertHelper.InsertManyAsync(connection, transaction, _schema, events, ct).ConfigureAwait(false);
+
             await RecordIdempotencyAsync(connection, transaction, actorUserId, requestId,
                 (int)RelationshipOperation.UnblockUser, fingerprint, null, true, null, occurredAtMs, ct).ConfigureAwait(false);
 
@@ -385,7 +514,8 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
     }
 
     public async Task<IReadOnlyList<RelationshipListItem>> ListFriendsAsync(
-        long actorUserId, int? pageSize, string? cursor, CancellationToken ct = default)
+        long actorUserId, int? pageSize, string? cursor,
+        long afterChangedAtMs = 0, CancellationToken ct = default)
     {
         var size = ClampPageSize(pageSize);
         var offset = DecodeCursor(cursor);
@@ -393,15 +523,20 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
         await using var connection = await _databaseClient
             .GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
 
+        var afterClause = afterChangedAtMs > 0
+            ? " AND f.\"created_at_ms\" > @after"
+            : string.Empty;
         await using var command = new NpgsqlCommand(
             $"SELECT f.\"friendship_id\", CASE WHEN f.\"user_id_low\" = @uid THEN f.\"user_id_high\" ELSE f.\"user_id_low\" END AS friend_id, " +
             $"f.\"created_at_ms\" FROM {_schema.FriendshipsTableSql} f " +
-            $"WHERE f.\"user_id_low\" = @uid OR f.\"user_id_high\" = @uid " +
+            $"WHERE (f.\"user_id_low\" = @uid OR f.\"user_id_high\" = @uid){afterClause} " +
             $"ORDER BY f.\"created_at_ms\" DESC, friend_id DESC LIMIT @limit OFFSET @offset",
             connection);
         command.Parameters.AddWithValue("uid", actorUserId);
         command.Parameters.AddWithValue("limit", size + 1);
         command.Parameters.AddWithValue("offset", offset);
+        if (afterChangedAtMs > 0)
+            command.Parameters.AddWithValue("after", afterChangedAtMs);
 
         var results = new List<RelationshipListItem>();
         await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
@@ -420,7 +555,8 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
     }
 
     public async Task<IReadOnlyList<RelationshipListItem>> ListFriendRequestsAsync(
-        long actorUserId, int? pageSize, string? cursor, CancellationToken ct = default)
+        long actorUserId, int? pageSize, string? cursor,
+        long afterChangedAtMs = 0, CancellationToken ct = default)
     {
         var size = ClampPageSize(pageSize);
         var offset = DecodeCursor(cursor);
@@ -428,14 +564,19 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
         await using var connection = await _databaseClient
             .GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
 
+        var afterClause = afterChangedAtMs > 0
+            ? " AND \"created_at_ms\" > @after"
+            : string.Empty;
         await using var command = new NpgsqlCommand(
             $"SELECT \"request_id\", \"requester_id\", \"message\", \"created_at_ms\" FROM {_schema.FriendRequestsTableSql} " +
-            $"WHERE \"target_id\" = @uid AND \"status\" = 0 " +
+            $"WHERE \"target_id\" = @uid AND \"status\" = 0{afterClause} " +
             $"ORDER BY \"created_at_ms\" DESC, \"requester_id\" DESC LIMIT @limit OFFSET @offset",
             connection);
         command.Parameters.AddWithValue("uid", actorUserId);
         command.Parameters.AddWithValue("limit", size + 1);
         command.Parameters.AddWithValue("offset", offset);
+        if (afterChangedAtMs > 0)
+            command.Parameters.AddWithValue("after", afterChangedAtMs);
 
         var results = new List<RelationshipListItem>();
         await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
@@ -455,8 +596,12 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
     }
 
     public async Task<IReadOnlyList<RelationshipListItem>> ListBlockedUsersAsync(
-        long actorUserId, int? pageSize, string? cursor, CancellationToken ct = default)
+        long actorUserId, int? pageSize, string? cursor,
+        long afterChangedAtMs = 0, CancellationToken ct = default)
     {
+        // Block-list table (T_BlockRecords) has no change timestamp; watermark is
+        // ignored here and the caller diffs client-side.
+        _ = afterChangedAtMs;
         var size = ClampPageSize(pageSize);
         var offset = DecodeCursor(cursor);
 
@@ -531,6 +676,44 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
         command.Parameters.AddWithValue("error_code", (object?)errorCode ?? DBNull.Value);
         command.Parameters.AddWithValue("created_at_ms", occurredAtMs);
         await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 构造关系域实时事件。PayloadJson 使用 <see cref="RealtimeDomainNotificationPayload"/>，
+    /// 与 Gateway 侧 <c>RelationshipListHandler</c> 解析格式一致。
+    /// </summary>
+    private static RealtimeEvent CreateRelationshipEvent(
+        RealtimeEventType type,
+        long targetUserId,
+        long actorUserId,
+        string? actorSessionId,
+        long occurredAtMs,
+        string resource,
+        string action,
+        string? resourceId,
+        string? message,
+        string eventId)
+    {
+        var payload = new RealtimeDomainNotificationPayload
+        {
+            Resource = resource,
+            Action = action,
+            ResourceId = resourceId,
+            Message = message,
+        };
+        return new RealtimeEvent
+        {
+            EventId = eventId,
+            Type = type,
+            TargetUserId = targetUserId,
+            ActorUserId = actorUserId,
+            SessionId = actorSessionId,
+            PayloadJson = JsonSerializer.Serialize(
+                payload, RealtimeJsonSerializerContext.Default.RealtimeDomainNotificationPayload),
+            OccurredAtMs = occurredAtMs,
+            TraceParent = RealtimeTraceContext.CaptureTraceParent(),
+            TraceState = RealtimeTraceContext.CaptureTraceState(),
+        };
     }
 
     private static string ComputeFingerprint(long actorUserId, string requestId, int operation) =>

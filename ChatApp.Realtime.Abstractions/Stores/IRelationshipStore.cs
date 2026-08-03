@@ -35,14 +35,30 @@ public interface IRelationshipStore
         string requestId, long actorUserId, long targetUserId,
         string? actorSessionId, long occurredAtMs, CancellationToken ct = default);
 
+    /// <summary>
+    /// List friends. When <paramref name="afterChangedAtMs" /> &gt; 0, returns only
+    /// rows whose created_at_ms &gt; afterChangedAtMs (incremental watermark advance).
+    /// </summary>
     Task<IReadOnlyList<RelationshipListItem>> ListFriendsAsync(
-        long actorUserId, int? pageSize, string? cursor, CancellationToken ct = default);
+        long actorUserId, int? pageSize, string? cursor,
+        long afterChangedAtMs = 0, CancellationToken ct = default);
 
+    /// <summary>
+    /// List pending friend requests. When <paramref name="afterChangedAtMs" /> &gt; 0,
+    /// returns only rows whose created_at_ms &gt; afterChangedAtMs.
+    /// </summary>
     Task<IReadOnlyList<RelationshipListItem>> ListFriendRequestsAsync(
-        long actorUserId, int? pageSize, string? cursor, CancellationToken ct = default);
+        long actorUserId, int? pageSize, string? cursor,
+        long afterChangedAtMs = 0, CancellationToken ct = default);
 
+    /// <summary>
+    /// List blocked users. The block-list table has no change timestamp, so
+    /// <paramref name="afterChangedAtMs" /> is ignored and the caller must diff
+    /// client-side. Parameter kept for interface symmetry.
+    /// </summary>
     Task<IReadOnlyList<RelationshipListItem>> ListBlockedUsersAsync(
-        long actorUserId, int? pageSize, string? cursor, CancellationToken ct = default);
+        long actorUserId, int? pageSize, string? cursor,
+        long afterChangedAtMs = 0, CancellationToken ct = default);
 }
 
 /// <summary>关系变更持久化结果。</summary>

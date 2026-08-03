@@ -45,14 +45,17 @@ public sealed class NoopRelationshipStore : IRelationshipStore
             "relationship_store_unavailable", "关系存储未配置。"));
 
     public Task<IReadOnlyList<RelationshipListItem>> ListFriendsAsync(
-        long actorUserId, int? pageSize, string? cursor, CancellationToken ct = default) =>
+        long actorUserId, int? pageSize, string? cursor,
+        long afterChangedAtMs = 0, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<RelationshipListItem>>(Array.Empty<RelationshipListItem>());
 
     public Task<IReadOnlyList<RelationshipListItem>> ListFriendRequestsAsync(
-        long actorUserId, int? pageSize, string? cursor, CancellationToken ct = default) =>
+        long actorUserId, int? pageSize, string? cursor,
+        long afterChangedAtMs = 0, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<RelationshipListItem>>(Array.Empty<RelationshipListItem>());
 
     public Task<IReadOnlyList<RelationshipListItem>> ListBlockedUsersAsync(
-        long actorUserId, int? pageSize, string? cursor, CancellationToken ct = default) =>
+        long actorUserId, int? pageSize, string? cursor,
+        long afterChangedAtMs = 0, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<RelationshipListItem>>(Array.Empty<RelationshipListItem>());
 }

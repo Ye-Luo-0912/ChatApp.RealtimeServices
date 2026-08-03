@@ -24,15 +24,15 @@ public sealed class DefaultRelationshipListQueryProcessor : IRelationshipListQue
         {
             case RelationshipListType.Friends:
                 items = await _store.ListFriendsAsync(
-                    query.ActorUserId, query.PageSize, query.Cursor, ct).ConfigureAwait(false);
+                    query.ActorUserId, query.PageSize, query.Cursor, afterChangedAtMs: 0, ct).ConfigureAwait(false);
                 break;
             case RelationshipListType.FriendRequests:
                 items = await _store.ListFriendRequestsAsync(
-                    query.ActorUserId, query.PageSize, query.Cursor, ct).ConfigureAwait(false);
+                    query.ActorUserId, query.PageSize, query.Cursor, afterChangedAtMs: 0, ct).ConfigureAwait(false);
                 break;
             case RelationshipListType.BlockedUsers:
                 items = await _store.ListBlockedUsersAsync(
-                    query.ActorUserId, query.PageSize, query.Cursor, ct).ConfigureAwait(false);
+                    query.ActorUserId, query.PageSize, query.Cursor, afterChangedAtMs: 0, ct).ConfigureAwait(false);
                 break;
             default:
                 return RelationshipListResult.Failed(

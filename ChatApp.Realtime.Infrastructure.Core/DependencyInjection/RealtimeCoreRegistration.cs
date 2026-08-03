@@ -87,6 +87,7 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IDeadLetterPublisher, NoopDeadLetterPublisher>();
         services.TryAddSingleton<IBlockListStore>(NoopBlockListStore.Instance);
         services.TryAddSingleton<IRelationshipStore, NoopRelationshipStore>();
+        services.TryAddSingleton<IRelationshipSyncCursorStore, NoopRelationshipSyncCursorStore>();
         services.TryAddSingleton<IRelationshipCommandProcessor, DefaultRelationshipCommandProcessor>();
         services.TryAddSingleton<IRelationshipListQueryProcessor, DefaultRelationshipListQueryProcessor>();
         services.TryAddSingleton<IDirectMessagePolicy>(NoopDirectMessagePolicy.Instance);

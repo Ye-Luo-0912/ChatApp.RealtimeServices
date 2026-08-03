@@ -31,6 +31,11 @@ public sealed class SyncBootstrapPage
     /// </summary>
     public IReadOnlyList<SyncCursorResetRequired> ResetsRequired { get; init; } = [];
 
+    /// <summary>
+    /// 关系列表增量同步结果。null 或空表示未请求关系同步。
+    /// </summary>
+    public IReadOnlyList<RelationshipCatchUp>? RelationshipCatchUps { get; init; }
+
     public static SyncBootstrapPage Success(
         string requestId,
         long serverTimeMs,
@@ -38,7 +43,8 @@ public sealed class SyncBootstrapPage
         ConversationListCursor? conversationsNextCursor,
         bool conversationsHasMore,
         IReadOnlyList<ConversationHistoryCatchUp> catchUps,
-        IReadOnlyList<SyncCursorResetRequired>? resetsRequired = null) =>
+        IReadOnlyList<SyncCursorResetRequired>? resetsRequired = null,
+        IReadOnlyList<RelationshipCatchUp>? relationshipCatchUps = null) =>
         new()
         {
             RequestId = requestId,
@@ -48,7 +54,8 @@ public sealed class SyncBootstrapPage
             ConversationsNextCursor = conversationsNextCursor,
             ConversationsHasMore = conversationsHasMore,
             CatchUps = catchUps,
-            ResetsRequired = resetsRequired ?? []
+            ResetsRequired = resetsRequired ?? [],
+            RelationshipCatchUps = relationshipCatchUps
         };
 
     public static SyncBootstrapPage Failed(

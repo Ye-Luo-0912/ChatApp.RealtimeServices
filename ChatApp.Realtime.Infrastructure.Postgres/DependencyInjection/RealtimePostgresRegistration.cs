@@ -85,6 +85,8 @@ public static class RealtimePostgresRegistration
             services.AddSingleton<IRelationshipStore>(sp => new NpgsqlRelationshipStore(
                 sp.GetRequiredService<RealtimeDatabaseClient>(),
                 sp.GetRequiredService<RealtimeDatabaseSchema>()));
+            services.RemoveAll<IRelationshipSyncCursorStore>();
+            services.AddSingleton<IRelationshipSyncCursorStore, NpgsqlRelationshipSyncCursorStore>();
             services.RemoveAll<IDirectMessagePolicy>();
             services.AddSingleton<IDirectMessagePolicy, NpgsqlDirectMessagePolicy>();
             services.RemoveAll<IPrivacySettingStore>();

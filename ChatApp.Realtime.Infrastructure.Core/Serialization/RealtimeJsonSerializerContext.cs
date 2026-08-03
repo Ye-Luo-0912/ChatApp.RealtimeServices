@@ -5,6 +5,7 @@ using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Attachments;
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Relationships;
+using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Abstractions.Sync;
 
 namespace ChatApp.Realtime.Infrastructure.Core.Serialization;
@@ -76,6 +77,13 @@ namespace ChatApp.Realtime.Infrastructure.Core.Serialization;
 [JsonSerializable(typeof(RelationshipListResult))]
 [JsonSerializable(typeof(RelationshipListItem))]
 [JsonSerializable(typeof(List<RelationshipListItem>))]
+[JsonSerializable(typeof(RelationshipListType))]
+[JsonSerializable(typeof(RelationshipSyncWatermark))]
+[JsonSerializable(typeof(List<RelationshipSyncWatermark>))]
+[JsonSerializable(typeof(RelationshipCatchUp))]
+[JsonSerializable(typeof(List<RelationshipCatchUp>))]
+[JsonSerializable(typeof(RelationshipSyncCursor))]
+[JsonSerializable(typeof(List<RelationshipSyncCursor>))]
 public sealed partial class RealtimeJsonSerializerContext : JsonSerializerContext
 {
 }

@@ -3,6 +3,7 @@ using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Protocol;
+using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Infrastructure.Core.Conversations;
@@ -24,6 +25,8 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
     private readonly IRealtimeDeviceSyncCursorStore _deviceCursorStore;
     private readonly IRealtimeAttachmentStore _attachmentStore;
     private readonly IRealtimeReactionStore _reactionStore;
+    private readonly IRelationshipStore? _relationshipStore;
+    private readonly IRelationshipSyncCursorStore? _relationshipCursorStore;
     private readonly SyncBootstrapOptions _options;
 
     public DefaultSyncBootstrapQueryProcessor(
@@ -32,13 +35,17 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
         IRealtimeDeviceSyncCursorStore deviceCursorStore,
         IRealtimeAttachmentStore attachmentStore,
         IRealtimeReactionStore reactionStore,
-        SyncBootstrapOptions? options = null)
+        SyncBootstrapOptions? options = null,
+        IRelationshipStore? relationshipStore = null,
+        IRelationshipSyncCursorStore? relationshipCursorStore = null)
     {
         _conversationStore = conversationStore;
         _historyStore = historyStore;
         _deviceCursorStore = deviceCursorStore;
         _attachmentStore = attachmentStore;
         _reactionStore = reactionStore;
+        _relationshipStore = relationshipStore;
+        _relationshipCursorStore = relationshipCursorStore;
         _options = options ?? new SyncBootstrapOptions();
     }
 
@@ -238,16 +245,22 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                 .ConfigureAwait(false);
         }
 
+        // 关系列表增量同步：在 EnforceByteBudget 之前构造，使其纳入字节预算硬约束。
+        // 与会话同步并行——RelationshipSyncWatermark 与 ConversationSyncWatermark 维度独立。
+        var relationshipCatchUps = await BuildRelationshipCatchUpsAsync(query, listLimit, ct)
+            .ConfigureAwait(false);
+
         // Perf-5：快速估算仅用于初始筛选；最终响应字节数必须通过实际 UTF-8 序列化硬约束。
         // 估算会漏算 Reply/Forward preview、MentionedUserIds/Roles、Reactions、Conversation title、
         // JSON 转义与包装结构，因此这里做最终实际序列化校验，超预算则按优先级逐项回退。
-        var (finalPage, finalCatchUps) = EnforceByteBudget(
+        var (finalPage, finalCatchUps, finalRelationshipCatchUps) = EnforceByteBudget(
             query.RequestId,
             conversations,
             conversationsNextCursor,
             conversationsHasMore,
             catchUps,
-            resetsRequired);
+            resetsRequired,
+            relationshipCatchUps);
 
         if (query.DeviceIdHash is ulong persistDeviceId)
         {
@@ -260,9 +273,174 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                     .UpsertManyAsync(query.UserId, persistDeviceId, toPersist, ct)
                     .ConfigureAwait(false);
             }
+
+            // 关系列表游标持久化：仅推进非 reset 且实际返回了条目的 catch-up 的新水位。
+            // ResetRequired 的列表不推进水位（客户端应保留旧水位并按 reset 语义清空本地）。
+            // BlockedUsers 无服务端水位（NewAfterChangedAtMs=0），不持久化。
+            var relCursorsToPersist = BuildRelationshipCursorsToPersist(finalRelationshipCatchUps);
+            if (relCursorsToPersist.Count > 0 && _relationshipCursorStore is not null)
+            {
+                await _relationshipCursorStore
+                    .UpsertManyAsync(query.UserId, persistDeviceId, relCursorsToPersist, ct)
+                    .ConfigureAwait(false);
+            }
         }
 
         return finalPage;
+    }
+
+    /// <summary>
+    /// 构造关系列表增量同步结果。
+    /// <para>
+    /// 水位来源优先级：
+    /// 1) 客户端在 query.RelationshipWatermarks 中显式传入的水位；
+    /// 2) 设备级持久化游标（query.DeviceIdHash 提供）。
+    /// </para>
+    /// <para>
+    /// 服务端过滤：Friends / FriendRequests 在 SQL 中按 created_at_ms &gt; after 过滤；
+    /// BlockedUsers 表无变更时间戳，返回全量列表，由客户端按本地缓存 diff。
+    /// </para>
+    /// <para>
+    /// 新水位：取返回 items 中最大的 CreatedAtMs（无 items 时保留原水位）。
+    /// BlockedUsers 的 NewAfterChangedAtMs 始终为 0（无法推进水位）。
+    /// </para>
+    /// </summary>
+    private async Task<List<RelationshipCatchUp>> BuildRelationshipCatchUpsAsync(
+        SyncBootstrapQuery query, int listLimit, CancellationToken ct)
+    {
+        if (_relationshipStore is null)
+            return [];
+
+        var relLimit = query.RelationshipListLimit is int rl && rl > 0
+            ? Math.Clamp(rl, 1, MaximumListLimit)
+            : listLimit;
+
+        // 1) 解析 after-by-listType 映射
+        var afterByListType = new Dictionary<byte, long>();
+        var clientWatermarks = query.RelationshipWatermarks;
+        if (clientWatermarks is { Count: > 0 })
+        {
+            foreach (var wm in clientWatermarks)
+                afterByListType[(byte)wm.ListType] = wm.AfterChangedAtMs;
+        }
+        else if (query.DeviceIdHash is ulong did && _relationshipCursorStore is not null)
+        {
+            var stored = await _relationshipCursorStore
+                .LoadAsync(query.UserId, did, ct)
+                .ConfigureAwait(false);
+            foreach (var cursor in stored)
+                afterByListType[cursor.ListType] = cursor.AfterChangedAtMs;
+        }
+
+        // 2) 三种 list type 顺序：Friends / FriendRequests / BlockedUsers
+        var result = new List<RelationshipCatchUp>(3);
+        var listTypes = new[]
+        {
+            RelationshipListType.Friends,
+            RelationshipListType.FriendRequests,
+            RelationshipListType.BlockedUsers
+        };
+
+        foreach (var listType in listTypes)
+        {
+            ct.ThrowIfCancellationRequested();
+            afterByListType.TryGetValue((byte)listType, out var afterMs);
+
+            IReadOnlyList<RelationshipListItem> items;
+            try
+            {
+                items = listType switch
+                {
+                    RelationshipListType.Friends => await _relationshipStore
+                        .ListFriendsAsync(query.UserId, relLimit, cursor: null, afterMs, ct)
+                        .ConfigureAwait(false),
+                    RelationshipListType.FriendRequests => await _relationshipStore
+                        .ListFriendRequestsAsync(query.UserId, relLimit, cursor: null, afterMs, ct)
+                        .ConfigureAwait(false),
+                    RelationshipListType.BlockedUsers => await _relationshipStore
+                        .ListBlockedUsersAsync(query.UserId, relLimit, cursor: null, afterMs, ct)
+                        .ConfigureAwait(false),
+                    _ => Array.Empty<RelationshipListItem>()
+                };
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                // 关系列表查询失败不应导致整个 SyncBootstrap 失败：降级为空 catch-up。
+                // 客户端会保留旧水位，下次 bootstrap 再尝试。
+                result.Add(new RelationshipCatchUp
+                {
+                    ListType = listType,
+                    Items = [],
+                    HasMore = false,
+                    NextCursor = null,
+                    NewAfterChangedAtMs = afterMs,
+                    ResetRequired = false,
+                    ResetReason = null
+                });
+                continue;
+            }
+
+            // 服务端已按 LIMIT relLimit+1 取数；超过 size 表示有更多
+            var size = relLimit;
+            var hasMore = items.Count > size;
+            var page = hasMore ? items.Take(size).ToArray() : items;
+
+            // 新水位：BlockedUsers 表无 created_at_ms（始终 0），不推进；
+            // 其它列表取最大 CreatedAtMs（单调推进）
+            long newAfterMs = afterMs;
+            if (listType != RelationshipListType.BlockedUsers)
+            {
+                foreach (var item in page)
+                {
+                    if (item.CreatedAtMs > newAfterMs)
+                        newAfterMs = item.CreatedAtMs;
+                }
+            }
+
+            result.Add(new RelationshipCatchUp
+            {
+                ListType = listType,
+                Items = page,
+                HasMore = hasMore,
+                NextCursor = null, // 当前实现不支持分页游标：单次返回 relLimit 条
+                NewAfterChangedAtMs = newAfterMs,
+                ResetRequired = false,
+                ResetReason = null
+            });
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 仅持久化实际返回了条目且非 BlockedUsers（无水位语义）的 catch-up 新水位。
+    /// </summary>
+    private static IReadOnlyList<RelationshipSyncCursor> BuildRelationshipCursorsToPersist(
+        IReadOnlyList<RelationshipCatchUp> catchUps)
+    {
+        var list = new List<RelationshipSyncCursor>(catchUps.Count);
+        foreach (var catchUp in catchUps)
+        {
+            if (catchUp.ResetRequired)
+                continue;
+            if (catchUp.NewAfterChangedAtMs <= 0)
+                continue;
+            if (catchUp.Items.Count == 0)
+                continue;
+            // BlockedUsers 的 NewAfterChangedAtMs 始终 0，天然被过滤
+            list.Add(new RelationshipSyncCursor
+            {
+                ListType = (byte)catchUp.ListType,
+                AfterChangedAtMs = catchUp.NewAfterChangedAtMs,
+                UpdatedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                LastSeenAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            });
+        }
+        return list;
     }
 
     /// <summary>
@@ -273,13 +451,14 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
     /// 3) 最后才移除会话列表项（从末尾起）。
     /// Resets 始终保留到最后——它们指导客户端清空本地缓存，不能因字节预算丢失。
     /// </summary>
-    private static (SyncBootstrapPage Page, List<ConversationHistoryCatchUp> FinalCatchUps) EnforceByteBudget(
+    private static (SyncBootstrapPage Page, List<ConversationHistoryCatchUp> FinalCatchUps, List<RelationshipCatchUp> FinalRelationshipCatchUps) EnforceByteBudget(
         string requestId,
         List<ConversationListItem> conversations,
         ConversationListCursor? conversationsNextCursor,
         bool conversationsHasMore,
         List<ConversationHistoryCatchUp> catchUps,
-        IReadOnlyList<SyncCursorResetRequired> resetsRequired)
+        IReadOnlyList<SyncCursorResetRequired> resetsRequired,
+        List<RelationshipCatchUp> relationshipCatchUps)
     {
         var serverTimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var page = SyncBootstrapPage.Success(
@@ -289,11 +468,12 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
             conversationsNextCursor,
             conversationsHasMore,
             catchUps,
-            resetsRequired);
+            resetsRequired,
+            relationshipCatchUps.Count == 0 ? null : relationshipCatchUps);
 
         var currentBytes = MeasureSyncBootstrapPageUtf8Json(page);
         if (currentBytes <= MaximumResponseBytes)
-            return (page, catchUps);
+            return (page, catchUps, relationshipCatchUps);
 
         // 阶段 1：逐条移除 catch-up 历史条目（从最后一个 catch-up 的尾部开始）。
         while (currentBytes > MaximumResponseBytes)
@@ -326,7 +506,8 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                     conversationsNextCursor,
                     conversationsHasMore,
                     catchUps,
-                    resetsRequired);
+                    resetsRequired,
+                    relationshipCatchUps.Count == 0 ? null : relationshipCatchUps);
                 currentBytes = MeasureSyncBootstrapPageUtf8Json(page);
             }
 
@@ -345,7 +526,71 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                 conversationsNextCursor,
                 conversationsHasMore,
                 catchUps,
-                resetsRequired);
+                resetsRequired,
+                relationshipCatchUps.Count == 0 ? null : relationshipCatchUps);
+            currentBytes = MeasureSyncBootstrapPageUtf8Json(page);
+        }
+
+        // 阶段 2.5：若仍超预算，逐条移除关系 catch-up 条目（从最后一个 catch-up 尾部起）。
+        // 关系列表条目优先级高于会话列表项（关系变更影响在线状态/会话可见性），
+        // 但低于会话 catch-up（消息投递优先级最高）。
+        while (currentBytes > MaximumResponseBytes)
+        {
+            var trimmed = false;
+            for (var i = relationshipCatchUps.Count - 1; i >= 0 && currentBytes > MaximumResponseBytes; i--)
+            {
+                var relCatchUp = relationshipCatchUps[i];
+                if (relCatchUp.Items.Count == 0)
+                    continue;
+
+                var newItems = relCatchUp.Items.Take(relCatchUp.Items.Count - 1).ToArray();
+                // 重新计算 NewAfterChangedAtMs：仅保留实际返回条目的最大 CreatedAtMs
+                long newAfterMs = 0;
+                foreach (var item in newItems)
+                {
+                    if (item.CreatedAtMs > newAfterMs)
+                        newAfterMs = item.CreatedAtMs;
+                }
+                relationshipCatchUps[i] = new RelationshipCatchUp
+                {
+                    ListType = relCatchUp.ListType,
+                    Items = newItems,
+                    HasMore = true,
+                    NextCursor = relCatchUp.NextCursor,
+                    NewAfterChangedAtMs = newAfterMs > 0 ? newAfterMs : relCatchUp.NewAfterChangedAtMs,
+                    ResetRequired = relCatchUp.ResetRequired,
+                    ResetReason = relCatchUp.ResetReason
+                };
+                trimmed = true;
+                page = SyncBootstrapPage.Success(
+                    requestId,
+                    serverTimeMs,
+                    conversations,
+                    conversationsNextCursor,
+                    conversationsHasMore,
+                    catchUps,
+                    resetsRequired,
+                    relationshipCatchUps.Count == 0 ? null : relationshipCatchUps);
+                currentBytes = MeasureSyncBootstrapPageUtf8Json(page);
+            }
+
+            if (!trimmed)
+                break;
+        }
+
+        // 阶段 2.6：移除整个关系 catch-up（从末尾起）。
+        while (currentBytes > MaximumResponseBytes && relationshipCatchUps.Count > 0)
+        {
+            relationshipCatchUps.RemoveAt(relationshipCatchUps.Count - 1);
+            page = SyncBootstrapPage.Success(
+                requestId,
+                serverTimeMs,
+                conversations,
+                conversationsNextCursor,
+                conversationsHasMore,
+                catchUps,
+                resetsRequired,
+                relationshipCatchUps.Count == 0 ? null : relationshipCatchUps);
             currentBytes = MeasureSyncBootstrapPageUtf8Json(page);
         }
 
@@ -375,11 +620,12 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                 conversationsNextCursor,
                 conversationsHasMore,
                 catchUps,
-                resetsRequired);
+                resetsRequired,
+                relationshipCatchUps.Count == 0 ? null : relationshipCatchUps);
             currentBytes = MeasureSyncBootstrapPageUtf8Json(page);
         }
 
-        return (page, catchUps);
+        return (page, catchUps, relationshipCatchUps);
     }
 
     /// <summary>

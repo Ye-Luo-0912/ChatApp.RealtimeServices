@@ -14,4 +14,15 @@ public sealed class SyncBootstrapQuery
     public int HistoryLimitPerConversation { get; init; } = 20;
     public int MaxConversationsWithHistory { get; init; } = 10;
     public IReadOnlyList<ConversationSyncWatermark>? Watermarks { get; init; }
+
+    /// <summary>
+    /// 关系列表增量同步水位。客户端可按 list_type 维度提供本地水位。
+    /// <para>
+    /// null 或空表示不请求关系同步（仅会话同步）。
+    /// </para>
+    /// </summary>
+    public IReadOnlyList<RelationshipSyncWatermark>? RelationshipWatermarks { get; init; }
+
+    /// <summary>关系列表分页大小。null 或 0 表示默认值 50。</summary>
+    public int? RelationshipListLimit { get; init; }
 }
