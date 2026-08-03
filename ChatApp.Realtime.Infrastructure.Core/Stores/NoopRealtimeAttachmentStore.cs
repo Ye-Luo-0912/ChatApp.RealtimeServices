@@ -1,3 +1,4 @@
+using ChatApp.Realtime.Abstractions.Attachments;
 using ChatApp.Realtime.Abstractions.Stores;
 using Microsoft.Extensions.Logging;
 
@@ -88,5 +89,47 @@ public sealed class NoopRealtimeAttachmentStore(ILogger<NoopRealtimeAttachmentSt
         ct.ThrowIfCancellationRequested();
         logger.LogCritical("未配置附件存储，拒绝确认上传。附件={AttachmentId}", attachmentId);
         throw new InvalidOperationException("未配置真实附件存储。");
+    }
+    public Task<AttachmentScanTransitionResult> BeginScanAsync(
+        string attachmentId,
+        long expectedStateVersion,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        logger.LogCritical("未配置附件存储，拒绝开始扫描。附件={AttachmentId}", attachmentId);
+        throw new InvalidOperationException("未配置真实附件存储。");
+    }
+
+    public Task<AttachmentScanTransitionResult> CompleteScanAsync(
+        string attachmentId,
+        long expectedStateVersion,
+        AttachmentScanVerdict verdict,
+        long sizeBytes,
+        string? contentHash,
+        string? contentType,
+        string? reason,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        logger.LogCritical("未配置附件存储，拒绝完成扫描。附件={AttachmentId}", attachmentId);
+        throw new InvalidOperationException("未配置真实附件存储。");
+    }
+
+    public Task<bool> MarkExpiredAsync(
+        string attachmentId,
+        long expectedStateVersion,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(false);
+    }
+
+    public Task<IReadOnlyList<RealtimeAttachmentRecord>> ListExpiryCandidatesAsync(
+        long cutoffMs,
+        int take,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult<IReadOnlyList<RealtimeAttachmentRecord>>([]);
     }
 }

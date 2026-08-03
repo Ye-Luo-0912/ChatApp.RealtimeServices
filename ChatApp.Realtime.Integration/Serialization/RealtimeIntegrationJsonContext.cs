@@ -6,6 +6,7 @@ using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Sync;
+using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Integration.Ephemeral;
 using ChatApp.Realtime.Integration.Push;
 
@@ -38,6 +39,8 @@ namespace ChatApp.Realtime.Integration.Serialization;
 [JsonSerializable(typeof(ConversationSetPrefsResult))]
 [JsonSerializable(typeof(GroupConversationCommand))]
 [JsonSerializable(typeof(GroupConversationResult))]
+[JsonSerializable(typeof(MessageReader))]
+[JsonSerializable(typeof(List<MessageReader>))]
 [JsonSerializable(typeof(ConversationMemberItem))]
 [JsonSerializable(typeof(List<ConversationMemberItem>))]
 [JsonSerializable(typeof(RealtimeMemberJoinedPayload))]
@@ -81,6 +84,8 @@ namespace ChatApp.Realtime.Integration.Serialization;
 [JsonSerializable(typeof(PushDeliveryCommand))]
 [JsonSerializable(typeof(AttachmentFinalizeCommand))]
 [JsonSerializable(typeof(AttachmentFinalizeResult))]
+[JsonSerializable(typeof(AttachmentDownloadAuthorizeCommand))]
+[JsonSerializable(typeof(AttachmentDownloadAuthorizeResult))]
 [JsonSerializable(typeof(RelationshipCommand))]
 [JsonSerializable(typeof(RelationshipCommandResult))]
 [JsonSerializable(typeof(RelationshipListQuery))]

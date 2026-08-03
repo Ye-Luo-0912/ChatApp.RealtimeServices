@@ -30,9 +30,19 @@ public interface IRealtimeMessageBus
     Task<GroupConversationResult> MutateGroupConversationAsync(
         GroupConversationCommand command,
         CancellationToken ct = default);
+
+    /// <summary>P1-4：查询群消息已读回执（仅消息发送者）。</summary>
+    Task<GroupConversationResult> QueryReadReceiptsAsync(
+        GroupConversationCommand command,
+        CancellationToken ct = default);
     /// <summary>附件上传确认：Ticketed → Uploaded 状态转换。</summary>
     Task<AttachmentFinalizeResult> FinalizeAttachmentUploadAsync(
         AttachmentFinalizeCommand command,
+        CancellationToken ct = default);
+
+    /// <summary>附件下载授权：为附件签发短时有效的签名下载 URL。</summary>
+    Task<AttachmentDownloadAuthorizeResult> AuthorizeAttachmentDownloadAsync(
+        AttachmentDownloadAuthorizeCommand command,
         CancellationToken ct = default);
 
     /// <summary>关系变更命令（发送/接受/拒绝好友请求、删除好友、拉黑/取消拉黑）。</summary>

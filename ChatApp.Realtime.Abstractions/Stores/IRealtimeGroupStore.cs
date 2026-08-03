@@ -93,6 +93,16 @@ public interface IRealtimeGroupStore
         string conversationId,
         IReadOnlyList<long> userIds,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// P1-2：查询会话受众（成员用户编号 + audience_version）。
+    /// 与 <see cref="ListMembersAsync"/> 不同，本操作不要求调用者必须是活跃成员，
+    /// 面向 Gateway 的会话级广播投递（AudienceKind=Conversation）解析成员集合。
+    /// 返回空用户列表表示会话不存在或已解散。
+    /// </summary>
+    Task<ConversationAudienceLoadResult> QueryAudienceAsync(
+        string conversationId,
+        CancellationToken ct = default);
 }
 
 public readonly record struct GroupCreatePersistResult(
@@ -135,4 +145,20 @@ public readonly record struct GroupMutatePersistResult(
 
     public static GroupMutatePersistResult Fail(string errorCode, string errorMessage) =>
         new(false, errorCode, errorMessage, null, null, null);
+}
+
+public readonly record struct ConversationAudienceLoadResult(
+    bool Succeeded,
+    string? ErrorCode,
+    string? ErrorMessage,
+    long AudienceVersion,
+    IReadOnlyList<long> MemberUserIds)
+{
+    public static ConversationAudienceLoadResult Ok(
+        long audienceVersion,
+        IReadOnlyList<long> memberUserIds) =>
+        new(true, null, null, audienceVersion, memberUserIds);
+
+    public static ConversationAudienceLoadResult Fail(string errorCode, string errorMessage) =>
+        new(false, errorCode, errorMessage, 0, Array.Empty<long>());
 }

@@ -22,6 +22,7 @@ public sealed class RealtimeIntegrationOptions
     public string SyncBootstrapQueriesSubject { get; set; } = "chat.sync.bootstrap";
     public string GroupConversationsSubject { get; set; } = "chat.group-conversation";
     public string AttachmentFinalizeSubject { get; set; } = "chat.attachment-finalize";
+    public string AttachmentDownloadAuthorizeSubject { get; set; } = "chat.attachment-download-authorize";
     public string RelationshipCommandsSubject { get; set; } = "chat.relationship.command";
     public string RelationshipListQueriesSubject { get; set; } = "chat.relationship-list.query";
     public string DeadLettersSubject { get; set; } = "chat.dead-letters";

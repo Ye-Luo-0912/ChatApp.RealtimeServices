@@ -93,7 +93,8 @@ public sealed class RealtimeSchemaMigrationRunner
         new Migration051_AttachmentStatusExtended(),
         new Migration052_Relationships(),
         new Migration053_RelationshipSyncCursors(),
-        new Migration054_RelationshipChangeLog()
+        new Migration054_RelationshipChangeLog(),
+        new Migration055_AttachmentStateVersion()
     ];
 
     public async Task MigrateAsync(

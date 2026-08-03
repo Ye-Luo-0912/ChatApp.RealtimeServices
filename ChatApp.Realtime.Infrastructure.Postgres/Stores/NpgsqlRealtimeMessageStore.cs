@@ -1752,6 +1752,41 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
     }
 
     /// <summary>
+    /// P1-4：解析消息元数据（会话序列号 + 发送者），用于已读回执查询的权限校验。
+    /// </summary>
+    public async Task<(long ConversationSequence, long SenderUserId)?> GetMessageMetaAsync(
+        string messageId,
+        string conversationId,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(messageId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(conversationId);
+
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT conversation_sequence, sender_user_id
+             FROM {_databaseSchema.MessagesTableSql}
+             WHERE message_id = @message_id
+               AND conversation_id = @conversation_id;
+             """,
+            connection);
+        command.Parameters.AddWithValue("message_id", messageId);
+        command.Parameters.AddWithValue("conversation_id", conversationId);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            return null;
+
+        return (reader.GetInt64(0), reader.GetInt64(1));
+    }
+
+    /// <summary>
     /// 一-3：批量查询已被撤回的消息编号。
     /// </summary>
     public async Task<IReadOnlyList<string>> BatchGetRecalledMessageIdsAsync(

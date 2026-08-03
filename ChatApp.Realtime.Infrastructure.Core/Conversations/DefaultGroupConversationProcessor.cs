@@ -1,4 +1,4 @@
-using ChatApp.Realtime.Abstractions.Conversations;
+﻿using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Stores;
 
 namespace ChatApp.Realtime.Infrastructure.Core.Conversations;
@@ -9,17 +9,23 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
     private readonly IRealtimeOutboxSignal _outboxSignal;
     private readonly IUserDeletionTombstoneStore _tombstoneStore;
     private readonly IGroupOperationAuditStore _auditStore;
+    private readonly IRealtimeMessageStore _messageStore;
+    private readonly IRealtimeReadReceiptStore _readReceiptStore;
 
     public DefaultGroupConversationProcessor(
         IRealtimeGroupStore store,
         IRealtimeOutboxSignal outboxSignal,
         IUserDeletionTombstoneStore tombstoneStore,
-        IGroupOperationAuditStore auditStore)
+        IGroupOperationAuditStore auditStore,
+        IRealtimeMessageStore messageStore,
+        IRealtimeReadReceiptStore readReceiptStore)
     {
         _store = store;
         _outboxSignal = outboxSignal;
         _tombstoneStore = tombstoneStore;
         _auditStore = auditStore;
+        _messageStore = messageStore;
+        _readReceiptStore = readReceiptStore;
     }
 
     public async Task<GroupConversationResult> ProcessAsync(
@@ -30,8 +36,9 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
         if (validationError is not null)
             return validationError;
 
-        // Feature 1：拒绝已注销用户的群操作。
-        if (await _tombstoneStore.IsUserDeletedAsync(command.ActorUserId, ct).ConfigureAwait(false))
+        // Feature 1：拒绝已注销用户的群操作。（QueryAudience 为系统内部受众查询，无真实调用者，跳过。）
+        if (command.Operation != GroupConversationOperation.QueryAudience
+            && await _tombstoneStore.IsUserDeletedAsync(command.ActorUserId, ct).ConfigureAwait(false))
         {
             return GroupConversationResult.Failed(
                 command.RequestId,
@@ -238,6 +245,81 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                     result.ConversationId!,
                     result.Title);
             }
+            case GroupConversationOperation.QueryAudience:
+            {
+                var result = await _store.QueryAudienceAsync(
+                        command.ConversationId!.Trim(),
+                        ct)
+                    .ConfigureAwait(false);
+                if (!result.Succeeded)
+                {
+                    return GroupConversationResult.Failed(
+                        command.RequestId,
+                        result.ErrorCode!,
+                        result.ErrorMessage!);
+                }
+                return GroupConversationResult.SuccessAudience(
+                    command.RequestId,
+                    command.ConversationId.Trim(),
+                    result.AudienceVersion,
+                    result.MemberUserIds);
+            }
+            case GroupConversationOperation.QueryReadReceipts:
+            {
+                var messageMeta = await _messageStore.GetMessageMetaAsync(
+                        command.MessageId!,
+                        command.ConversationId!.Trim(),
+                        ct)
+                    .ConfigureAwait(false);
+                if (messageMeta is null)
+                {
+                    return GroupConversationResult.Failed(
+                        command.RequestId,
+                        "message_not_found",
+                        "消息不存在或不属于该会话。");
+                }
+                if (messageMeta.Value.SenderUserId != command.ActorUserId)
+                {
+                    return GroupConversationResult.Failed(
+                        command.RequestId,
+                        "forbidden",
+                        "无权查询该消息的已读回执。");
+                }
+
+                var summary = await _readReceiptStore.GetReadSummaryAsync(
+                        command.ConversationId.Trim(),
+                        messageMeta.Value.ConversationSequence,
+                        command.ActorUserId,
+                        ct)
+                    .ConfigureAwait(false);
+                if (!summary.IsSmallGroup)
+                {
+                    return GroupConversationResult.SuccessReadReceipt(
+                        command.RequestId,
+                        command.ConversationId.Trim(),
+                        summary.ReadCount,
+                        summary.TotalMemberCount,
+                        summary.IsSmallGroup);
+                }
+
+                var page = await _readReceiptStore.GetReadersAsync(
+                        command.ConversationId.Trim(),
+                        messageMeta.Value.ConversationSequence,
+                        command.ActorUserId,
+                        command.Cursor,
+                        command.PageSize > 0 ? command.PageSize : 20,
+                        ct)
+                    .ConfigureAwait(false);
+                return GroupConversationResult.SuccessReadReceipt(
+                    command.RequestId,
+                    command.ConversationId.Trim(),
+                    summary.ReadCount,
+                    summary.TotalMemberCount,
+                    summary.IsSmallGroup,
+                    page.Readers,
+                    page.NextCursor,
+                    page.HasMore);
+            }
             default:
                 return GroupConversationResult.Failed(
                     command.RequestId,
@@ -288,11 +370,14 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                 command.RequestId ?? string.Empty,
                 "invalid_request_id",
                 "请求编号不能为空且长度不能超过 64。");
-        if (command.ActorUserId <= 0)
+        if (command.ActorUserId <= 0
+            && command.Operation != GroupConversationOperation.QueryAudience)
+        {
             return GroupConversationResult.Failed(
                 command.RequestId,
                 "invalid_user_id",
                 "操作用户编号必须大于 0。");
+        }
 
         switch (command.Operation)
         {
@@ -313,6 +398,8 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
             case GroupConversationOperation.ChangeRole:
             case GroupConversationOperation.ListMembers:
             case GroupConversationOperation.Dissolve:
+            case GroupConversationOperation.QueryAudience:
+            case GroupConversationOperation.QueryReadReceipts:
                 if (string.IsNullOrWhiteSpace(command.ConversationId)
                     || !ConversationId.IsGroup(command.ConversationId.Trim()))
                 {
@@ -323,6 +410,7 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                 }
 
                 break;
+
             default:
                 return GroupConversationResult.Failed(
                     command.RequestId,
@@ -358,6 +446,15 @@ public sealed class DefaultGroupConversationProcessor : IGroupConversationProces
                 command.RequestId,
                 "invalid_members",
                 "至少需要一名有效成员。");
+        }
+
+        if (command.Operation == GroupConversationOperation.QueryReadReceipts
+            && string.IsNullOrWhiteSpace(command.MessageId))
+        {
+            return GroupConversationResult.Failed(
+                command.RequestId,
+                "invalid_message_id",
+                "消息编号不能为空。");
         }
 
         return null;

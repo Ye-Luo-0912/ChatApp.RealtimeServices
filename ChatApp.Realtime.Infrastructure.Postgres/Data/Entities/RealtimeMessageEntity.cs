@@ -1,4 +1,4 @@
-namespace ChatApp.Realtime.Infrastructure.Postgres.Data.Entities;
+﻿namespace ChatApp.Realtime.Infrastructure.Postgres.Data.Entities;
 
 public sealed class RealtimeMessageEntity
 {
@@ -13,6 +13,7 @@ public sealed class RealtimeMessageEntity
     public long ReceivedAtMs { get; init; }
     public long? DeliveredAtMs { get; set; }
     public long? ReadAtMs { get; set; }
+    public long? ConversationSequence { get; init; }
     public string? ReplyToMessageId { get; init; }
     public long? ReplyToSenderUserId { get; init; }
     public string? ReplyToPreview { get; init; }

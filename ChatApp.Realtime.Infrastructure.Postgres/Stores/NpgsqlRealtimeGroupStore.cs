@@ -1415,6 +1415,54 @@ public sealed class NpgsqlRealtimeGroupStore : IRealtimeGroupStore
         return valid;
     }
 
+    /// <summary>
+    /// P1-2：查询会话受众（成员用户编号 + audience_version）。
+    /// 与 <see cref="ListMembersAsync"/> 不同，本操作不要求调用者必须是活跃成员，
+    /// 面向 Gateway 的会话级广播投递（AudienceKind=Conversation）解析成员集合。
+    /// 单条 SQL 返回受众版本与活跃成员；会话不存在或已解散时返回空成员列表。
+    /// </summary>
+    public async Task<ConversationAudienceLoadResult> QueryAudienceAsync(
+        string conversationId,
+        CancellationToken ct = default)
+    {
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT c.audience_version,
+                    COALESCE(
+                        (SELECT ARRAY(
+                            SELECT m.user_id
+                            FROM {_databaseSchema.ConversationMembersTableSql} AS m
+                            WHERE m.conversation_id = c.conversation_id
+                              AND m.left_at_ms IS NULL
+                            ORDER BY m.user_id
+                        )),
+                        ARRAY[]::bigint[]
+                    )
+             FROM {_databaseSchema.ConversationsTableSql} AS c
+             WHERE c.conversation_id = @conversation_id
+               AND c.type = @group_type
+               AND c.dissolved_at_ms IS NULL;
+             """,
+            connection);
+        command.Parameters.AddWithValue("conversation_id", conversationId);
+        command.Parameters.AddWithValue("group_type", (short)ConversationType.Group);
+
+        long audienceVersion = 0;
+        long[] memberIds = Array.Empty<long>();
+
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            audienceVersion = reader.GetInt64(0);
+            memberIds = reader.GetFieldValue<long[]>(1) ?? Array.Empty<long>();
+        }
+
+        return ConversationAudienceLoadResult.Ok(audienceVersion, memberIds);
+    }
     private async Task<(string? Title, ConversationMemberRole? ActorRole, int MemberCount)> LoadGroupContextAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,

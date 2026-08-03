@@ -106,4 +106,13 @@ public interface IRealtimeMessageStore
     Task EnqueueEventAsync(
         Events.RealtimeEvent eventToPublish,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// P1-4：解析消息元数据（会话序列号 + 发送者），用于已读回执查询的权限校验。
+    /// 返回 null 表示消息不存在或不属于该会话。
+    /// </summary>
+    Task<(long ConversationSequence, long SenderUserId)?> GetMessageMetaAsync(
+        string messageId,
+        string conversationId,
+        CancellationToken cancellationToken = default);
 }

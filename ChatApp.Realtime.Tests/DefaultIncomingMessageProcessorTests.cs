@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
@@ -295,6 +295,12 @@ public sealed class DefaultIncomingMessageProcessorTests
             CancellationToken ct = default) =>
             Task.FromResult(0L);
 
+        public Task<(long ConversationSequence, long SenderUserId)?> GetMessageMetaAsync(
+            string messageId,
+            string conversationId,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult<(long ConversationSequence, long SenderUserId)?>(null);
+
         public Task EnqueueEventAsync(
             RealtimeEvent eventToPublish,
             CancellationToken ct = default) =>
@@ -391,5 +397,10 @@ public sealed class DefaultIncomingMessageProcessorTests
             IReadOnlyList<long> userIds,
             CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<long>>(userIds.ToArray());
+
+        public Task<ConversationAudienceLoadResult> QueryAudienceAsync(
+            string conversationId,
+            CancellationToken ct = default) =>
+            Task.FromResult(ConversationAudienceLoadResult.Ok(0, Array.Empty<long>()));
     }
 }

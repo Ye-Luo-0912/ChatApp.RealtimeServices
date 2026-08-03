@@ -301,7 +301,9 @@ public sealed class GroupChatTests : IAsyncLifetime
             groupStore,
             new RecordingRealtimeOutboxSignal(),
             NoopTombstoneAndLedger.Tombstone,
-            new NoopGroupOperationAuditStore(NullLogger<NoopGroupOperationAuditStore>.Instance));
+            new NoopGroupOperationAuditStore(NullLogger<NoopGroupOperationAuditStore>.Instance),
+            new NoopRealtimeMessageStore(NullLogger<NoopRealtimeMessageStore>.Instance),
+            NoopRealtimeReadReceiptStore.Instance);
         var conversationId = ConversationId.CreateGroup();
         await groupStore.CreateGroupAsync(
             "req-create-roles",

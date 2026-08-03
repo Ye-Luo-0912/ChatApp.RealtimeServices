@@ -126,4 +126,12 @@ public sealed class NoopRealtimeGroupStore : IRealtimeGroupStore
         ct.ThrowIfCancellationRequested();
         return Task.FromResult<IReadOnlyList<long>>(Array.Empty<long>());
     }
+
+    public Task<ConversationAudienceLoadResult> QueryAudienceAsync(
+        string conversationId,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(ConversationAudienceLoadResult.Ok(0, Array.Empty<long>()));
+    }
 }

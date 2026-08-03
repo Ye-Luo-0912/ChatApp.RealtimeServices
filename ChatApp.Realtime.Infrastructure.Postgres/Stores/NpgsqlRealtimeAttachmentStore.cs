@@ -1,3 +1,4 @@
+using ChatApp.Realtime.Abstractions.Attachments;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
@@ -84,7 +85,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                  client_attachment_id,
                  created_at_ms,
                  confirmed_at_ms,
-                 bound_at_ms
+                 bound_at_ms,
+                 state_version
              )
              VALUES (
                  @attachment_id,
@@ -100,7 +102,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                  @client_attachment_id,
                  @created_at_ms,
                  @confirmed_at_ms,
-                 NULL
+                 NULL,
+                 0
              )
              ON CONFLICT (attachment_id) DO NOTHING;
              """,
@@ -146,7 +149,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
             Status = AttachmentStatus.Confirmed,
             ClientAttachmentId = clientAttachmentId,
             CreatedAtMs = now,
-            ConfirmedAtMs = confirmedAt
+            ConfirmedAtMs = confirmedAt,
+            StateVersion = 0
         };
     }
 
@@ -175,14 +179,15 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
              SET status = @status,
                  size_bytes = @size_bytes,
                  content_hash = @content_hash,
-                 confirmed_at_ms = @confirmed_at_ms
+                 confirmed_at_ms = @confirmed_at_ms,
+                 state_version = state_version + 1
              WHERE attachment_id = @attachment_id
                AND uploader_user_id = @uploader_user_id
                AND status = @ticketed
              RETURNING attachment_id, uploader_user_id, object_key, public_url, content_type,
                        size_bytes, original_name, status, message_id, conversation_id,
                        client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                       content_hash;
+                       content_hash, state_version;
              """,
             connection);
         command.Parameters.AddWithValue("status", (short)AttachmentStatus.Uploaded);
@@ -211,6 +216,183 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
             return AttachmentFinalizePersistResult.Ok(existing);
         }
         return AttachmentFinalizePersistResult.Fail("invalid_state", $"附件当前状态 {existing.Status} 不允许确认上传。");
+    }
+
+    public async Task<AttachmentScanTransitionResult> BeginScanAsync(
+        string attachmentId,
+        long expectedStateVersion,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(attachmentId);
+
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+
+        await using var command = new NpgsqlCommand(
+            $"""
+             UPDATE {_databaseSchema.AttachmentsTableSql}
+             SET status = @scanning,
+                 state_version = state_version + 1
+             WHERE attachment_id = @attachment_id
+               AND status = @uploaded
+               AND state_version = @expected_version
+             RETURNING attachment_id, uploader_user_id, object_key, public_url, content_type,
+                       size_bytes, original_name, status, message_id, conversation_id,
+                       client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
+                       content_hash, state_version;
+             """,
+            connection);
+        command.Parameters.AddWithValue("scanning", (short)AttachmentStatus.Scanning);
+        command.Parameters.AddWithValue("uploaded", (short)AttachmentStatus.Uploaded);
+        command.Parameters.AddWithValue("expected_version", expectedStateVersion);
+        command.Parameters.AddWithValue("attachment_id", attachmentId);
+
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (await reader.ReadAsync(ct).ConfigureAwait(false))
+            return AttachmentScanTransitionResult.Ok(Map(reader));
+
+        var existing = await TryGetByIdAsync(connection, attachmentId, ct).ConfigureAwait(false);
+        if (existing is null)
+            return AttachmentScanTransitionResult.Fail("not_found", "附件不存在。");
+        if (existing.Status == AttachmentStatus.Scanning)
+            return AttachmentScanTransitionResult.Ok(existing);
+        return AttachmentScanTransitionResult.Fail(
+            "invalid_state",
+            $"附件当前状态 {existing.Status} 不允许开始扫描（且版本 {existing.StateVersion} 与期望 {expectedStateVersion} 不符）。");
+    }
+
+    public async Task<AttachmentScanTransitionResult> CompleteScanAsync(
+        string attachmentId,
+        long expectedStateVersion,
+        AttachmentScanVerdict verdict,
+        long sizeBytes,
+        string? contentHash,
+        string? contentType,
+        string? reason,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(attachmentId);
+
+        var targetStatus = verdict == AttachmentScanVerdict.Pass
+            ? AttachmentStatus.Available
+            : AttachmentStatus.Rejected;
+        var hash = string.IsNullOrWhiteSpace(contentHash) ? null : contentHash.Trim();
+        var mime = string.IsNullOrWhiteSpace(contentType) ? null : contentType.Trim();
+        var rejectReason = string.IsNullOrWhiteSpace(reason) ? null : reason.Trim();
+
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+
+        await using var command = new NpgsqlCommand(
+            $"""
+             UPDATE {_databaseSchema.AttachmentsTableSql}
+             SET status = @status,
+                 size_bytes = @size_bytes,
+                 content_hash = COALESCE(@content_hash, content_hash),
+                 content_type = COALESCE(@content_type, content_type),
+                 original_name = COALESCE(@reason, original_name),
+                 state_version = state_version + 1
+             WHERE attachment_id = @attachment_id
+               AND status = @scanning
+               AND state_version = @expected_version
+             RETURNING attachment_id, uploader_user_id, object_key, public_url, content_type,
+                       size_bytes, original_name, status, message_id, conversation_id,
+                       client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
+                       content_hash, state_version;
+             """,
+            connection);
+        command.Parameters.AddWithValue("status", (short)targetStatus);
+        command.Parameters.AddWithValue("size_bytes", sizeBytes);
+        command.Parameters.AddWithValue("content_hash", (object?)hash ?? DBNull.Value);
+        command.Parameters.AddWithValue("content_type", (object?)mime ?? DBNull.Value);
+        command.Parameters.AddWithValue("reason", (object?)rejectReason ?? DBNull.Value);
+        command.Parameters.AddWithValue("scanning", (short)AttachmentStatus.Scanning);
+        command.Parameters.AddWithValue("expected_version", expectedStateVersion);
+        command.Parameters.AddWithValue("attachment_id", attachmentId);
+
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (await reader.ReadAsync(ct).ConfigureAwait(false))
+            return AttachmentScanTransitionResult.Ok(Map(reader));
+
+        var existing = await TryGetByIdAsync(connection, attachmentId, ct).ConfigureAwait(false);
+        if (existing is null)
+            return AttachmentScanTransitionResult.Fail("not_found", "附件不存在。");
+        return AttachmentScanTransitionResult.Fail(
+            "stale_state_version",
+            $"扫描结果过期：附件当前状态 {existing.Status}、版本 {existing.StateVersion}，与期望 {expectedStateVersion} 不符。");
+    }
+
+    public async Task<bool> MarkExpiredAsync(
+        string attachmentId,
+        long expectedStateVersion,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(attachmentId);
+
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+
+        await using var command = new NpgsqlCommand(
+            $"""
+             UPDATE {_databaseSchema.AttachmentsTableSql}
+             SET status = @expired,
+                 state_version = state_version + 1
+             WHERE attachment_id = @attachment_id
+               AND message_id IS NULL
+               AND status IN (@ticketed, @uploaded, @scanning)
+               AND state_version = @expected_version;
+             """,
+            connection);
+        command.Parameters.AddWithValue("expired", (short)AttachmentStatus.Expired);
+        command.Parameters.AddWithValue("ticketed", (short)AttachmentStatus.Ticketed);
+        command.Parameters.AddWithValue("uploaded", (short)AttachmentStatus.Uploaded);
+        command.Parameters.AddWithValue("scanning", (short)AttachmentStatus.Scanning);
+        command.Parameters.AddWithValue("expected_version", expectedStateVersion);
+        command.Parameters.AddWithValue("attachment_id", attachmentId);
+
+        var affected = await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        return affected > 0;
+    }
+
+    public async Task<IReadOnlyList<RealtimeAttachmentRecord>> ListExpiryCandidatesAsync(
+        long cutoffMs,
+        int take,
+        CancellationToken ct = default)
+    {
+        take = Math.Clamp(take, 1, 1000);
+
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
+                    size_bytes, original_name, status, message_id, conversation_id,
+                    client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
+                    content_hash, state_version
+             FROM {_databaseSchema.AttachmentsTableSql}
+             WHERE message_id IS NULL
+               AND status IN (@ticketed, @uploaded, @scanning)
+               AND created_at_ms < @cutoff_ms
+             ORDER BY created_at_ms
+             LIMIT @take;
+             """,
+            connection);
+        command.Parameters.AddWithValue("ticketed", (short)AttachmentStatus.Ticketed);
+        command.Parameters.AddWithValue("uploaded", (short)AttachmentStatus.Uploaded);
+        command.Parameters.AddWithValue("scanning", (short)AttachmentStatus.Scanning);
+        command.Parameters.AddWithValue("cutoff_ms", cutoffMs);
+        command.Parameters.AddWithValue("take", take);
+
+        return await ReadAllAsync(command, ct).ConfigureAwait(false);
     }
 
     public async Task<int> BindToMessageAsync(
@@ -280,7 +462,7 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
              SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                     size_bytes, original_name, status, message_id, conversation_id,
                     client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                    content_hash
+                    content_hash, state_version
              FROM {_databaseSchema.AttachmentsTableSql}
              WHERE message_id = ANY(@message_ids)
              ORDER BY message_id, created_at_ms, attachment_id;
@@ -311,7 +493,7 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                       size_bytes, original_name, status, message_id, conversation_id,
                       client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                      content_hash
+                      content_hash, state_version
                FROM {_databaseSchema.AttachmentsTableSql}
                WHERE uploader_user_id = @user_id
                ORDER BY attachment_id
@@ -321,7 +503,7 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                       size_bytes, original_name, status, message_id, conversation_id,
                       client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                      content_hash
+                      content_hash, state_version
                FROM {_databaseSchema.AttachmentsTableSql}
                WHERE uploader_user_id = @user_id
                  AND attachment_id > @after_id
@@ -495,7 +677,7 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
              SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                     size_bytes, original_name, status, message_id, conversation_id,
                     client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                    content_hash
+                    content_hash, state_version
              FROM {_databaseSchema.AttachmentsTableSql}
              WHERE attachment_id = @attachment_id;
              """,
@@ -518,7 +700,7 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
              SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                     size_bytes, original_name, status, message_id, conversation_id,
                     client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                    content_hash
+                    content_hash, state_version
              FROM {_databaseSchema.AttachmentsTableSql}
              WHERE uploader_user_id = @uploader_user_id
                AND client_attachment_id = @client_attachment_id;
@@ -561,6 +743,7 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
         BoundAtMs = reader.IsDBNull(13) ? null : reader.GetInt64(13),
         ContentHash = reader.FieldCount > 14 && !reader.IsDBNull(14)
             ? reader.GetString(14)
-            : null
+            : null,
+        StateVersion = reader.FieldCount > 15 ? reader.GetInt64(15) : 0
     };
 }

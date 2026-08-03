@@ -19,4 +19,10 @@ public sealed class RealtimeAttachmentRecord
 
     /// <summary>SHA-256 十六进制（小写），上传或扫描写入；可空。</summary>
     public string? ContentHash { get; init; }
+
+    /// <summary>
+    /// 状态版本号。每次状态转换必须递增并使用条件更新（<c>WHERE state_version = @旧值</c>），
+    /// 防止旧扫描结果/旧回调覆盖新状态（ABA 防护）。
+    /// </summary>
+    public long StateVersion { get; init; }
 }

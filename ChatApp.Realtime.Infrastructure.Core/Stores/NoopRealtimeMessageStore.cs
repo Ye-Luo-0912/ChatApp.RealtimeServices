@@ -114,6 +114,20 @@ public sealed class NoopRealtimeMessageStore : IRealtimeMessageStore
     }
 
     /// <summary>
+    /// P1-4：Noop 实现返回 null（消息不存在），与未配置真实存储时的一致语义。
+    /// </summary>
+    public Task<(long ConversationSequence, long SenderUserId)?> GetMessageMetaAsync(
+        string messageId,
+        string conversationId,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(messageId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(conversationId);
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult<(long ConversationSequence, long SenderUserId)?>(null);
+    }
+
+    /// <summary>
     /// 一-3：Noop 实现返回空集合（无已撤回消息），与未配置真实存储时的一致语义。
     /// </summary>
     public Task<IReadOnlyList<string>> BatchGetRecalledMessageIdsAsync(

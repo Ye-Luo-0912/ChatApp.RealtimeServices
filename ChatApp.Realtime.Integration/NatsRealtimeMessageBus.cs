@@ -153,10 +153,20 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
         CancellationToken ct = default)
         => _requestClient.MutateGroupConversationAsync(command, ct);
 
+    public Task<GroupConversationResult> QueryReadReceiptsAsync(
+        GroupConversationCommand command,
+        CancellationToken ct = default)
+        => _requestClient.MutateGroupConversationAsync(command, ct);
+
     public Task<AttachmentFinalizeResult> FinalizeAttachmentUploadAsync(
         AttachmentFinalizeCommand command,
         CancellationToken ct = default)
         => _requestClient.FinalizeAttachmentUploadAsync(command, ct);
+
+    public Task<AttachmentDownloadAuthorizeResult> AuthorizeAttachmentDownloadAsync(
+        AttachmentDownloadAuthorizeCommand command,
+        CancellationToken ct = default)
+        => _requestClient.AuthorizeAttachmentDownloadAsync(command, ct);
 
     public Task<RelationshipCommandResult> MutateRelationshipAsync(
         RelationshipCommand command,

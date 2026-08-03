@@ -1,4 +1,4 @@
-using ChatApp.Realtime.Abstractions.Messaging;
+﻿using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Messaging;
@@ -171,6 +171,12 @@ public sealed class DefaultMessageEditProcessorTests
             int batchSize = 1000,
             CancellationToken ct = default) =>
             Task.FromResult(0L);
+
+        public Task<(long ConversationSequence, long SenderUserId)?> GetMessageMetaAsync(
+            string messageId,
+            string conversationId,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult<(long ConversationSequence, long SenderUserId)?>(null);
 
         public Task EnqueueEventAsync(
             ChatApp.Realtime.Abstractions.Events.RealtimeEvent eventToPublish,

@@ -1,4 +1,4 @@
-using ChatApp.Realtime.Infrastructure.Postgres.Data.Entities;
+﻿using ChatApp.Realtime.Infrastructure.Postgres.Data.Entities;
 using Microsoft.EntityFrameworkCore;
 
 namespace ChatApp.Realtime.Infrastructure.Postgres.Data;
@@ -69,6 +69,9 @@ public sealed class RealtimeDbContext : DbContext
 
             entity.Property(message => message.ReadAtMs)
                 .HasColumnName("read_at_ms");
+
+            entity.Property(message => message.ConversationSequence)
+                .HasColumnName("conversation_sequence");
 
             entity.Property(message => message.ReplyToMessageId)
                 .HasColumnName("reply_to_message_id")

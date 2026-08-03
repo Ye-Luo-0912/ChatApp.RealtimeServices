@@ -151,6 +151,26 @@ internal sealed class RealtimeRequestClient
                ?? throw new JsonException("附件上传确认响应无法反序列化。");
     }
 
+    public async Task<AttachmentDownloadAuthorizeResult> AuthorizeAttachmentDownloadAsync(
+        AttachmentDownloadAuthorizeCommand command,
+        CancellationToken ct = default)
+    {
+        var data = await RequestRawAsync(
+            "attachment_download_authorize.request",
+            _options.AttachmentDownloadAuthorizeSubject,
+            RealtimeWireSerializer.Serialize(command),
+            command.ActorUserId,
+            command.ActorSessionId,
+            timeoutMs: _options.HistoryRequestTimeoutMs,
+            ct).ConfigureAwait(false);
+
+        if (data is null)
+            throw new JsonException("附件下载授权返回了空响应。");
+
+        return RealtimeWireSerializer.DeserializeAttachmentDownloadAuthorizeResult(data)
+               ?? throw new JsonException("附件下载授权响应无法反序列化。");
+    }
+
     public async Task<RelationshipCommandResult> MutateRelationshipAsync(
         RelationshipCommand command,
         CancellationToken ct = default)

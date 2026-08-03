@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
@@ -349,6 +349,33 @@ public sealed class EfCoreRealtimeMessageStore : IRealtimeMessageStore
             MessageReceiptPersistStatus.Applied,
             receipt.MessageId,
             message.SenderUserId);
+    }
+
+    /// <summary>
+    /// P1-4：解析消息元数据（会话序列号 + 发送者），用于已读回执查询的权限校验。
+    /// </summary>
+    public async Task<(long ConversationSequence, long SenderUserId)?> GetMessageMetaAsync(
+        string messageId,
+        string conversationId,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(messageId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(conversationId);
+
+        await using var dbContext = await _dbContextFactory
+            .CreateDbContextAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var meta = await dbContext.Messages
+            .Where(m => m.MessageId == messageId && m.ConversationId == conversationId)
+            .Select(m => new { m.ConversationSequence, m.SenderUserId })
+            .SingleOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        if (meta is null || meta.ConversationSequence is null)
+            return null;
+
+        return (meta.ConversationSequence.Value, meta.SenderUserId);
     }
 
     private async Task<long?> AdvanceConversationSequenceAsync(

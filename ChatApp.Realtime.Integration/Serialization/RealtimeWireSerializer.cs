@@ -103,6 +103,12 @@ public static class RealtimeWireSerializer
     public static string Serialize(AttachmentFinalizeCommand command) =>
         JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.AttachmentFinalizeCommand);
 
+    public static string Serialize(AttachmentDownloadAuthorizeCommand command) =>
+        JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.AttachmentDownloadAuthorizeCommand);
+
+    public static AttachmentDownloadAuthorizeResult? DeserializeAttachmentDownloadAuthorizeResult(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.AttachmentDownloadAuthorizeResult);
+
     public static AttachmentFinalizeResult? DeserializeAttachmentFinalizeResult(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.AttachmentFinalizeResult);
 

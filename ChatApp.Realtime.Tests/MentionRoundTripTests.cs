@@ -1,4 +1,4 @@
-using ChatApp.Realtime.Abstractions.Conversations;
+﻿using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Stores;
@@ -299,6 +299,12 @@ public sealed class MentionRoundTripTests
             CancellationToken ct = default) =>
             Task.FromResult(0L);
 
+        public Task<(long ConversationSequence, long SenderUserId)?> GetMessageMetaAsync(
+            string messageId,
+            string conversationId,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult<(long ConversationSequence, long SenderUserId)?>(null);
+
         public Task EnqueueEventAsync(
             RealtimeEvent eventToPublish,
             CancellationToken ct = default) =>
@@ -406,5 +412,12 @@ public sealed class MentionRoundTripTests
             var result = userIds.Where(id => memberIds.Contains(id)).OrderBy(id => id).ToArray();
             return Task.FromResult<IReadOnlyList<long>>(result);
         }
+
+        public Task<ConversationAudienceLoadResult> QueryAudienceAsync(
+            string conversationId,
+            CancellationToken ct = default) =>
+            Task.FromResult(ConversationAudienceLoadResult.Ok(
+                0,
+                _members.Select(m => m.UserId).OrderBy(id => id).ToArray()));
     }
 }

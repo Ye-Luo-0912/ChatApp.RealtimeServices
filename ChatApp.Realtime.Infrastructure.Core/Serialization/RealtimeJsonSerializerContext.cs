@@ -33,6 +33,8 @@ namespace ChatApp.Realtime.Infrastructure.Core.Serialization;
 [JsonSerializable(typeof(ConversationSetPrefsResult))]
 [JsonSerializable(typeof(GroupConversationCommand))]
 [JsonSerializable(typeof(GroupConversationResult))]
+[JsonSerializable(typeof(MessageReader))]
+[JsonSerializable(typeof(List<MessageReader>))]
 [JsonSerializable(typeof(ConversationMemberItem))]
 [JsonSerializable(typeof(List<ConversationMemberItem>))]
 [JsonSerializable(typeof(RealtimeMemberJoinedPayload))]

@@ -26,4 +26,13 @@ public sealed class GroupConversationCommand
 
     /// <summary>上行会话 Id（幂等 / 回声跳过）。</summary>
     public string? ActorSessionId { get; init; }
+
+    /// <summary>QueryReadReceipts：目标消息编号。</summary>
+    public string? MessageId { get; init; }
+
+    /// <summary>QueryReadReceipts：分页游标（上一页最后一条 reader 的 user_id，null 表示第一页）。</summary>
+    public long? Cursor { get; init; }
+
+    /// <summary>QueryReadReceipts：每页大小。</summary>
+    public int PageSize { get; init; }
 }

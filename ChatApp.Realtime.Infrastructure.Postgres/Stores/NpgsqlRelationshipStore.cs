@@ -171,6 +171,7 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
         {
             long requesterId;
             long targetId;
+            short status;
             await using (var load = new NpgsqlCommand(
                 $"SELECT \"requester_id\", \"target_id\", \"status\" FROM {_schema.FriendRequestsTableSql} " +
                 $"WHERE \"request_id\" = @request_id FOR UPDATE",
@@ -180,19 +181,29 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
                 await using var reader = await load.ExecuteReaderAsync(ct).ConfigureAwait(false);
                 if (!await reader.ReadAsync(ct).ConfigureAwait(false))
                 {
-                    await transaction.RollbackAsync(ct).ConfigureAwait(false);
-                    return RelationshipMutatePersistResult.Fail("request_not_found", "好友请求不存在。");
+                    requesterId = 0;
+                    targetId = 0;
+                    status = -1;
                 }
-                requesterId = reader.GetInt64(0);
-                targetId = reader.GetInt64(1);
-                var status = reader.GetInt16(2);
-                if (status != FriendRequestStatusPending)
+                else
                 {
-                    await transaction.RollbackAsync(ct).ConfigureAwait(false);
-                    return RelationshipMutatePersistResult.Fail("request_not_pending", "好友请求已处理。");
+                    requesterId = reader.GetInt64(0);
+                    targetId = reader.GetInt64(1);
+                    status = reader.GetInt16(2);
                 }
             }
 
+            // reader 已释放，此后才允许在当前连接上回滚（避免 command in progress 冲突）。
+            if (status == -1)
+            {
+                await transaction.RollbackAsync(ct).ConfigureAwait(false);
+                return RelationshipMutatePersistResult.Fail("request_not_found", "好友请求不存在。");
+            }
+            if (status != FriendRequestStatusPending)
+            {
+                await transaction.RollbackAsync(ct).ConfigureAwait(false);
+                return RelationshipMutatePersistResult.Fail("request_not_pending", "好友请求已处理。");
+            }
             if (targetId != actorUserId)
             {
                 await transaction.RollbackAsync(ct).ConfigureAwait(false);
@@ -302,6 +313,7 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
         {
             long requesterId;
             long targetId;
+            short status;
             await using (var load = new NpgsqlCommand(
                 $"SELECT \"requester_id\", \"target_id\", \"status\" FROM {_schema.FriendRequestsTableSql} " +
                 $"WHERE \"request_id\" = @request_id FOR UPDATE",
@@ -311,19 +323,29 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
                 await using var reader = await load.ExecuteReaderAsync(ct).ConfigureAwait(false);
                 if (!await reader.ReadAsync(ct).ConfigureAwait(false))
                 {
-                    await transaction.RollbackAsync(ct).ConfigureAwait(false);
-                    return RelationshipMutatePersistResult.Fail("request_not_found", "好友请求不存在。");
+                    requesterId = 0;
+                    targetId = 0;
+                    status = -1;
                 }
-                requesterId = reader.GetInt64(0);
-                targetId = reader.GetInt64(1);
-                var status = reader.GetInt16(2);
-                if (status != FriendRequestStatusPending)
+                else
                 {
-                    await transaction.RollbackAsync(ct).ConfigureAwait(false);
-                    return RelationshipMutatePersistResult.Fail("request_not_pending", "好友请求已处理。");
+                    requesterId = reader.GetInt64(0);
+                    targetId = reader.GetInt64(1);
+                    status = reader.GetInt16(2);
                 }
             }
 
+            // reader 已释放，此后才允许在当前连接上回滚（避免 command in progress 冲突）。
+            if (status == -1)
+            {
+                await transaction.RollbackAsync(ct).ConfigureAwait(false);
+                return RelationshipMutatePersistResult.Fail("request_not_found", "好友请求不存在。");
+            }
+            if (status != FriendRequestStatusPending)
+            {
+                await transaction.RollbackAsync(ct).ConfigureAwait(false);
+                return RelationshipMutatePersistResult.Fail("request_not_pending", "好友请求已处理。");
+            }
             if (targetId != actorUserId)
             {
                 await transaction.RollbackAsync(ct).ConfigureAwait(false);

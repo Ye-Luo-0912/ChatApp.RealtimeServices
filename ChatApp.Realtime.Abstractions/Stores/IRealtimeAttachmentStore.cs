@@ -1,3 +1,5 @@
+using ChatApp.Realtime.Abstractions.Attachments;
+
 namespace ChatApp.Realtime.Abstractions.Stores;
 
 /// <summary>
@@ -36,6 +38,48 @@ public interface IRealtimeAttachmentStore
         string? contentHash,
         CancellationToken ct = default);
 
+    /// <summary>
+    /// 扫描开抢：Uploaded(4) → Scanning(5)。条件更新（<c>WHERE status=Uploaded AND state_version=@版本</c>），
+    /// state_version 递增并返回新版本。仅当自 Uploaded 迁移成功才返回成功。
+    /// </summary>
+    Task<AttachmentScanTransitionResult> BeginScanAsync(
+        string attachmentId,
+        long expectedStateVersion,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// 扫描完成：Scanning(5) → Available(7) 或 Rejected(6)。
+    /// 条件更新（<c>WHERE status=Scanning AND state_version=@版本</c>），state_version 递增。
+    /// 若版本不匹配（旧扫描结果覆盖新状态）返回失败，绝不覆盖新状态。
+    /// </summary>
+    Task<AttachmentScanTransitionResult> CompleteScanAsync(
+        string attachmentId,
+        long expectedStateVersion,
+        AttachmentScanVerdict verdict,
+        long sizeBytes,
+        string? contentHash,
+        string? contentType,
+        string? reason,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// 未绑定过期：Ticketed/Uploaded/Scanning → Expired(8)。条件更新（state_version 匹配）。
+    /// 返回是否转换成功。
+    /// </summary>
+    Task<bool> MarkExpiredAsync(
+        string attachmentId,
+        long expectedStateVersion,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// 列出未绑定且超过保留期的过期候选（Ticketed/Uploaded/Scanning，且 message_id 为空，
+    /// 创建时间早于 cutoffMs）。用于扫尾清理。
+    /// </summary>
+    Task<IReadOnlyList<RealtimeAttachmentRecord>> ListExpiryCandidatesAsync(
+        long cutoffMs,
+        int take,
+        CancellationToken ct = default);
+
     Task<IReadOnlyList<RealtimeAttachmentRecord>> ListByMessageIdsAsync(
         IReadOnlyList<string> messageIds,
         CancellationToken ct = default);
@@ -68,8 +112,7 @@ public interface IRealtimeAttachmentStore
 
     /// <summary>
     /// 按 attachment_id 主键批量删除附件行，返回已删除行数。
-    /// 用于账号清理 Saga 分批删除：列出 200 条 → 写 purge Outbox → 删除这 200 条 → 更新游标。
-    /// 一次 DELETE（单事务），避免 <see cref="DeleteByUserAsync"/> 的循环小事务。
+    /// 用于账号清理 Saga 分批删除。
     /// </summary>
     Task<int> DeleteByAttachmentIdsAsync(
         IReadOnlyList<string> attachmentIds,
@@ -86,5 +129,19 @@ public readonly record struct AttachmentFinalizePersistResult(
         new(true, null, null, record);
 
     public static AttachmentFinalizePersistResult Fail(string errorCode, string errorMessage) =>
+        new(false, errorCode, errorMessage, null);
+}
+
+/// <summary>扫描状态转换持久化结果。</summary>
+public readonly record struct AttachmentScanTransitionResult(
+    bool Succeeded,
+    string? ErrorCode,
+    string? ErrorMessage,
+    RealtimeAttachmentRecord? Record)
+{
+    public static AttachmentScanTransitionResult Ok(RealtimeAttachmentRecord record) =>
+        new(true, null, null, record);
+
+    public static AttachmentScanTransitionResult Fail(string errorCode, string errorMessage) =>
         new(false, errorCode, errorMessage, null);
 }

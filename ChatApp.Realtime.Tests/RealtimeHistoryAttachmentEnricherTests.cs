@@ -1,3 +1,4 @@
+using ChatApp.Realtime.Abstractions.Attachments;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Stores;
@@ -139,5 +140,34 @@ public sealed class RealtimeHistoryAttachmentEnricherTests
             IReadOnlyList<string> attachmentIds,
             CancellationToken ct = default) =>
             throw new NotSupportedException();
+
+        public Task<AttachmentScanTransitionResult> BeginScanAsync(
+            string attachmentId,
+            long expectedStateVersion,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<AttachmentScanTransitionResult> CompleteScanAsync(
+            string attachmentId,
+            long expectedStateVersion,
+            AttachmentScanVerdict verdict,
+            long sizeBytes,
+            string? contentHash,
+            string? contentType,
+            string? reason,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<bool> MarkExpiredAsync(
+            string attachmentId,
+            long expectedStateVersion,
+            CancellationToken ct = default) =>
+            Task.FromResult(false);
+
+        public Task<IReadOnlyList<RealtimeAttachmentRecord>> ListExpiryCandidatesAsync(
+            long cutoffMs,
+            int take,
+            CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<RealtimeAttachmentRecord>>([]);
     }
 }
