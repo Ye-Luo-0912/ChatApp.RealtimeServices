@@ -315,13 +315,13 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
             ? Math.Clamp(rl, 1, MaximumListLimit)
             : listLimit;
 
-        // 1) 解析 after-by-listType 映射
-        var afterByListType = new Dictionary<byte, long>();
+        // 1) 解析 afterSequence-by-listType 映射
+        var afterSequenceByListType = new Dictionary<byte, long>();
         var clientWatermarks = query.RelationshipWatermarks;
         if (clientWatermarks is { Count: > 0 })
         {
             foreach (var wm in clientWatermarks)
-                afterByListType[(byte)wm.ListType] = wm.AfterChangedAtMs;
+                afterSequenceByListType[(byte)wm.ListType] = wm.AfterSequence;
         }
         else if (query.DeviceIdHash is ulong did && _relationshipCursorStore is not null)
         {
@@ -329,7 +329,7 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                 .LoadAsync(query.UserId, did, ct)
                 .ConfigureAwait(false);
             foreach (var cursor in stored)
-                afterByListType[cursor.ListType] = cursor.AfterChangedAtMs;
+                afterSequenceByListType[cursor.ListType] = cursor.AfterSequence;
         }
 
         // 2) 三种 list type 顺序：Friends / FriendRequests / BlockedUsers
@@ -344,24 +344,18 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
         foreach (var listType in listTypes)
         {
             ct.ThrowIfCancellationRequested();
-            afterByListType.TryGetValue((byte)listType, out var afterMs);
+            afterSequenceByListType.TryGetValue((byte)listType, out var afterSequence);
 
-            IReadOnlyList<RelationshipListItem> items;
+            IReadOnlyList<RelationshipChangeLogEntry> changes;
+            long floorSequence;
             try
             {
-                items = listType switch
-                {
-                    RelationshipListType.Friends => await _relationshipStore
-                        .ListFriendsAsync(query.UserId, relLimit, cursor: null, afterMs, ct)
-                        .ConfigureAwait(false),
-                    RelationshipListType.FriendRequests => await _relationshipStore
-                        .ListFriendRequestsAsync(query.UserId, relLimit, cursor: null, afterMs, ct)
-                        .ConfigureAwait(false),
-                    RelationshipListType.BlockedUsers => await _relationshipStore
-                        .ListBlockedUsersAsync(query.UserId, relLimit, cursor: null, afterMs, ct)
-                        .ConfigureAwait(false),
-                    _ => Array.Empty<RelationshipListItem>()
-                };
+                changes = await _relationshipStore
+                    .ListChangesAsync(query.UserId, listType, afterSequence, relLimit + 1, ct)
+                    .ConfigureAwait(false);
+                floorSequence = await _relationshipStore
+                    .GetRelationshipRetentionFloorAsync(query.UserId, listType, ct)
+                    .ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -374,10 +368,11 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                 result.Add(new RelationshipCatchUp
                 {
                     ListType = listType,
-                    Items = [],
+                    Changes = [],
                     HasMore = false,
                     NextCursor = null,
-                    NewAfterChangedAtMs = afterMs,
+                    NextSequence = afterSequence,
+                    RetentionFloorSequence = 0,
                     ResetRequired = false,
                     ResetReason = null
                 });
@@ -386,30 +381,29 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
 
             // 服务端已按 LIMIT relLimit+1 取数；超过 size 表示有更多
             var size = relLimit;
-            var hasMore = items.Count > size;
-            var page = hasMore ? items.Take(size).ToArray() : items;
+            var hasMore = changes.Count > size;
+            var page = hasMore ? changes.Take(size).ToArray() : changes;
 
-            // 新水位：BlockedUsers 表无 created_at_ms（始终 0），不推进；
-            // 其它列表取最大 CreatedAtMs（单调推进）
-            long newAfterMs = afterMs;
-            if (listType != RelationshipListType.BlockedUsers)
+            // 新水位：返回条目的最大 ChangeSequence（无返回时保持原水位）
+            long nextSequence = afterSequence;
+            foreach (var chg in page)
             {
-                foreach (var item in page)
-                {
-                    if (item.CreatedAtMs > newAfterMs)
-                        newAfterMs = item.CreatedAtMs;
-                }
+                if (chg.ChangeSequence > nextSequence)
+                    nextSequence = chg.ChangeSequence;
             }
 
+            // 客户端水位早于保留水位时无法增量同步，需全量重建
+            var resetRequired = afterSequence > 0 && afterSequence < floorSequence;
             result.Add(new RelationshipCatchUp
             {
                 ListType = listType,
-                Items = page,
+                Changes = page,
                 HasMore = hasMore,
                 NextCursor = null, // 当前实现不支持分页游标：单次返回 relLimit 条
-                NewAfterChangedAtMs = newAfterMs,
-                ResetRequired = false,
-                ResetReason = null
+                NextSequence = nextSequence,
+                RetentionFloorSequence = floorSequence,
+                ResetRequired = resetRequired,
+                ResetReason = resetRequired ? "beyond_retention" : null
             });
         }
 
@@ -427,15 +421,14 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
         {
             if (catchUp.ResetRequired)
                 continue;
-            if (catchUp.NewAfterChangedAtMs <= 0)
+            if (catchUp.NextSequence <= 0)
                 continue;
-            if (catchUp.Items.Count == 0)
+            if (catchUp.Changes.Count == 0)
                 continue;
-            // BlockedUsers 的 NewAfterChangedAtMs 始终 0，天然被过滤
             list.Add(new RelationshipSyncCursor
             {
                 ListType = (byte)catchUp.ListType,
-                AfterChangedAtMs = catchUp.NewAfterChangedAtMs,
+                AfterSequence = catchUp.NextSequence,
                 UpdatedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 LastSeenAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
             });
@@ -540,24 +533,25 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
             for (var i = relationshipCatchUps.Count - 1; i >= 0 && currentBytes > MaximumResponseBytes; i--)
             {
                 var relCatchUp = relationshipCatchUps[i];
-                if (relCatchUp.Items.Count == 0)
+                if (relCatchUp.Changes.Count == 0)
                     continue;
 
-                var newItems = relCatchUp.Items.Take(relCatchUp.Items.Count - 1).ToArray();
-                // 重新计算 NewAfterChangedAtMs：仅保留实际返回条目的最大 CreatedAtMs
-                long newAfterMs = 0;
-                foreach (var item in newItems)
+                var newChanges = relCatchUp.Changes.Take(relCatchUp.Changes.Count - 1).ToArray();
+                // 重新计算 NextSequence：仅保留实际返回条目的最大 ChangeSequence
+                long nextSequence = 0;
+                foreach (var chg in newChanges)
                 {
-                    if (item.CreatedAtMs > newAfterMs)
-                        newAfterMs = item.CreatedAtMs;
+                    if (chg.ChangeSequence > nextSequence)
+                        nextSequence = chg.ChangeSequence;
                 }
                 relationshipCatchUps[i] = new RelationshipCatchUp
                 {
                     ListType = relCatchUp.ListType,
-                    Items = newItems,
+                    Changes = newChanges,
                     HasMore = true,
                     NextCursor = relCatchUp.NextCursor,
-                    NewAfterChangedAtMs = newAfterMs > 0 ? newAfterMs : relCatchUp.NewAfterChangedAtMs,
+                    NextSequence = nextSequence > 0 ? nextSequence : relCatchUp.NextSequence,
+                    RetentionFloorSequence = relCatchUp.RetentionFloorSequence,
                     ResetRequired = relCatchUp.ResetRequired,
                     ResetReason = relCatchUp.ResetReason
                 };

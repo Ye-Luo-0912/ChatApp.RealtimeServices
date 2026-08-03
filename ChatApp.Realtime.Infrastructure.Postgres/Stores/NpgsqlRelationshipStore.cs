@@ -4,6 +4,7 @@ using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Stores;
+using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
@@ -116,6 +117,12 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
                 await insert.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             }
 
+            // 变更日志：target 的好友请求列表新增一条 Pending
+            await AppendChangeLogAsync(
+                connection, transaction,
+                targetUserId, RelationshipListType.FriendRequests, RelationshipChangeOperation.Upsert,
+                requestId, "Pending", message, occurredAtMs, occurredAtMs, requestId, ct).ConfigureAwait(false);
+
             // 事件发布：通知双方好友请求列表变更
             var events = new List<RealtimeEvent>(2)
             {
@@ -216,6 +223,20 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
                 insertFriendship.Parameters.AddWithValue("created_at_ms", occurredAtMs);
                 await insertFriendship.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             }
+
+            // 变更日志：接受者的待处理请求删除；请求者与接受者的好友列表新增
+            await AppendChangeLogAsync(
+                connection, transaction,
+                actorUserId, RelationshipListType.FriendRequests, RelationshipChangeOperation.Delete,
+                requestIdToRespond, null, null, occurredAtMs, occurredAtMs, requestId, ct).ConfigureAwait(false);
+            await AppendChangeLogAsync(
+                connection, transaction,
+                requesterId, RelationshipListType.Friends, RelationshipChangeOperation.Upsert,
+                friendshipId, "Accepted", null, occurredAtMs, occurredAtMs, requestId, ct).ConfigureAwait(false);
+            await AppendChangeLogAsync(
+                connection, transaction,
+                actorUserId, RelationshipListType.Friends, RelationshipChangeOperation.Upsert,
+                friendshipId, "Accepted", null, occurredAtMs, occurredAtMs, requestId, ct).ConfigureAwait(false);
 
             // 事件发布：好友请求状态变更通知双方 + 好友列表变更通知双方
             var events = new List<RealtimeEvent>(4)
@@ -320,6 +341,12 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
                 await update.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             }
 
+            // 变更日志：拒绝者的待处理请求删除
+            await AppendChangeLogAsync(
+                connection, transaction,
+                actorUserId, RelationshipListType.FriendRequests, RelationshipChangeOperation.Delete,
+                requestIdToRespond, null, null, occurredAtMs, occurredAtMs, requestId, ct).ConfigureAwait(false);
+
             // 事件发布：通知双方好友请求被拒绝
             var events = new List<RealtimeEvent>(2)
             {
@@ -367,19 +394,40 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
         try
         {
             var (low, high) = CanonicalPair(actorUserId, targetUserId);
+            string friendshipId;
+            await using (var select = new NpgsqlCommand(
+                $"SELECT \"friendship_id\" FROM {_schema.FriendshipsTableSql} WHERE \"user_id_low\" = @low AND \"user_id_high\" = @high",
+                connection, transaction))
+            {
+                select.Parameters.AddWithValue("low", low);
+                select.Parameters.AddWithValue("high", high);
+                var found = await select.ExecuteScalarAsync(ct).ConfigureAwait(false);
+                if (found is null)
+                {
+                    await transaction.RollbackAsync(ct).ConfigureAwait(false);
+                    return RelationshipMutatePersistResult.Fail("not_friends", "不是好友关系。");
+                }
+                friendshipId = (string)found;
+            }
+
             await using (var delete = new NpgsqlCommand(
                 $"DELETE FROM {_schema.FriendshipsTableSql} WHERE \"user_id_low\" = @low AND \"user_id_high\" = @high",
                 connection, transaction))
             {
                 delete.Parameters.AddWithValue("low", low);
                 delete.Parameters.AddWithValue("high", high);
-                var rows = await delete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-                if (rows == 0)
-                {
-                    await transaction.RollbackAsync(ct).ConfigureAwait(false);
-                    return RelationshipMutatePersistResult.Fail("not_friends", "不是好友关系。");
-                }
+                await delete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             }
+
+            // 变更日志：双方好友列表删除
+            await AppendChangeLogAsync(
+                connection, transaction,
+                actorUserId, RelationshipListType.Friends, RelationshipChangeOperation.Delete,
+                friendshipId, null, null, occurredAtMs, occurredAtMs, requestId, ct).ConfigureAwait(false);
+            await AppendChangeLogAsync(
+                connection, transaction,
+                targetUserId, RelationshipListType.Friends, RelationshipChangeOperation.Delete,
+                friendshipId, null, null, occurredAtMs, occurredAtMs, requestId, ct).ConfigureAwait(false);
 
             // 事件发布：通知双方好友列表变更（删除）
             var events = new List<RealtimeEvent>(2)
@@ -439,6 +487,12 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
                 await insert.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             }
 
+            // 变更日志：操作者黑名单新增
+            await AppendChangeLogAsync(
+                connection, transaction,
+                actorUserId, RelationshipListType.BlockedUsers, RelationshipChangeOperation.Upsert,
+                targetUserId.ToString(), "Blocked", null, occurredAtMs, occurredAtMs, requestId, ct).ConfigureAwait(false);
+
             // 事件发布：通知操作者黑名单变更（不通知被拉黑方）
             var events = new List<RealtimeEvent>(1)
             {
@@ -487,6 +541,12 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
                 delete.Parameters.AddWithValue("blocked", targetUserId);
                 await delete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
             }
+
+            // 变更日志：操作者黑名单删除
+            await AppendChangeLogAsync(
+                connection, transaction,
+                actorUserId, RelationshipListType.BlockedUsers, RelationshipChangeOperation.Delete,
+                targetUserId.ToString(), null, null, occurredAtMs, occurredAtMs, requestId, ct).ConfigureAwait(false);
 
             // 事件发布：通知操作者黑名单变更（不通知被取消拉黑方）
             var events = new List<RealtimeEvent>(1)
@@ -631,6 +691,82 @@ public sealed class NpgsqlRelationshipStore : IRelationshipStore
         return results;
     }
 
+    public async Task<IReadOnlyList<RelationshipChangeLogEntry>> ListChangesAsync(
+        long userId, RelationshipListType listType, long afterSequence, int limit, CancellationToken ct = default)
+    {
+        await using var connection = await _databaseClient
+            .GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
+
+        await using var command = new NpgsqlCommand(
+            $"SELECT \"change_sequence\",\"operation\",\"resource_id\",\"status\",\"message\",\"created_at_ms\",\"occurred_at_ms\",\"request_id\" " +
+            $"FROM {_schema.RelationshipChangeLogTableSql} " +
+            $"WHERE \"user_id\"=@uid AND \"list_type\"=@lt AND \"change_sequence\">@after " +
+            $"ORDER BY \"change_sequence\" ASC LIMIT @limit",
+            connection);
+        command.Parameters.AddWithValue("uid", userId);
+        command.Parameters.AddWithValue("lt", (short)listType);
+        command.Parameters.AddWithValue("after", afterSequence);
+        command.Parameters.AddWithValue("limit", limit + 1);
+
+        var results = new List<RelationshipChangeLogEntry>();
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            results.Add(new RelationshipChangeLogEntry
+            {
+                ChangeSequence = reader.GetInt64(0),
+                Operation = (RelationshipChangeOperation)reader.GetInt16(1),
+                ResourceId = reader.GetString(2),
+                UserId = userId,
+                Status = reader.IsDBNull(3) ? null : reader.GetString(3),
+                Message = reader.IsDBNull(4) ? null : reader.GetString(4),
+                CreatedAtMs = reader.GetInt64(5),
+                OccurredAtMs = reader.GetInt64(6),
+                RequestId = reader.IsDBNull(7) ? null : reader.GetString(7)
+            });
+        }
+        return results;
+    }
+
+    public async Task<long> GetRelationshipRetentionFloorAsync(
+        long userId, RelationshipListType listType, CancellationToken ct = default)
+    {
+        await using var connection = await _databaseClient
+            .GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
+
+        await using var command = new NpgsqlCommand(
+            $"SELECT COALESCE(MIN(\"change_sequence\"), 0) FROM {_schema.RelationshipChangeLogTableSql} " +
+            $"WHERE \"user_id\"=@uid AND \"list_type\"=@lt",
+            connection);
+        command.Parameters.AddWithValue("uid", userId);
+        command.Parameters.AddWithValue("lt", (short)listType);
+        var result = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return result is long value ? value : 0L;
+    }
+
+    private async Task AppendChangeLogAsync(
+        NpgsqlConnection connection, NpgsqlTransaction transaction,
+        long userId, RelationshipListType listType, RelationshipChangeOperation operation,
+        string resourceId, string? status, string? message, long createdAtMs, long occurredAtMs, string? requestId, CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand(
+            $"""
+             INSERT INTO {_schema.RelationshipChangeLogTableSql}
+             ("change_sequence", "user_id", "list_type", "operation", "resource_id", "status", "message", "created_at_ms", "occurred_at_ms", "request_id")
+             VALUES (nextval('{_schema.RelationshipChangeLogSequenceSql}'), @user_id, @list_type, @operation, @resource_id, @status, @message, @created_at_ms, @occurred_at_ms, @request_id)
+             """,
+            connection, transaction);
+        command.Parameters.AddWithValue("user_id", userId);
+        command.Parameters.AddWithValue("list_type", (short)listType);
+        command.Parameters.AddWithValue("operation", (short)operation);
+        command.Parameters.AddWithValue("resource_id", resourceId);
+        command.Parameters.AddWithValue("status", (object?)status ?? DBNull.Value);
+        command.Parameters.AddWithValue("message", (object?)message ?? DBNull.Value);
+        command.Parameters.AddWithValue("created_at_ms", createdAtMs);
+        command.Parameters.AddWithValue("occurred_at_ms", occurredAtMs);
+        command.Parameters.AddWithValue("request_id", (object?)requestId ?? DBNull.Value);
+        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
     private async Task<(RelationshipMutatePersistResult? Result, string Fingerprint)> TryReadIdempotencyAsync(
         long actorUserId, string requestId, int operation, CancellationToken ct)
     {

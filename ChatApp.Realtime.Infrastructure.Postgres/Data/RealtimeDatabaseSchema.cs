@@ -34,6 +34,8 @@ public sealed class RealtimeDatabaseSchema
     public string FriendshipsTableSql => $"{QuotedSchema}.\"friendships\"";
     public string RelationshipMutationRequestsTableSql => $"{QuotedSchema}.\"relationship_mutation_requests\"";
     public string RelationshipSyncCursorsTableSql => $"{QuotedSchema}.\"relationship_sync_cursors\"";
+    public string RelationshipChangeLogTableSql => $"{QuotedSchema}.\"relationship_change_log\"";
+    public string RelationshipChangeLogSequenceSql => $"{QuotedSchema}.\"relationship_change_seq\"";
 
     public static string QuoteIdentifier(string identifier)
     {

@@ -26,7 +26,7 @@ public sealed class Migration053_RelationshipSyncCursors : IRealtimeSchemaMigrat
                  "user_id" bigint NOT NULL,
                  "device_id_hash" bigint NOT NULL,
                  "list_type" smallint NOT NULL,
-                 "after_changed_at_ms" bigint NOT NULL,
+                 "after_sequence" bigint NOT NULL,
                  "updated_at_ms" bigint NOT NULL,
                  "last_seen_at_ms" bigint NOT NULL,
                  PRIMARY KEY ("user_id", "device_id_hash", "list_type")

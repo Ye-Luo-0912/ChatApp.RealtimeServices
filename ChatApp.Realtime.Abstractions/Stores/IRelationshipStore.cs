@@ -1,4 +1,5 @@
 using ChatApp.Realtime.Abstractions.Relationships;
+using ChatApp.Realtime.Abstractions.Sync;
 
 namespace ChatApp.Realtime.Abstractions.Stores;
 
@@ -59,6 +60,18 @@ public interface IRelationshipStore
     Task<IReadOnlyList<RelationshipListItem>> ListBlockedUsersAsync(
         long actorUserId, int? pageSize, string? cursor,
         long afterChangedAtMs = 0, CancellationToken ct = default);
+
+    /// <summary>
+    /// 读取指定列表类型从 afterSequence 起的增量变更日志（按 change_sequence 升序）。
+    /// limit 上限为 limit+1 条以便调用方判断 hasMore。
+    /// </summary>
+    Task<IReadOnlyList<RelationshipChangeLogEntry>> ListChangesAsync(
+        long userId, RelationshipListType listType, long afterSequence, int limit, CancellationToken ct = default);
+
+    /// <summary>
+    /// 读取指定列表类型仍保留的最旧 change_sequence（retention floor）。无记录时返回 0。
+    /// </summary>
+    Task<long> GetRelationshipRetentionFloorAsync(long userId, RelationshipListType listType, CancellationToken ct = default);
 }
 
 /// <summary>关系变更持久化结果。</summary>

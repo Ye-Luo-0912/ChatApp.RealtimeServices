@@ -50,7 +50,7 @@ public sealed class NpgsqlRelationshipSyncCursorStore : IRelationshipSyncCursorS
             results.Add(new RelationshipSyncCursor
             {
                 ListType = reader.GetByte(0),
-                AfterChangedAtMs = reader.GetInt64(1),
+                AfterSequence = reader.GetInt64(1),
                 UpdatedAtMs = reader.GetInt64(2),
                 LastSeenAtMs = reader.GetInt64(3),
             });
@@ -76,20 +76,20 @@ public sealed class NpgsqlRelationshipSyncCursorStore : IRelationshipSyncCursorS
             await using var command = new NpgsqlCommand(
                 $"""
                  INSERT INTO {_schema.RelationshipSyncCursorsTableSql}
-                 ("user_id", "device_id_hash", "list_type", "after_changed_at_ms", "updated_at_ms", "last_seen_at_ms")
+                 ("user_id", "device_id_hash", "list_type", "after_sequence", "updated_at_ms", "last_seen_at_ms")
                  VALUES (@uid, @did, @lt, @ac, @upd, @ls)
                  ON CONFLICT ("user_id", "device_id_hash", "list_type")
                  DO UPDATE SET
-                     "after_changed_at_ms" = EXCLUDED."after_changed_at_ms",
+                     "after_sequence" = EXCLUDED."after_sequence",
                      "updated_at_ms" = EXCLUDED."updated_at_ms",
                      "last_seen_at_ms" = EXCLUDED."last_seen_at_ms"
-                 WHERE {_schema.RelationshipSyncCursorsTableSql}."after_changed_at_ms" < EXCLUDED."after_changed_at_ms"
+                 WHERE {_schema.RelationshipSyncCursorsTableSql}."after_sequence" < EXCLUDED."after_sequence"
                  """,
                 connection);
             command.Parameters.AddWithValue("uid", userId);
             command.Parameters.AddWithValue("did", (long)deviceIdHash);
             command.Parameters.AddWithValue("lt", (short)cursor.ListType);
-            command.Parameters.AddWithValue("ac", cursor.AfterChangedAtMs);
+            command.Parameters.AddWithValue("ac", cursor.AfterSequence);
             command.Parameters.AddWithValue("upd", now);
             command.Parameters.AddWithValue("ls", now);
             await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);

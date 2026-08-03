@@ -46,7 +46,7 @@ public interface IRelationshipSyncCursorStore
 public sealed class RelationshipSyncCursor
 {
     public required byte ListType { get; init; }
-    public long AfterChangedAtMs { get; init; }
+    public long AfterSequence { get; init; }
     public long UpdatedAtMs { get; init; }
     public long LastSeenAtMs { get; init; }
 }

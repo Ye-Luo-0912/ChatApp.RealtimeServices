@@ -1,4 +1,5 @@
 using ChatApp.Realtime.Abstractions.Relationships;
+using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Abstractions.Stores;
 
 namespace ChatApp.Realtime.Infrastructure.Core.Stores;
@@ -58,4 +59,11 @@ public sealed class NoopRelationshipStore : IRelationshipStore
         long actorUserId, int? pageSize, string? cursor,
         long afterChangedAtMs = 0, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<RelationshipListItem>>(Array.Empty<RelationshipListItem>());
-}
+
+    public Task<IReadOnlyList<RelationshipChangeLogEntry>> ListChangesAsync(
+        long userId, RelationshipListType listType, long afterSequence, int limit, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<RelationshipChangeLogEntry>>(Array.Empty<RelationshipChangeLogEntry>());
+
+    public Task<long> GetRelationshipRetentionFloorAsync(
+        long userId, RelationshipListType listType, CancellationToken ct = default) =>
+        Task.FromResult(0L);}
