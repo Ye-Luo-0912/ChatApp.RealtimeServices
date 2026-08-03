@@ -45,17 +45,27 @@ public sealed class NpgsqlRealtimeReadReceiptStore : IRealtimeReadReceiptStore
             .OpenConnectionAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        // 查询已读该消息的活跃成员（排除查询者自身），按 user_id 分页。
+        // 四-1：JOIN messages 表验证 viewerUserId 是消息发送者，且消息属于该会话。
+        // 同时检查 membership 在消息产生时已入群且未离群。
         var sql = $"""
-            SELECT user_id, last_read_at_ms
-            FROM {_schema.ConversationMembersTableSql}
-            WHERE conversation_id = @conversation_id
-              AND left_at_ms IS NULL
-              AND user_id <> @viewer_user_id
-              AND last_read_sequence IS NOT NULL
-              AND last_read_sequence >= @conversation_sequence
-              AND (@cursor IS NULL OR user_id > @cursor)
-            ORDER BY user_id
+            SELECT cm.user_id, cm.last_read_at_ms
+            FROM {_schema.ConversationMembersTableSql} cm
+            INNER JOIN {_schema.MessagesTableSql} m
+                ON m.conversation_id = cm.conversation_id
+                AND m.conversation_sequence = @conversation_sequence
+            LEFT JOIN {_schema.MembershipPeriodsTableSql} mp
+                ON mp.conversation_id = cm.conversation_id
+                AND mp.user_id = cm.user_id
+                AND mp.joined_at_ms <= m.created_at_ms
+                AND (mp.left_at_ms IS NULL OR mp.left_at_ms > m.created_at_ms)
+            WHERE cm.conversation_id = @conversation_id
+              AND cm.user_id <> @viewer_user_id
+              AND m.sender_user_id = @viewer_user_id
+              AND cm.last_read_sequence IS NOT NULL
+              AND cm.last_read_sequence >= @conversation_sequence
+              AND cm.left_at_ms IS NULL
+              AND (@cursor IS NULL OR cm.user_id > @cursor)
+            ORDER BY cm.user_id
             LIMIT @page_size;
             """;
 
@@ -109,13 +119,22 @@ public sealed class NpgsqlRealtimeReadReceiptStore : IRealtimeReadReceiptStore
 
         var sql = $"""
             SELECT
-                COUNT(*) FILTER (WHERE last_read_sequence IS NOT NULL
-                                  AND last_read_sequence >= @conversation_sequence) AS read_count,
+                COUNT(*) FILTER (WHERE cm.last_read_sequence IS NOT NULL
+                                  AND cm.last_read_sequence >= @conversation_sequence) AS read_count,
                 COUNT(*) AS total_count
-            FROM {_schema.ConversationMembersTableSql}
-            WHERE conversation_id = @conversation_id
-              AND left_at_ms IS NULL
-              AND user_id <> @viewer_user_id;
+            FROM {_schema.ConversationMembersTableSql} cm
+            INNER JOIN {_schema.MessagesTableSql} m
+                ON m.conversation_id = cm.conversation_id
+                AND m.conversation_sequence = @conversation_sequence
+            LEFT JOIN {_schema.MembershipPeriodsTableSql} mp
+                ON mp.conversation_id = cm.conversation_id
+                AND mp.user_id = cm.user_id
+                AND mp.joined_at_ms <= m.created_at_ms
+                AND (mp.left_at_ms IS NULL OR mp.left_at_ms > m.created_at_ms)
+            WHERE cm.conversation_id = @conversation_id
+              AND cm.user_id <> @viewer_user_id
+              AND m.sender_user_id = @viewer_user_id
+              AND cm.left_at_ms IS NULL;
             """;
 
         await using var command = new NpgsqlCommand(sql, connection);
@@ -128,8 +147,11 @@ public sealed class NpgsqlRealtimeReadReceiptStore : IRealtimeReadReceiptStore
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             return new MessageReadSummary { ReadCount = 0, TotalMemberCount = 0, IsSmallGroup = true };
 
-        var readCount = reader.GetInt32(0);
-        var totalCount = reader.GetInt32(1);
+        // 四-2：COUNT(*) 返回 bigint，使用 GetInt64 后做 checked/clamp 转换。
+        var readCount64 = reader.GetInt64(0);
+        var totalCount64 = reader.GetInt64(1);
+        var readCount = checked((int)readCount64);
+        var totalCount = checked((int)totalCount64);
 
         return new MessageReadSummary
         {

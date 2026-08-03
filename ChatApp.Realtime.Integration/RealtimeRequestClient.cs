@@ -1,8 +1,11 @@
 using System.Text.Json;
+using ChatApp.Realtime.Abstractions.Attachments;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
+using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Protocol;
+using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.Ephemeral;
@@ -127,6 +130,67 @@ internal sealed class RealtimeRequestClient
                ?? throw new JsonException("群会话操作响应无法反序列化。");
     }
 
+
+    public async Task<AttachmentFinalizeResult> FinalizeAttachmentUploadAsync(
+        AttachmentFinalizeCommand command,
+        CancellationToken ct = default)
+    {
+        var data = await RequestRawAsync(
+            "attachment_finalize.request",
+            _options.AttachmentFinalizeSubject,
+            RealtimeWireSerializer.Serialize(command),
+            command.ActorUserId,
+            command.ActorSessionId,
+            timeoutMs: _options.HistoryRequestTimeoutMs,
+            ct).ConfigureAwait(false);
+
+        if (data is null)
+            throw new JsonException("附件上传确认返回了空响应。");
+
+        return RealtimeWireSerializer.DeserializeAttachmentFinalizeResult(data)
+               ?? throw new JsonException("附件上传确认响应无法反序列化。");
+    }
+
+    public async Task<RelationshipCommandResult> MutateRelationshipAsync(
+        RelationshipCommand command,
+        CancellationToken ct = default)
+    {
+        var data = await RequestRawAsync(
+            "relationship_command.request",
+            _options.RelationshipCommandsSubject,
+            RealtimeWireSerializer.Serialize(command),
+            command.ActorUserId,
+            command.ActorSessionId,
+            timeoutMs: _options.HistoryRequestTimeoutMs,
+            ct).ConfigureAwait(false);
+
+        if (data is null)
+            throw new JsonException("关系操作返回了空响应。");
+
+        return RealtimeWireSerializer.DeserializeRelationshipCommandResult(data)
+               ?? throw new JsonException("关系操作响应无法反序列化。");
+    }
+
+    public async Task<RelationshipListResult> QueryRelationshipListAsync(
+        RelationshipListQuery query,
+        CancellationToken ct = default)
+    {
+        var data = await RequestRawAsync(
+            "relationship_list.query",
+            _options.RelationshipListQueriesSubject,
+            RealtimeWireSerializer.Serialize(query),
+            query.ActorUserId,
+            query.ActorSessionId,
+            timeoutMs: _options.HistoryRequestTimeoutMs,
+            ct).ConfigureAwait(false);
+
+        if (data is null)
+            throw new JsonException("关系列表查询返回了空响应。");
+
+        return RealtimeWireSerializer.DeserializeRelationshipListResult(data)
+               ?? throw new JsonException("关系列表查询响应无法反序列化。");
+    }
+
     public async Task<MessageRecallResult> RecallMessageAsync(
         MessageRecallCommand command,
         CancellationToken ct = default)
@@ -249,6 +313,29 @@ internal sealed class RealtimeRequestClient
 
         return RealtimeWireSerializer.DeserializePresenceAuthorizeResponse(data)
                ?? new PresenceAuthorizeResponse { AllowedUserIds = [] };
+    }
+
+    public async Task<UserLifecycleResponse> QueryUserLifecycleAsync(
+        UserLifecycleQuery query,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        // 三-3：fail-open — 空响应或反序列化为 null 时返回 Active（不抛异常），
+        // 保证 FrozenUserCache 后台刷新失败时不阻断 Presence/消息路径。
+        var data = await RequestRawAsync(
+            "user_lifecycle.request",
+            _options.UserLifecycleQuerySubject,
+            RealtimeWireSerializer.Serialize(query),
+            query.UserId,
+            sessionId: null,
+            timeoutMs: Math.Max(500, _options.HistoryRequestTimeoutMs),
+            ct).ConfigureAwait(false);
+
+        if (string.IsNullOrWhiteSpace(data))
+            return new UserLifecycleResponse { State = UserLifecycleState.Active };
+
+        return RealtimeWireSerializer.DeserializeUserLifecycleResponse(data)
+               ?? new UserLifecycleResponse { State = UserLifecycleState.Active };
     }
 
     /// <summary>

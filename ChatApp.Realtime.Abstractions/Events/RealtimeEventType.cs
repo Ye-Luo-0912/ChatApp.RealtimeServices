@@ -119,4 +119,10 @@ public enum RealtimeEventType : byte
     /// 客户端据此明确识别群已解散，与普通 ConversationChanged 区分。
     /// </summary>
     ConversationDissolved = 23,
+
+    /// <summary>
+    /// 三-3：用户生命周期变更（冻结/解冻）。Payload：<c>RealtimeUserLifecycleChangedPayload</c>。
+    /// Server 冻结/解冻用户时发布；Gateway 收到后更新 FrozenUserCache 并关闭冻结用户的活跃会话。
+    /// </summary>
+    UserLifecycleChanged = 24,
 }

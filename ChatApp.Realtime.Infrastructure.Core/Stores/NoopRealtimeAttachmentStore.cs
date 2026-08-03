@@ -78,4 +78,15 @@ public sealed class NoopRealtimeAttachmentStore(ILogger<NoopRealtimeAttachmentSt
         logger.LogCritical("未配置附件存储，拒绝按 ID 批量删除附件。数量={Count}", attachmentIds.Count);
         throw new InvalidOperationException("未配置真实附件存储。");
     }
+    public Task<AttachmentFinalizePersistResult> FinalizeUploadAsync(
+        long actorUserId,
+        string attachmentId,
+        long sizeBytes,
+        string? contentHash,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        logger.LogCritical("未配置附件存储，拒绝确认上传。附件={AttachmentId}", attachmentId);
+        throw new InvalidOperationException("未配置真实附件存储。");
+    }
 }

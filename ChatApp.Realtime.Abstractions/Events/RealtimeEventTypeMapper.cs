@@ -24,6 +24,7 @@ public static class RealtimeEventTypeMapper
             RealtimeEventNames.MembersAdded => RealtimeEventType.MembersAdded,
             RealtimeEventNames.ConversationRead => RealtimeEventType.ConversationRead,
             RealtimeEventNames.ConversationDissolved => RealtimeEventType.ConversationDissolved,
+            RealtimeEventNames.UserLifecycleChanged => RealtimeEventType.UserLifecycleChanged,
             _ => throw new ArgumentOutOfRangeException(nameof(businessName), businessName, null)
         };
 }

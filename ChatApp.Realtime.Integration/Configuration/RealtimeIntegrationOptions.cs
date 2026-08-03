@@ -21,6 +21,9 @@ public sealed class RealtimeIntegrationOptions
     public string MessageReactionsSubject { get; set; } = "chat.message-reaction";
     public string SyncBootstrapQueriesSubject { get; set; } = "chat.sync.bootstrap";
     public string GroupConversationsSubject { get; set; } = "chat.group-conversation";
+    public string AttachmentFinalizeSubject { get; set; } = "chat.attachment-finalize";
+    public string RelationshipCommandsSubject { get; set; } = "chat.relationship.command";
+    public string RelationshipListQueriesSubject { get; set; } = "chat.relationship-list.query";
     public string DeadLettersSubject { get; set; } = "chat.dead-letters";
 
     /// <summary>推送投递命令 subject（RealtimeServices 发布，Gateway 消费后执行实际推送）。</summary>
@@ -34,6 +37,8 @@ public sealed class RealtimeIntegrationOptions
 
     /// <summary>NATS Core request/reply：Presence 好友鉴权。</summary>
     public string PresenceAuthorizeSubject { get; set; } = "chat.presence.authorize";
+    /// <summary>NATS Core request/reply：用户生命周期查询（冻结/解冻）。</summary>
+    public string UserLifecycleQuerySubject { get; set; } = "realtime.user.lifecycle.query";
 
     public string IncomingMessagesStream { get; set; } = "INCOMING_MESSAGES";
     public string MessageReceiptsStream { get; set; } = "MESSAGE_RECEIPTS";

@@ -77,6 +77,20 @@ public static class RealtimePostgresRegistration
                 sp.GetRequiredService<IGroupOperationAuditStore>(),
                 sp.GetRequiredService<IMembershipPeriodStore>(),
                 sp.GetRequiredService<IUserExistenceChecker>()));
+            services.RemoveAll<IUserExistenceChecker>();
+            services.AddSingleton<IUserExistenceChecker, NpgsqlUserExistenceChecker>();
+            services.RemoveAll<IBlockListStore>();
+            services.AddSingleton<IBlockListStore, NpgsqlBlockListStore>();
+            services.RemoveAll<IRelationshipStore>();
+            services.AddSingleton<IRelationshipStore>(sp => new NpgsqlRelationshipStore(
+                sp.GetRequiredService<RealtimeDatabaseClient>(),
+                sp.GetRequiredService<RealtimeDatabaseSchema>()));
+            services.RemoveAll<IDirectMessagePolicy>();
+            services.AddSingleton<IDirectMessagePolicy, NpgsqlDirectMessagePolicy>();
+            services.RemoveAll<IPrivacySettingStore>();
+            services.AddSingleton<IPrivacySettingStore, NpgsqlPrivacySettingStore>();
+            services.RemoveAll<IMessageRateLimiter>();
+            services.AddSingleton<IMessageRateLimiter, NpgsqlMessageRateLimiter>();
             services.RemoveAll<IRealtimeDeviceSyncCursorStore>();
             services.AddSingleton<IRealtimeDeviceSyncCursorStore, NpgsqlRealtimeDeviceSyncCursorStore>();
             services.RemoveAll<IRealtimeOutboxStore>();
@@ -149,3 +163,4 @@ public static class RealtimePostgresRegistration
                && messageStoreProvider.Equals("Npgsql", StringComparison.OrdinalIgnoreCase);
     }
 }
+

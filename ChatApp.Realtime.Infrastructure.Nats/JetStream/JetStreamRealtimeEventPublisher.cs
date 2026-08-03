@@ -24,7 +24,7 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
     private readonly RoutingMetrics? _routingMetrics;
     private readonly RealtimeMetrics? _realtimeMetrics;
     private readonly ILogger<JetStreamRealtimeEventPublisher>? _logger;
-    private readonly IRealtimeMessageBus? _messageBus;
+    private readonly PushDeliveryTrigger? _pushTrigger;
 
     public JetStreamRealtimeEventPublisher(
         JetStreamContextManager contextManager,
@@ -50,7 +50,7 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
         _routingMetrics = routingMetrics;
         _realtimeMetrics = realtimeMetrics;
         _logger = logger;
-        _messageBus = messageBus;
+        _pushTrigger = messageBus is not null ? new PushDeliveryTrigger(messageBus, realtimeMetrics, logger) : null;
     }
 
     /// <summary>Perf-4：旧入口，回退到序列化路径。实际逻辑在 <see cref="PublishWithPayloadAsync"/>。</summary>
@@ -108,7 +108,7 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
         {
             // 查询成功但用户离线：触发离线推送。
             _routingMetrics?.RecordBroadcastFallback("realtime", "user_offline");
-            await TriggerPushDeliveryAsync(evt, evt.TargetUserId, ct).ConfigureAwait(false);
+            await _pushTrigger!.TriggerAsync(evt, evt.TargetUserId, ct).ConfigureAwait(false);
             return;
         }
 
@@ -223,13 +223,13 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
         }
 
         // 离线用户触发推送（群消息场景）：Gateway 列表为空表示该用户当前无在线会话。
-        if (_messageBus is not null && evt.Type == RealtimeEventType.MessageReceived)
+        if (_pushTrigger is not null && evt.Type == RealtimeEventType.MessageReceived)
         {
             foreach (var kvp in lookup.GatewayMap)
             {
                 if (kvp.Value is null || kvp.Value.Count == 0)
                 {
-                    await TriggerPushDeliveryAsync(evt, kvp.Key, ct).ConfigureAwait(false);
+                    await _pushTrigger.TriggerAsync(evt, kvp.Key, ct).ConfigureAwait(false);
                 }
             }
         }
@@ -392,81 +392,5 @@ public sealed class JetStreamRealtimeEventPublisher : IRealtimeEventPublisher
         await _contextManager
             .PublishRealtimeEventToSubjectAsync(subject, msgId, payload, ct)
             .ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// 离线推送触发：目标用户离线时构造 <see cref="PushDeliveryCommand"/> 并通过
-    /// <see cref="IRealtimeMessageBus.PublishPushDeliveryAsync"/> 发布到 NATS，由 Push 投递方消费执行实际推送。
-    /// <para>仅对 <see cref="RealtimeEventType.MessageReceived"/> 触发；回执/编辑/撤回等事件不推送。</para>
-    /// <para>fire-and-forget：推送失败仅记录日志，不影响主消息投递流程。</para>
-    /// </summary>
-    private async Task TriggerPushDeliveryAsync(RealtimeEvent evt, long targetUserId, CancellationToken ct)
-    {
-        if (_messageBus is null)
-            return;
-
-        // 仅对聊天消息触发推送（收据/编辑/撤回等不推送）。
-        if (evt.Type != RealtimeEventType.MessageReceived)
-            return;
-
-        try
-        {
-            var command = BuildPushCommand(evt, targetUserId);
-            await _messageBus.PublishPushDeliveryAsync(command, ct).ConfigureAwait(false);
-            _realtimeMetrics?.RecordPushTriggered(command.IsMention);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            // 推送失败不影响主流程
-            _logger?.LogWarning(ex, "Failed to publish push delivery for user {TargetUserId}", targetUserId);
-        }
-    }
-
-    /// <summary>
-    /// 从 <see cref="RealtimeEvent"/> 构造 <see cref="PushDeliveryCommand"/>。
-    /// 反序列化 <see cref="RealtimeEvent.PayloadJson"/> 为 <see cref="RealtimeChatMessagePayload"/>
-    /// 提取消息正文与 @mention 信息；解析失败回退到默认文案。
-    /// </summary>
-    private static PushDeliveryCommand BuildPushCommand(RealtimeEvent evt, long targetUserId)
-    {
-        const string defaultTitle = "New Message";
-        const string defaultBody = "You have a new message";
-        string title = defaultTitle;
-        string body = defaultBody;
-        bool isMention = false;
-
-        if (!string.IsNullOrEmpty(evt.PayloadJson))
-        {
-            try
-            {
-                var payload = JsonSerializer.Deserialize(
-                    evt.PayloadJson, RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload);
-                if (payload is not null)
-                {
-                    body = payload.Content;
-                    // Check if target user is mentioned
-                    if (payload.MentionedUserIds is not null && payload.MentionedUserIds.Count > 0)
-                    {
-                        isMention = payload.MentionedUserIds.Contains(targetUserId);
-                    }
-                }
-            }
-            catch (JsonException)
-            {
-                // Fall back to defaults
-            }
-        }
-
-        return new PushDeliveryCommand
-        {
-            TargetUserId = targetUserId,
-            Title = title,
-            Body = body,
-            ConversationId = evt.ConversationId,
-            MessageId = evt.MessageId,
-            SenderDisplayName = null,
-            IsMention = isMention,
-            OccurredAtMs = evt.OccurredAtMs
-        };
     }
 }

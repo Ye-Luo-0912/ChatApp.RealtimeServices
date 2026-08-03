@@ -25,6 +25,16 @@ public interface IRealtimeAttachmentStore
         long uploaderUserId,
         IReadOnlyList<string> attachmentIds,
         CancellationToken ct = default);
+    /// <summary>
+    /// 确认附件上传完成：Ticketed(0) → Uploaded(4)。
+    /// 幂等：已是 Uploaded 返回成功；状态不符返回失败。
+    /// </summary>
+    Task<AttachmentFinalizePersistResult> FinalizeUploadAsync(
+        long actorUserId,
+        string attachmentId,
+        long sizeBytes,
+        string? contentHash,
+        CancellationToken ct = default);
 
     Task<IReadOnlyList<RealtimeAttachmentRecord>> ListByMessageIdsAsync(
         IReadOnlyList<string> messageIds,
@@ -64,4 +74,17 @@ public interface IRealtimeAttachmentStore
     Task<int> DeleteByAttachmentIdsAsync(
         IReadOnlyList<string> attachmentIds,
         CancellationToken ct = default);
+}
+
+public readonly record struct AttachmentFinalizePersistResult(
+    bool Succeeded,
+    string? ErrorCode,
+    string? ErrorMessage,
+    RealtimeAttachmentRecord? Record)
+{
+    public static AttachmentFinalizePersistResult Ok(RealtimeAttachmentRecord record) =>
+        new(true, null, null, record);
+
+    public static AttachmentFinalizePersistResult Fail(string errorCode, string errorMessage) =>
+        new(false, errorCode, errorMessage, null);
 }

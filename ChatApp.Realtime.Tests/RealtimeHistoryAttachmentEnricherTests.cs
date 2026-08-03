@@ -89,6 +89,14 @@ public sealed class RealtimeHistoryAttachmentEnricherTests
             CancellationToken ct = default) =>
             throw new NotSupportedException();
 
+        public Task<AttachmentFinalizePersistResult> FinalizeUploadAsync(
+            long actorUserId,
+            string attachmentId,
+            long sizeBytes,
+            string? contentHash,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
         public Task<int> BindToMessageAsync(
             string messageId,
             string? conversationId,

@@ -1,8 +1,10 @@
+using ChatApp.Realtime.Abstractions.Attachments;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
+using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration.Configuration;
@@ -151,6 +153,21 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
         CancellationToken ct = default)
         => _requestClient.MutateGroupConversationAsync(command, ct);
 
+    public Task<AttachmentFinalizeResult> FinalizeAttachmentUploadAsync(
+        AttachmentFinalizeCommand command,
+        CancellationToken ct = default)
+        => _requestClient.FinalizeAttachmentUploadAsync(command, ct);
+
+    public Task<RelationshipCommandResult> MutateRelationshipAsync(
+        RelationshipCommand command,
+        CancellationToken ct = default)
+        => _requestClient.MutateRelationshipAsync(command, ct);
+
+    public Task<RelationshipListResult> QueryRelationshipListAsync(
+        RelationshipListQuery query,
+        CancellationToken ct = default)
+        => _requestClient.QueryRelationshipListAsync(query, ct);
+
     public Task<MessageRecallResult> RecallMessageAsync(
         MessageRecallCommand command,
         CancellationToken ct = default)
@@ -217,6 +234,16 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
         Func<PresenceAuthorizeQuery, CancellationToken, ValueTask<PresenceAuthorizeResponse>> handler,
         CancellationToken ct = default)
         => _ephemeralEventBus.ServePresenceAuthorizeAsync(handler, ct);
+
+    public Task<UserLifecycleResponse> QueryUserLifecycleAsync(
+        UserLifecycleQuery query,
+        CancellationToken ct = default)
+        => _requestClient.QueryUserLifecycleAsync(query, ct);
+
+    public Task ServeUserLifecycleQueryAsync(
+        Func<UserLifecycleQuery, CancellationToken, ValueTask<UserLifecycleResponse>> handler,
+        CancellationToken ct = default)
+        => _ephemeralEventBus.ServeUserLifecycleQueryAsync(handler, ct);
 
     public Task<TimeSpan> PingAsync(CancellationToken ct = default)
         => _connectionProvider.PingAsync(ct);

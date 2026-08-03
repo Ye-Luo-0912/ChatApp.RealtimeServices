@@ -1,6 +1,8 @@
 using System.Text.Json.Serialization;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Attachments;
+using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Sync;
@@ -72,8 +74,19 @@ namespace ChatApp.Realtime.Integration.Serialization;
 [JsonSerializable(typeof(EphemeralPresenceEvent))]
 [JsonSerializable(typeof(PresenceAuthorizeQuery))]
 [JsonSerializable(typeof(PresenceAuthorizeResponse))]
+[JsonSerializable(typeof(UserLifecycleQuery))]
+[JsonSerializable(typeof(UserLifecycleResponse))]
+[JsonSerializable(typeof(RealtimeUserLifecycleChangedPayload))]
 [JsonSerializable(typeof(List<long>))]
 [JsonSerializable(typeof(PushDeliveryCommand))]
+[JsonSerializable(typeof(AttachmentFinalizeCommand))]
+[JsonSerializable(typeof(AttachmentFinalizeResult))]
+[JsonSerializable(typeof(RelationshipCommand))]
+[JsonSerializable(typeof(RelationshipCommandResult))]
+[JsonSerializable(typeof(RelationshipListQuery))]
+[JsonSerializable(typeof(RelationshipListResult))]
+[JsonSerializable(typeof(RelationshipListItem))]
+[JsonSerializable(typeof(List<RelationshipListItem>))]
 internal sealed partial class RealtimeIntegrationJsonContext : JsonSerializerContext
 {
 }

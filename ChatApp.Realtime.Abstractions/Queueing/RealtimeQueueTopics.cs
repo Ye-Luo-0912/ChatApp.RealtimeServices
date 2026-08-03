@@ -20,6 +20,9 @@ public sealed class RealtimeQueueTopics
     public string MessageReactions { get; init; } = "chat.message-reaction";
     public string SyncBootstrapQueries { get; init; } = "chat.sync.bootstrap";
     public string GroupConversations { get; init; } = "chat.group-conversation";
+    public string AttachmentFinalize { get; init; } = "chat.attachment-finalize";
+    public string RelationshipCommands { get; init; } = "chat.relationship.command";
+    public string RelationshipListQueries { get; init; } = "chat.relationship-list.query";
     public string? MessagePersistence { get; init; }
     public string DeadLetters { get; init; } = "chat.dead-letters";
 }

@@ -30,6 +30,9 @@ public sealed class RealtimeDatabaseSchema
     public string SchemaMigrationCheckpointsTableSql =>
         $"{QuotedSchema}.\"schema_migration_checkpoints\"";
 
+    public string FriendRequestsTableSql => $"{QuotedSchema}.\"friend_requests\"";
+    public string FriendshipsTableSql => $"{QuotedSchema}.\"friendships\"";
+    public string RelationshipMutationRequestsTableSql => $"{QuotedSchema}.\"relationship_mutation_requests\"";
     public static string QuoteIdentifier(string identifier)
     {
         if (string.IsNullOrWhiteSpace(identifier))

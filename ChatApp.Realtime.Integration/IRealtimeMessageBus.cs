@@ -1,7 +1,10 @@
+using ChatApp.Realtime.Abstractions.Attachments;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
+using ChatApp.Realtime.Abstractions.Relationships;
+using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Integration.Ephemeral;
 using ChatApp.Realtime.Integration.Push;
@@ -27,6 +30,21 @@ public interface IRealtimeMessageBus
     Task<GroupConversationResult> MutateGroupConversationAsync(
         GroupConversationCommand command,
         CancellationToken ct = default);
+    /// <summary>附件上传确认：Ticketed → Uploaded 状态转换。</summary>
+    Task<AttachmentFinalizeResult> FinalizeAttachmentUploadAsync(
+        AttachmentFinalizeCommand command,
+        CancellationToken ct = default);
+
+    /// <summary>关系变更命令（发送/接受/拒绝好友请求、删除好友、拉黑/取消拉黑）。</summary>
+    Task<RelationshipCommandResult> MutateRelationshipAsync(
+        RelationshipCommand command,
+        CancellationToken ct = default);
+
+    /// <summary>关系列表查询（好友 / 好友请求 / 黑名单）。</summary>
+    Task<RelationshipListResult> QueryRelationshipListAsync(
+        RelationshipListQuery query,
+        CancellationToken ct = default);
+
     Task<MessageRecallResult> RecallMessageAsync(
         MessageRecallCommand command,
         CancellationToken ct = default);
@@ -89,6 +107,23 @@ public interface IRealtimeMessageBus
     Task ServePresenceAuthorizeAsync(
         Func<PresenceAuthorizeQuery, CancellationToken, ValueTask<PresenceAuthorizeResponse>> handler,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// 三-3：Gateway → Server：查询单个用户生命周期状态（FrozenUserCache 后台刷新）。
+    /// 默认实现返回 Active（fail-open），生产路径由 NatsRealtimeMessageBus 覆盖。
+    /// </summary>
+    Task<UserLifecycleResponse> QueryUserLifecycleAsync(
+        UserLifecycleQuery query,
+        CancellationToken ct = default)
+        => Task.FromResult(new UserLifecycleResponse { State = UserLifecycleState.Active });
+
+    /// <summary>
+    /// 三-3：Server 侧：订阅用户生命周期查询 request/reply 并调用 handler 回复。
+    /// </summary>
+    Task ServeUserLifecycleQueryAsync(
+        Func<UserLifecycleQuery, CancellationToken, ValueTask<UserLifecycleResponse>> handler,
+        CancellationToken ct = default)
+        => Task.CompletedTask;
 
     Task<TimeSpan> PingAsync(CancellationToken ct = default);
 }

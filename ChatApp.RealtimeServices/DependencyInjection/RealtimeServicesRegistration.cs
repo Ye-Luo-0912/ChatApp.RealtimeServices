@@ -102,6 +102,9 @@ public static class RealtimeServicesRegistration
         services.AddHostedService<ConversationMarkReadWorker>();
         services.AddHostedService<ConversationSetPrefsWorker>();
         services.AddHostedService<GroupConversationWorker>();
+        services.AddHostedService<AttachmentFinalizeWorker>();
+        services.AddHostedService<RelationshipCommandWorker>();
+        services.AddHostedService<RelationshipListQueryWorker>();
         services.AddHostedService<MessageRecallWorker>();
         services.AddHostedService<MessageEditWorker>();
         services.AddHostedService<MessageReactionWorker>();
@@ -391,6 +394,7 @@ public static class RealtimeServicesRegistration
                 MessageReactions = options.Subjects.MessageReactions,
                 SyncBootstrapQueries = options.Subjects.SyncBootstrapQueries,
                 GroupConversations = options.Subjects.GroupConversations,
+                AttachmentFinalize = options.Subjects.AttachmentFinalize,
                 MessagePersistence = options.Subjects.MessagePersistence,
                 DeadLetters = options.Subjects.DeadLetters
             },

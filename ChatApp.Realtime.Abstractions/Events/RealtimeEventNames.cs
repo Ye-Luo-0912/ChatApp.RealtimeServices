@@ -56,4 +56,7 @@ public static class RealtimeEventNames
 
     /// <summary>业务名 ConversationDissolved → 线协议 <see cref="RealtimeEventType.ConversationDissolved"/>。</summary>
     public const string ConversationDissolved = "conversation_dissolved";
+
+    /// <summary>业务名 UserLifecycleChanged → 线协议 <see cref="RealtimeEventType.UserLifecycleChanged"/>。</summary>
+    public const string UserLifecycleChanged = "user_lifecycle_changed";
 }

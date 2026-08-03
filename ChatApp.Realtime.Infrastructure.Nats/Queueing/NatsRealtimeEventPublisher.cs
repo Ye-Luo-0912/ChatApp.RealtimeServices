@@ -6,6 +6,7 @@ using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
+using ChatApp.Realtime.Integration;
 using ChatApp.Realtime.Infrastructure.Nats.Diagnostics;
 using Microsoft.Extensions.Logging;
 
@@ -21,6 +22,7 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
     private readonly ILogger<NatsRealtimeEventPublisher> _logger;
     private readonly RoutingMetrics? _routingMetrics;
     private readonly RealtimeMetrics? _realtimeMetrics;
+    private readonly PushDeliveryTrigger? _pushTrigger;
 
     public NatsRealtimeEventPublisher(
         RealtimeQueueOptions options,
@@ -30,7 +32,8 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
         string? shardSubjectPattern = null,
         RoutingMetrics? routingMetrics = null,
         IWatcherGatewayDirectory? watcherGatewayDirectory = null,
-        RealtimeMetrics? realtimeMetrics = null)
+        RealtimeMetrics? realtimeMetrics = null,
+        IRealtimeMessageBus? messageBus = null)
     {
         _options = options;
         _connectionClient = connectionClient;
@@ -42,6 +45,7 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
             : shardSubjectPattern;
         _routingMetrics = routingMetrics;
         _realtimeMetrics = realtimeMetrics;
+        _pushTrigger = messageBus is not null ? new PushDeliveryTrigger(messageBus, realtimeMetrics, logger) : null;
     }
 
     /// <summary>Perf-4：旧入口，回退到序列化路径。实际逻辑在 <see cref="PublishWithPayloadAsync"/>。</summary>
@@ -102,8 +106,12 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
 
         if (lookup.Kind == GatewayLookupResultKind.UserOffline)
         {
-            // 查询成功但用户离线：正常不投递（避免无谓 fanout）。
+            // 查询成功但用户离线：触发离线推送（与 JetStream 版行为对齐）。
             _routingMetrics?.RecordBroadcastFallback("realtime", "user_offline");
+            if (_pushTrigger is not null)
+            {
+                await _pushTrigger.TriggerAsync(evt, evt.TargetUserId, ct).ConfigureAwait(false);
+            }
             return;
         }
 
@@ -177,6 +185,18 @@ public sealed class NatsRealtimeEventPublisher : IRealtimeEventPublisher
         }
 
         _routingMetrics?.RecordDirectoryQuery("gateway", "many", sw.Elapsed, instances.Count);
+
+        // 离线用户触发推送（群消息场景）：Gateway 列表为空表示该用户当前无在线会话。
+        if (_pushTrigger is not null && evt.Type == RealtimeEventType.MessageReceived)
+        {
+            foreach (var kvp in lookup.GatewayMap)
+            {
+                if (kvp.Value is null || kvp.Value.Count == 0)
+                {
+                    await _pushTrigger.TriggerAsync(evt, kvp.Key, ct).ConfigureAwait(false);
+                }
+            }
+        }
 
         // P0-9：批量查询失败时枚举所有活跃 shards 分别发布。
         if (lookup.Kind is GatewayLookupResultKind.LookupFailure

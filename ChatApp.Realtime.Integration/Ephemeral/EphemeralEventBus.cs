@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Routing;
+using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Integration.Configuration;
 using ChatApp.Realtime.Integration.Serialization;
 using Microsoft.Extensions.Logging;
@@ -321,6 +322,59 @@ internal sealed class EphemeralEventBus
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
                 _logger.LogWarning(ex, "PresenceAuthorize 回复失败");
+            }
+        }
+    }
+
+    public async Task ServeUserLifecycleQueryAsync(
+        Func<UserLifecycleQuery, CancellationToken, ValueTask<UserLifecycleResponse>> handler,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+        await foreach (var msg in _connectionProvider.Client.SubscribeAsync<string>(
+                           _options.UserLifecycleQuerySubject,
+                           cancellationToken: ct)
+                       .ConfigureAwait(false))
+        {
+            if (string.IsNullOrWhiteSpace(msg.Data) || string.IsNullOrWhiteSpace(msg.ReplyTo))
+                continue;
+
+            UserLifecycleQuery? query;
+            try
+            {
+                query = RealtimeWireSerializer.DeserializeUserLifecycleQuery(msg.Data);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "UserLifecycle 请求反序列化失败");
+                continue;
+            }
+
+            if (query is null)
+                continue;
+
+            UserLifecycleResponse response;
+            try
+            {
+                response = await handler(query, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "UserLifecycle handler 失败 UserId={UserId}", query.UserId);
+                response = new UserLifecycleResponse { State = UserLifecycleState.Active };
+            }
+
+            try
+            {
+                await _connectionProvider.Client.PublishAsync(
+                        msg.ReplyTo,
+                        RealtimeWireSerializer.Serialize(response),
+                        cancellationToken: ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                _logger.LogWarning(ex, "UserLifecycle 回复失败");
             }
         }
     }

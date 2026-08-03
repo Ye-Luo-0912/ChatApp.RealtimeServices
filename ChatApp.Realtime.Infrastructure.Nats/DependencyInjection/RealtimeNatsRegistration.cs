@@ -1,4 +1,6 @@
+using ChatApp.Realtime.Abstractions.Attachments;
 using ChatApp.Realtime.Abstractions.Conversations;
+using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
@@ -48,6 +50,8 @@ public static class RealtimeNatsRegistration
         services.AddSingleton<IConversationSetPrefsConsumer, NatsConversationSetPrefsConsumer>();
         services.RemoveAll<IGroupConversationConsumer>();
         services.AddSingleton<IGroupConversationConsumer, NatsGroupConversationConsumer>();
+        services.RemoveAll<IAttachmentFinalizeConsumer>();
+        services.AddSingleton<IAttachmentFinalizeConsumer, NatsAttachmentFinalizeConsumer>();
         services.RemoveAll<IMessageRecallConsumer>();
         services.AddSingleton<IMessageRecallConsumer, NatsMessageRecallConsumer>();
         services.RemoveAll<IMessageEditConsumer>();
@@ -56,6 +60,10 @@ public static class RealtimeNatsRegistration
         services.AddSingleton<IMessageReactionConsumer, NatsMessageReactionConsumer>();
         services.RemoveAll<ISyncBootstrapQueryConsumer>();
         services.AddSingleton<ISyncBootstrapQueryConsumer, NatsSyncBootstrapQueryConsumer>();
+        services.RemoveAll<IRelationshipCommandConsumer>();
+        services.AddSingleton<IRelationshipCommandConsumer, NatsRelationshipCommandConsumer>();
+        services.RemoveAll<IRelationshipListQueryConsumer>();
+        services.AddSingleton<IRelationshipListQueryConsumer, NatsRelationshipListQueryConsumer>();
 
         // Reliability-4：Null* 目录始终注册（查询路径的 IGatewayDirectory 依赖注入需要）。
         // Null* 仅暴露私有构造函数 + 静态 Instance（单例），不能用 TryAddSingleton<TImpl>

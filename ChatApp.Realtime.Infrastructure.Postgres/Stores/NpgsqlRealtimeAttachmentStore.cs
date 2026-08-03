@@ -150,6 +150,69 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
         };
     }
 
+    public async Task<AttachmentFinalizePersistResult> FinalizeUploadAsync(
+        long actorUserId,
+        string attachmentId,
+        long sizeBytes,
+        string? contentHash,
+        CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(actorUserId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(attachmentId);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(sizeBytes);
+
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var hash = string.IsNullOrWhiteSpace(contentHash) ? null : contentHash.Trim();
+
+        await using var command = new NpgsqlCommand(
+            $"""
+             UPDATE {_databaseSchema.AttachmentsTableSql}
+             SET status = @status,
+                 size_bytes = @size_bytes,
+                 content_hash = @content_hash,
+                 confirmed_at_ms = @confirmed_at_ms
+             WHERE attachment_id = @attachment_id
+               AND uploader_user_id = @uploader_user_id
+               AND status = @ticketed
+             RETURNING attachment_id, uploader_user_id, object_key, public_url, content_type,
+                       size_bytes, original_name, status, message_id, conversation_id,
+                       client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
+                       content_hash;
+             """,
+            connection);
+        command.Parameters.AddWithValue("status", (short)AttachmentStatus.Uploaded);
+        command.Parameters.AddWithValue("size_bytes", sizeBytes);
+        command.Parameters.AddWithValue("content_hash", (object?)hash ?? DBNull.Value);
+        command.Parameters.AddWithValue("confirmed_at_ms", now);
+        command.Parameters.AddWithValue("attachment_id", attachmentId);
+        command.Parameters.AddWithValue("uploader_user_id", actorUserId);
+        command.Parameters.AddWithValue("ticketed", (short)AttachmentStatus.Ticketed);
+
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            return AttachmentFinalizePersistResult.Ok(Map(reader));
+        }
+
+        var existing = await TryGetByIdAsync(connection, attachmentId, ct).ConfigureAwait(false);
+        if (existing is null)
+            return AttachmentFinalizePersistResult.Fail("not_found", "附件不存在。");
+        if (existing.UploaderUserId != actorUserId)
+            return AttachmentFinalizePersistResult.Fail("forbidden", "无权确认此附件。");
+        if (existing.Status == AttachmentStatus.Uploaded)
+        {
+            if (existing.SizeBytes != sizeBytes)
+                return AttachmentFinalizePersistResult.Fail("size_mismatch", "附件大小与已确认记录不一致。");
+            return AttachmentFinalizePersistResult.Ok(existing);
+        }
+        return AttachmentFinalizePersistResult.Fail("invalid_state", $"附件当前状态 {existing.Status} 不允许确认上传。");
+    }
+
     public async Task<int> BindToMessageAsync(
         string messageId,
         string? conversationId,

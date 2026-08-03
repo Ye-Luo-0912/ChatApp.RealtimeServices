@@ -1,6 +1,8 @@
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Attachments;
+using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Sync;
@@ -60,6 +62,11 @@ public static class RealtimeWireSerializer
 
     public static string Serialize(PresenceAuthorizeResponse response) =>
         JsonSerializer.Serialize(response, RealtimeIntegrationJsonContext.Default.PresenceAuthorizeResponse);
+    public static string Serialize(UserLifecycleQuery query) =>
+        JsonSerializer.Serialize(query, RealtimeIntegrationJsonContext.Default.UserLifecycleQuery);
+
+    public static string Serialize(UserLifecycleResponse response) =>
+        JsonSerializer.Serialize(response, RealtimeIntegrationJsonContext.Default.UserLifecycleResponse);
 
     public static EphemeralTypingEvent? DeserializeEphemeralTyping(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.EphemeralTypingEvent);
@@ -72,6 +79,11 @@ public static class RealtimeWireSerializer
 
     public static PresenceAuthorizeResponse? DeserializePresenceAuthorizeResponse(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.PresenceAuthorizeResponse);
+    public static UserLifecycleQuery? DeserializeUserLifecycleQuery(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.UserLifecycleQuery);
+
+    public static UserLifecycleResponse? DeserializeUserLifecycleResponse(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.UserLifecycleResponse);
 
     public static MessageHistoryPage? DeserializeMessageHistoryPage(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.MessageHistoryPage);
@@ -87,6 +99,12 @@ public static class RealtimeWireSerializer
 
     public static GroupConversationResult? DeserializeGroupConversationResult(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.GroupConversationResult);
+
+    public static string Serialize(AttachmentFinalizeCommand command) =>
+        JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.AttachmentFinalizeCommand);
+
+    public static AttachmentFinalizeResult? DeserializeAttachmentFinalizeResult(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.AttachmentFinalizeResult);
 
     public static MessageRecallResult? DeserializeMessageRecallResult(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.MessageRecallResult);
@@ -150,4 +168,16 @@ public static class RealtimeWireSerializer
 
     public static string Serialize(RealtimeDomainNotificationPayload payload) =>
         JsonSerializer.Serialize(payload, RealtimeIntegrationJsonContext.Default.RealtimeDomainNotificationPayload);
+
+    public static string Serialize(RelationshipCommand command) =>
+        JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.RelationshipCommand);
+
+    public static RelationshipCommandResult? DeserializeRelationshipCommandResult(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RelationshipCommandResult);
+
+    public static string Serialize(RelationshipListQuery query) =>
+        JsonSerializer.Serialize(query, RealtimeIntegrationJsonContext.Default.RelationshipListQuery);
+
+    public static RelationshipListResult? DeserializeRelationshipListResult(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RelationshipListResult);
 }
