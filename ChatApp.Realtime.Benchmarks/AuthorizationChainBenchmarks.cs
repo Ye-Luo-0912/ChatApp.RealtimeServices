@@ -1,6 +1,5 @@
 using BenchmarkDotNet.Attributes;
 using Microsoft.Extensions.Logging.Abstractions;
-using Xunit;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
@@ -29,7 +28,7 @@ namespace ChatApp.Realtime.Benchmarks;
 /// </summary>
 [MemoryDiagnoser]
 [SimpleJob(warmupCount: 3, iterationCount: 5)]
-public class AuthorizationChainBenchmarks : IAsyncLifetime
+public class AuthorizationChainBenchmarks
 {
     private PostgreSqlContainer? _container;
     private RealtimeDatabaseClient? _dbClient;
@@ -44,6 +43,7 @@ public class AuthorizationChainBenchmarks : IAsyncLifetime
     private const long BlockedUserId = 10003;
     private const long NonExistentUser = 99999;
 
+    [GlobalSetup]
     public async Task InitializeAsync()
     {
         _container = new PostgreSqlBuilder()
@@ -62,6 +62,7 @@ public class AuthorizationChainBenchmarks : IAsyncLifetime
         _rateLimiter = new NpgsqlMessageRateLimiter();
     }
 
+    [GlobalCleanup]
     public async Task DisposeAsync()
     {
         _rateLimiter?.Dispose();

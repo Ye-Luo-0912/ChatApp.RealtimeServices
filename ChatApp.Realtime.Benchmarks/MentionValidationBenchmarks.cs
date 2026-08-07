@@ -1,6 +1,5 @@
 using BenchmarkDotNet.Attributes;
 using Microsoft.Extensions.Logging.Abstractions;
-using Xunit;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
@@ -27,7 +26,7 @@ namespace ChatApp.Realtime.Benchmarks;
 /// </summary>
 [MemoryDiagnoser]
 [SimpleJob(warmupCount: 3, iterationCount: 5)]
-public class MentionValidationBenchmarks : IAsyncLifetime
+public class MentionValidationBenchmarks
 {
     private PostgreSqlContainer? _container;
     private RealtimeDatabaseClient? _dbClient;
@@ -41,6 +40,7 @@ public class MentionValidationBenchmarks : IAsyncLifetime
         .Select(static userId => (long)userId)
         .ToArray();
 
+    [GlobalSetup]
     public async Task InitializeAsync()
     {
         _container = new PostgreSqlBuilder()
@@ -61,6 +61,7 @@ public class MentionValidationBenchmarks : IAsyncLifetime
         _groupStore = new NpgsqlRealtimeGroupStore(_dbClient, _schema);
     }
 
+    [GlobalCleanup]
     public async Task DisposeAsync()
     {
         if (_container is not null)

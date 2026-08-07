@@ -1,6 +1,5 @@
 using BenchmarkDotNet.Attributes;
 using Microsoft.Extensions.Logging.Abstractions;
-using Xunit;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
@@ -15,7 +14,7 @@ namespace ChatApp.Realtime.Benchmarks;
 
 [MemoryDiagnoser]
 [SimpleJob(warmupCount: 3, iterationCount: 5)]
-public class ReadReceiptBenchmarks : IAsyncLifetime
+public class ReadReceiptBenchmarks
 {
     private PostgreSqlContainer? _container;
     private RealtimeDatabaseClient? _dbClient;
@@ -29,6 +28,7 @@ public class ReadReceiptBenchmarks : IAsyncLifetime
     private const long LateJoinerUserId = 20005;
     private const long MessageSequence = 42;
 
+    [GlobalSetup]
     public async Task InitializeAsync()
     {
         _container = new PostgreSqlBuilder()
@@ -47,6 +47,7 @@ public class ReadReceiptBenchmarks : IAsyncLifetime
         _readReceiptStore = new NpgsqlRealtimeReadReceiptStore(_dbClient, _schema);
     }
 
+    [GlobalCleanup]
     public async Task DisposeAsync()
     {
         if (_container is not null)
