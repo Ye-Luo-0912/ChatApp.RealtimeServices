@@ -33,6 +33,9 @@ try {
         $baseProjectLines = @(& git show "${BaseRef}:$relativeProject" 2> $null)
         if ($LASTEXITCODE -ne 0) {
             Write-Host "新增包项目，跳过历史版本比较: $relativeProject ($($currentVersionNode.InnerText))"
+            # git show 对基准中不存在的新项目会按预期返回非零。该状态已在此
+            # 分支处理，必须清除，否则 pwsh 会把整个成功门禁误报为失败。
+            $global:LASTEXITCODE = 0
             continue
         }
 
