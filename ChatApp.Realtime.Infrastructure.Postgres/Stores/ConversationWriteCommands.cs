@@ -460,9 +460,9 @@ internal static class ConversationWriteCommands
                     last_message_id, last_message_preview, last_message_at_ms,
                     last_sender_user_id, last_sequence
                 ) VALUES (
-                    @conversation_id, @type, @received_at_ms, @received_at_ms,
-                    @message_id, @preview, @received_at_ms,
-                    @sender_user_id, 1
+                    $1, $2, $3, $3,
+                    $4, $5, $3,
+                    $6, 1
                 )
                 ON CONFLICT (conversation_id) DO UPDATE SET
                     -- 序列始终递增（保证每条消息获得单调序列）
@@ -507,7 +507,7 @@ internal static class ConversationWriteCommands
                 INSERT INTO {schema.ConversationMembersTableSql} (
                     conversation_id, user_id, peer_user_id, joined_at_ms, last_message_at_ms
                 ) VALUES
-                    (@conversation_id, @receiver_user_id, @sender_user_id, @received_at_ms, @received_at_ms)
+                    ($1, $7, $6, $3, $3)
                 ON CONFLICT (conversation_id, user_id) DO NOTHING
             ),
             sender_upsert AS (
@@ -517,10 +517,10 @@ internal static class ConversationWriteCommands
                 INSERT INTO {schema.ConversationMembersTableSql} (
                     conversation_id, user_id, peer_user_id, joined_at_ms, last_message_at_ms, sent_count
                 ) VALUES
-                    (@conversation_id, @sender_user_id, @receiver_user_id, @received_at_ms, @received_at_ms, 1)
+                    ($1, $6, $7, $3, $3, 1)
                 ON CONFLICT (conversation_id, user_id) DO UPDATE SET
                     sent_count = {schema.ConversationMembersTableSql}.sent_count + 1,
-                    last_message_at_ms = @received_at_ms
+                    last_message_at_ms = $3
                 WHERE EXISTS (SELECT 1 FROM upsert_conversation)
                 RETURNING sent_count
             ),
@@ -528,20 +528,20 @@ internal static class ConversationWriteCommands
                 UPDATE {schema.MessagesTableSql}
                 SET conversation_sequence = (SELECT last_sequence FROM upsert_conversation),
                     sender_sequence = (SELECT sent_count FROM sender_upsert)
-                WHERE message_id = @message_id
+                WHERE message_id = $4
                   AND EXISTS (SELECT 1 FROM upsert_conversation)
             )
             SELECT last_sequence FROM upsert_conversation;
             """,
             connection,
             transaction);
-        command.Parameters.AddWithValue("conversation_id", conversationId);
-        command.Parameters.AddWithValue("type", (short)ConversationType.Direct);
-        command.Parameters.AddWithValue("received_at_ms", receivedAtMs);
-        command.Parameters.AddWithValue("message_id", messageId);
-        command.Parameters.AddWithValue("preview", preview);
-        command.Parameters.AddWithValue("sender_user_id", senderUserId);
-        command.Parameters.AddWithValue("receiver_user_id", receiverUserId);
+        command.Parameters.AddWithValue(conversationId);
+        command.Parameters.AddWithValue((short)ConversationType.Direct);
+        command.Parameters.AddWithValue(receivedAtMs);
+        command.Parameters.AddWithValue(messageId);
+        command.Parameters.AddWithValue(preview);
+        command.Parameters.AddWithValue(senderUserId);
+        command.Parameters.AddWithValue(receiverUserId);
 
         var result = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
         return result is long seq ? seq : (result is int i ? (long)i : null);
@@ -654,9 +654,9 @@ internal static class ConversationWriteCommands
                     last_message_id, last_message_preview, last_message_at_ms,
                     last_sender_user_id, last_sequence
                 ) VALUES (
-                    @conversation_id, @type, @received_at_ms, @received_at_ms,
-                    @message_id, @preview, @received_at_ms,
-                    @sender_user_id, 1
+                    $1, $2, $3, $3,
+                    $4, $5, $3,
+                    $6, 1
                 )
                 ON CONFLICT (conversation_id) DO UPDATE SET
                     last_sequence = {schema.ConversationsTableSql}.last_sequence + 1,
@@ -699,17 +699,17 @@ internal static class ConversationWriteCommands
                 INSERT INTO {schema.ConversationMembersTableSql} (
                     conversation_id, user_id, peer_user_id, joined_at_ms, last_message_at_ms
                 ) VALUES
-                    (@conversation_id, @receiver_user_id, @sender_user_id, @received_at_ms, @received_at_ms)
+                    ($1, $7, $6, $3, $3)
                 ON CONFLICT (conversation_id, user_id) DO NOTHING
             ),
             sender_upsert AS (
                 INSERT INTO {schema.ConversationMembersTableSql} (
                     conversation_id, user_id, peer_user_id, joined_at_ms, last_message_at_ms, sent_count
                 ) VALUES
-                    (@conversation_id, @sender_user_id, @receiver_user_id, @received_at_ms, @received_at_ms, 1)
+                    ($1, $6, $7, $3, $3, 1)
                 ON CONFLICT (conversation_id, user_id) DO UPDATE SET
                     sent_count = {schema.ConversationMembersTableSql}.sent_count + 1,
-                    last_message_at_ms = @received_at_ms
+                    last_message_at_ms = $3
                 WHERE EXISTS (SELECT 1 FROM upsert_conversation)
                 RETURNING sent_count
             )
@@ -719,13 +719,13 @@ internal static class ConversationWriteCommands
             """,
             connection,
             transaction);
-        command.Parameters.AddWithValue("conversation_id", conversationId);
-        command.Parameters.AddWithValue("type", (short)ConversationType.Direct);
-        command.Parameters.AddWithValue("received_at_ms", receivedAtMs);
-        command.Parameters.AddWithValue("message_id", messageId);
-        command.Parameters.AddWithValue("preview", preview);
-        command.Parameters.AddWithValue("sender_user_id", senderUserId);
-        command.Parameters.AddWithValue("receiver_user_id", receiverUserId);
+        command.Parameters.AddWithValue(conversationId);
+        command.Parameters.AddWithValue((short)ConversationType.Direct);
+        command.Parameters.AddWithValue(receivedAtMs);
+        command.Parameters.AddWithValue(messageId);
+        command.Parameters.AddWithValue(preview);
+        command.Parameters.AddWithValue(senderUserId);
+        command.Parameters.AddWithValue(receiverUserId);
 
         await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
         if (!await reader.ReadAsync(ct).ConfigureAwait(false))

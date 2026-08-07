@@ -58,84 +58,73 @@ internal sealed class MessageWriter
                 sender_sequence
             )
             VALUES (
-                @message_id,
-                @client_message_id,
-                @sender_user_id,
-                @sender_session_id,
-                @receiver_user_id,
-                @conversation_id,
-                @content,
-                @content_fingerprint,
-                @received_at_ms,
-                @created_at_ms,
-                @reply_to_message_id,
-                @reply_to_sender_user_id,
-                @reply_to_preview,
-                @forwarded_from_message_id,
-                @forwarded_from_sender_user_id,
-                @forwarded_from_preview,
-                @mentioned_user_ids,
-                @mentioned_roles,
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                $7,
+                $8,
+                $9,
+                $10,
+                $11,
+                $12,
+                $13,
+                $14,
+                $15,
+                $16,
+                $17,
+                $18,
                 1,
-                @received_at_ms,
-                @conversation_sequence,
-                @sender_sequence
+                $9,
+                $19,
+                $20
             )
             ON CONFLICT (sender_user_id, client_message_id) DO NOTHING;
             """,
             _session.Connection,
             _session.Transaction);
 
-        command.Parameters.AddWithValue("message_id", message.MessageId);
-        command.Parameters.AddWithValue("client_message_id", message.ClientMessageId);
-        command.Parameters.AddWithValue("sender_user_id", message.SenderUserId);
-        command.Parameters.AddWithValue("sender_session_id", message.SenderSessionId);
-        command.Parameters.AddWithValue("receiver_user_id", message.ReceiverUserId);
+        command.Parameters.AddWithValue(message.MessageId);
+        command.Parameters.AddWithValue(message.ClientMessageId);
+        command.Parameters.AddWithValue(message.SenderUserId);
+        command.Parameters.AddWithValue(message.SenderSessionId);
+        command.Parameters.AddWithValue(message.ReceiverUserId);
         command.Parameters.AddWithValue(
-            "conversation_id",
             (object?)message.ConversationId ?? DBNull.Value);
-        command.Parameters.AddWithValue("content", message.Content);
-        command.Parameters.AddWithValue("content_fingerprint", fingerprint);
-        command.Parameters.AddWithValue("received_at_ms", message.ReceivedAtMs);
-        command.Parameters.AddWithValue("created_at_ms", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        command.Parameters.AddWithValue(message.Content);
+        command.Parameters.AddWithValue(fingerprint);
+        command.Parameters.AddWithValue(message.ReceivedAtMs);
+        command.Parameters.AddWithValue(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
         command.Parameters.AddWithValue(
-            "reply_to_message_id",
             (object?)message.ReplyToMessageId ?? DBNull.Value);
         command.Parameters.AddWithValue(
-            "reply_to_sender_user_id",
             message.ReplyToSenderUserId.HasValue
                 ? message.ReplyToSenderUserId.Value
                 : DBNull.Value);
         command.Parameters.AddWithValue(
-            "reply_to_preview",
             (object?)message.ReplyToPreview ?? DBNull.Value);
         command.Parameters.AddWithValue(
-            "forwarded_from_message_id",
             (object?)message.ForwardedFromMessageId ?? DBNull.Value);
         command.Parameters.AddWithValue(
-            "forwarded_from_sender_user_id",
             message.ForwardedFromSenderUserId.HasValue
                 ? message.ForwardedFromSenderUserId.Value
                 : DBNull.Value);
         command.Parameters.AddWithValue(
-            "forwarded_from_preview",
             (object?)message.ForwardedFromPreview ?? DBNull.Value);
         command.Parameters.AddWithValue(
-            "mentioned_user_ids",
             message.MentionedUserIds is { Count: > 0 }
                 ? (object)message.MentionedUserIds.ToArray()
                 : DBNull.Value);
         command.Parameters.AddWithValue(
-            "mentioned_roles",
             message.MentionedRoles is { Count: > 0 }
                 ? (object)message.MentionedRoles.ToArray()
                 : DBNull.Value);
         // 极限-2：序列由调用方前置分配；未提供时写 NULL（向后兼容旧调用方）。
         command.Parameters.AddWithValue(
-            "conversation_sequence",
             conversationSequence.HasValue ? (object)conversationSequence.Value : DBNull.Value);
         command.Parameters.AddWithValue(
-            "sender_sequence",
             senderSequence.HasValue ? (object)senderSequence.Value : DBNull.Value);
 
         return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);

@@ -195,22 +195,20 @@ public sealed class NpgsqlCommandIdempotencyLedger(
              INSERT INTO {databaseSchema.CommandIdempotencyLedgerTableSql}
                  (sender_user_id, client_message_id, command_id, content_fingerprint,
                   result_kind, message_id, received_at_ms)
-             VALUES (@sender_user_id, @client_message_id, @command_id, @content_fingerprint,
-                     @result_kind, @message_id, @received_at_ms)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (sender_user_id, client_message_id) DO NOTHING
              RETURNING command_id, content_fingerprint, result_kind, message_id;
              """,
             connection,
             transaction);
-        command.Parameters.AddWithValue("sender_user_id", senderUserId);
-        command.Parameters.AddWithValue("client_message_id", clientMessageId);
-        command.Parameters.AddWithValue("command_id", commandId);
-        command.Parameters.AddWithValue("content_fingerprint", contentFingerprint);
-        command.Parameters.AddWithValue("result_kind", (byte)kind);
+        command.Parameters.AddWithValue(senderUserId);
+        command.Parameters.AddWithValue(clientMessageId);
+        command.Parameters.AddWithValue(commandId);
+        command.Parameters.AddWithValue(contentFingerprint);
+        command.Parameters.AddWithValue((byte)kind);
         command.Parameters.AddWithValue(
-            "message_id",
             (object?)messageId ?? DBNull.Value);
-        command.Parameters.AddWithValue("received_at_ms", receivedAtMs);
+        command.Parameters.AddWithValue(receivedAtMs);
 
         // P0-3：reader 必须在 ReadCanonicalAsync 之前释放，否则同一连接上会触发
         // NpgsqlOperationInProgressException（INSERT...RETURNING 0 行时 reader 仍占用连接）。
@@ -283,13 +281,13 @@ public sealed class NpgsqlCommandIdempotencyLedger(
             $"""
              SELECT command_id, content_fingerprint, result_kind, message_id, received_at_ms
              FROM {databaseSchema.CommandIdempotencyLedgerTableSql}
-             WHERE sender_user_id = @sender_user_id
-               AND client_message_id = @client_message_id
+             WHERE sender_user_id = $1
+               AND client_message_id = $2
              LIMIT 1;
              """,
             connection);
-        command.Parameters.AddWithValue("sender_user_id", senderUserId);
-        command.Parameters.AddWithValue("client_message_id", clientMessageId);
+        command.Parameters.AddWithValue(senderUserId);
+        command.Parameters.AddWithValue(clientMessageId);
 
         await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
         if (!await reader.ReadAsync(ct).ConfigureAwait(false))

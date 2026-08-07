@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Stores;
@@ -37,6 +38,23 @@ namespace ChatApp.Realtime.Infrastructure.Postgres.Outbox;
 /// </remarks>
 internal static class OutboxInsertHelper
 {
+    private const string ArrayInsertCommandText = """
+        INSERT INTO {0} (
+            event_id, payload_json, payload_utf8, target_user_id, event_type, status,
+            created_at_ms, next_attempt_at_ms, attempt_count, target_user_ids,
+            audience_kind, conversation_id, exclude_user_id, trace_parent, trace_state, occurred_at_ms
+        )
+        VALUES (
+            $1, NULL, $2, $3, $4, $5,
+            $6, $7, 0, $8,
+            $9, $10, NULLIF($11, 0), $12, $13, $14
+        )
+        ON CONFLICT (event_id) DO NOTHING;
+        """;
+
+    private static readonly ConcurrentDictionary<string, string> ArrayInsertCommandTexts =
+        new(StringComparer.Ordinal);
+
     /// <summary>
     /// 在指定事务内批量写入 Outbox 事件（<c>ON CONFLICT (event_id) DO NOTHING</c> 幂等）。
     /// 支持聚合事件（<see cref="RealtimeEvent.TargetUserIds"/> 非空时写入 target_user_ids 列）。
@@ -132,9 +150,9 @@ internal static class OutboxInsertHelper
                  arr.payload_utf8,
                  arr.target_user_id,
                  arr.event_type,
-                 @status,
-                 @created_at_ms,
-                 @next_attempt_at_ms,
+                 $1,
+                 $2,
+                 $3,
                  0,
                  NULL,
                  arr.audience_kind,
@@ -144,46 +162,34 @@ internal static class OutboxInsertHelper
                  arr.trace_state,
                  arr.occurred_at_ms
              FROM UNNEST(
-                 @event_ids,
-                 @payload_utf8s,
-                 @target_user_ids,
-                 @event_types,
-                 @audience_kinds,
-                 @conversation_ids,
-                 @exclude_user_ids,
-                 @trace_parents,
-                 @trace_states,
-                 @occurred_at_ms_values
+                 $4,
+                 $5,
+                 $6,
+                 $7,
+                 $8,
+                 $10,
+                 $9,
+                 $11,
+                 $12,
+                 $13
              ) AS arr(event_id, payload_utf8, target_user_id, event_type, audience_kind, conversation_id, exclude_user_id, trace_parent, trace_state, occurred_at_ms)
              ON CONFLICT (event_id) DO NOTHING;
              """,
             connection,
             transaction);
-        command.Parameters.AddWithValue("status", (short)RealtimeOutboxStatus.Pending);
-        command.Parameters.AddWithValue("created_at_ms", now);
-        command.Parameters.AddWithValue("next_attempt_at_ms", now);
-        command.Parameters.AddWithValue("event_ids", eventIds);
-        var payloadUtf8Param = command.Parameters.Add(
-            "payload_utf8s",
-            NpgsqlDbType.Array | NpgsqlDbType.Bytea);
-        payloadUtf8Param.Value = payloadUtf8s;
-        command.Parameters.AddWithValue("target_user_ids", targetUserIds);
-        command.Parameters.AddWithValue("event_types", eventTypes);
-        command.Parameters.AddWithValue("audience_kinds", audienceKinds);
-        command.Parameters.AddWithValue("exclude_user_ids", excludeUserIds);
-        var conversationIdsParam = command.Parameters.Add(
-            "conversation_ids",
-            NpgsqlDbType.Array | NpgsqlDbType.Text);
-        conversationIdsParam.Value = conversationIds;
-        var traceParentsParam = command.Parameters.Add(
-            "trace_parents",
-            NpgsqlDbType.Array | NpgsqlDbType.Text);
-        traceParentsParam.Value = traceParents;
-        var traceStatesParam = command.Parameters.Add(
-            "trace_states",
-            NpgsqlDbType.Array | NpgsqlDbType.Text);
-        traceStatesParam.Value = traceStates;
-        command.Parameters.AddWithValue("occurred_at_ms_values", occurredAtMsValues);
+        command.Parameters.AddWithValue((short)RealtimeOutboxStatus.Pending);
+        command.Parameters.AddWithValue(now);
+        command.Parameters.AddWithValue(now);
+        command.Parameters.AddWithValue(eventIds);
+        command.Parameters.AddWithValue(NpgsqlDbType.Array | NpgsqlDbType.Bytea, payloadUtf8s);
+        command.Parameters.AddWithValue(targetUserIds);
+        command.Parameters.AddWithValue(eventTypes);
+        command.Parameters.AddWithValue(audienceKinds);
+        command.Parameters.AddWithValue(excludeUserIds);
+        command.Parameters.AddWithValue(NpgsqlDbType.Array | NpgsqlDbType.Text, conversationIds);
+        command.Parameters.AddWithValue(NpgsqlDbType.Array | NpgsqlDbType.Text, traceParents);
+        command.Parameters.AddWithValue(NpgsqlDbType.Array | NpgsqlDbType.Text, traceStates);
+        command.Parameters.AddWithValue(occurredAtMsValues);
         return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
@@ -201,54 +207,50 @@ internal static class OutboxInsertHelper
         long now,
         CancellationToken ct)
     {
-        const string commandText = """
-            INSERT INTO {0} (
-                event_id, payload_json, payload_utf8, target_user_id, event_type, status,
-                created_at_ms, next_attempt_at_ms, attempt_count, target_user_ids,
-                audience_kind, conversation_id, exclude_user_id, trace_parent, trace_state, occurred_at_ms
-            )
-            VALUES (
-                @event_id, NULL, @payload_utf8, @target_user_id, @event_type, @status,
-                @created_at_ms, @next_attempt_at_ms, 0, @target_user_ids,
-                @audience_kind, @conversation_id, NULLIF(@exclude_user_id, 0), @trace_parent, @trace_state, @occurred_at_ms
-            )
-            ON CONFLICT (event_id) DO NOTHING;
-            """;
-        var formattedCommandText = string.Format(commandText, schema.OutboxTableSql);
-
         var inserted = 0;
         foreach (var evt in events)
         {
-            var wireEvt = CreateWirePayload(evt);
-            var payloadUtf8 = JsonSerializer.SerializeToUtf8Bytes(
-                wireEvt,
-                RealtimeJsonSerializerContext.Default.RealtimeEvent);
-
-            await using var command = new NpgsqlCommand(formattedCommandText, connection, transaction);
-            command.Parameters.AddWithValue("event_id", evt.EventId);
-            var payloadParam = command.Parameters.Add(
-                "payload_utf8",
-                NpgsqlDbType.Bytea);
-            payloadParam.Value = payloadUtf8;
-            command.Parameters.AddWithValue("target_user_id", evt.TargetUserId);
-            command.Parameters.AddWithValue("event_type", (short)evt.Type);
-            command.Parameters.AddWithValue("status", (short)RealtimeOutboxStatus.Pending);
-            command.Parameters.AddWithValue("created_at_ms", now);
-            command.Parameters.AddWithValue("next_attempt_at_ms", now);
-            // 极限-6：原生 bigint[] 参数，Npgsql 直接映射 long[] → bigint[]，无需文本编码。
-            var targetUserIdsParam = command.Parameters.Add(
-                "target_user_ids",
-                NpgsqlDbType.Array | NpgsqlDbType.Bigint);
-            targetUserIdsParam.Value = evt.TargetUserIds!;
-            command.Parameters.AddWithValue("audience_kind", (short)(evt.AudienceKind ?? 0));
-            command.Parameters.AddWithValue("conversation_id", (object?)evt.ConversationId ?? DBNull.Value);
-            command.Parameters.AddWithValue("exclude_user_id", evt.ExcludeUserId ?? 0L);
-            command.Parameters.AddWithValue("trace_parent", (object?)evt.TraceParent ?? DBNull.Value);
-            command.Parameters.AddWithValue("trace_state", (object?)evt.TraceState ?? DBNull.Value);
-            command.Parameters.AddWithValue("occurred_at_ms", evt.OccurredAtMs);
-            inserted += await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            inserted += await InsertArrayAsync(connection, transaction, schema, evt, now, ct)
+                .ConfigureAwait(false);
         }
         return inserted;
+    }
+
+    private static async Task<int> InsertArrayAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        RealtimeDatabaseSchema schema,
+        RealtimeEvent evt,
+        long now,
+        CancellationToken ct)
+    {
+        var formattedCommandText = ArrayInsertCommandTexts.GetOrAdd(
+            schema.OutboxTableSql,
+            static table => ArrayInsertCommandText.Replace("{0}", table, StringComparison.Ordinal));
+        var wireEvt = CreateWirePayload(evt);
+        var payloadUtf8 = JsonSerializer.SerializeToUtf8Bytes(
+            wireEvt,
+            RealtimeJsonSerializerContext.Default.RealtimeEvent);
+
+        await using var command = new NpgsqlCommand(formattedCommandText, connection, transaction);
+        command.Parameters.AddWithValue(evt.EventId);
+        command.Parameters.AddWithValue(NpgsqlDbType.Bytea, payloadUtf8);
+        command.Parameters.AddWithValue(evt.TargetUserId);
+        command.Parameters.AddWithValue((short)evt.Type);
+        command.Parameters.AddWithValue((short)RealtimeOutboxStatus.Pending);
+        command.Parameters.AddWithValue(now);
+        command.Parameters.AddWithValue(now);
+        // 极限-6：原生 bigint[] 参数，Npgsql 直接映射 long[] → bigint[]，无需文本编码。
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Array | NpgsqlDbType.Bigint,
+            evt.TargetUserIds!);
+        command.Parameters.AddWithValue((short)(evt.AudienceKind ?? 0));
+        command.Parameters.AddWithValue((object?)evt.ConversationId ?? DBNull.Value);
+        command.Parameters.AddWithValue(evt.ExcludeUserId ?? 0L);
+        command.Parameters.AddWithValue((object?)evt.TraceParent ?? DBNull.Value);
+        command.Parameters.AddWithValue((object?)evt.TraceState ?? DBNull.Value);
+        command.Parameters.AddWithValue(evt.OccurredAtMs);
+        return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -277,6 +279,9 @@ internal static class OutboxInsertHelper
             ConversationId = evt.ConversationId,
             // 极限-3：ExcludeUserId 保留在 wire payload 中。
             ExcludeUserId = evt.ExcludeUserId,
+            ProtocolVersion = evt.ProtocolVersion,
+            AudienceVersion = evt.AudienceVersion,
+            MinProtocolVersion = evt.MinProtocolVersion,
             // TargetUserIds 仍排除：O(N) 数组不在 payload 中，数据库列是唯一权威。
             TargetUserIds = null,
             // Payload 是 [JsonIgnore] 的运行时引用，不参与序列化，置空避免携带。
@@ -295,11 +300,11 @@ internal static class OutboxInsertHelper
         if (evt.TargetUserIds is { Length: > 0 })
         {
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            return await InsertArrayBatchAsync(
+            return await InsertArrayAsync(
                     connection,
                     transaction,
                     schema,
-                    [evt],
+                    evt,
                     now,
                     ct)
                 .ConfigureAwait(false);

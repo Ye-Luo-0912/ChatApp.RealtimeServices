@@ -46,45 +46,45 @@ public sealed class NpgsqlDirectMessageAuthorizationStore : IDirectMessageAuthor
                 EXISTS (
                     SELECT 1
                     FROM public."AspNetUsers"
-                    WHERE "Id" = @sender_id
+                    WHERE "Id" = $1
                 ) AS sender_exists,
                 EXISTS (
                     SELECT 1
                     FROM public."AspNetUsers"
-                    WHERE "Id" = @receiver_id
+                    WHERE "Id" = $2
                 ) AS receiver_exists,
                 EXISTS (
                     SELECT 1
                     FROM public."T_BlockRecords"
-                    WHERE "BlockerId" = @receiver_id
-                      AND "BlockedUserId" = @sender_id
+                    WHERE "BlockerId" = $2
+                      AND "BlockedUserId" = $1
                 ) AS is_blocked,
                 COALESCE((
                     SELECT "FriendRequestPolicy"::int
                     FROM public."AspNetUsers"
-                    WHERE "Id" = @receiver_id
+                    WHERE "Id" = $2
                     LIMIT 1
                 ), -1) AS privacy_policy,
                 (
                     EXISTS (
                         SELECT 1
                         FROM public."T_UserFriendEntry"
-                        WHERE "UserId" = @sender_id
-                          AND "FriendId" = @receiver_id
+                        WHERE "UserId" = $1
+                          AND "FriendId" = $2
                           AND NOT "IsDeleted"
                     )
                     AND EXISTS (
                         SELECT 1
                         FROM public."T_UserFriendEntry"
-                        WHERE "UserId" = @receiver_id
-                          AND "FriendId" = @sender_id
+                        WHERE "UserId" = $2
+                          AND "FriendId" = $1
                           AND NOT "IsDeleted"
                     )
                 ) AS are_friends;
             """,
             connection);
-        command.Parameters.Add("sender_id", NpgsqlDbType.Bigint).Value = senderUserId;
-        command.Parameters.Add("receiver_id", NpgsqlDbType.Bigint).Value = receiverUserId;
+        command.Parameters.AddWithValue(NpgsqlDbType.Bigint, senderUserId);
+        command.Parameters.AddWithValue(NpgsqlDbType.Bigint, receiverUserId);
 
         await using var reader = await command
             .ExecuteReaderAsync(cancellationToken)
