@@ -7,7 +7,7 @@ namespace ChatApp.Realtime.Abstractions.Attachments;
 public interface IObjectStorage
 {
     /// <summary>
-    /// 探测对象元数据（HEAD）。在 <see cref="AttachmentScanProcessor"/> 中用于校验
+    /// 探测对象元数据（HEAD）。在 <c>AttachmentScanProcessor</c> 中用于校验
     /// 实际 Size / Hash / Content-Type 与票证一致。对象不存在时返回 null。
     /// </summary>
     Task<ObjectHead?> HeadAsync(string objectKey, CancellationToken ct = default);

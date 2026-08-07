@@ -243,6 +243,25 @@ public static class RealtimeServicesRegistration
             throw new InvalidOperationException("Nats:Mode 只允许 Core 或 JetStream。");
         if (string.IsNullOrWhiteSpace(options.Subjects.DeadLetters))
             throw new InvalidOperationException("Nats:Subjects:DeadLetters 为必填配置。");
+        if (options.Routing?.Mode == EventRoutingMode.Sharded)
+        {
+            var shardPattern = string.IsNullOrWhiteSpace(options.Routing.RealtimeEventsShardSubjectPattern)
+                ? "chat.realtime-events.shards.{0}"
+                : options.Routing.RealtimeEventsShardSubjectPattern;
+            if (!ShardedSubjectFormatter.IsSharded(shardPattern))
+            {
+                throw new InvalidOperationException(
+                    "Nats:Routing:RealtimeEventsShardSubjectPattern 必须包含 {0} 占位符。");
+            }
+
+            var shardWildcard = ShardedSubjectFormatter.ToWildcard(shardPattern);
+            if (ShardWildcardMatchesSubject(shardWildcard, options.Subjects.AccountCleanup))
+            {
+                throw new InvalidOperationException(
+                    "Nats 分片 subject 不能覆盖 Nats:Subjects:AccountCleanup；" +
+                    "请使用独立命名空间，例如 chat.realtime-events.shards.{0}。");
+            }
+        }
 
         return new NatsOptions
         {
@@ -366,7 +385,7 @@ public static class RealtimeServicesRegistration
         if (options.Routing.Mode == EventRoutingMode.Sharded)
         {
             shardPattern = string.IsNullOrWhiteSpace(options.Routing.RealtimeEventsShardSubjectPattern)
-                ? "chat.realtime-events.{0}"
+                ? "chat.realtime-events.shards.{0}"
                 : options.Routing.RealtimeEventsShardSubjectPattern;
         }
 
@@ -531,6 +550,19 @@ public static class RealtimeServicesRegistration
         }
 
         return warnings;
+    }
+
+    private static bool ShardWildcardMatchesSubject(string wildcard, string subject)
+    {
+        if (string.IsNullOrWhiteSpace(subject))
+            return false;
+
+        const string suffix = ">";
+        if (!wildcard.EndsWith(suffix, StringComparison.Ordinal))
+            return string.Equals(wildcard, subject, StringComparison.Ordinal);
+
+        var prefix = wildcard[..^suffix.Length];
+        return subject.StartsWith(prefix, StringComparison.Ordinal);
     }
 
     private static bool HasNatsAuth(NatsAuthOptions? auth) =>

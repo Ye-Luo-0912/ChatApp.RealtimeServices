@@ -12,20 +12,34 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Package version bump gate
+        shell: pwsh
+        env:
+          PACKAGE_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: ./tools/verify-package-version-bump.ps1 -BaseRef $env:PACKAGE_BASE_REF
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: '10.0.301'
 
       - name: Restore
-        run: dotnet restore ChatApp.RealtimeServices.slnx
+        run: dotnet restore ChatApp.RealtimeServices.slnx --locked-mode
 
       - name: Build
         run: dotnet build ChatApp.RealtimeServices.slnx --no-restore --configuration Release
 
+      - name: Package content reproducibility smoke
+        shell: pwsh
+        run: |
+          ./tools/publish-contracts.ps1 -FeedPath .artifacts/package-integrity
+          ./tools/publish-contracts.ps1 -FeedPath .artifacts/package-integrity
+
       - name: Test
-        run: dotnet test ChatApp.RealtimeServices.slnx --no-build --configuration Release
+        run: dotnet test ChatApp.RealtimeServices.slnx --no-build --no-restore --configuration Release
 
       - name: Build container
         run: docker build --file ChatApp.RealtimeServices/Dockerfile --tag chatapp-realtime-services:ci .
@@ -40,10 +54,10 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: '10.0.301'
 
       - name: Restore
-        run: dotnet restore ChatApp.RealtimeServices.slnx
+        run: dotnet restore ChatApp.RealtimeServices.slnx --locked-mode
 
       - name: Build benchmarks
         run: dotnet build ChatApp.Realtime.Benchmarks/ChatApp.Realtime.Benchmarks.csproj -c Release --no-restore
@@ -75,10 +89,10 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: '10.0.301'
 
       - name: Restore
-        run: dotnet restore ChatApp.RealtimeServices.slnx
+        run: dotnet restore ChatApp.RealtimeServices.slnx --locked-mode
 
       - name: Build benchmarks
         run: dotnet build ChatApp.Realtime.Benchmarks/ChatApp.Realtime.Benchmarks.csproj -c Release --no-restore

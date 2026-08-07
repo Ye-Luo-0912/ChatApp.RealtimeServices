@@ -1,3 +1,5 @@
+using ChatApp.Realtime.Abstractions.Conversations;
+
 namespace ChatApp.Realtime.Abstractions.Events;
 
 /// <summary>

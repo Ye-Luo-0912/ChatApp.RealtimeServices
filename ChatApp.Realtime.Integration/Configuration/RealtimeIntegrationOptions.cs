@@ -115,7 +115,7 @@ public sealed class RealtimeIntegrationOptions
     /// 发布方按目标用户的在线 Gateway 集合定向投递到此 subject。
     /// </para>
     /// </summary>
-    public string RealtimeEventsShardSubjectPattern { get; set; } = "chat.realtime-events.{0}";
+    public string RealtimeEventsShardSubjectPattern { get; set; } = "chat.realtime-events.shards.{0}";
 
     /// <summary>
     /// Ephemeral Typing 分片 subject 模板，使用 {0} 作为实例 ID 占位符。

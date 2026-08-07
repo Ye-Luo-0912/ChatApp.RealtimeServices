@@ -29,7 +29,7 @@ public sealed class PartialShardFailureTests : IAsyncDisposable
     public async Task PublishWithPayload_ShardPublishFailures_ThrowsAggregateExceptionNotSilentSuccess()
     {
         var (publisher, connectionClient) = BuildPublisher(
-            shardSubjectPattern: "chat.realtime-events.{0}",
+            shardSubjectPattern: "chat.realtime-events.shards.{0}",
             gatewayInstanceIds: ["gw-fail-1", "gw-fail-2", "gw-fail-3"]);
 
         var evt = new RealtimeEvent
@@ -53,7 +53,7 @@ public sealed class PartialShardFailureTests : IAsyncDisposable
     public async Task PublishToMany_ShardPublishFailures_ThrowsAggregateExceptionNotSilentSuccess()
     {
         var (publisher, connectionClient) = BuildPublisher(
-            shardSubjectPattern: "chat.realtime-events.{0}",
+            shardSubjectPattern: "chat.realtime-events.shards.{0}",
             gatewayInstanceIds: ["gw-many-1", "gw-many-2"]);
 
         var evt = new RealtimeEvent

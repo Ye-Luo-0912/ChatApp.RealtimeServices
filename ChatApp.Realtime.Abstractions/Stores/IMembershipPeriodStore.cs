@@ -53,7 +53,13 @@ public interface IMembershipPeriodStore
     /// 仅更新 <c>left_at_ms IS NULL</c> 的记录（当前活跃时间段），已关闭的时间段不受影响。
     /// </para>
     /// </summary>
+    /// <param name="connection">调用方已打开的数据库连接。</param>
+    /// <param name="transaction">包含群操作的当前数据库事务。</param>
+    /// <param name="conversationId">会话 ID。</param>
+    /// <param name="userId">离群用户 ID。</param>
+    /// <param name="leftAtMs">离群时间（Unix 毫秒）。</param>
     /// <param name="leftReason">离群原因（leave / removed / dissolved）。</param>
+    /// <param name="ct">取消令牌。</param>
     Task RecordLeaveInTransactionAsync(
         DbConnection connection,
         DbTransaction transaction,

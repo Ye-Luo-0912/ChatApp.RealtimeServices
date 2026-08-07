@@ -48,7 +48,7 @@ public sealed class NatsRoutingOptions
     /// <para>
     /// Sharded 模式下，Gateway 订阅此 subject（填入自身 InstanceId），
     /// 发布方按目标用户的在线 Gateway 集合定向投递。
-    /// 留空则使用默认 <c>chat.realtime-events.{0}</c>。
+    /// 留空则使用默认 <c>chat.realtime-events.shards.{0}</c>。
     /// </para>
     /// </summary>
     public string? RealtimeEventsShardSubjectPattern { get; init; }

@@ -22,6 +22,7 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
     private readonly long _maxSinglePayloadBytes;
     private readonly TimeSpan _ackWait;
     private readonly Func<TEnvelope, Func<CancellationToken, ValueTask>?>? _progressAckSelector;
+    private readonly Lazy<AckLeaseScheduler?> _ackLeaseScheduler;
 
     public PartitionedConsumerRuntime(
         string workerName,
@@ -47,6 +48,10 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
         _maxSinglePayloadBytes = maxSinglePayloadBytes;
         _ackWait = ackWait;
         _progressAckSelector = progressAckSelector;
+        // Reliability-4：共享 ACK 租约调度器，仅在需要 progress-ack 时惰性创建一次。
+        _ackLeaseScheduler = new Lazy<AckLeaseScheduler?>(
+            () => AckLeaseScheduler.Start(ackWait, logger),
+            LazyThreadSafetyMode.ExecutionAndPublication);
     }
 
     /// <summary>
@@ -144,6 +149,9 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
                 // P0-6：释放 ByteBudget 持有的 SemaphoreSlim 资源
                 byteBudget?.Dispose();
                 faultCts.Cancel();
+                // Reliability-4：停止共享 ACK 租约调度器（若已惰性创建）。
+                if (_ackLeaseScheduler.IsValueCreated && _ackLeaseScheduler.Value is { } scheduler)
+                    await scheduler.DisposeAsync().ConfigureAwait(false);
                 await WorkerHeartbeat
                     .SuppressCancellationAsync(queueDepthTask)
                     .ConfigureAwait(false);
@@ -181,14 +189,15 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
                     _readinessState.RecordMessageConsumed(_workerName);
                     var partition = getPartition(envelope);
 
-                    // Reliability-4：在 envelope 从 NATS 收到后、入 Channel 前立即启动 ack lease，
+                    // Reliability-4：在 envelope 从 NATS 收到后、入 Channel 前立即注册 ack lease，
                     // 覆盖排队等待 + 处理全周期，防止队列等待 > AckWait 时合法消息被重投。
-                    ProgressAckGuard? ackGuard = null;
+                    // 共享调度器负责统一发送 progress-ack，快消息仅做一次原子注册。
+                    var ackLease = default(AckLease);
                     if (_progressAckSelector is not null && _ackWait > TimeSpan.Zero)
                     {
                         var progressAck = _progressAckSelector(envelope);
-                        if (progressAck is not null)
-                            ackGuard = ProgressAckGuard.Start(progressAck, _ackWait, ct, _logger);
+                        if (progressAck is not null && _ackLeaseScheduler.Value is { } scheduler)
+                            ackLease = scheduler.Register(progressAck, ct);
                     }
 
                     // P0-6：入队前按 payload 字节长度计费，返回 lease。
@@ -210,7 +219,7 @@ internal sealed class PartitionedConsumerRuntime<TEnvelope>
                         }
                     }
 
-                    var leased = new LeasedEnvelope<TEnvelope>(envelope, lease, ackGuard);
+                    var leased = new LeasedEnvelope<TEnvelope>(envelope, lease, ackLease);
                     await channels[partition].Writer.WriteAsync(leased, ct).ConfigureAwait(false);
 
                     // Reliability-2：报告队列深度，满队列持续过久会被 GetSnapshot 判定为不就绪。

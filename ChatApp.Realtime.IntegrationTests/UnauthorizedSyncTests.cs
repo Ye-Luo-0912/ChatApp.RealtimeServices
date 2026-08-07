@@ -44,6 +44,8 @@ public sealed class UnauthorizedSyncTests
         const long alice = 9_100_000_031;
         const long bob = 9_100_000_032;
         const long mallory = 9_100_000_033;
+        await _fixture.EnsureDirectMessageAllowedAsync(alice, bob);
+        await _fixture.EnsureUsersExistAsync(mallory);
         var privateConversation = ConversationId.CreateDirect(alice, bob);
         var clientMessageId = Guid.CreateVersion7().ToString("N");
         var commandId = PipelineTestIds.CreateMessageCommandId(alice, clientMessageId);

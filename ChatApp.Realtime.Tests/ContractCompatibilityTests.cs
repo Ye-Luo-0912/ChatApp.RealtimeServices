@@ -6,9 +6,9 @@ namespace ChatApp.Realtime.Tests;
 public sealed class ContractCompatibilityTests
 {
     [Fact]
-    public void Metadata_PackageVersion_Is2_0_0()
+    public void Metadata_PackageVersion_MatchesContractsPackage()
     {
-        Assert.Equal("2.0.0", RealtimeContractMetadata.PackageVersion);
+        Assert.Equal("2.3.0", RealtimeContractMetadata.PackageVersion);
     }
 
     [Fact]

@@ -50,9 +50,7 @@ public sealed class MessageReceiptWorker : BackgroundService
         _options = options.Value;
         _trust = trust;
         _queueOptions = queueOptions;
-        _ackWait = jetStreamOptions is not null
-            ? TimeSpan.FromSeconds(Math.Max(1, jetStreamOptions.Consumer.AckWaitSeconds))
-            : TimeSpan.Zero;
+        _ackWait = JetStreamAckTiming.GetEffectiveAckWait(jetStreamOptions);
         _logger = logger;
     }
 
@@ -120,8 +118,8 @@ public sealed class MessageReceiptWorker : BackgroundService
                 if (leased.Lease is not null)
                     await leased.Lease.DisposeAsync().ConfigureAwait(false);
                 // Reliability-4：ack lease 覆盖排队等待 + 处理全周期，处理完成时停止。
-                if (leased.AckGuard is not null)
-                    await leased.AckGuard.DisposeAsync().ConfigureAwait(false);
+                // 轻量原子置位，快路径无异步清理、无异常。
+                leased.AckLease.Complete();
                 _readinessState.MarkHeartbeat(WorkerName);
                 _metrics.RecordProcessingDuration(
                     Stopwatch.GetElapsedTime(started));

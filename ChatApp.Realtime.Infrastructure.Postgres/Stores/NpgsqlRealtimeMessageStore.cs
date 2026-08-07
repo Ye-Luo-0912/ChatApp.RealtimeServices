@@ -376,18 +376,13 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 RealtimeMessageEventFactory.CopyWithMessageId(eventToPublish, message.MessageId),
                 boundAttachmentRefs,
                 conversationSequence,
-                ConversationType.Direct);
+                ConversationType.Direct,
+                targetUserIds: [message.ReceiverUserId, message.SenderUserId]);
 
-            // 极限-1：单聊 4 行 → 2 行。payload 已携带 ConversationType + ConversationSequence，
-            // 客户端从 MessageReceived 即可更新会话列表，不再生成双方 ConversationChanged 行。
-            // 保留 receiver MessageReceived + sender echo：单聊投递必须按 TargetUserId 精确路由（隐私边界）。
-            var outboxEvents = new List<RealtimeEvent>(2) { createdEvent };
-
-            // 发送方其他在线设备回声：同事务写入；Gateway 会跳过来源 SessionId。
-            if (message.SenderUserId != message.ReceiverUserId)
-                outboxEvents.Add(RealtimeMessageEventFactory.CreateSenderEchoEvent(createdEvent, message.SenderUserId));
-
-            await outboxWriter.InsertManyAsync(outboxEvents).ConfigureAwait(false);
+            // Perf：接收方投递与发送方其他设备回声合并为一条多目标事件。
+            // Gateway 仅在 sender 目标上跳过来源 SessionId；receiver 仍正常投递。
+            // 单聊 Outbox / NATS 写入由每条消息 2 行降为 1 行。
+            await outboxWriter.InsertAsync(createdEvent).ConfigureAwait(false);
         }
 
         // Perf-3：事务内记录 Created 结果到独立账本，解耦幂等性与 messages 行生命周期。

@@ -7,7 +7,7 @@ namespace ChatApp.Realtime.Abstractions.Events;
 public static class RealtimeContractMetadata
 {
     /// <summary>契约包 SemVer 版本（与 ChatApp.Realtime.Contracts 包版本保持一致）。</summary>
-    public const string PackageVersion = "2.0.0";
+    public const string PackageVersion = "2.3.0";
 
     /// <summary>当前线协议版本（与 <see cref="RealtimeProtocolVersions.Current"/> 对齐）。</summary>
     public const int ProtocolVersion = RealtimeProtocolVersions.V2;

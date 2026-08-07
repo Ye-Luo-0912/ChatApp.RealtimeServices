@@ -72,6 +72,7 @@ public interface IAccountCleanupJobStore
     /// </summary>
     /// <param name="instanceId">当前实例标识，写入 locked_by。</param>
     /// <param name="leaseDuration">租约时长；到期后 running 作业可被其他实例重新认领。</param>
+    /// <param name="ct">取消令牌。</param>
     Task<AccountCleanupJob?> GetNextPendingAsync(
         string instanceId,
         TimeSpan leaseDuration,
@@ -102,6 +103,7 @@ public interface IAccountCleanupJobStore
     /// <param name="lastAttachmentId">本批最后一条 attachment_id，作为新 cursor。</param>
     /// <param name="attachmentIds">本批待删除的 attachment_id 列表。</param>
     /// <param name="purgeEvent">预构造的 purge Outbox 事件（含稳定 EventId）。</param>
+    /// <param name="ct">取消令牌。</param>
     /// <returns><c>true</c> 表示 cursor 已推进；<c>false</c> 表示 lease 失效需停止处理。</returns>
     Task<bool> ProcessAttachmentsBatchAtomicAsync(
         long userId,

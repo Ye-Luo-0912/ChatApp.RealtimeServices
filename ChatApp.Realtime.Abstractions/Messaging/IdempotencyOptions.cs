@@ -9,7 +9,7 @@ namespace ChatApp.Realtime.Abstractions.Messaging;
 /// JetStream 最大回放周期（<c>Nats:JetStream:MaxAgeHours</c>）。
 /// </para>
 /// <para>
-/// 启动时由 <see cref="Diagnostics.RealtimeStartupReporter"/> 校验
+/// 启动时由宿主的 <c>RealtimeStartupReporter</c> 校验
 /// <c>ResolveEffectiveHorizonMs(jetStreamMaxAgeMs) &gt;= jetStreamMaxAgeMs</c>。
 /// </para>
 /// </summary>

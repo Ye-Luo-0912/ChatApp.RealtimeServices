@@ -53,7 +53,7 @@ public sealed class NpgsqlPrivacySettingStore : IPrivacySettingStore
         if (scalar is null)
             return false;
 
-        var policy = (byte)scalar;
+        var policy = Convert.ToByte(scalar, System.Globalization.CultureInfo.InvariantCulture);
 
         // DisallowAll (2) 拒绝所有非好友 DM
         if (policy == 2)

@@ -25,6 +25,7 @@ public sealed class LargeResponseBudgetTests
 
         const long sender = 9_100_000_051;
         const long receiver = 9_100_000_052;
+        await _fixture.EnsureDirectMessageAllowedAsync(sender, receiver);
         var conversationId = ConversationId.CreateDirect(sender, receiver);
         var baseMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         // ~2 KiB content × 40 ≈ well over 64 KiB when serialized with metadata.

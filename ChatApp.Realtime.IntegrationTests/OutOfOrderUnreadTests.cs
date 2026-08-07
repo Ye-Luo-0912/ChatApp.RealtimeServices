@@ -21,6 +21,7 @@ public sealed class OutOfOrderUnreadTests
 
         const long sender = 9_100_000_041;
         const long receiver = 9_100_000_042;
+        await _fixture.EnsureDirectMessageAllowedAsync(sender, receiver);
         var conversationId = ConversationId.CreateDirect(sender, receiver);
         var newerClientId = Guid.CreateVersion7().ToString("N");
         var olderClientId = Guid.CreateVersion7().ToString("N");

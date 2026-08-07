@@ -2,6 +2,8 @@ using System.Net;
 using System.Net.Sockets;
 using ChatApp.Realtime.Integration;
 using ChatApp.Realtime.Integration.Configuration;
+using ChatApp.Realtime.Abstractions.Stores;
+using ChatApp.Realtime.Infrastructure.Core.Stores;
 using ChatApp.RealtimeServices.DependencyInjection;
 using ChatApp.RealtimeServices.Diagnostics;
 using ChatApp.RealtimeServices.Options;
@@ -10,9 +12,11 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Npgsql;
 using Testcontainers.Nats;
 using Testcontainers.PostgreSql;
 
@@ -47,6 +51,7 @@ public sealed class RealtimePipelineFixture : IAsyncLifetime
 
         PostgresConnectionString = _postgres.GetConnectionString();
         NatsUrl = SanitizeNatsUrl(_nats.GetConnectionString());
+        await InitializeIdentitySchemaAsync().ConfigureAwait(false);
 
         var httpPort = GetFreeTcpPort();
         var contentRoot = FindRealtimeServicesContentRoot();
@@ -82,6 +87,11 @@ public sealed class RealtimePipelineFixture : IAsyncLifetime
         builder.Services.Configure<OpsOptions>(builder.Configuration.GetSection(OpsOptions.SectionName));
         builder.Services.AddRealtimeServices(builder.Configuration, builder.Environment);
         builder.Services.AddRealtimeObservability(builder.Configuration);
+        // The pipeline suite validates transport, persistence and wire budgets;
+        // its 40-message budget case must not be capped by the production
+        // per-user 30-message sliding window.
+        builder.Services.RemoveAll<IMessageRateLimiter>();
+        builder.Services.AddSingleton<IMessageRateLimiter>(NoopMessageRateLimiter.Instance);
 
         _host = builder.Build();
         _host.MapGet("/live", () => Results.Ok(new
@@ -122,6 +132,51 @@ public sealed class RealtimePipelineFixture : IAsyncLifetime
                 Replicas = 1
             },
             NullLogger<NatsRealtimeMessageBus>.Instance);
+    }
+
+    /// <summary>
+    /// Seeds the minimal shared Identity boundary used by the production
+    /// authorization stores. Pipeline tests opt in explicitly so missing users
+    /// continue to exercise the fail-closed path.
+    /// </summary>
+    public async Task EnsureUsersExistAsync(params long[] userIds)
+    {
+        var ids = userIds.Where(static id => id > 0).Distinct().ToArray();
+        if (ids.Length == 0)
+            return;
+
+        await using var connection = new NpgsqlConnection(PostgresConnectionString);
+        await connection.OpenAsync().ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            """
+            INSERT INTO public."AspNetUsers" ("Id")
+            SELECT unnest(@user_ids)
+            ON CONFLICT ("Id") DO NOTHING;
+            """,
+            connection);
+        command.Parameters.AddWithValue("user_ids", ids);
+        await command.ExecuteNonQueryAsync().ConfigureAwait(false);
+    }
+
+    public async Task EnsureDirectMessageAllowedAsync(long senderUserId, long receiverUserId)
+    {
+        await EnsureUsersExistAsync(senderUserId, receiverUserId).ConfigureAwait(false);
+
+        await using var connection = new NpgsqlConnection(PostgresConnectionString);
+        await connection.OpenAsync().ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            """
+            INSERT INTO public."T_UserFriendEntry" ("UserId", "FriendId", "IsDeleted")
+            VALUES
+                (@sender_id, @receiver_id, FALSE),
+                (@receiver_id, @sender_id, FALSE)
+            ON CONFLICT ("UserId", "FriendId")
+            DO UPDATE SET "IsDeleted" = FALSE;
+            """,
+            connection);
+        command.Parameters.AddWithValue("sender_id", senderUserId);
+        command.Parameters.AddWithValue("receiver_id", receiverUserId);
+        await command.ExecuteNonQueryAsync().ConfigureAwait(false);
     }
 
     public async Task DisposeAsync()
@@ -184,6 +239,37 @@ public sealed class RealtimePipelineFixture : IAsyncLifetime
                 ? "<none>"
                 : lastReadyResponse[..Math.Min(lastReadyResponse.Length, 4096)]),
             last);
+    }
+
+    private async Task InitializeIdentitySchemaAsync()
+    {
+        await using var connection = new NpgsqlConnection(PostgresConnectionString);
+        await connection.OpenAsync().ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            """
+            CREATE TABLE public."AspNetUsers"
+            (
+                "Id" bigint PRIMARY KEY,
+                "FriendRequestPolicy" smallint NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE public."T_BlockRecords"
+            (
+                "BlockerId" bigint NOT NULL,
+                "BlockedUserId" bigint NOT NULL,
+                PRIMARY KEY ("BlockerId", "BlockedUserId")
+            );
+
+            CREATE TABLE public."T_UserFriendEntry"
+            (
+                "UserId" bigint NOT NULL,
+                "FriendId" bigint NOT NULL,
+                "IsDeleted" boolean NOT NULL DEFAULT FALSE,
+                PRIMARY KEY ("UserId", "FriendId")
+            );
+            """,
+            connection);
+        await command.ExecuteNonQueryAsync().ConfigureAwait(false);
     }
 
     private static string SanitizeNatsUrl(string connectionString)

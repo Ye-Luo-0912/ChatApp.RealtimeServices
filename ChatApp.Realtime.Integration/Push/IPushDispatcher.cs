@@ -10,7 +10,7 @@ namespace ChatApp.Realtime.Integration.Push;
 /// <item>对无效令牌（Provider 返回 invalid_token）返回指纹，调用方负责注销。</item>
 /// <item>实现有界 Retry + DLQ：Provider 限流/不可用时指数退避重试，超限进入 DLQ。</item>
 /// <item>实现 Provider 限流：单 Provider QPS 上限，超限排队或拒绝。</item>
-/// </item>
+/// </list>
 /// </para>
 /// <para>
 /// 实现方不负责：

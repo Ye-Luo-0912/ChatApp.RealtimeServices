@@ -227,6 +227,35 @@ public sealed class DefaultIncomingMessageProcessorTests
         Assert.Null(store.Message);
     }
 
+    [Fact]
+    public async Task ProcessAsync_UsesSingleDirectAuthorizationStore_WhenRegistered()
+    {
+        var store = new CapturingStore();
+        var authorizationStore = new RecordingDirectAuthorizationStore(
+            DirectMessageAuthorizationDecision.Blocked);
+        using var metrics = new RealtimeMetrics();
+        var processor = new DefaultIncomingMessageProcessor(
+            store,
+            new RecordingRealtimeOutboxSignal(),
+            metrics,
+            NoopTombstoneAndLedger.Tombstone,
+            new AlwaysMemberGroupStore(),
+            new ThrowingUserExistenceChecker(),
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
+            NullLogger<DefaultIncomingMessageProcessor>.Instance,
+            authorizationStore);
+
+        var result = await processor.ProcessAsync(ValidCommand());
+
+        Assert.False(result.Succeeded);
+        Assert.Equal("blocked", result.ErrorCode);
+        Assert.Equal(1, authorizationStore.Calls);
+        Assert.Null(store.Message);
+    }
+
     private static IncomingMessageCommand ValidCommand() => new()
     {
         CommandId = "command-1",
@@ -305,6 +334,34 @@ public sealed class DefaultIncomingMessageProcessorTests
             RealtimeEvent eventToPublish,
             CancellationToken ct = default) =>
             Task.CompletedTask;
+    }
+
+    private sealed class RecordingDirectAuthorizationStore(
+        DirectMessageAuthorizationDecision decision) : IDirectMessageAuthorizationStore
+    {
+        public int Calls { get; private set; }
+
+        public Task<DirectMessageAuthorizationResult> AuthorizeAsync(
+            long senderUserId,
+            long receiverUserId,
+            CancellationToken cancellationToken = default)
+        {
+            Calls++;
+            return Task.FromResult(new DirectMessageAuthorizationResult(decision));
+        }
+    }
+
+    private sealed class ThrowingUserExistenceChecker : IUserExistenceChecker
+    {
+        public Task<bool> ExistsAsync(
+            long userId,
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("聚合授权路径不应调用旧的存在性查询。");
+
+        public Task<IReadOnlyList<long>> FilterNonExistentAsync(
+            IReadOnlyList<long> userIds,
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("聚合授权路径不应调用旧的存在性查询。");
     }
 
     private sealed class AlwaysMemberGroupStore : IRealtimeGroupStore

@@ -1,5 +1,5 @@
+using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Events;
-using ChatApp.Realtime.Integration.Serialization;
 
 namespace ChatApp.Realtime.Integration.Outbox;
 
@@ -24,7 +24,7 @@ public sealed class RealtimeIntegrationOutboxItem
         return new RealtimeIntegrationOutboxItem
         {
             EventId = evt.EventId,
-            PayloadJson = RealtimeWireSerializer.Serialize(evt),
+            PayloadJson = JsonSerializer.Serialize(evt, RealtimeOutboxJsonContext.Default.RealtimeEvent),
             TargetUserId = evt.TargetUserId,
             EventType = (short)evt.Type,
             CreatedAtMs = now,

@@ -24,6 +24,7 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
     private readonly IDirectMessagePolicy _directMessagePolicy;
     private readonly IMessageRateLimiter _messageRateLimiter;
     private readonly ILogger<DefaultIncomingMessageProcessor> _logger;
+    private readonly IDirectMessageAuthorizationStore? _directMessageAuthorizationStore;
 
     public DefaultIncomingMessageProcessor(
         IRealtimeMessageStore messageStore,
@@ -36,7 +37,8 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
         IPrivacySettingStore privacySettingStore,
         IDirectMessagePolicy directMessagePolicy,
         IMessageRateLimiter messageRateLimiter,
-        ILogger<DefaultIncomingMessageProcessor> logger)
+        ILogger<DefaultIncomingMessageProcessor> logger,
+        IDirectMessageAuthorizationStore? directMessageAuthorizationStore = null)
     {
         _messageStore = messageStore;
         _outboxSignal = outboxSignal;
@@ -49,6 +51,7 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
         _directMessagePolicy = directMessagePolicy;
         _messageRateLimiter = messageRateLimiter;
         _logger = logger;
+        _directMessageAuthorizationStore = directMessageAuthorizationStore;
     }
 
     public async Task<MessageProcessResult> ProcessAsync(
@@ -477,6 +480,10 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
     /// </list>
     /// </para>
     /// <para>
+    /// PostgreSQL 生产路径通过 <see cref="IDirectMessageAuthorizationStore"/> 一次查询完成前四项；
+    /// 聚合查询失败时因同时包含 existence/block 判定而整体 fail-closed。
+    /// </para>
+    /// <para>
     /// Lifecycle/Frozen 不在此预检查，由 SaveAsync 事务内 advisory lock 权威处理，避免 TOCTOU。
     /// </para>
     /// </summary>
@@ -486,6 +493,37 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
         bool isGroupMessage,
         CancellationToken ct)
     {
+        if (!isGroupMessage
+            && receiverUserId > 0
+            && _directMessageAuthorizationStore is not null)
+        {
+            try
+            {
+                var authorization = await _directMessageAuthorizationStore
+                    .AuthorizeAsync(senderUserId, receiverUserId, ct)
+                    .ConfigureAwait(false);
+                var authorizationError = MapDirectAuthorizationFailure(authorization.Decision);
+                if (authorizationError is not null)
+                    return authorizationError;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // 聚合查询同时承载 existence/block 两个 fail-closed 判定，整体故障必须拒绝。
+                _logger.LogWarning(
+                    ex,
+                    "单聊授权聚合查询失败，fail-closed 拒绝。发送用户={SenderUserId}；接收用户={ReceiverUserId}",
+                    senderUserId,
+                    receiverUserId);
+                return ("authorization_check_failed", "单聊授权校验暂时不可用。");
+            }
+
+            return await ValidateRateLimitAsync(senderUserId, ct).ConfigureAwait(false);
+        }
+
         // 1. User existence（发送方必须存在；单聊接收方也必须存在）
         try
         {
@@ -547,7 +585,14 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             }
         }
 
-        // 5. User rate limit（fail-open）
+        return await ValidateRateLimitAsync(senderUserId, ct).ConfigureAwait(false);
+    }
+
+    private async Task<(string ErrorCode, string ErrorMessage)?> ValidateRateLimitAsync(
+        long senderUserId,
+        CancellationToken ct)
+    {
+        // User rate limit（fail-open）
         try
         {
             var rateLimitResult = await _messageRateLimiter.TryAcquireAsync(senderUserId, ct).ConfigureAwait(false);
@@ -562,6 +607,23 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
 
         return null;
     }
+
+    private static (string ErrorCode, string ErrorMessage)? MapDirectAuthorizationFailure(
+        DirectMessageAuthorizationDecision decision) => decision switch
+        {
+            DirectMessageAuthorizationDecision.Allowed => null,
+            DirectMessageAuthorizationDecision.SenderNotFound =>
+                ("user_not_found", "发送方用户不存在。"),
+            DirectMessageAuthorizationDecision.ReceiverNotFound =>
+                ("user_not_found", "接收方用户不存在。"),
+            DirectMessageAuthorizationDecision.Blocked =>
+                ("blocked", "已被对方屏蔽。"),
+            DirectMessageAuthorizationDecision.PrivacyRejected =>
+                ("privacy_rejected", "对方隐私设置不允许接收你的消息。"),
+            DirectMessageAuthorizationDecision.NotFriend =>
+                ("not_friend", "仅好友可发送消息。"),
+            _ => ("authorization_rejected", "单聊授权校验未通过。")
+        };
 
     private static MessageProcessResult? Validate(IncomingMessageCommand command)
     {

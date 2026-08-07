@@ -51,10 +51,32 @@ public sealed class RealtimeIntegrationContractTests
         var item = RealtimeIntegrationOutboxItem.FromEvent(evt);
         var restored = RealtimeWireSerializer.DeserializeEvent(item.PayloadJson);
 
+        Assert.Equal(RealtimeWireSerializer.Serialize(evt), item.PayloadJson);
         Assert.Equal(item.CreatedAtMs, item.NextAttemptAtMs);
         Assert.Equal(evt.EventId, item.EventId);
         Assert.Equal(evt.TargetUserId, item.TargetUserId);
         Assert.Equal((short)evt.Type, item.EventType);
         Assert.Equal(evt.EventId, restored!.EventId);
+    }
+
+    [Fact]
+    public void PackageBoundaries_KeepEntityFrameworkOutOfIntegration()
+    {
+        var integrationReferences = typeof(RealtimeWireSerializer).Assembly
+            .GetReferencedAssemblies()
+            .Select(reference => reference.Name)
+            .ToArray();
+        var outboxReferences = typeof(RealtimeIntegrationOutboxItem).Assembly
+            .GetReferencedAssemblies()
+            .Select(reference => reference.Name)
+            .ToArray();
+
+        Assert.DoesNotContain(
+            integrationReferences,
+            name => name is not null && name.StartsWith("Microsoft.EntityFrameworkCore", StringComparison.Ordinal));
+        Assert.DoesNotContain("ChatApp.Realtime.Integration", outboxReferences);
+        Assert.DoesNotContain(
+            outboxReferences,
+            name => name is not null && name.StartsWith("NATS.Client", StringComparison.Ordinal));
     }
 }

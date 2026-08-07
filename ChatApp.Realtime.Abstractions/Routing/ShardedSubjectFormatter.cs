@@ -6,7 +6,7 @@ namespace ChatApp.Realtime.Abstractions.Routing;
 /// 分片 subject 格式化工具：将实例 ID 填入 subject 模板。
 /// <para>
 /// 模板中使用 <c>{0}</c> 作为实例 ID 占位符，如
-/// <c>chat.realtime-events.{0}</c> -> <c>chat.realtime-events.gateway-01</c>。
+/// <c>chat.realtime-events.shards.{0}</c> -> <c>chat.realtime-events.shards.gateway-01</c>。
 /// </para>
 /// </summary>
 public static class ShardedSubjectFormatter
@@ -38,7 +38,7 @@ public static class ShardedSubjectFormatter
     /// <summary>
     /// 将分片 subject 模板转换为通配符 subject，用于 JetStream 流配置。
     /// <para>
-    /// 例如 <c>chat.realtime-events.{0}</c> -> <c>chat.realtime-events.&gt;</c>。
+    /// 例如 <c>chat.realtime-events.shards.{0}</c> -> <c>chat.realtime-events.shards.&gt;</c>。
     /// </para>
     /// </summary>
     /// <param name="pattern">包含 <c>{0}</c> 占位符的 subject 模板。</param>

@@ -22,7 +22,7 @@ namespace ChatApp.Realtime.Infrastructure.Postgres.Outbox;
 /// <list type="bullet">
 /// <item>标量事件（无 TargetUserIds，占绝大多数）：UNNEST 批量 INSERT，
 /// <c>target_user_ids</c> 列写 NULL，零文本编码开销。</item>
-/// <item>数组事件（MembersAdded 等低频多用户事件）：逐行 INSERT，
+/// <item>数组事件（单聊双目标、MembersAdded 等多用户事件）：逐行 INSERT，
 /// Npgsql 直接将 <c>long[]</c> 映射为 <c>bigint[]</c> 参数，原生二进制传输。</item>
 /// </list>
 /// 群消息广播（AudienceKind=Conversation）走标量路径，<c>target_user_ids</c> 始终为 NULL——
@@ -80,7 +80,7 @@ internal static class OutboxInsertHelper
     /// <summary>
     /// 极限-6：标量事件批量写入（TargetUserIds 为空的事件）。
     /// 使用 UNNEST 单条 SQL，<c>target_user_ids</c> 列写 NULL。
-    /// 群广播（AudienceKind=Conversation）与单聊点对点事件都走此路径。
+    /// 群广播（AudienceKind=Conversation）与其他单目标事件走此路径；单聊消息使用双目标数组路径。
     /// </summary>
     private static async Task<int> InsertScalarBatchAsync(
         NpgsqlConnection connection,
@@ -191,7 +191,7 @@ internal static class OutboxInsertHelper
     /// 极限-6：数组事件逐行写入（TargetUserIds 非空的事件）。
     /// Npgsql 直接将 <c>long[]</c> 映射为 <c>bigint[]</c> 参数，原生二进制传输，
     /// 替代旧的 <c>string.Join</c> + <c>string_to_array</c> 文本编码。
-    /// 此类事件低频（MembersAdded 等），逐行 INSERT 开销可忽略。
+    /// 单事件入口会绕过临时 List 分组，直接执行一条参数化 INSERT。
     /// </summary>
     private static async Task<int> InsertArrayBatchAsync(
         NpgsqlConnection connection,
@@ -285,10 +285,27 @@ internal static class OutboxInsertHelper
     }
 
     /// <summary>单条事件的便捷包装。</summary>
-    public static Task<int> InsertAsync(
+    public static async Task<int> InsertAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
         RealtimeDatabaseSchema schema,
         RealtimeEvent evt,
-        CancellationToken ct) => InsertManyAsync(connection, transaction, schema, [evt], ct);
+        CancellationToken ct)
+    {
+        if (evt.TargetUserIds is { Length: > 0 })
+        {
+            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            return await InsertArrayBatchAsync(
+                    connection,
+                    transaction,
+                    schema,
+                    [evt],
+                    now,
+                    ct)
+                .ConfigureAwait(false);
+        }
+
+        return await InsertManyAsync(connection, transaction, schema, [evt], ct)
+            .ConfigureAwait(false);
+    }
 }

@@ -24,6 +24,7 @@ public sealed class MessagePersistPipelineTests
         var clientMessageId = Guid.CreateVersion7().ToString("N");
         const long senderUserId = 9_100_000_001;
         const long receiverUserId = 9_100_000_002;
+        await _fixture.EnsureDirectMessageAllowedAsync(senderUserId, receiverUserId);
         var conversationId = ConversationId.CreateDirect(senderUserId, receiverUserId);
         var commandId = PipelineTestIds.CreateMessageCommandId(senderUserId, clientMessageId);
         var command = new IncomingMessageCommand

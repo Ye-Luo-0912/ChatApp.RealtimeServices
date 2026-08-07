@@ -18,7 +18,7 @@ public static class AttachmentEventIdFactory
     }
 
     /// <summary>
-    /// 六-2：使用稳定哈希（SHA256）替代 <see cref="string.GetHashCode"/>，
+    /// 六-2：使用稳定哈希（SHA256）替代 <see cref="string.GetHashCode()"/>，
     /// 保证跨进程/重启后同一 cursor 产生相同 EventId，维持幂等性。
     /// 取 SHA256 前 4 字节作为 int chunkIndex，再委托给 <see cref="CreateAttachmentBlobsPurgeEventId(string, int)"/>。
     /// </summary>

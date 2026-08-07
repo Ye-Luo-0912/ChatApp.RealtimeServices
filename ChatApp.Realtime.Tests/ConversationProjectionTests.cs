@@ -68,19 +68,17 @@ public sealed class ConversationProjectionTests : IAsyncLifetime
 
         await using (var outbox = new NpgsqlCommand(
                            $"""
-                            SELECT event_type, target_user_id
+                            SELECT event_type, target_user_id, target_user_ids
                             FROM {schema.OutboxTableSql}
                             WHERE event_type = @event_type
-                            ORDER BY target_user_id
                             """,
                            connection))
         {
             outbox.Parameters.AddWithValue("event_type", (short)RealtimeEventType.MessageReceived);
             await using var reader = await outbox.ExecuteReaderAsync();
             Assert.True(await reader.ReadAsync());
-            Assert.Equal(1001, reader.GetInt64(1)); // sender echo
-            Assert.True(await reader.ReadAsync());
-            Assert.Equal(1002, reader.GetInt64(1)); // receiver
+            Assert.Equal(1002, reader.GetInt64(1));
+            Assert.Equal([1002L, 1001L], reader.GetFieldValue<long[]>(2));
             Assert.False(await reader.ReadAsync());
         }
 

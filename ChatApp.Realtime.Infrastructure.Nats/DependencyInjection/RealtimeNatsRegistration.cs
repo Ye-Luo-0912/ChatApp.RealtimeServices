@@ -29,8 +29,8 @@ public static class RealtimeNatsRegistration
     {
         services.AddSingleton(queueOptions);
         // Reliability-4：始终注册 JetStreamOptions（即使 Noop 模式），
-        // 使 Worker 能注入并读取 AckWait 配置以驱动 In-Progress ACK 守卫。
-        // Noop 模式下 AckWait=0，ProgressAckGuard.Start 返回 null（空操作）。
+        // 使 Worker 能注入并读取 AckWait 配置以驱动 In-Progress ACK 租约调度器。
+        // Noop 模式下 AckWait=0，AckLeaseScheduler.Start 返回 null（空操作）。
         services.TryAddSingleton(jetStreamOptions ?? new JetStreamOptions());
         if (!ShouldUseNatsQueue(queueOptions))
         {

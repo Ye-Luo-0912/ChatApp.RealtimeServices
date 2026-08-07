@@ -1,17 +1,27 @@
 ARG FINAL_BASE_IMAGE=mcr.microsoft.com/dotnet/aspnet:10.0
 
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0.301 AS build
 ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
 
+COPY ["global.json", "."]
+COPY ["Directory.Build.props", "."]
 COPY ["ChatApp.RealtimeServices.slnx", "."]
 COPY ["ChatApp.Realtime.Abstractions/ChatApp.Realtime.Abstractions.csproj", "ChatApp.Realtime.Abstractions/"]
+COPY ["ChatApp.Realtime.Abstractions/packages.lock.json", "ChatApp.Realtime.Abstractions/"]
 COPY ["ChatApp.Realtime.Infrastructure.Core/ChatApp.Realtime.Infrastructure.Core.csproj", "ChatApp.Realtime.Infrastructure.Core/"]
+COPY ["ChatApp.Realtime.Infrastructure.Core/packages.lock.json", "ChatApp.Realtime.Infrastructure.Core/"]
 COPY ["ChatApp.Realtime.Infrastructure.Nats/ChatApp.Realtime.Infrastructure.Nats.csproj", "ChatApp.Realtime.Infrastructure.Nats/"]
+COPY ["ChatApp.Realtime.Infrastructure.Nats/packages.lock.json", "ChatApp.Realtime.Infrastructure.Nats/"]
 COPY ["ChatApp.Realtime.Infrastructure.Postgres/ChatApp.Realtime.Infrastructure.Postgres.csproj", "ChatApp.Realtime.Infrastructure.Postgres/"]
+COPY ["ChatApp.Realtime.Infrastructure.Postgres/packages.lock.json", "ChatApp.Realtime.Infrastructure.Postgres/"]
 COPY ["ChatApp.Realtime.Infrastructure.Redis/ChatApp.Realtime.Infrastructure.Redis.csproj", "ChatApp.Realtime.Infrastructure.Redis/"]
+COPY ["ChatApp.Realtime.Infrastructure.Redis/packages.lock.json", "ChatApp.Realtime.Infrastructure.Redis/"]
+COPY ["ChatApp.Realtime.Integration/ChatApp.Realtime.Integration.csproj", "ChatApp.Realtime.Integration/"]
+COPY ["ChatApp.Realtime.Integration/packages.lock.json", "ChatApp.Realtime.Integration/"]
 COPY ["ChatApp.RealtimeServices/ChatApp.RealtimeServices.csproj", "ChatApp.RealtimeServices/"]
-RUN dotnet restore "ChatApp.RealtimeServices/ChatApp.RealtimeServices.csproj"
+COPY ["ChatApp.RealtimeServices/packages.lock.json", "ChatApp.RealtimeServices/"]
+RUN dotnet restore "ChatApp.RealtimeServices/ChatApp.RealtimeServices.csproj" --locked-mode
 
 COPY . .
 RUN dotnet publish "ChatApp.RealtimeServices/ChatApp.RealtimeServices.csproj" \

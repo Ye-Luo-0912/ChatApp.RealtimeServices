@@ -79,6 +79,8 @@ public static class RealtimePostgresRegistration
                 sp.GetRequiredService<IUserExistenceChecker>()));
             services.RemoveAll<IUserExistenceChecker>();
             services.AddSingleton<IUserExistenceChecker, NpgsqlUserExistenceChecker>();
+            services.RemoveAll<IDirectMessageAuthorizationStore>();
+            services.AddSingleton<IDirectMessageAuthorizationStore, NpgsqlDirectMessageAuthorizationStore>();
             services.RemoveAll<IBlockListStore>();
             services.AddSingleton<IBlockListStore, NpgsqlBlockListStore>();
             services.RemoveAll<IRelationshipStore>();

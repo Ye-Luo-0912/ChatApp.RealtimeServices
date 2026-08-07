@@ -32,4 +32,8 @@
     </None>
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="ChatApp.Realtime.IntegrationTests" />
+  </ItemGroup>
+
 </Project>

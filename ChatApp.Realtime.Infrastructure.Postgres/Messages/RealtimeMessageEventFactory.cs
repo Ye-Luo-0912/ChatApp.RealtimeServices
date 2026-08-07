@@ -18,7 +18,8 @@ internal static class RealtimeMessageEventFactory
         RealtimeEvent evt,
         IReadOnlyList<AttachmentRef>? attachments,
         long? conversationSequence = null,
-        ConversationType? conversationType = null)
+        ConversationType? conversationType = null,
+        long[]? targetUserIds = null)
     {
         // P1-4：优先使用应用层传入的 Payload 对象，省去一次 deserialize + reserialize。
         // 仅当 Payload 缺失（如旧调用方/测试）且 PayloadJson 存在时，才回退到反序列化路径。
@@ -37,12 +38,12 @@ internal static class RealtimeMessageEventFactory
             }
             catch (JsonException)
             {
-                return evt;
+                return CopyWithTargetUserIds(evt, targetUserIds);
             }
         }
 
         if (payload is null)
-            return evt;
+            return CopyWithTargetUserIds(evt, targetUserIds);
 
         var enriched = new RealtimeChatMessagePayload
         {
@@ -87,7 +88,8 @@ internal static class RealtimeMessageEventFactory
             PayloadJson = payloadJson,
             OccurredAtMs = evt.OccurredAtMs,
             TraceParent = evt.TraceParent,
-            TraceState = evt.TraceState
+            TraceState = evt.TraceState,
+            TargetUserIds = targetUserIds
             // Payload 故意不传递：已物化为 PayloadJson，避免持有冗余引用。
         };
     }
@@ -125,27 +127,6 @@ internal static class RealtimeMessageEventFactory
         };
     }
 
-    /// <summary>
-    /// 发送方其他在线设备回声事件：Gateway 会跳过来源 SessionId。
-    /// </summary>
-    public static RealtimeEvent CreateSenderEchoEvent(RealtimeEvent receiverEvent, long senderUserId)
-    {
-        var messageId = receiverEvent.MessageId ?? string.Empty;
-        return new RealtimeEvent
-        {
-            EventId = MessageEventIdFactory.CreateSenderEchoEventId(messageId, senderUserId),
-            Type = RealtimeEventType.MessageReceived,
-            TargetUserId = senderUserId,
-            ActorUserId = receiverEvent.ActorUserId,
-            MessageId = receiverEvent.MessageId,
-            SessionId = receiverEvent.SessionId,
-            PayloadJson = receiverEvent.PayloadJson,
-            OccurredAtMs = receiverEvent.OccurredAtMs,
-            TraceParent = receiverEvent.TraceParent,
-            TraceState = receiverEvent.TraceState
-        };
-    }
-
     public static RealtimeEvent CopyForReceipt(RealtimeEvent evt, long senderUserId) => new()
     {
         EventId = evt.EventId,
@@ -176,4 +157,34 @@ internal static class RealtimeMessageEventFactory
         // 而不必走 PayloadJson 反序列化回退路径。
         Payload = evt.Payload
     };
+
+    private static RealtimeEvent CopyWithTargetUserIds(
+        RealtimeEvent evt,
+        long[]? targetUserIds)
+    {
+        if (targetUserIds is null)
+            return evt;
+
+        return new RealtimeEvent
+        {
+            EventId = evt.EventId,
+            Type = evt.Type,
+            TargetUserId = evt.TargetUserId,
+            ActorUserId = evt.ActorUserId,
+            MessageId = evt.MessageId,
+            SessionId = evt.SessionId,
+            PayloadJson = evt.PayloadJson,
+            OccurredAtMs = evt.OccurredAtMs,
+            TraceParent = evt.TraceParent,
+            TraceState = evt.TraceState,
+            TargetUserIds = targetUserIds,
+            AudienceKind = evt.AudienceKind,
+            ConversationId = evt.ConversationId,
+            ExcludeUserId = evt.ExcludeUserId,
+            ProtocolVersion = evt.ProtocolVersion,
+            AudienceVersion = evt.AudienceVersion,
+            MinProtocolVersion = evt.MinProtocolVersion,
+            Payload = evt.Payload
+        };
+    }
 }

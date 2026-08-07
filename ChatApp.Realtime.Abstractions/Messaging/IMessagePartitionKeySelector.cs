@@ -25,6 +25,9 @@ public interface IMessagePartitionKeySelector
 /// </summary>
 public sealed class DefaultMessagePartitionKeySelector : IMessagePartitionKeySelector
 {
+    private const ulong FirstUserSalt = 0x9E3779B97F4A7C15UL;
+    private const ulong SecondUserSalt = 0xD1B54A32D192ED03UL;
+
     public static readonly DefaultMessagePartitionKeySelector Instance = new();
 
     public ulong GetPartitionKey(IncomingMessageCommand command)
@@ -39,7 +42,34 @@ public sealed class DefaultMessagePartitionKeySelector : IMessagePartitionKeySel
         // 单聊：双方用户稳定组合，A→B 与 B→A 同分区。
         var first = Math.Min(command.SenderUserId, command.ReceiverUserId);
         var second = Math.Max(command.SenderUserId, command.ReceiverUserId);
-        return unchecked((ulong)first * 397UL ^ (ulong)second);
+        return StableDirectPairHash(first, second);
+    }
+
+    /// <summary>
+    /// 对规范化后的双方用户编号做稳定的 64-bit avalanche 混合。
+    /// 调用方通常以 2 的幂作为分区数，因此低位也必须具备良好分布；简单的
+    /// <c>(first * 397) ^ second</c> 会让连续用户组成的 peer ring 只命中少数分区。
+    /// </summary>
+    private static ulong StableDirectPairHash(long first, long second)
+    {
+        unchecked
+        {
+            var firstHash = Mix64((ulong)first + FirstUserSalt);
+            var secondHash = Mix64((ulong)second + SecondUserSalt);
+            return Mix64(firstHash ^ secondHash);
+        }
+    }
+
+    private static ulong Mix64(ulong value)
+    {
+        unchecked
+        {
+            value ^= value >> 30;
+            value *= 0xBF58476D1CE4E5B9UL;
+            value ^= value >> 27;
+            value *= 0x94D049BB133111EBUL;
+            return value ^ (value >> 31);
+        }
     }
 
     /// <summary>

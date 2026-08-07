@@ -6,9 +6,9 @@
     <Nullable>enable</Nullable>
     <IsPackable>true</IsPackable>
     <PackageId>ChatApp.Realtime.Contracts</PackageId>
-    <Version>2.2.0</Version>
-    <AssemblyVersion>2.2.0.0</AssemblyVersion>
-    <FileVersion>2.2.0.0</FileVersion>
+    <Version>2.3.0</Version>
+    <AssemblyVersion>2.3.0.0</AssemblyVersion>
+    <FileVersion>2.3.0.0</FileVersion>
     <Description>ChatApp 跨仓库共享的 BCL-only 实时契约层（事件/协议/路由/存储接口）。SemVer 兼容性由契约测试保障。</Description>
     <PackageTags>chatapp;realtime;contracts;protocol</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

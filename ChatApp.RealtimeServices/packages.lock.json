@@ -1,0 +1,263 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net10.0": {
+      "Microsoft.VisualStudio.Azure.Containers.Tools.Targets": {
+        "type": "Direct",
+        "requested": "[1.23.0, )",
+        "resolved": "1.23.0",
+        "contentHash": "2wDnb4umupJZ/1ikgWozFVpggH1mlHQFc0odXVv2ZagL3RYwXgW9zmC15fiqIBzmaC0vLZUnLGwDY+p8ZR7Syw=="
+      },
+      "OpenTelemetry.Exporter.OpenTelemetryProtocol": {
+        "type": "Direct",
+        "requested": "[1.17.0, )",
+        "resolved": "1.17.0",
+        "contentHash": "R1omQOrQpGlS0Cp5UIr/TAiuEA48JrPlgr1NPV5gESiTU7HhWU+ILe2EBSYb1fKdsSavZ7nZkHcUxAzofPqr2A==",
+        "dependencies": {
+          "OpenTelemetry": "1.17.0"
+        }
+      },
+      "OpenTelemetry.Exporter.Prometheus.AspNetCore": {
+        "type": "Direct",
+        "requested": "[1.17.0-beta.1, )",
+        "resolved": "1.17.0-beta.1",
+        "contentHash": "eecXu43HkY7LFJDutrQ6kpwvUOMDeqLMtU+UeN225ckXw33qN/StTcdW6mTHH1jDSYdFM29vvDXB3jnFwPHkXg==",
+        "dependencies": {
+          "OpenTelemetry": "[1.17.0, 2.0.0)"
+        }
+      },
+      "OpenTelemetry.Extensions.Hosting": {
+        "type": "Direct",
+        "requested": "[1.17.0, )",
+        "resolved": "1.17.0",
+        "contentHash": "t1OwL/4qgboGMobYVT+UV5zgWnFqCp4Pw8lcsmzh8m2K8PQsTKkyxrC32tqYTMYny3GOW4q5cltE3dTVzLmRew==",
+        "dependencies": {
+          "OpenTelemetry": "1.17.0"
+        }
+      },
+      "OpenTelemetry.Instrumentation.AspNetCore": {
+        "type": "Direct",
+        "requested": "[1.17.0, )",
+        "resolved": "1.17.0",
+        "contentHash": "rGbmk1vuy1kvgZmE0ps7Vb99YZvDap6AalrrF60FwnNit1uW/PbeFZj1cpb0T8MPkYmjhBrRJ1/JB6QqXkRjHA==",
+        "dependencies": {
+          "OpenTelemetry.Api.ProviderBuilderExtensions": "[1.17.0, 2.0.0)"
+        }
+      },
+      "Microsoft.EntityFrameworkCore": {
+        "type": "Transitive",
+        "resolved": "10.0.5",
+        "contentHash": "9tNBmK3EpYVGRQLiqP+bqK2m+TD0Gv//4vCzR7ZOgl4FWzCFyOpYdIVka13M4kcBdPdSJcs3wbHr3rmzOqbIMA==",
+        "dependencies": {
+          "Microsoft.EntityFrameworkCore.Abstractions": "10.0.5",
+          "Microsoft.EntityFrameworkCore.Analyzers": "10.0.5"
+        }
+      },
+      "Microsoft.EntityFrameworkCore.Abstractions": {
+        "type": "Transitive",
+        "resolved": "10.0.5",
+        "contentHash": "32c58Rnm47Qvhimawf67KO9PytgPz3QoWye7Abapt0Yocw/JnzMiSNj/pRoIKyn8Jxypkv86zxKD4Q/zNTc0Ag=="
+      },
+      "Microsoft.EntityFrameworkCore.Analyzers": {
+        "type": "Transitive",
+        "resolved": "10.0.5",
+        "contentHash": "ipC4u1VojgEfoIZhtbS2Sx5IluJTP/Jf1hz3yGsxGBgSukYY/CquI6rAjxn5H58CZgVn36qcuPPtNMwZ0AUzMg=="
+      },
+      "Microsoft.EntityFrameworkCore.Relational": {
+        "type": "Transitive",
+        "resolved": "10.0.4",
+        "contentHash": "DOTjTHy93W3TwpMLM4SCm0n57Sc0Jj3+m2S6LSTstKyBB34eT1UouaMS19mpWwvtj42+sRiEjA3+rOTNoNzXFQ==",
+        "dependencies": {
+          "Microsoft.EntityFrameworkCore": "10.0.4"
+        }
+      },
+      "NATS.Client.Abstractions": {
+        "type": "Transitive",
+        "resolved": "2.8.0",
+        "contentHash": "8LMnewa4bXwwVqjFyEsFp7CA6OK921tvBF1xK1Z+5W+PdLMjsYK2RMrp6fmUQsb7+d5o+GG8SgQV6zdqvZcJFA=="
+      },
+      "NATS.Client.Core": {
+        "type": "Transitive",
+        "resolved": "2.8.0",
+        "contentHash": "DPu2sd1DuvL0+agx6U2RbXWfWQcmwJTl5vFasxLjqy0tg3Uih7mc6EfsDY1YE9aWeDgSRM4DU4n/UTrlVCP7Pg==",
+        "dependencies": {
+          "NATS.Client.Abstractions": "2.8.0",
+          "NATS.NKeys": "1.0.1"
+        }
+      },
+      "NATS.Client.Hosting": {
+        "type": "Transitive",
+        "resolved": "2.8.0",
+        "contentHash": "yNSIXMHODM3WYGHAR252xqpKPZudy6RAv4AonHSuJs5j+nr/WIGtS7SZ8EJnrWHHDuG5MLuDxXNtz7hvqJHw4g==",
+        "dependencies": {
+          "NATS.Client.Core": "2.8.0"
+        }
+      },
+      "NATS.Client.JetStream": {
+        "type": "Transitive",
+        "resolved": "2.8.0",
+        "contentHash": "BhfKO8IY6FQYmq1pX7iBn9McFR+Ww9zW1pO3vghD996IqkixCShudb6XKJRBcTSwOh6+yWZNau8UmQGBHVFY7g==",
+        "dependencies": {
+          "NATS.Client.Core": "2.8.0"
+        }
+      },
+      "NATS.Client.KeyValueStore": {
+        "type": "Transitive",
+        "resolved": "2.8.0",
+        "contentHash": "2HfxBLU4HBN/KKJXa5gCI18mQPXE30BvKUuADMQ/TW1mJkLE7e1kcWEq5hMvrhqR/KgX2M0cMBeOCpzKtno9Jg==",
+        "dependencies": {
+          "NATS.Client.JetStream": "2.8.0"
+        }
+      },
+      "NATS.Client.ObjectStore": {
+        "type": "Transitive",
+        "resolved": "2.8.0",
+        "contentHash": "h0RGiHT7KRU4YNvA6aj6A7Fl5lK6nilz4rK48wb7BIeXthxGZGDdl76gyDbcaiWeK6GE/y41Pg5xadeUntFuOQ==",
+        "dependencies": {
+          "NATS.Client.JetStream": "2.8.0"
+        }
+      },
+      "NATS.Client.Serializers.Json": {
+        "type": "Transitive",
+        "resolved": "2.8.0",
+        "contentHash": "oDxXCdWgu1DcPDbCtZSGfXMcv0PSY7t8019DD7sdruPhAVa6aDVwWvwfws18SUHJAhPA+AlnMuE5MoA78/Zs2Q==",
+        "dependencies": {
+          "NATS.Client.Abstractions": "2.8.0"
+        }
+      },
+      "NATS.Client.Services": {
+        "type": "Transitive",
+        "resolved": "2.8.0",
+        "contentHash": "pJElVPZ2+eaBMQ5E2FGLcLh4JcosOCFjlnq2iezuL7nhB5tLFnScTNgMHhUe4xde6cWepqE3nEhFqBNuijSGYg==",
+        "dependencies": {
+          "NATS.Client.Core": "2.8.0"
+        }
+      },
+      "NATS.Client.Simplified": {
+        "type": "Transitive",
+        "resolved": "2.8.0",
+        "contentHash": "9xJKE6Fb67JCuE0mlQwKzeUTFx7kUPYp8vr8zBII9kJp24OEqgsWIlN7RhXxq8j2daMLcLrr6wn9Dw8KekCqRg==",
+        "dependencies": {
+          "NATS.Client.Core": "2.8.0",
+          "NATS.Client.Serializers.Json": "2.8.0"
+        }
+      },
+      "NATS.Net": {
+        "type": "Transitive",
+        "resolved": "2.8.0",
+        "contentHash": "S53x3Mg53QgCZrdALiNBBemkT11YTYvEaNQ2XGCmekYfXIFS2MZYIoLl0VX9cgo729gD97Kj2rIbKZWzjJvddQ==",
+        "dependencies": {
+          "NATS.Client.Core": "2.8.0",
+          "NATS.Client.Hosting": "2.8.0",
+          "NATS.Client.JetStream": "2.8.0",
+          "NATS.Client.KeyValueStore": "2.8.0",
+          "NATS.Client.ObjectStore": "2.8.0",
+          "NATS.Client.Serializers.Json": "2.8.0",
+          "NATS.Client.Services": "2.8.0",
+          "NATS.Client.Simplified": "2.8.0"
+        }
+      },
+      "NATS.NKeys": {
+        "type": "Transitive",
+        "resolved": "1.0.1",
+        "contentHash": "xtURX0fexmMd10noG3Uc8gFgwaH7QLQxxgdaVoQKFo0+8a4blwe8vPGgY2S5pzeVYcRXyjlIoA4AR4JgtThyjQ=="
+      },
+      "Npgsql": {
+        "type": "Transitive",
+        "resolved": "10.0.2",
+        "contentHash": "q5RfBI+wywJSFUNDE1L4ZbHEHCFTblo8Uf6A6oe4feOUFYiUQXyAf9GBh5qEZpvJaHiEbpBPkQumjEhXCJxdrg=="
+      },
+      "Npgsql.EntityFrameworkCore.PostgreSQL": {
+        "type": "Transitive",
+        "resolved": "10.0.1",
+        "contentHash": "P6EwH0Q4xkaA264iNZDqCPhWt8pscfUGxXazDQg4noBfqjoOlk4hKWfvBjF9ZX3R/9JybRmmJfmxr2iBMj0EpA==",
+        "dependencies": {
+          "Microsoft.EntityFrameworkCore": "[10.0.4, 11.0.0)",
+          "Microsoft.EntityFrameworkCore.Relational": "[10.0.4, 11.0.0)",
+          "Npgsql": "10.0.2"
+        }
+      },
+      "OpenTelemetry": {
+        "type": "Transitive",
+        "resolved": "1.17.0",
+        "contentHash": "rMLOTftlMlTm7+MSrvXDHnJRjVkROFNKXHZrYjOsX+LankaFG7QSflx7qRRGjoqZoirohnxmJQ7GEb9occO4Gg==",
+        "dependencies": {
+          "OpenTelemetry.Api.ProviderBuilderExtensions": "1.17.0"
+        }
+      },
+      "OpenTelemetry.Api": {
+        "type": "Transitive",
+        "resolved": "1.17.0",
+        "contentHash": "mSBxzomZgHIJu9CyVNqyDu/n2JHEtqVgfcCD1Br0cV5iLYogjZOMqhlVLt99PEp+0KGBNUR3GXgeOdN2GR3F9g=="
+      },
+      "OpenTelemetry.Api.ProviderBuilderExtensions": {
+        "type": "Transitive",
+        "resolved": "1.17.0",
+        "contentHash": "Xgc3Qf9B9TFMFpx6exTdGqMWuYIT2miNzkdMPutVvT9YuMFaEovXWke1Gb6z8NxYaQbbGF38vYLuSg1JCeui5Q==",
+        "dependencies": {
+          "OpenTelemetry.Api": "1.17.0"
+        }
+      },
+      "Pipelines.Sockets.Unofficial": {
+        "type": "Transitive",
+        "resolved": "2.2.8",
+        "contentHash": "zG2FApP5zxSx6OcdJQLbZDk2AVlN2BNQD6MorwIfV6gVj0RRxWPEp2LXAxqDGZqeNV1Zp0BNPcNaey/GXmTdvQ=="
+      },
+      "StackExchange.Redis": {
+        "type": "Transitive",
+        "resolved": "2.12.4",
+        "contentHash": "KNyzLp0aTcvWSxnbS6rCxX+2e+Q3goXhW80Iu7dwMkCQbENkoBw418I/UpgIxGzmS4gV10a5CdfdY4O0tO9Nrg==",
+        "dependencies": {
+          "Pipelines.Sockets.Unofficial": "2.2.8",
+          "System.IO.Hashing": "10.0.2"
+        }
+      },
+      "System.IO.Hashing": {
+        "type": "Transitive",
+        "resolved": "10.0.2",
+        "contentHash": "AKJknIFi9O3+rGExxTry188JPvUoZAPcCtS2qdqyFhIzsxQ1Ap94BeGDG0VzVEHakhmRxmJtVih6TsHoghIt/g=="
+      },
+      "ChatApp.Realtime.Contracts": {
+        "type": "Project"
+      },
+      "chatapp.realtime.infrastructure.core": {
+        "type": "Project",
+        "dependencies": {
+          "ChatApp.Realtime.Contracts": "[2.3.0, )"
+        }
+      },
+      "chatapp.realtime.infrastructure.nats": {
+        "type": "Project",
+        "dependencies": {
+          "ChatApp.Realtime.Infrastructure.Core": "[1.0.0, )",
+          "ChatApp.Realtime.Integration": "[2.4.0, )",
+          "NATS.Client.JetStream": "[2.8.0, )",
+          "NATS.Net": "[2.8.0, )"
+        }
+      },
+      "chatapp.realtime.infrastructure.postgres": {
+        "type": "Project",
+        "dependencies": {
+          "ChatApp.Realtime.Infrastructure.Core": "[1.0.0, )",
+          "Microsoft.EntityFrameworkCore": "[10.0.5, )",
+          "Npgsql": "[10.0.2, )",
+          "Npgsql.EntityFrameworkCore.PostgreSQL": "[10.0.1, )"
+        }
+      },
+      "chatapp.realtime.infrastructure.redis": {
+        "type": "Project",
+        "dependencies": {
+          "ChatApp.Realtime.Infrastructure.Core": "[1.0.0, )",
+          "StackExchange.Redis": "[2.12.4, )"
+        }
+      },
+      "chatapp.realtime.integration": {
+        "type": "Project",
+        "dependencies": {
+          "ChatApp.Realtime.Contracts": "[2.3.0, )",
+          "NATS.Client.JetStream": "[2.8.0, )"
+        }
+      }
+    }
+  }
+}

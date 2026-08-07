@@ -1,3 +1,5 @@
+using ChatApp.Realtime.Abstractions.Sync;
+
 namespace ChatApp.Realtime.Abstractions.Relationships;
 
 /// <summary>

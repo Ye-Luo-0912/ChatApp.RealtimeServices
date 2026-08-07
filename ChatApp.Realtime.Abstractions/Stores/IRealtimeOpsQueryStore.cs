@@ -28,6 +28,11 @@ public sealed record RealtimeMigrationCheckpointDto(
     string? CheckpointValue,
     long UpdatedAtMs);
 
+/// <summary>实时服务运维积压快照。</summary>
+/// <remarks>
+/// <c>MessagesBeyondRetentionCount</c> 在消息保留 GC 关闭或保留期为 0 时为 <c>null</c>；
+/// <c>OldestPurgeableReceivedAtMs</c> 在无可清理消息或保留策略关闭时为 <c>null</c>。
+/// </remarks>
 public sealed record RealtimeOpsBacklogDto(
     long OutboxPendingCount,
     long OutboxDeadCount,
@@ -41,9 +46,7 @@ public sealed record RealtimeOpsBacklogDto(
     long AttachmentConfirmedUnboundCount,
     long AttachmentScanningCount,
     long AttachmentAbandonedCount,
-    /// <summary>Null when message retention GC is disabled / horizon 0.</summary>
     long? MessagesBeyondRetentionCount,
-    /// <summary>Oldest purgeable <c>received_at_ms</c>; null when none or retention off.</summary>
     long? OldestPurgeableReceivedAtMs,
     string CleanupNote,
     long GeneratedAtMs);

@@ -2,8 +2,8 @@ namespace ChatApp.Realtime.Abstractions.Conversations;
 
 /// <summary>
 /// P1-2：会话受众查询请求（Gateway NATS request/reply）。
-/// 用于 <see cref="Stores.ConversationAudienceQuery"/> — 由 Gateway 的
-/// ConversationAudienceCache 在冷启动或 AudienceVersion 落后时发起。
+/// 由 Gateway 的 <c>ConversationAudienceCache</c> 在冷启动或
+/// AudienceVersion 落后时作为 request/reply 请求载荷发起。
 /// </summary>
 public sealed class ConversationAudienceQuery
 {

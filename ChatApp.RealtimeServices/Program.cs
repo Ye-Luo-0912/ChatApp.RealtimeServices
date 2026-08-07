@@ -24,6 +24,13 @@ try
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".chatapp", "realtime.user.json"),
         optional: true,
         reloadOnChange: false);
+    // The optional per-user file supplies local defaults only. CreateSlimBuilder has
+    // already registered environment variables and command-line arguments, so adding
+    // another JSON provider here would otherwise give the user file the highest
+    // precedence. Re-register the explicit process-level providers after it to keep
+    // deployments and isolated performance runs deterministic.
+    builder.Configuration.AddEnvironmentVariables();
+    builder.Configuration.AddCommandLine(args);
 
     builder.Logging.ClearProviders();
     builder.Logging.AddSimpleConsole(options =>

@@ -21,7 +21,10 @@
 
 ## 与业务 API、TCP 网关的边界
 
-跨项目通信集中在独立的 [.NET 10 集成模块](./ChatApp.Realtime.Integration/README.md)：
+跨项目通信使用版本化的 .NET 10 包：BCL-only 契约位于
+`ChatApp.Realtime.Contracts`，NATS/JetStream 客户端位于
+[ChatApp.Realtime.Integration](./ChatApp.Realtime.Integration/README.md)，仅业务 API 需要的
+EF Outbox 模型与映射位于 `ChatApp.Realtime.Outbox.EntityFrameworkCore`：
 
 1. `ChatApp.Server` 的好友请求、好友列表和屏蔽列表变更，由 EF Core SaveChanges 拦截器在业务事务内写入 `realtime.outbox`。
 2. 本服务抢占 Outbox，获得 JetStream 服务端确认后标记发布完成。
@@ -29,7 +32,8 @@
 4. 每个网关实例使用独立 durable consumer，避免普通队列组把用户事件分配给没有该用户连接的网关。
 5. TCP 网关通过 chat.message-history.query 请求历史；服务只信任网关注入的已认证 UserId。
 
-集成模块以 .NET 10 提供，当前 .NET 11 TCP 网关可直接引用；网关不复制消息存储或 NATS 实现。
+这些包以 .NET 10 提供；TCP 网关只引用 Contracts/Integration，不会传递引入 EF Core，
+也不复制消息存储或 NATS 实现。
 
 ## 本地启动
 
