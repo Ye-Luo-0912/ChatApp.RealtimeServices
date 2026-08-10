@@ -6,9 +6,9 @@
     <Nullable>enable</Nullable>
     <IsPackable>true</IsPackable>
     <PackageId>ChatApp.Realtime.Outbox.EntityFrameworkCore</PackageId>
-    <Version>1.0.0</Version>
-    <AssemblyVersion>1.0.0.0</AssemblyVersion>
-    <FileVersion>1.0.0.0</FileVersion>
+    <Version>1.0.1</Version>
+    <AssemblyVersion>1.0.1.0</AssemblyVersion>
+    <FileVersion>1.0.1.0</FileVersion>
     <Description>ChatApp Realtime 事务 Outbox 模型与 Entity Framework Core 映射。</Description>
     <PackageTags>chatapp;realtime;outbox;entity-framework-core</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
