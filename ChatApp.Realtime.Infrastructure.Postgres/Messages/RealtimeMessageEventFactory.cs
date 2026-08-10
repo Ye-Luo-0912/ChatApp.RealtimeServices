@@ -19,7 +19,8 @@ internal static class RealtimeMessageEventFactory
         IReadOnlyList<AttachmentRef>? attachments,
         long? conversationSequence = null,
         ConversationType? conversationType = null,
-        long[]? targetUserIds = null)
+        long[]? targetUserIds = null,
+        bool materializePayloadJson = true)
     {
         // P1-4：优先使用应用层传入的 Payload 对象，省去一次 deserialize + reserialize。
         // 仅当 Payload 缺失（如旧调用方/测试）且 PayloadJson 存在时，才回退到反序列化路径。
@@ -71,11 +72,13 @@ internal static class RealtimeMessageEventFactory
             MentionedRoles = payload.MentionedRoles
         };
 
-        // 一次性物化：把 enriched 对象序列化为 PayloadJson。
-        // 此后所有派生事件（聚合 / 回声 / 拷贝）直接复用此 PayloadJson，不再重复序列化。
-        var payloadJson = JsonSerializer.Serialize(
-            enriched,
-            RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload);
+        // EF/兼容路径仍物化字符串；Npgsql 热路径保留 typed payload，由 Outbox wire serializer
+        // 直接写 UTF-8，避免每消息创建 UTF-16 中间字符串。
+        var payloadJson = materializePayloadJson
+            ? JsonSerializer.Serialize(
+                enriched,
+                RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload)
+            : null;
 
         return new RealtimeEvent
         {
@@ -89,8 +92,14 @@ internal static class RealtimeMessageEventFactory
             OccurredAtMs = evt.OccurredAtMs,
             TraceParent = evt.TraceParent,
             TraceState = evt.TraceState,
-            TargetUserIds = targetUserIds
-            // Payload 故意不传递：已物化为 PayloadJson，避免持有冗余引用。
+            TargetUserIds = targetUserIds,
+            AudienceKind = evt.AudienceKind,
+            ConversationId = evt.ConversationId,
+            ExcludeUserId = evt.ExcludeUserId,
+            ProtocolVersion = evt.ProtocolVersion,
+            AudienceVersion = evt.AudienceVersion,
+            MinProtocolVersion = evt.MinProtocolVersion,
+            Payload = materializePayloadJson ? null : enriched
         };
     }
 
@@ -123,7 +132,14 @@ internal static class RealtimeMessageEventFactory
             OccurredAtMs = template.OccurredAtMs,
             TraceParent = template.TraceParent,
             TraceState = template.TraceState,
-            TargetUserIds = targetUserIds?.ToArray()
+            TargetUserIds = targetUserIds?.ToArray(),
+            AudienceKind = template.AudienceKind,
+            ConversationId = template.ConversationId,
+            ExcludeUserId = template.ExcludeUserId,
+            ProtocolVersion = template.ProtocolVersion,
+            AudienceVersion = template.AudienceVersion,
+            MinProtocolVersion = template.MinProtocolVersion,
+            Payload = template.Payload
         };
     }
 
@@ -138,7 +154,15 @@ internal static class RealtimeMessageEventFactory
         PayloadJson = evt.PayloadJson,
         OccurredAtMs = evt.OccurredAtMs,
         TraceParent = evt.TraceParent,
-        TraceState = evt.TraceState
+        TraceState = evt.TraceState,
+        TargetUserIds = evt.TargetUserIds,
+        AudienceKind = evt.AudienceKind,
+        ConversationId = evt.ConversationId,
+        ExcludeUserId = evt.ExcludeUserId,
+        ProtocolVersion = evt.ProtocolVersion,
+        AudienceVersion = evt.AudienceVersion,
+        MinProtocolVersion = evt.MinProtocolVersion,
+        Payload = evt.Payload
     };
 
     public static RealtimeEvent CopyWithMessageId(RealtimeEvent evt, string messageId) => new()
@@ -153,6 +177,13 @@ internal static class RealtimeMessageEventFactory
         OccurredAtMs = evt.OccurredAtMs,
         TraceParent = evt.TraceParent,
         TraceState = evt.TraceState,
+        TargetUserIds = evt.TargetUserIds,
+        AudienceKind = evt.AudienceKind,
+        ConversationId = evt.ConversationId,
+        ExcludeUserId = evt.ExcludeUserId,
+        ProtocolVersion = evt.ProtocolVersion,
+        AudienceVersion = evt.AudienceVersion,
+        MinProtocolVersion = evt.MinProtocolVersion,
         // P1-4：保留 Payload 对象引用，让后续 EnrichChatMessagePayload 能直接消费
         // 而不必走 PayloadJson 反序列化回退路径。
         Payload = evt.Payload

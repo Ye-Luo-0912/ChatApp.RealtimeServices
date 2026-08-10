@@ -42,12 +42,14 @@ internal static class OutboxInsertHelper
         INSERT INTO {0} (
             event_id, payload_json, payload_utf8, target_user_id, event_type, status,
             created_at_ms, next_attempt_at_ms, attempt_count, target_user_ids,
-            audience_kind, conversation_id, exclude_user_id, trace_parent, trace_state, occurred_at_ms
+            audience_kind, conversation_id, exclude_user_id, trace_parent, trace_state, occurred_at_ms,
+            locked_by, locked_until_ms, claim_token
         )
         VALUES (
             $1, NULL, $2, $3, $4, $5,
-            $6, $7, 0, $8,
-            $9, $10, NULLIF($11, 0), $12, $13, $14
+            $6, $7, $15, $8,
+            $9, $10, NULLIF($11, 0), $12, $13, $14,
+            $16, $17, $18
         )
         ON CONFLICT (event_id) DO NOTHING;
         """;
@@ -123,10 +125,7 @@ internal static class OutboxInsertHelper
         {
             var evt = events[i];
             eventIds[i] = evt.EventId;
-            var wireEvt = CreateWirePayload(evt);
-            payloadUtf8s[i] = JsonSerializer.SerializeToUtf8Bytes(
-                wireEvt,
-                RealtimeJsonSerializerContext.Default.RealtimeEvent);
+            payloadUtf8s[i] = SerializeWirePayloadToUtf8(evt);
             targetUserIds[i] = evt.TargetUserId;
             eventTypes[i] = (short)evt.Type;
             audienceKinds[i] = (short)(evt.AudienceKind ?? 0);
@@ -210,7 +209,7 @@ internal static class OutboxInsertHelper
         var inserted = 0;
         foreach (var evt in events)
         {
-            inserted += await InsertArrayAsync(connection, transaction, schema, evt, now, ct)
+            inserted += await InsertArrayAsync(connection, transaction, schema, evt, now, ct, null)
                 .ConfigureAwait(false);
         }
         return inserted;
@@ -222,15 +221,13 @@ internal static class OutboxInsertHelper
         RealtimeDatabaseSchema schema,
         RealtimeEvent evt,
         long now,
-        CancellationToken ct)
+        CancellationToken ct,
+        RealtimeOutboxPreclaim? preclaim)
     {
         var formattedCommandText = ArrayInsertCommandTexts.GetOrAdd(
             schema.OutboxTableSql,
             static table => ArrayInsertCommandText.Replace("{0}", table, StringComparison.Ordinal));
-        var wireEvt = CreateWirePayload(evt);
-        var payloadUtf8 = JsonSerializer.SerializeToUtf8Bytes(
-            wireEvt,
-            RealtimeJsonSerializerContext.Default.RealtimeEvent);
+        var payloadUtf8 = SerializeWirePayloadToUtf8(evt);
 
         await using var command = new NpgsqlCommand(formattedCommandText, connection, transaction);
         command.Parameters.AddWithValue(evt.EventId);
@@ -239,7 +236,10 @@ internal static class OutboxInsertHelper
         command.Parameters.AddWithValue((short)evt.Type);
         command.Parameters.AddWithValue((short)RealtimeOutboxStatus.Pending);
         command.Parameters.AddWithValue(now);
-        command.Parameters.AddWithValue(now);
+        // 预领取行在租约到期前不应进入 recovery 候选。旧实现仍写 now，导致恢复扫描
+        // 每轮从 Pending 索引读到所有 in-flight 行后再被 locked_until 谓词过滤。
+        // next_attempt_at=locked_until 与原可恢复时刻等价，但能直接由索引排除有效租约。
+        command.Parameters.AddWithValue(preclaim?.LockedUntilMs ?? now);
         // 极限-6：原生 bigint[] 参数，Npgsql 直接映射 long[] → bigint[]，无需文本编码。
         command.Parameters.AddWithValue(
             NpgsqlDbType.Array | NpgsqlDbType.Bigint,
@@ -250,6 +250,16 @@ internal static class OutboxInsertHelper
         command.Parameters.AddWithValue((object?)evt.TraceParent ?? DBNull.Value);
         command.Parameters.AddWithValue((object?)evt.TraceState ?? DBNull.Value);
         command.Parameters.AddWithValue(evt.OccurredAtMs);
+        command.Parameters.AddWithValue(NpgsqlDbType.Integer, preclaim is null ? 0 : 1);
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Text,
+            (object?)preclaim?.LockOwner ?? DBNull.Value);
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Bigint,
+            (object?)preclaim?.LockedUntilMs ?? DBNull.Value);
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Text,
+            (object?)preclaim?.ClaimToken ?? DBNull.Value);
         return await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
@@ -259,6 +269,9 @@ internal static class OutboxInsertHelper
     /// 在 wire payload 中，Gateway 需要这些字段判断投递语义（会话级受众 vs 普通用户事件）。
     /// <see cref="RealtimeEvent.TargetUserIds"/> 仍排除：O(N) 数组不在 payload 中，数据库列是唯一权威。
     /// </summary>
+    internal static byte[] SerializeWirePayloadToUtf8(RealtimeEvent evt) =>
+        RealtimeEventWireSerializer.SerializeToUtf8Bytes(CreateWirePayload(evt));
+
     private static RealtimeEvent CreateWirePayload(RealtimeEvent evt)
     {
         return new RealtimeEvent
@@ -285,7 +298,7 @@ internal static class OutboxInsertHelper
             // TargetUserIds 仍排除：O(N) 数组不在 payload 中，数据库列是唯一权威。
             TargetUserIds = null,
             // Payload 是 [JsonIgnore] 的运行时引用，不参与序列化，置空避免携带。
-            Payload = null,
+            Payload = evt.Payload,
         };
     }
 
@@ -295,7 +308,8 @@ internal static class OutboxInsertHelper
         NpgsqlTransaction transaction,
         RealtimeDatabaseSchema schema,
         RealtimeEvent evt,
-        CancellationToken ct)
+        CancellationToken ct,
+        RealtimeOutboxPreclaim? preclaim = null)
     {
         if (evt.TargetUserIds is { Length: > 0 })
         {
@@ -306,7 +320,8 @@ internal static class OutboxInsertHelper
                     schema,
                     evt,
                     now,
-                    ct)
+                    ct,
+                    preclaim)
                 .ConfigureAwait(false);
         }
 

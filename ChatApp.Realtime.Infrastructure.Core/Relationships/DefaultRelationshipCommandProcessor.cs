@@ -6,6 +6,7 @@ namespace ChatApp.Realtime.Infrastructure.Core.Relationships;
 /// <summary>
 /// 关系变更命令处理器：校验 → 调用 <see cref="IRelationshipStore"/> → 映射结果。
 /// <para>遵循 <see cref="DefaultGroupConversationProcessor"/> 模式。</para>
+/// <para>仅供显式的数据迁移/兼容工具使用；默认运行时由 ChatApp.Server 独占关系写入。</para>
 /// </summary>
 public sealed class DefaultRelationshipCommandProcessor : IRelationshipCommandProcessor
 {

@@ -4,11 +4,12 @@ using ChatApp.Realtime.Abstractions.Sync;
 namespace ChatApp.Realtime.Abstractions.Stores;
 
 /// <summary>
-/// 关系域持久化端口：好友请求 / 友谊 / 黑名单的 CRUD。
+/// 关系域旧数据迁移/投影端口：好友请求 / 友谊 / 黑名单的 CRUD。
 /// <para>
 /// 黑名单操作复用既有 <c>public."T_BlockRecords"</c> 表（与 <see cref="IBlockListStore"/> 共享），
 /// 好友请求与友谊使用 realtime schema 新表（Migration052）。
 /// </para>
+/// <para>默认在线写入必须经 ChatApp.Server，不得将本端口直接暴露为 TCP/NATS 写入入口。</para>
 /// </summary>
 public interface IRelationshipStore
 {

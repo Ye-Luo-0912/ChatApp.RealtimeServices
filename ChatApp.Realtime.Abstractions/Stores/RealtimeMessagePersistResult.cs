@@ -3,7 +3,8 @@ namespace ChatApp.Realtime.Abstractions.Stores;
 public sealed record RealtimeMessagePersistResult(
     RealtimeMessagePersistKind Kind,
     string MessageId,
-    long? ConversationSequence = null)
+    long? ConversationSequence = null,
+    DirectMessageAuthorizationDecision? AuthorizationDecision = null)
 {
     public bool IsNew => Kind == RealtimeMessagePersistKind.Created;
     public bool IsConflict => Kind == RealtimeMessagePersistKind.ContentConflict;
@@ -26,6 +27,11 @@ public sealed record RealtimeMessagePersistResult(
 
     public static RealtimeMessagePersistResult NotAllowed(string messageId) =>
         new(RealtimeMessagePersistKind.NotAllowed, messageId);
+
+    public static RealtimeMessagePersistResult AuthorizationRejected(
+        string messageId,
+        DirectMessageAuthorizationDecision decision) =>
+        new(RealtimeMessagePersistKind.NotAllowed, messageId, AuthorizationDecision: decision);
 
     public static RealtimeMessagePersistResult UserDeleted(string messageId) =>
         new(RealtimeMessagePersistKind.UserDeleted, messageId);

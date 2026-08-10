@@ -1,3 +1,5 @@
+using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Stores;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
@@ -66,6 +68,168 @@ public sealed class RealtimeOpsQueryStoreTests : IAsyncLifetime
         Assert.False(backlogs.Migration009Applied);
         Assert.True(backlogs.MessagesMissingConversationIdCount > 0);
         Assert.Contains("ChatApp.Server", backlogs.CleanupNote);
+    }
+
+    [Fact]
+    public async Task RelationshipProjectionStatus_ReportsDurableCursorAndSnapshotCoverage()
+    {
+        const string schemaName = "realtime_ops_relationship";
+        var schema = new RealtimeDatabaseSchema(schemaName);
+        var client = new RealtimeDatabaseClient(
+            _postgres.GetConnectionString(),
+            NullLogger<RealtimeDatabaseClient>.Instance);
+        await using (var connection = await client.GetDataSource().OpenConnectionAsync())
+        {
+            await using var createSchema = new NpgsqlCommand(
+                $"CREATE SCHEMA IF NOT EXISTS {schema.QuotedSchema};",
+                connection);
+            await createSchema.ExecuteNonQueryAsync();
+            await new Migration060_ServerRelationshipProjection().ApplyAsync(
+                connection, null, schema, CancellationToken.None);
+            await new Migration061_RelationshipProjectionSnapshots().ApplyAsync(
+                connection, null, schema, CancellationToken.None);
+            await new Migration062_RelationshipProjectionRebuilder().ApplyAsync(
+                connection, null, schema, CancellationToken.None);
+        }
+
+        var projectionStore = new NpgsqlRelationshipProjectionStore(client, schema);
+        const long owner = 9_200_001;
+        var delta = new RelationshipProjectionDelta
+        {
+            EventId = RelationshipEventIdFactory.CreateRelationshipProjectionEventId(
+                owner,
+                RelationshipProjectionListType.Friends,
+                1),
+            OwnerUserId = owner,
+            ListType = RelationshipProjectionListType.Friends,
+            Version = 1,
+            Operation = RelationshipProjectionOperation.Upsert,
+            ResourceId = "friend-ops",
+            SubjectUserId = owner + 1,
+            ActorUserId = owner,
+            State = "Accepted",
+            OccurredAtMs = 1_800_000_000_001
+        };
+        await projectionStore.ApplyAsync(delta);
+
+        var ops = new NpgsqlRelationshipProjectionOpsQueryStore(
+            client,
+            schema,
+            NullLogger<NpgsqlRelationshipProjectionOpsQueryStore>.Instance);
+        var beforeSnapshot = await ops.GetStatusAsync();
+        Assert.True(beforeSnapshot.Available);
+        Assert.Equal(1, beforeSnapshot.VersionStreamCount);
+        Assert.Equal(0, beforeSnapshot.SnapshotBaselineStreamCount);
+        Assert.Equal(1, beforeSnapshot.StreamsWithoutSnapshotBaselineCount);
+        Assert.Equal(1, beforeSnapshot.ProjectionItemCount);
+        Assert.Equal(1, beforeSnapshot.InboxEventCount);
+
+        var items = new[]
+        {
+            new RelationshipProjectionSnapshotItem
+            {
+                ResourceId = delta.ResourceId,
+                SubjectUserId = delta.SubjectUserId,
+                ActorUserId = delta.ActorUserId,
+                State = delta.State,
+                OccurredAtMs = delta.OccurredAtMs
+            }
+        };
+        var resourceHash = RelationshipProjectionSnapshotHash.Compute(
+            items.Select(static item => item.ResourceId));
+        await projectionStore.ApplySnapshotAsync(new RelationshipProjectionStreamSnapshot
+        {
+            SnapshotId = RelationshipEventIdFactory.CreateRelationshipProjectionSnapshotId(
+                owner,
+                RelationshipProjectionListType.Friends,
+                1,
+                resourceHash),
+            OwnerUserId = owner,
+            ListType = RelationshipProjectionListType.Friends,
+            Version = 1,
+            CapturedAtMs = 1_800_000_000_002,
+            ItemCount = items.Length,
+            ResourceHash = resourceHash,
+            Items = items
+        });
+
+        var stateStore = new NpgsqlRelationshipProjectionRebuildStateStore(client, schema);
+        var lease = Assert.IsType<RelationshipProjectionRebuildLease>(
+            await stateStore.TryAcquireAsync("ops-status", TimeSpan.FromSeconds(30)));
+        Assert.True(await stateStore.CommitPageAsync(
+            lease,
+            owner,
+            RelationshipProjectionListType.Friends,
+            false,
+            TimeSpan.FromSeconds(30)));
+
+        var status = await ops.GetStatusAsync();
+        Assert.True(status.Available);
+        Assert.True(status.LeaseActive);
+        Assert.Equal(owner, status.CursorOwnerUserId);
+        Assert.Equal(RelationshipProjectionListType.Friends, status.CursorListType);
+        Assert.Equal(1, status.SnapshotBaselineStreamCount);
+        Assert.Equal(0, status.StreamsWithoutSnapshotBaselineCount);
+        Assert.True(status.GeneratedAtMs >= status.UpdatedAtMs);
+
+        await projectionStore.ApplyAsync(new RelationshipProjectionDelta
+        {
+            EventId = RelationshipEventIdFactory.CreateRelationshipProjectionEventId(
+                owner,
+                RelationshipProjectionListType.BlockedUsers,
+                1),
+            OwnerUserId = owner,
+            ListType = RelationshipProjectionListType.BlockedUsers,
+            Version = 1,
+            Operation = RelationshipProjectionOperation.Upsert,
+            ResourceId = "blocked-ops",
+            SubjectUserId = owner + 2,
+            ActorUserId = owner,
+            State = "Blocked",
+            OccurredAtMs = 1_800_000_000_003
+        });
+
+        var firstPage = await ops.ListStreamsAsync(null, null, 1);
+        var first = Assert.Single(firstPage.Items);
+        Assert.True(firstPage.HasMore);
+        Assert.Equal(RelationshipProjectionListType.Friends, first.ListType);
+        Assert.True(first.HasSnapshotBaseline);
+        Assert.True(first.IsLocallyContiguous);
+        Assert.Equal(0, first.DeltaInboxCountAfterSnapshot);
+
+        var secondPage = await ops.ListStreamsAsync(
+            firstPage.NextOwnerUserId,
+            firstPage.NextListType,
+            1);
+        var second = Assert.Single(secondPage.Items);
+        Assert.False(secondPage.HasMore);
+        Assert.Equal(RelationshipProjectionListType.BlockedUsers, second.ListType);
+        Assert.False(second.HasSnapshotBaseline);
+        Assert.True(second.IsLocallyContiguous);
+        Assert.Equal(1, second.DeltaInboxCountAfterSnapshot);
+
+        await using (var connection = await client.GetDataSource().OpenConnectionAsync())
+        {
+            await using var removeInbox = new NpgsqlCommand(
+                $"""
+                 DELETE FROM {schema.RelationshipProjectionInboxTableSql}
+                 WHERE "owner_user_id" = @owner AND "list_type" = @list_type;
+                 """,
+                connection);
+            removeInbox.Parameters.AddWithValue("owner", owner);
+            removeInbox.Parameters.AddWithValue(
+                "list_type",
+                (short)RelationshipProjectionListType.BlockedUsers);
+            Assert.Equal(1, await removeInbox.ExecuteNonQueryAsync());
+        }
+
+        var gapPage = await ops.ListStreamsAsync(
+            firstPage.NextOwnerUserId,
+            firstPage.NextListType,
+            1);
+        var gap = Assert.Single(gapPage.Items);
+        Assert.False(gap.IsLocallyContiguous);
+        Assert.Equal(0, gap.DeltaInboxCountAfterSnapshot);
     }
 
     private static async Task SeedMessagesWithoutConversationIdAsync(

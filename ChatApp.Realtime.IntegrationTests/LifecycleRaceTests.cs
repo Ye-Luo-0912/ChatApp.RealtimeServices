@@ -250,6 +250,118 @@ public sealed class LifecycleRaceTests : IAsyncLifetime
         Assert.Equal(RealtimeMessagePersistKind.Created, result.Kind);
     }
 
+    [Fact]
+    public async Task DirectAdmissionSequenceGate_ReplayAndAuthorizationReject_HaveNoSequenceSideEffects()
+    {
+        var (client, schema) = await CreateStoreAsync("rt_direct_admission_sequence_gate");
+        await EnsureIdentitySchemaAsync(client);
+        var ledger = new NpgsqlCommandIdempotencyLedger(
+            client,
+            schema,
+            NullLogger<NpgsqlCommandIdempotencyLedger>.Instance);
+        var messageStore = new NpgsqlRealtimeMessageStore(
+            client,
+            schema,
+            new PostgresConversationMessageMutationPolicy(
+                NullLogger<PostgresConversationMessageMutationPolicy>.Instance),
+            NullLogger<NpgsqlRealtimeMessageStore>.Instance,
+            idempotencyLedger: ledger);
+
+        const long senderUserId = 9_400_000_061L;
+        const long receiverUserId = 9_400_000_062L;
+        await SeedDirectAuthorizationAsync(client, senderUserId, receiverUserId, allow: true);
+
+        var message = CreateDirectMessage("msg-direct-gate-created", senderUserId, receiverUserId);
+        var evt = CreateDirectMessageEvent(
+            "evt-direct-gate-created",
+            senderUserId,
+            receiverUserId,
+            message.MessageId);
+        var created = await messageStore.SaveAsync(message, evt);
+        var replay = await messageStore.SaveAsync(message, evt);
+
+        Assert.Equal(RealtimeMessagePersistKind.Created, created.Kind);
+        Assert.Equal(RealtimeMessagePersistKind.Duplicate, replay.Kind);
+
+        await using (var connection = await client.GetDataSource().OpenConnectionAsync())
+        await using (var command = new NpgsqlCommand(
+                         $"""
+                          SELECT c.last_sequence, sender.sent_count,
+                                 (SELECT COUNT(*) FROM {schema.MessagesTableSql}),
+                                 (SELECT COUNT(*) FROM {schema.OutboxTableSql}),
+                                 (SELECT COUNT(*) FROM {schema.CommandIdempotencyLedgerTableSql})
+                          FROM {schema.ConversationsTableSql} AS c
+                          INNER JOIN {schema.ConversationMembersTableSql} AS sender
+                            ON sender.conversation_id = c.conversation_id
+                           AND sender.user_id = @sender_user_id
+                          WHERE c.conversation_id = @conversation_id;
+                          """,
+                         connection))
+        {
+            command.Parameters.AddWithValue("sender_user_id", senderUserId);
+            command.Parameters.AddWithValue(
+                "conversation_id",
+                ConversationId.CreateDirect(senderUserId, receiverUserId));
+            await using var reader = await command.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync());
+            Assert.Equal(1L, reader.GetInt64(0));
+            Assert.Equal(1L, reader.GetInt64(1));
+            Assert.Equal(1L, reader.GetInt64(2));
+            Assert.Equal(1L, reader.GetInt64(3));
+            Assert.Equal(1L, reader.GetInt64(4));
+        }
+
+        const long deniedSenderUserId = 9_400_000_063L;
+        const long deniedReceiverUserId = 9_400_000_064L;
+        await SeedDirectAuthorizationAsync(
+            client,
+            deniedSenderUserId,
+            deniedReceiverUserId,
+            allow: false);
+        var deniedMessage = CreateDirectMessage(
+            "msg-direct-gate-denied",
+            deniedSenderUserId,
+            deniedReceiverUserId);
+        var deniedEvent = CreateDirectMessageEvent(
+            "evt-direct-gate-denied",
+            deniedSenderUserId,
+            deniedReceiverUserId,
+            deniedMessage.MessageId);
+
+        var denied = await messageStore.SaveAsync(deniedMessage, deniedEvent);
+
+        Assert.Equal(RealtimeMessagePersistKind.NotAllowed, denied.Kind);
+        Assert.Equal(DirectMessageAuthorizationDecision.NotFriend, denied.AuthorizationDecision);
+        await using var verifyConnection = await client.GetDataSource().OpenConnectionAsync();
+        await using var verifyCommand = new NpgsqlCommand(
+            $"""
+             SELECT
+                 (SELECT COUNT(*) FROM {schema.ConversationsTableSql}
+                  WHERE conversation_id = @conversation_id),
+                 (SELECT COUNT(*) FROM {schema.MessagesTableSql}
+                  WHERE message_id = @message_id),
+                 (SELECT COUNT(*) FROM {schema.OutboxTableSql}
+                  WHERE event_id = @event_id),
+                 (SELECT COUNT(*) FROM {schema.CommandIdempotencyLedgerTableSql}
+                  WHERE sender_user_id = @sender_user_id
+                    AND client_message_id = @client_message_id);
+             """,
+            verifyConnection);
+        verifyCommand.Parameters.AddWithValue(
+            "conversation_id",
+            ConversationId.CreateDirect(deniedSenderUserId, deniedReceiverUserId));
+        verifyCommand.Parameters.AddWithValue("message_id", deniedMessage.MessageId);
+        verifyCommand.Parameters.AddWithValue("event_id", deniedEvent.EventId);
+        verifyCommand.Parameters.AddWithValue("sender_user_id", deniedSenderUserId);
+        verifyCommand.Parameters.AddWithValue("client_message_id", deniedMessage.ClientMessageId);
+        await using var verifyReader = await verifyCommand.ExecuteReaderAsync();
+        Assert.True(await verifyReader.ReadAsync());
+        Assert.Equal(0L, verifyReader.GetInt64(0));
+        Assert.Equal(0L, verifyReader.GetInt64(1));
+        Assert.Equal(0L, verifyReader.GetInt64(2));
+        Assert.Equal(0L, verifyReader.GetInt64(3));
+    }
+
     private async Task<(RealtimeDatabaseClient Client, RealtimeDatabaseSchema Schema)> CreateStoreAsync(
         string schemaName)
     {
@@ -262,6 +374,64 @@ public sealed class LifecycleRaceTests : IAsyncLifetime
         await new RealtimeSchemaMigrationRunner(schema, NullLogger.Instance)
             .MigrateAsync(connection);
         return (client, schema);
+    }
+
+    private static async Task EnsureIdentitySchemaAsync(RealtimeDatabaseClient client)
+    {
+        await using var connection = await client.GetDataSource().OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            CREATE TABLE IF NOT EXISTS public."AspNetUsers"
+            (
+                "Id" bigint PRIMARY KEY,
+                "FriendRequestPolicy" smallint NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS public."T_BlockRecords"
+            (
+                "BlockerId" bigint NOT NULL,
+                "BlockedUserId" bigint NOT NULL,
+                PRIMARY KEY ("BlockerId", "BlockedUserId")
+            );
+            CREATE TABLE IF NOT EXISTS public."T_UserFriendEntry"
+            (
+                "UserId" bigint NOT NULL,
+                "FriendId" bigint NOT NULL,
+                "IsDeleted" boolean NOT NULL DEFAULT FALSE,
+                PRIMARY KEY ("UserId", "FriendId")
+            );
+            """,
+            connection);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task SeedDirectAuthorizationAsync(
+        RealtimeDatabaseClient client,
+        long senderUserId,
+        long receiverUserId,
+        bool allow)
+    {
+        await using var connection = await client.GetDataSource().OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            INSERT INTO public."AspNetUsers" ("Id")
+            VALUES (@sender_user_id), (@receiver_user_id)
+            ON CONFLICT ("Id") DO NOTHING;
+
+            INSERT INTO public."T_UserFriendEntry" ("UserId", "FriendId", "IsDeleted")
+            SELECT item.user_id, item.friend_id, FALSE
+            FROM (VALUES
+                (@sender_user_id, @receiver_user_id),
+                (@receiver_user_id, @sender_user_id)
+            ) AS item(user_id, friend_id)
+            WHERE @allow
+            ON CONFLICT ("UserId", "FriendId")
+            DO UPDATE SET "IsDeleted" = FALSE;
+            """,
+            connection);
+        command.Parameters.AddWithValue("sender_user_id", senderUserId);
+        command.Parameters.AddWithValue("receiver_user_id", receiverUserId);
+        command.Parameters.AddWithValue("allow", allow);
+        await command.ExecuteNonQueryAsync();
     }
 
     private static async Task AcquireExclusiveLockAsync(

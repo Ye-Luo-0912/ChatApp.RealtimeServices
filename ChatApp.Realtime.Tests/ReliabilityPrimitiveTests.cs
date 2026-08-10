@@ -46,6 +46,67 @@ public sealed class ReliabilityPrimitiveTests
     }
 
     [Fact]
+    public void OutboxSignal_BoundsCommittedHintsAndPreservesOrder()
+    {
+        using var signal = new RealtimeOutboxSignal(hintCapacity: 2);
+        var hints = (IRealtimeOutboxHintSource)signal;
+
+        signal.Notify("event-1");
+        signal.Notify("event-2");
+        signal.Notify("event-overflow");
+
+        Assert.True(hints.TryReadCommittedEventId(out var first));
+        Assert.True(hints.TryReadCommittedEventId(out var second));
+        Assert.False(hints.TryReadCommittedEventId(out _));
+        Assert.Equal("event-1", first);
+        Assert.Equal("event-2", second);
+    }
+
+    [Fact]
+    public void OutboxSignal_PreclaimReservationIsBoundedAndCommitCarriesOwnership()
+    {
+        using var signal = new RealtimeOutboxSignal(hintCapacity: 1);
+        var coordinator = (IRealtimeOutboxPreclaimCoordinator)signal;
+        var hints = (IRealtimeOutboxHintSource)signal;
+        coordinator.ConfigurePreclaimOwner("publisher-1", TimeSpan.FromSeconds(30));
+
+        Assert.True(coordinator.TryReservePreclaim("event-cancel", out var cancelled));
+        Assert.False(coordinator.TryReservePreclaim("event-overflow", out _));
+        coordinator.CancelPreclaim(cancelled);
+
+        Assert.True(coordinator.TryReservePreclaim("event-commit", out var committed));
+        coordinator.CommitPreclaim(committed);
+
+        Assert.True(hints.TryReadCommittedHint(out var hint));
+        Assert.True(hint.IsPreclaimed);
+        Assert.Equal(committed.EventId, hint.EventId);
+        Assert.Equal(committed.LockOwner, hint.LockOwner);
+        Assert.Equal(committed.ClaimToken, hint.ClaimToken);
+        Assert.False(hints.TryReadCommittedHint(out _));
+    }
+
+    [Fact]
+    public void OutboxSignal_PreclaimsReusePublisherGenerationToken()
+    {
+        using var signal = new RealtimeOutboxSignal(hintCapacity: 3);
+        var coordinator = (IRealtimeOutboxPreclaimCoordinator)signal;
+        coordinator.ConfigurePreclaimOwner("publisher-1", TimeSpan.FromSeconds(30));
+
+        Assert.True(coordinator.TryReservePreclaim("event-1", out var first));
+        Assert.True(coordinator.TryReservePreclaim("event-2", out var second));
+        Assert.Equal(first.ClaimToken, second.ClaimToken);
+
+        coordinator.ConfigurePreclaimOwner("publisher-2", TimeSpan.FromSeconds(30));
+        Assert.True(coordinator.TryReservePreclaim("event-3", out var nextGeneration));
+        Assert.NotEqual(first.ClaimToken, nextGeneration.ClaimToken);
+        Assert.Equal("publisher-2", nextGeneration.LockOwner);
+
+        coordinator.CancelPreclaim(first);
+        coordinator.CancelPreclaim(second);
+        coordinator.CancelPreclaim(nextGeneration);
+    }
+
+    [Fact]
     public async Task InMemoryStateStore_RemovesExpiredEntries()
     {
         var store = new InMemoryRealtimeStateStore();

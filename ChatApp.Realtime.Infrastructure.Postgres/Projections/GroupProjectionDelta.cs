@@ -124,7 +124,12 @@ internal sealed class GroupProjectionDelta
         // P0-3：targets 为 null 时 TargetUserIds=null（群广播），由 AudienceKind=Conversation 路由。
         TargetUserIds = targets,
         AudienceKind = conversationId is null ? null : AudienceKind.Conversation,
-        ConversationId = conversationId
+        ConversationId = conversationId,
+        ExcludeUserId = template.ExcludeUserId,
+        ProtocolVersion = template.ProtocolVersion,
+        AudienceVersion = template.AudienceVersion,
+        MinProtocolVersion = template.MinProtocolVersion,
+        Payload = template.Payload
     };
 
     /// <summary>
@@ -151,6 +156,10 @@ internal sealed class GroupProjectionDelta
         AudienceKind = AudienceKind.Conversation,
         ConversationId = conversationId,
         // 排除用户（读者本人）：Gateway 投递时跳过该用户的所有会话。
-        ExcludeUserId = excludeUserId
+        ExcludeUserId = excludeUserId,
+        ProtocolVersion = template.ProtocolVersion,
+        AudienceVersion = template.AudienceVersion,
+        MinProtocolVersion = template.MinProtocolVersion,
+        Payload = template.Payload
     };
 }

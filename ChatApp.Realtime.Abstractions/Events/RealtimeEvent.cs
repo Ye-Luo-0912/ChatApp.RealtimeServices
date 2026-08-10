@@ -101,10 +101,10 @@ public sealed class RealtimeEvent
     /// <summary>
     /// P1-4：应用层（如 <c>DefaultIncomingMessageProcessor</c>）可将已构造的 payload 对象通过此属性
     /// 直接传给 <c>IRealtimeMessageStore</c>，避免在 Processor 中先序列化、Store 又反序列化回对象
-    /// 才能绑定附件。Store 在最终写入 Outbox 前会调用 <c>EnrichChatMessagePayload</c> 物化一次得到
-    /// <see cref="PayloadJson"/>，物化后应清空此引用。
+    /// 才能绑定附件。Store 在最终写入 Outbox 前会调用 <c>EnrichChatMessagePayload</c> 完成字段补充；
+    /// Npgsql 热路径随后直接写入 UTF-8 wire payload，兼容实现可继续物化 <see cref="PayloadJson"/>。
     /// <para>
-    /// 该字段不参与 JSON 序列化：Outbox 表中的 <c>payload_json</c> 仅保存物化后的 <see cref="PayloadJson"/>。
+    /// 该字段不参与 JSON 序列化，也不得跨请求共享或在对象池归还后继续持有。
     /// </para>
     /// </summary>
     [JsonIgnore]

@@ -31,9 +31,10 @@ internal sealed class MessageWriter
         long? senderSequence = null)
     {
         var ct = _session.CancellationToken;
-        await using var command = new NpgsqlCommand(
-            $"""
-            INSERT INTO {_session.Schema.MessagesTableSql} (
+        var commandText = _session.Schema.GetOrAddCommandText(
+            "insert-message",
+            static schema => $"""
+            INSERT INTO {schema.MessagesTableSql} (
                 message_id,
                 client_message_id,
                 sender_user_id,
@@ -82,7 +83,9 @@ internal sealed class MessageWriter
                 $20
             )
             ON CONFLICT (sender_user_id, client_message_id) DO NOTHING;
-            """,
+            """);
+        await using var command = new NpgsqlCommand(
+            commandText,
             _session.Connection,
             _session.Transaction);
 

@@ -47,10 +47,12 @@ public sealed class SyncCatchUpMutationCursorTests
 
         var last = items[^1];
         var cursor = new MessageHistoryCursor(
-            last.ChangedAtMs > 0 ? last.ChangedAtMs : last.ReceivedAtMs,
-            last.MessageId);
+            last.ReceivedAtMs,
+            last.MessageId,
+            last.ChangedAtMs > 0 ? last.ChangedAtMs : last.ReceivedAtMs);
 
-        Assert.Equal(500, cursor.ReceivedAtMs);
+        Assert.Equal(100, cursor.ReceivedAtMs);
+        Assert.Equal(500, cursor.ChangedAtMs);
         Assert.Equal("old-msg", cursor.MessageId);
         Assert.Equal("new-msg", items[0].MessageId);
         Assert.Equal("old-msg", items[1].MessageId);

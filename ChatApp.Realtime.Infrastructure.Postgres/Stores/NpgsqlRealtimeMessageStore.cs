@@ -39,7 +39,9 @@ namespace ChatApp.Realtime.Infrastructure.Postgres.Stores;
 /// 注入 <see cref="NpgsqlCommandIdempotencyLedger"/>。
 /// </para>
 /// </summary>
-public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
+public sealed class NpgsqlRealtimeMessageStore :
+    IRealtimeMessageStore,
+    ITransactionalDirectMessageAuthorizationStore
 {
     private readonly RealtimeWriteSessionFactory _sessionFactory;
     private readonly RealtimeDatabaseClient _databaseClient;
@@ -48,19 +50,27 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
     private readonly ICommandIdempotencyLedger? _idempotencyLedger;
     private readonly ILogger<NpgsqlRealtimeMessageStore> _logger;
 
+    public bool AuthorizesDirectMessagesTransactionally =>
+        _idempotencyLedger is NpgsqlCommandIdempotencyLedger;
+
     public NpgsqlRealtimeMessageStore(
         RealtimeDatabaseClient databaseClient,
         RealtimeDatabaseSchema databaseSchema,
         IConversationMessageMutationPolicy mutationPolicy,
         ILogger<NpgsqlRealtimeMessageStore> logger,
         RealtimeMetrics? metrics = null,
-        ICommandIdempotencyLedger? idempotencyLedger = null)
+        ICommandIdempotencyLedger? idempotencyLedger = null,
+        IRealtimeOutboxSignal? outboxSignal = null)
     {
         _databaseClient = databaseClient;
         _databaseSchema = databaseSchema;
         _mutationPolicy = mutationPolicy;
         // Reliability-4：传入 RealtimeMetrics，由 session 在事务提交成功后记录 outbox 入队行数。
-        _sessionFactory = new RealtimeWriteSessionFactory(databaseClient, databaseSchema, metrics);
+        _sessionFactory = new RealtimeWriteSessionFactory(
+            databaseClient,
+            databaseSchema,
+            metrics,
+            outboxSignal);
         _logger = logger;
         // Perf-3：可选注入幂等账本，未注入时 SaveAsync 跳过 ledger 操作。
         _idempotencyLedger = idempotencyLedger;
@@ -93,15 +103,11 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         // 按 userId 升序获取锁，消除 A→B 与 B→A 并发写入之间的死锁环。
         // 消除"processor 预检查 tombstone → 开消息事务 → 提交"之间的 TOCTOU 竞态。
         // 单聊同时锁接收方，防止接收方正在被删除时写入孤儿消息。
-        var lifecycleUserIds = message.ReceiverUserId > 0
-            ? new[] { message.SenderUserId, message.ReceiverUserId }
-            : new[] { message.SenderUserId };
-        var lifecycleGate = await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveManyAsync(
-                session.Connection,
-                session.Transaction,
-                session.Schema,
-                lifecycleUserIds,
-                ct).ConfigureAwait(false);
+        var isGroup = !string.IsNullOrWhiteSpace(message.ConversationId)
+                      && ConversationId.IsGroup(message.ConversationId);
+        var admission = await AcquireMessageWriteAdmissionAsync(session, message, isGroup, ct)
+            .ConfigureAwait(false);
+        var lifecycleGate = admission.Lifecycle;
         if (!lifecycleGate.IsActive)
         {
             await session.RollbackAsync().ConfigureAwait(false);
@@ -118,19 +124,27 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
                 : RealtimeMessagePersistResult.UserDeleted(message.MessageId);
         }
 
+        if (admission.DirectAuthorizationDecision is { } authorizationDecision
+            && authorizationDecision != DirectMessageAuthorizationDecision.Allowed)
+        {
+            await session.RollbackAsync().ConfigureAwait(false);
+            _logger.LogWarning(
+                "单聊消息事务内授权拒绝。发送用户={SenderUserId}；接收用户={ReceiverUserId}；判定={Decision}；消息={MessageId}",
+                message.SenderUserId,
+                message.ReceiverUserId,
+                authorizationDecision,
+                message.MessageId);
+            return RealtimeMessagePersistResult.AuthorizationRejected(
+                message.MessageId,
+                authorizationDecision);
+        }
+
         // Perf-3：在事务内查询独立幂等账本，消除 Processor 中事务外的 FindAsync 连接获取。
         // 账本 canonical 解耦幂等性依据与 messages 行生命周期：消息行被 retention GC 或
         // 账号删除清理后，账本仍保留命令处理结果，防止 JetStream replay 将旧命令当作新消息重新写入。
         if (_idempotencyLedger is not null)
         {
-            var ledgerEntry = await _idempotencyLedger
-                .FindInTransactionAsync(
-                    session.Connection,
-                    session.Transaction,
-                    message.SenderUserId,
-                    message.ClientMessageId,
-                    ct)
-                .ConfigureAwait(false);
+            var ledgerEntry = admission.LedgerEntry;
             if (ledgerEntry is not null)
             {
                 if (string.Equals(ledgerEntry.ContentFingerprint, fingerprint, StringComparison.Ordinal))
@@ -169,11 +183,10 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
         // 消除旧流程"INSERT NULL → UPDATE 回写"产生的第二个 tuple 与额外 WAL/索引写入。
         // 群路径授权失败（会话不存在/非群/已解散/发送者非活跃成员）时 allocation 返回 null，
         // 此时直接返回 NotAllowed，不再走"INSERT → 回滚"的弯路。
-        var isGroup = !string.IsNullOrWhiteSpace(message.ConversationId)
-                      && ConversationId.IsGroup(message.ConversationId);
-
-        long? conversationSequence = null;
-        long? senderSequence = null;
+        // 生产单聊路径已在 admission 命令中按 gate 条件完成序号分配；群聊和自定义账本
+        // 回退路径仍从 null 开始并调用原有分配器。
+        long? conversationSequence = admission.ConversationSequence;
+        long? senderSequence = admission.SenderSequence;
 
         if (isGroup)
         {
@@ -201,7 +214,8 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             conversationSequence = allocation.ConversationSequence;
             senderSequence = allocation.SenderSequence;
         }
-        else if (!string.IsNullOrWhiteSpace(message.ConversationId))
+        else if (!string.IsNullOrWhiteSpace(message.ConversationId)
+                 && conversationSequence is null)
         {
             // 单聊路径：allocation 通常不会失败（UPSERT 语义），失败回退到 NULL 序列。
             var allocation = await conversationWriter
@@ -220,9 +234,38 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             }
         }
 
-        var affectedRows = await messageWriter
-            .InsertAsync(message, fingerprint, conversationSequence, senderSequence)
-            .ConfigureAwait(false);
+        // 极限-7：无附件消息不需要在消息 INSERT 后读取绑定结果，因此可在已知序列号后
+        // 预先构造最终事件，并以单条数据修改 CTE 原子写入 message + Outbox + ledger。
+        // 附件路径仍保留分步写入：必须先绑定并读回附件元数据，才能物化权威 payload。
+        var hasAttachments = message.AttachmentIds is { Count: > 0 };
+        var usedCreateBundle = !hasAttachments;
+        RealtimeEvent? createdEvent = null;
+        int affectedRows;
+        if (usedCreateBundle)
+        {
+            createdEvent = CreateMessageCreatedEvent(
+                message,
+                eventToPublish,
+                isGroup,
+                boundAttachmentRefs: null,
+                conversationSequence);
+            var bundleResult = await new MessageCreateBundleWriter(session)
+                .InsertAsync(
+                    message,
+                    fingerprint,
+                    conversationSequence,
+                    senderSequence,
+                    createdEvent,
+                    writeLedger: _idempotencyLedger is not null)
+                .ConfigureAwait(false);
+            affectedRows = bundleResult.MessageInserted ? 1 : 0;
+        }
+        else
+        {
+            affectedRows = await messageWriter
+                .InsertAsync(message, fingerprint, conversationSequence, senderSequence)
+                .ConfigureAwait(false);
+        }
         if (affectedRows == 0)
         {
             var existing = await messageWriter
@@ -343,51 +386,22 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             }
         }
 
-        // 极限-2：序列已在 INSERT 前分配并写入 messages 行。此处仅构造 Outbox 事件。
-        if (isGroup)
+        // 附件消息只有在绑定成功并读回元数据后才能构造最终 payload；无附件消息的事件已由
+        // MessageCreateBundleWriter 在同一数据库操作中写入。
+        if (!usedCreateBundle)
         {
-            // 序列号已知后物化 payload，使 PayloadJson 携带 ConversationSequence。
-            var createdEvent = RealtimeMessageEventFactory.EnrichChatMessagePayload(
-                RealtimeMessageEventFactory.CopyWithMessageId(eventToPublish, message.MessageId),
-                boundAttachmentRefs,
-                conversationSequence,
-                ConversationType.Group);
-
-            // P0-3：群广播事件 AudienceKind=Conversation + ConversationId，TargetUserIds=null。
-            // Publisher 通过 IConversationGatewayDirectory 一次查询会话在线 Gateway 实例集合投递，
-            // 不再物化成员数组。GroupProjectionDelta 构造时不传 memberUserIds 即为广播模式。
-            var delta = new GroupProjectionDelta(message.ConversationId!);
-            delta.AddBroadcast(RealtimeMessageEventFactory.CreateGroupMessageAggregatedEvent(
-                createdEvent,
+            createdEvent = CreateMessageCreatedEvent(
                 message,
-                targetUserIds: null));
-
-            // 极限-1：不再生成单独的 ConversationListChanged 广播行——payload 已携带
-            // ConversationType + ConversationSequence，客户端从单条 MessageReceived 即可更新会话列表。
-            await outboxWriter.InsertManyAsync(delta.Build()).ConfigureAwait(false);
-        }
-        else
-        {
-            // P0-1：写入路径不再物化接收方 unread_count，也不再发送 per-user UnreadCountChanged 事件。
-            // 客户端通过 MessageReceived / ConversationChanged 中的 last_sequence 自行推导未读数变化。
-
-            // 序列号已知后物化 payload，使 PayloadJson 携带 ConversationSequence。
-            var createdEvent = RealtimeMessageEventFactory.EnrichChatMessagePayload(
-                RealtimeMessageEventFactory.CopyWithMessageId(eventToPublish, message.MessageId),
+                eventToPublish,
+                isGroup,
                 boundAttachmentRefs,
-                conversationSequence,
-                ConversationType.Direct,
-                targetUserIds: [message.ReceiverUserId, message.SenderUserId]);
-
-            // Perf：接收方投递与发送方其他设备回声合并为一条多目标事件。
-            // Gateway 仅在 sender 目标上跳过来源 SessionId；receiver 仍正常投递。
-            // 单聊 Outbox / NATS 写入由每条消息 2 行降为 1 行。
+                conversationSequence);
             await outboxWriter.InsertAsync(createdEvent).ConfigureAwait(false);
         }
 
         // Perf-3：事务内记录 Created 结果到独立账本，解耦幂等性与 messages 行生命周期。
         // 与消息写入同生共死：ledger INSERT 失败则整个事务回滚（更正确的行为）。
-        if (_idempotencyLedger is not null)
+        if (_idempotencyLedger is not null && !usedCreateBundle)
         {
             await _idempotencyLedger
                 .RecordInTransactionAsync(
@@ -412,6 +426,96 @@ public sealed class NpgsqlRealtimeMessageStore : IRealtimeMessageStore
             message.SenderUserId,
             message.ReceiverUserId);
         return RealtimeMessagePersistResult.Created(message.MessageId, conversationSequence);
+    }
+
+    private static RealtimeEvent CreateMessageCreatedEvent(
+        RealtimeMessageRecord message,
+        RealtimeEvent eventToPublish,
+        bool isGroup,
+        IReadOnlyList<AttachmentRef>? boundAttachmentRefs,
+        long? conversationSequence)
+    {
+        var enriched = RealtimeMessageEventFactory.EnrichChatMessagePayload(
+            RealtimeMessageEventFactory.CopyWithMessageId(eventToPublish, message.MessageId),
+            boundAttachmentRefs,
+            conversationSequence,
+            isGroup ? ConversationType.Group : ConversationType.Direct,
+            targetUserIds: isGroup ? null : [message.ReceiverUserId, message.SenderUserId],
+            materializePayloadJson: false);
+
+        if (!isGroup)
+            return enriched;
+
+        // 群事件必须烙印 Conversation audience；不物化成员数组，由 Gateway 目录路由。
+        var delta = new GroupProjectionDelta(message.ConversationId!);
+        delta.AddBroadcast(RealtimeMessageEventFactory.CreateGroupMessageAggregatedEvent(
+            enriched,
+            message,
+            targetUserIds: null));
+        return delta.Build()[0];
+    }
+
+    private async Task<MessageWriteAdmission> AcquireMessageWriteAdmissionAsync(
+        RealtimeWriteSession session,
+        RealtimeMessageRecord message,
+        bool isGroup,
+        CancellationToken ct)
+    {
+        // 生产 Npgsql 账本路径：生命周期锁/状态与 canonical 账本读取共用一个命令。
+        if (_idempotencyLedger is NpgsqlCommandIdempotencyLedger)
+        {
+            if (!isGroup && !string.IsNullOrWhiteSpace(message.ConversationId))
+            {
+                return await MessageWriteAdmissionReader.AcquireDirectAndAllocateSequenceAsync(
+                        session.Connection,
+                        session.Transaction,
+                        session.Schema,
+                        message.SenderUserId,
+                        message.ReceiverUserId,
+                        message.ClientMessageId,
+                        message.ConversationId,
+                        message.MessageId,
+                        ConversationId.CreatePreview(message.Content),
+                        message.ReceivedAtMs,
+                        ct)
+                    .ConfigureAwait(false);
+            }
+
+            return await MessageWriteAdmissionReader.AcquireAsync(
+                    session.Connection,
+                    session.Transaction,
+                    session.Schema,
+                    message.SenderUserId,
+                    message.ReceiverUserId,
+                    message.ClientMessageId,
+                    requireDirectAuthorization: !isGroup,
+                    ct)
+                .ConfigureAwait(false);
+        }
+
+        // 测试或自定义账本实现保留抽象回退，行为与旧路径一致。
+        var lifecycle = await UserLifecycleAdvisoryLock.AcquireSharedAndCheckActiveAsync(
+                session.Connection,
+                session.Transaction,
+                session.Schema,
+                message.SenderUserId,
+                message.ReceiverUserId,
+                ct)
+            .ConfigureAwait(false);
+        IdempotencyLedgerEntry? ledgerEntry = null;
+        if (lifecycle.IsActive && _idempotencyLedger is not null)
+        {
+            ledgerEntry = await _idempotencyLedger
+                .FindInTransactionAsync(
+                    session.Connection,
+                    session.Transaction,
+                    message.SenderUserId,
+                    message.ClientMessageId,
+                    ct)
+                .ConfigureAwait(false);
+        }
+
+        return new MessageWriteAdmission(lifecycle, ledgerEntry, DirectAuthorizationDecision: null);
     }
 
     public async Task<MessageReceiptPersistResult> ApplyReceiptAsync(

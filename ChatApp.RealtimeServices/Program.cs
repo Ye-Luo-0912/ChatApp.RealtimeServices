@@ -1,12 +1,15 @@
 using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
+using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Configuration;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using ChatApp.Realtime.Infrastructure.Postgres.Migrations;
 using ChatApp.Realtime.Abstractions.Stores;
+using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.RealtimeServices.DependencyInjection;
 using ChatApp.RealtimeServices.Diagnostics;
 using ChatApp.RealtimeServices.Options;
+using ChatApp.RealtimeServices.Workers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Options;
 using OpenTelemetry.Metrics;
@@ -40,6 +43,10 @@ try
     });
 
     builder.Services.Configure<OpsOptions>(builder.Configuration.GetSection(OpsOptions.SectionName));
+    builder.Services.ConfigureHttpJsonOptions(options =>
+        options.SerializerOptions.TypeInfoResolverChain.Insert(
+            0,
+            RealtimeJsonSerializerContext.Default));
     builder.Services.AddRealtimeServices(builder.Configuration, builder.Environment);
     var observabilityOptions = builder.Services.AddRealtimeObservability(
         builder.Configuration);
@@ -187,6 +194,109 @@ try
     opsBacklogs.AddEndpointFilter(new OpsApiKeyEndpointFilter());
     opsBacklogs.MapGet("/", async (IRealtimeOpsQueryStore opsQuery, CancellationToken ct) =>
         Results.Ok(await opsQuery.GetBacklogsAsync(ct).ConfigureAwait(false)));
+
+    var relationshipProjectionOps = app.MapGroup("/ops/relationship-projection");
+    relationshipProjectionOps.AddEndpointFilter(new OpsApiKeyEndpointFilter());
+    relationshipProjectionOps.MapGet("/status", async (
+        IRelationshipProjectionOpsQueryStore opsQuery,
+        CancellationToken ct) =>
+        Results.Ok(await opsQuery.GetStatusAsync(ct)
+            .ConfigureAwait(false)));
+    relationshipProjectionOps.MapGet("/streams", async (
+        long? afterOwnerUserId,
+        RelationshipProjectionListType? afterListType,
+        int? pageSize,
+        IRelationshipProjectionOpsQueryStore opsQuery,
+        CancellationToken ct) =>
+    {
+        try
+        {
+            return Results.Ok(await opsQuery.ListStreamsAsync(
+                    afterOwnerUserId,
+                    afterListType,
+                    pageSize ?? 100,
+                    ct)
+                .ConfigureAwait(false));
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.BadRequest(new
+            {
+                error = "invalid_relationship_projection_cursor",
+                message = ex.Message
+            });
+        }
+    });
+    relationshipProjectionOps.MapGet("/reconcile", async (
+        long? afterOwnerUserId,
+        RelationshipProjectionListType? afterListType,
+        int? pageSize,
+        RelationshipProjectionReconciliationService reconciler,
+        CancellationToken ct) =>
+    {
+        try
+        {
+            var report = await reconciler.ReconcileAsync(
+                    afterOwnerUserId,
+                    afterListType,
+                    pageSize ?? 50,
+                    ct)
+                .ConfigureAwait(false);
+            var statusCode = !report.Available
+                ? StatusCodes.Status503ServiceUnavailable
+                : report.MismatchCount > 0
+                    ? StatusCodes.Status409Conflict
+                    : StatusCodes.Status200OK;
+            return Results.Json(report, statusCode: statusCode);
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.BadRequest(new
+            {
+                error = "invalid_relationship_projection_reconciliation_cursor",
+                message = ex.Message
+            });
+        }
+    });
+    relationshipProjectionOps.MapPost("/snapshots", async (
+        RelationshipProjectionStreamSnapshot snapshot,
+        IRelationshipProjectionStore store,
+        CancellationToken ct) =>
+    {
+        try
+        {
+            var result = await store.ApplySnapshotAsync(snapshot, ct).ConfigureAwait(false);
+            return Results.Ok(new
+            {
+                result = result.ToString(),
+                snapshot.SnapshotId,
+                snapshot.OwnerUserId,
+                snapshot.ListType,
+                snapshot.Version,
+                snapshot.ItemCount,
+                snapshot.ResourceHash
+            });
+        }
+        catch (RelationshipProjectionSnapshotVersionMismatchException ex)
+        {
+            return Results.Conflict(new
+            {
+                error = "relationship_snapshot_version_mismatch",
+                ex.OwnerUserId,
+                ex.ListType,
+                ex.SnapshotVersion,
+                ex.CurrentVersion
+            });
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.BadRequest(new { error = "invalid_relationship_snapshot", message = ex.Message });
+        }
+        catch (NotSupportedException ex)
+        {
+            return Results.BadRequest(new { error = "unsupported_relationship_snapshot", message = ex.Message });
+        }
+    });
 
     var realtimeOptions = app.Services.GetRequiredService<IOptions<RealtimeOptions>>().Value;
     app.Logger.LogInformation(

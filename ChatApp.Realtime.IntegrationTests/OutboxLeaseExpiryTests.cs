@@ -65,6 +65,169 @@ public sealed class OutboxLeaseExpiryTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ClaimBatchByIds_UsesExactKeysAndKeepsLeaseSemantics()
+    {
+        var (client, schema) = await CreateStoreAsync("rt_outbox_hint_claim");
+        var store = new NpgsqlRealtimeOutboxStore(client, schema);
+        await InsertPendingAsync(client, schema, "hint-1");
+        await InsertPendingAsync(client, schema, "hint-2");
+        await InsertPendingAsync(client, schema, "not-hinted");
+
+        var claimed = await store.ClaimBatchByIdsAsync(
+            "instance-hint",
+            new List<string> { "hint-2", "missing-id", "hint-1" },
+            10,
+            TimeSpan.FromSeconds(30));
+
+        Assert.Equal(2, claimed.Count);
+        Assert.All(claimed, record => Assert.Equal("instance-hint", record.LockOwner));
+        Assert.Equal(
+            ["hint-1", "hint-2"],
+            claimed.Select(record => record.EventId).Order().ToArray());
+
+        Assert.Empty(await store.ClaimBatchByIdsAsync(
+            "other-instance",
+            new[] { "hint-1", "hint-2" },
+            10,
+            TimeSpan.FromSeconds(30)));
+
+        var recovery = Assert.Single(
+            await store.ClaimBatchAsync("recovery", 10, TimeSpan.FromSeconds(30)));
+        Assert.Equal("not-hinted", recovery.EventId);
+    }
+
+    [Fact]
+    public async Task ConversationHotMigration_DropsTipIndexAndSetsFillFactor()
+    {
+        var (client, schema) = await CreateStoreAsync("rt_conversation_hot_migration");
+        await using var connection = await client.GetDataSource().OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            SELECT
+                to_regclass(@qualified_index) IS NULL,
+                COALESCE(c.reloptions, ARRAY[]::text[])
+            FROM pg_class AS c
+            INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE n.nspname = @schema_name
+              AND c.relname = 'conversations';
+            """,
+            connection);
+        command.Parameters.AddWithValue(
+            "qualified_index",
+            $"{schema.Schema}.ix_conversations_last_message_list");
+        command.Parameters.AddWithValue("schema_name", schema.Schema);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.True(reader.GetBoolean(0));
+        Assert.Contains("fillfactor=80", reader.GetFieldValue<string[]>(1));
+    }
+
+    [Fact]
+    public async Task PendingIndexCleanup_DropsDuplicateAndKeepsRetryIndex()
+    {
+        var (client, schema) = await CreateStoreAsync("rt_outbox_pending_index_cleanup");
+        await using var connection = await client.GetDataSource().OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            """
+            SELECT
+                to_regclass(@duplicate_index) IS NULL,
+                to_regclass(@retry_index) IS NOT NULL;
+            """,
+            connection);
+        command.Parameters.AddWithValue(
+            "duplicate_index",
+            $"{schema.Schema}.ix_outbox_pending_created");
+        command.Parameters.AddWithValue(
+            "retry_index",
+            $"{schema.Schema}.ix_outbox_pending");
+
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.True(reader.GetBoolean(0));
+        Assert.True(reader.GetBoolean(1));
+    }
+
+    [Fact]
+    public async Task ClaimSession_ReusesPreparedCommandsForHintAndRecoveryPaths()
+    {
+        var (client, schema) = await CreateStoreAsync("rt_outbox_claim_session");
+        var store = new NpgsqlRealtimeOutboxStore(client, schema);
+        await using var session = await store.OpenClaimSessionAsync("session-worker");
+
+        await InsertPendingAsync(client, schema, "session-hint");
+        var hinted = Assert.Single(await session.ClaimBatchByIdsAsync(
+            new List<string> { "session-hint" },
+            10,
+            TimeSpan.FromSeconds(30)));
+        Assert.Equal("session-hint", hinted.EventId);
+
+        await InsertPendingAsync(client, schema, "session-recovery");
+        var recovered = Assert.Single(await session.ClaimBatchAsync(
+            10,
+            TimeSpan.FromSeconds(30)));
+        Assert.Equal("session-recovery", recovered.EventId);
+
+        var preclaim = new RealtimeOutboxPreclaim(
+            "session-preclaimed",
+            "session-worker",
+            "session-preclaimed-token",
+            DateTimeOffset.UtcNow.AddSeconds(30).ToUnixTimeMilliseconds());
+        await InsertPreclaimedAsync(client, schema, preclaim);
+        var preclaimed = Assert.Single(await session.ReadPreclaimedAsync(
+            new List<string> { preclaim.EventId },
+            new List<string> { preclaim.ClaimToken },
+            10));
+        Assert.Equal(preclaim.EventId, preclaimed.EventId);
+        Assert.Equal(preclaim.LockOwner, preclaimed.LockOwner);
+        Assert.Equal(preclaim.ClaimToken, preclaimed.ClaimToken);
+        Assert.Equal(1, preclaimed.AttemptCount);
+    }
+
+    [Fact]
+    public async Task PreclaimedRead_RequiresCurrentOwnerTokenAndLease_ThenRecoveryReclaims()
+    {
+        var (client, schema) = await CreateStoreAsync("rt_outbox_preclaimed_read");
+        var store = new NpgsqlRealtimeOutboxStore(client, schema);
+        var preclaim = new RealtimeOutboxPreclaim(
+            "preclaimed-1",
+            "publisher-a",
+            "preclaimed-token-a",
+            DateTimeOffset.UtcNow.AddMilliseconds(400).ToUnixTimeMilliseconds());
+        await InsertPreclaimedAsync(client, schema, preclaim);
+
+        Assert.Empty(await store.ReadPreclaimedAsync(
+            "publisher-b",
+            [preclaim.EventId],
+            [preclaim.ClaimToken],
+            10));
+        Assert.Empty(await store.ReadPreclaimedAsync(
+            preclaim.LockOwner,
+            [preclaim.EventId],
+            ["wrong-token"],
+            10));
+
+        var current = Assert.Single(await store.ReadPreclaimedAsync(
+            preclaim.LockOwner,
+            [preclaim.EventId],
+            [preclaim.ClaimToken],
+            10));
+        Assert.Equal(preclaim.ClaimToken, current.ClaimToken);
+        Assert.Empty(await store.ClaimBatchAsync(
+            "recovery",
+            10,
+            TimeSpan.FromSeconds(30)));
+
+        await Task.Delay(550);
+        var recovered = Assert.Single(await store.ClaimBatchAsync(
+            "recovery",
+            10,
+            TimeSpan.FromSeconds(30)));
+        Assert.Equal(preclaim.EventId, recovered.EventId);
+        Assert.NotEqual(preclaim.ClaimToken, recovered.ClaimToken);
+    }
+
+    [Fact]
     public async Task MarkPublished_WithMismatchedClaimToken_DoesNotUpdateRow()
     {
         var (client, schema) = await CreateStoreAsync("rt_outbox_claim_token_mismatch");
@@ -90,6 +253,37 @@ public sealed class OutboxLeaseExpiryTests : IAsyncLifetime
         var after = await store.TryGetAsync("token-mismatch-1");
         Assert.NotNull(after);
         Assert.Equal(RealtimeOutboxStatus.Published, after!.Status);
+    }
+
+    [Fact]
+    public async Task TryMarkPublished_ReturnsExactOwnershipResult_AndClearsClaim()
+    {
+        var (client, schema) = await CreateStoreAsync("rt_outbox_single_publish");
+        var store = new NpgsqlRealtimeOutboxStore(client, schema);
+        await InsertPendingAsync(client, schema, "single-publish-1");
+
+        var record = Assert.Single(
+            await store.ClaimBatchAsync("instance-single", 10, TimeSpan.FromSeconds(30)));
+        var forged = record with { ClaimToken = "stale-token" };
+
+        Assert.Equal(0, await store.TryMarkPublishedAsync(forged));
+        Assert.Equal(1, await store.TryMarkPublishedAsync(record));
+
+        await using var connection = await client.GetDataSource().OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT status, locked_by, locked_until_ms, claim_token
+             FROM {schema.OutboxTableSql}
+             WHERE event_id = @event_id;
+             """,
+            connection);
+        command.Parameters.AddWithValue("event_id", record.EventId);
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal((short)RealtimeOutboxStatus.Published, reader.GetInt16(0));
+        Assert.True(reader.IsDBNull(1));
+        Assert.True(reader.IsDBNull(2));
+        Assert.True(reader.IsDBNull(3));
     }
 
     [Fact]
@@ -195,6 +389,34 @@ public sealed class OutboxLeaseExpiryTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task DeleteClaimedPublishedBatch_DeletesOnlyCurrentLeaseOwners()
+    {
+        var (client, schema) = await CreateStoreAsync("rt_outbox_compact_publish");
+        var store = new NpgsqlRealtimeOutboxStore(client, schema);
+        await InsertPendingAsync(client, schema, "compact-1");
+        await InsertPendingAsync(client, schema, "compact-2");
+
+        var claimed = await store.ClaimBatchAsync(
+            "instance-compact",
+            10,
+            TimeSpan.FromSeconds(30));
+        Assert.Equal(2, claimed.Count);
+        var mixedOwnership = new[]
+        {
+            claimed[0],
+            claimed[1] with { ClaimToken = "stale-token" }
+        };
+
+        Assert.Equal(1, await store.DeleteClaimedPublishedBatchAsync(mixedOwnership));
+        Assert.Null(await store.TryGetAsync(claimed[0].EventId));
+        Assert.NotNull(await store.TryGetAsync(claimed[1].EventId));
+
+        Assert.Equal(0, await store.DeleteClaimedPublishedAsync(mixedOwnership[1]));
+        Assert.Equal(1, await store.DeleteClaimedPublishedAsync(claimed[1]));
+        Assert.Null(await store.TryGetAsync(claimed[1].EventId));
+    }
+
+    [Fact]
     public async Task SameInstance_ReclaimAfterExpiry_GeneratesNewClaimToken()
     {
         var (client, schema) = await CreateStoreAsync("rt_outbox_reclaim_token");
@@ -272,5 +494,44 @@ public sealed class OutboxLeaseExpiryTests : IAsyncLifetime
                 RealtimeJsonSerializerContext.Default.RealtimeEvent));
         cmd.Parameters.AddWithValue("event_type", (short)evt.Type);
         await cmd.ExecuteNonQueryAsync();
+    }
+
+    private static async Task InsertPreclaimedAsync(
+        RealtimeDatabaseClient client,
+        RealtimeDatabaseSchema schema,
+        RealtimeOutboxPreclaim preclaim)
+    {
+        var evt = new RealtimeEvent
+        {
+            EventId = preclaim.EventId,
+            Type = RealtimeEventType.MessageReceived,
+            TargetUserId = 42,
+            OccurredAtMs = 1
+        };
+        await using var connection = await client.GetDataSource().OpenConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            $"""
+             INSERT INTO {schema.OutboxTableSql} (
+                 event_id, payload_json, target_user_id, event_type, status,
+                 created_at_ms, next_attempt_at_ms, attempt_count,
+                 locked_by, locked_until_ms, claim_token
+             ) VALUES (
+                 @event_id, @payload, 42, @event_type, 0,
+                 1, @locked_until_ms, 1,
+                 @locked_by, @locked_until_ms, @claim_token
+             );
+             """,
+            connection);
+        command.Parameters.AddWithValue("event_id", preclaim.EventId);
+        command.Parameters.AddWithValue(
+            "payload",
+            JsonSerializer.Serialize(
+                evt,
+                RealtimeJsonSerializerContext.Default.RealtimeEvent));
+        command.Parameters.AddWithValue("event_type", (short)evt.Type);
+        command.Parameters.AddWithValue("locked_by", preclaim.LockOwner);
+        command.Parameters.AddWithValue("locked_until_ms", preclaim.LockedUntilMs);
+        command.Parameters.AddWithValue("claim_token", preclaim.ClaimToken);
+        await command.ExecuteNonQueryAsync();
     }
 }

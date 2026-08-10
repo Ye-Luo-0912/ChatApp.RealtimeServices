@@ -175,6 +175,9 @@ public static class RealtimeWireSerializer
     public static string Serialize(RealtimeDomainNotificationPayload payload) =>
         JsonSerializer.Serialize(payload, RealtimeIntegrationJsonContext.Default.RealtimeDomainNotificationPayload);
 
+    public static RealtimeDomainNotificationPayload? DeserializeDomainNotification(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RealtimeDomainNotificationPayload);
+
     public static string Serialize(RelationshipCommand command) =>
         JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.RelationshipCommand);
 

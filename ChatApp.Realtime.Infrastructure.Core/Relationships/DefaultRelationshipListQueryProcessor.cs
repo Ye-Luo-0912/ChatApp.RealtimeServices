@@ -5,6 +5,7 @@ namespace ChatApp.Realtime.Infrastructure.Core.Relationships;
 
 /// <summary>
 /// 关系列表查询处理器：按 <see cref="RelationshipListType"/> 分发到 store。
+/// <para>仅供显式的旧数据迁移/校验工具使用；默认在线读取必须等待 Server 权威投影。</para>
 /// </summary>
 public sealed class DefaultRelationshipListQueryProcessor : IRelationshipListQueryProcessor
 {

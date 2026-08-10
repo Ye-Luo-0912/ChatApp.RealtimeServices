@@ -19,6 +19,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="ChatApp.Realtime.Infrastructure.Postgres" />
+    <InternalsVisibleTo Include="ChatApp.Realtime.Tests" />
   </ItemGroup>
 
 </Project>

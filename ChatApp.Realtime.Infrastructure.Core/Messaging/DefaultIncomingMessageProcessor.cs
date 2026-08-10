@@ -123,6 +123,10 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             command.SenderUserId,
             receiverUserId,
             isGroupMessage,
+            _messageStore is ITransactionalDirectMessageAuthorizationStore
+            {
+                AuthorizesDirectMessagesTransactionally: true
+            },
             ct).ConfigureAwait(false);
         if (authError is not null)
         {
@@ -226,9 +230,8 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             ActorUserId = command.SenderUserId,
             MessageId = command.CommandId,
             SessionId = command.SenderSessionId,
-            // P1-4：直接传 payload 对象给 Store，由 Store 在附件绑定后调用
-            // EnrichChatMessagePayload 一次性物化为 PayloadJson，省去 Processor
-            // 序列化 + Store 反序列化的重复工作。Outbox 仅看到物化后的 PayloadJson。
+            // P1-4：直接传 payload 对象给 Store，由 Store 在附件绑定后补充最终字段并直接
+            // 写入 UTF-8 wire payload，省去 Processor 序列化、Store 反序列化和 UTF-16 中间字符串。
             Payload = new RealtimeChatMessagePayload
             {
                 MessageId = command.CommandId,
@@ -287,11 +290,17 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
 
         if (persisted.IsNotAllowed)
         {
-            _metrics.RecordProcessingFailure("not_member");
+            var authorizationError = persisted.AuthorizationDecision is { } decision
+                ? MapDirectAuthorizationFailure(decision)
+                : null;
+            var errorCode = authorizationError?.ErrorCode ?? "forbidden";
+            var errorMessage = authorizationError?.ErrorMessage ?? "无权在该会话发送消息。";
+            _metrics.RecordProcessingFailure(
+                authorizationError is null ? "not_member" : errorCode);
             // 权限失败不记录账本：重试可能成功（成员关系可能变化）。
             return MessageProcessResult.Failed(
-                "forbidden",
-                "无权在该会话发送消息。",
+                errorCode,
+                errorMessage,
                 MessageFailureKind.Permanent);
         }
 
@@ -315,6 +324,8 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
                 MessageFailureKind.Permanent);
         }
 
+        // PostgreSQL 写会话在事务提交后提供 event-id 快速提示；Processor 的普通唤醒保留，
+        // 兼容自定义/Noop Store，并确保提示溢出时发布器立即进入恢复路径。
         _outboxSignal.Notify();
 
         if (!persisted.IsNew)
@@ -491,8 +502,16 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
         long senderUserId,
         long receiverUserId,
         bool isGroupMessage,
+        bool authorizationHandledByMessageTransaction,
         CancellationToken ct)
     {
+        if (!isGroupMessage && authorizationHandledByMessageTransaction)
+        {
+            // PostgreSQL 生产路径把 existence/block/privacy/friend 与 lifecycle/ledger
+            // 合并到 SaveAsync 的同一事务和同一 SQL；这里保留独立的限流语义。
+            return await ValidateRateLimitAsync(senderUserId, ct).ConfigureAwait(false);
+        }
+
         if (!isGroupMessage
             && receiverUserId > 0
             && _directMessageAuthorizationStore is not null)

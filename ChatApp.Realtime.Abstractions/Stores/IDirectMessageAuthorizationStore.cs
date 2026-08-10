@@ -12,6 +12,15 @@ public interface IDirectMessageAuthorizationStore
         CancellationToken cancellationToken = default);
 }
 
+/// <summary>
+/// 标记消息存储会在消息写事务内完成单聊授权。处理器检测到该能力后仅执行限流，
+/// 不再提前打开第二个数据库连接做相同授权，避免 TOCTOU 和每消息一次额外往返。
+/// </summary>
+public interface ITransactionalDirectMessageAuthorizationStore
+{
+    bool AuthorizesDirectMessagesTransactionally { get; }
+}
+
 /// <summary>单聊授权的标准化判定。</summary>
 public enum DirectMessageAuthorizationDecision
 {

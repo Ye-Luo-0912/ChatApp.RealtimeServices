@@ -256,6 +256,36 @@ public sealed class DefaultIncomingMessageProcessorTests
         Assert.Null(store.Message);
     }
 
+    [Fact]
+    public async Task ProcessAsync_UsesTransactionalAuthorization_WhenStoreSupportsIt()
+    {
+        var store = new TransactionalCapturingStore(
+            DirectMessageAuthorizationDecision.NotFriend);
+        var authorizationStore = new RecordingDirectAuthorizationStore(
+            DirectMessageAuthorizationDecision.Allowed);
+        using var metrics = new RealtimeMetrics();
+        var processor = new DefaultIncomingMessageProcessor(
+            store,
+            new RecordingRealtimeOutboxSignal(),
+            metrics,
+            NoopTombstoneAndLedger.Tombstone,
+            new AlwaysMemberGroupStore(),
+            new ThrowingUserExistenceChecker(),
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
+            NullLogger<DefaultIncomingMessageProcessor>.Instance,
+            authorizationStore);
+
+        var result = await processor.ProcessAsync(ValidCommand());
+
+        Assert.False(result.Succeeded);
+        Assert.Equal("not_friend", result.ErrorCode);
+        Assert.Equal(0, authorizationStore.Calls);
+        Assert.NotNull(store.Message);
+    }
+
     private static IncomingMessageCommand ValidCommand() => new()
     {
         CommandId = "command-1",
@@ -267,7 +297,10 @@ public sealed class DefaultIncomingMessageProcessorTests
         ReceivedAtMs = 1_700_000_000_000
     };
 
-    private sealed class CapturingStore(bool isNew = true, bool conflict = false) : IRealtimeMessageStore
+    private class CapturingStore(
+        bool isNew = true,
+        bool conflict = false,
+        DirectMessageAuthorizationDecision? authorizationDecision = null) : IRealtimeMessageStore
     {
         public RealtimeMessageRecord? Message { get; private set; }
         public RealtimeEvent? Event { get; private set; }
@@ -279,6 +312,11 @@ public sealed class DefaultIncomingMessageProcessorTests
         {
             Message = message;
             Event = eventToPublish;
+            if (authorizationDecision is { } decision)
+            {
+                return Task.FromResult(
+                    RealtimeMessagePersistResult.AuthorizationRejected(message.MessageId, decision));
+            }
             if (conflict)
                 return Task.FromResult(RealtimeMessagePersistResult.Conflict(message.MessageId));
             return Task.FromResult(
@@ -334,6 +372,14 @@ public sealed class DefaultIncomingMessageProcessorTests
             RealtimeEvent eventToPublish,
             CancellationToken ct = default) =>
             Task.CompletedTask;
+    }
+
+    private sealed class TransactionalCapturingStore(
+        DirectMessageAuthorizationDecision decision)
+        : CapturingStore(authorizationDecision: decision),
+            ITransactionalDirectMessageAuthorizationStore
+    {
+        public bool AuthorizesDirectMessagesTransactionally => true;
     }
 
     private sealed class RecordingDirectAuthorizationStore(

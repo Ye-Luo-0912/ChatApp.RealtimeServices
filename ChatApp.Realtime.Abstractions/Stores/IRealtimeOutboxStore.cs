@@ -10,6 +10,14 @@ public interface IRealtimeOutboxStore
 
     Task MarkPublishedAsync(RealtimeOutboxRecord record, CancellationToken ct = default);
 
+    /// <summary>
+    /// 单记录发布快路径。仍使用 claim_token 校验所有权，返回实际命中行数，
+    /// 避免为了取得影响行数构造单元素批量数组。
+    /// </summary>
+    Task<int> TryMarkPublishedAsync(
+        RealtimeOutboxRecord record,
+        CancellationToken ct = default);
+
     Task MarkFailedAsync(
         RealtimeOutboxRecord record,
         string error,
@@ -109,6 +117,81 @@ public interface IRealtimeOutboxStore
         CancellationToken ct = default);
 
     Task<RealtimeOutboxListItem?> TryGetAsync(string eventId, CancellationToken ct = default);
+}
+
+/// <summary>
+/// 按已提交事件编号精确认领 Outbox 的可选快速路径。实现必须执行与普通认领相同的
+/// 状态、重试时间、租约及 claim token 校验；调用方会周期性使用
+/// <see cref="IRealtimeOutboxStore.ClaimBatchAsync"/> 恢复任何丢失的提示。
+/// </summary>
+public interface IRealtimeOutboxHintClaimStore
+{
+    Task<IReadOnlyList<RealtimeOutboxRecord>> ClaimBatchByIdsAsync(
+        string instanceId,
+        IReadOnlyList<string> eventIds,
+        int batchSize,
+        TimeSpan leaseDuration,
+        CancellationToken ct = default);
+}
+
+/// <summary>
+/// 读取已在业务事务内预领取的 Outbox 行。实现只能返回 owner/token、Pending、retry 和
+/// lease 均仍有效的记录；读取本身不再产生第二次 claim UPDATE。
+/// </summary>
+public interface IRealtimeOutboxPreclaimedStore
+{
+    Task<IReadOnlyList<RealtimeOutboxRecord>> ReadPreclaimedAsync(
+        string instanceId,
+        IReadOnlyList<string> eventIds,
+        IReadOnlyList<string> claimTokens,
+        int batchSize,
+        CancellationToken ct = default);
+}
+
+/// <summary>
+/// 为单个 Outbox publisher 独占的认领会话。实现可以安全复用连接和已准备命令；
+/// 会话不得在多个 Worker/线程之间并发使用，故障后由调用方释放并重新创建。
+/// </summary>
+public interface IRealtimeOutboxClaimSession : IAsyncDisposable
+{
+    Task<IReadOnlyList<RealtimeOutboxRecord>> ClaimBatchAsync(
+        int batchSize,
+        TimeSpan leaseDuration,
+        CancellationToken ct = default);
+
+    Task<IReadOnlyList<RealtimeOutboxRecord>> ClaimBatchByIdsAsync(
+        IReadOnlyList<string> eventIds,
+        int batchSize,
+        TimeSpan leaseDuration,
+        CancellationToken ct = default);
+
+    Task<IReadOnlyList<RealtimeOutboxRecord>> ReadPreclaimedAsync(
+        IReadOnlyList<string> eventIds,
+        IReadOnlyList<string> claimTokens,
+        int batchSize,
+        CancellationToken ct = default);
+}
+
+public interface IRealtimeOutboxClaimSessionFactory
+{
+    ValueTask<IRealtimeOutboxClaimSession> OpenClaimSessionAsync(
+        string instanceId,
+        CancellationToken ct = default);
+}
+
+/// <summary>
+/// 发布成功后的紧凑完成能力。仅删除仍由相同 claim_token 持有的 Pending 行；
+/// 发布确认后进程崩溃但删除前，租约到期会用相同 EventId 重试，由消息系统去重。
+/// </summary>
+public interface IRealtimeOutboxCompactionStore
+{
+    Task<int> DeleteClaimedPublishedAsync(
+        RealtimeOutboxRecord record,
+        CancellationToken ct = default);
+
+    Task<int> DeleteClaimedPublishedBatchAsync(
+        IReadOnlyList<RealtimeOutboxRecord> records,
+        CancellationToken ct = default);
 }
 
 public sealed record RealtimeOutboxStats(

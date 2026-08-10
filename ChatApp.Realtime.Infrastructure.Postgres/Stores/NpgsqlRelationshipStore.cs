@@ -14,10 +14,14 @@ using Npgsql;
 namespace ChatApp.Realtime.Infrastructure.Postgres.Stores;
 
 /// <summary>
-/// PostgreSQL 关系域权威实现。
+/// PostgreSQL 关系域旧表兼容实现。
 /// <para>
 /// 好友请求 / 友谊使用 realtime schema 表（Migration052），
 /// 黑名单复用 public."T_BlockRecords"（与 <see cref="NpgsqlBlockListStore"/> 共享）。
+/// </para>
+/// <para>
+/// ChatApp.Server 是默认运行时的唯一写权威；本类仅保留给显式迁移和兼容工具，
+/// 不得直接注册为在线命令处理器。
 /// </para>
 /// <para>
 /// 幂等：relationship_mutation_requests 表按 (actor_user_id, request_id) 去重，

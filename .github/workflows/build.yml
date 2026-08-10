@@ -41,6 +41,10 @@ jobs:
       - name: Test
         run: dotnet test ChatApp.RealtimeServices.slnx --no-build --no-restore --configuration Release
 
+      - name: Relationship projection reconcile gate tests
+        shell: pwsh
+        run: ./scripts/tests/RelationshipProjectionReconcile.Tests.ps1
+
       - name: Build container
         run: docker build --file ChatApp.RealtimeServices/Dockerfile --tag chatapp-realtime-services:ci .
 
