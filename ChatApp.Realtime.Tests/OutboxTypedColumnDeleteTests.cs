@@ -1,6 +1,8 @@
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
+using ChatApp.Realtime.Infrastructure.Core.Stores;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using ChatApp.Realtime.Infrastructure.Postgres.Migrations;
@@ -101,11 +103,13 @@ public sealed class OutboxTypedColumnDeleteTests : IAsyncLifetime
             schema,
             RealtimeSchemaMigrationRunner.DefaultMigrations());
 
+        using var outboxSignal = new RealtimeOutboxSignal();
         var store = new NpgsqlRealtimeMessageStore(
             client,
             schema,
             TestMutationPolicy.Instance,
-            NullLogger<NpgsqlRealtimeMessageStore>.Instance);
+            NullLogger<NpgsqlRealtimeMessageStore>.Instance,
+            outboxSignal: outboxSignal);
 
         await store.EnqueueEventAsync(new RealtimeEvent
         {
@@ -128,6 +132,22 @@ public sealed class OutboxTypedColumnDeleteTests : IAsyncLifetime
             TargetUserId = 12,
             OccurredAtMs = 1
         });
+
+        var hints = (IRealtimeOutboxHintSource)outboxSignal;
+        var committedIds = new List<string>();
+        while (hints.TryReadCommittedEventId(out var eventId))
+            committedIds.Add(eventId);
+        Assert.Equal(["enq-12", "enq-123", "enq-12-done"], committedIds);
+
+        // ON CONFLICT DO NOTHING 未插入新行时不得产生新的提交提示。
+        await store.EnqueueEventAsync(new RealtimeEvent
+        {
+            EventId = "enq-123",
+            Type = RealtimeEventType.MessageReceived,
+            TargetUserId = 123,
+            OccurredAtMs = 1
+        });
+        Assert.False(hints.TryReadCommittedEventId(out _));
 
         await store.DeleteByUserAsync(12);
 

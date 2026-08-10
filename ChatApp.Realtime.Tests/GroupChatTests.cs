@@ -237,6 +237,17 @@ public sealed class GroupChatTests : IAsyncLifetime
             Content = "hi all",
             ReceivedAtMs = 1_700_000_000_500
         };
+        var chatPayload = new RealtimeChatMessagePayload
+        {
+            MessageId = "g-msg-1",
+            ClientMessageId = "g-client-1",
+            SenderUserId = 1,
+            SenderSessionId = "s1",
+            ReceiverUserId = 0,
+            ConversationId = conversationId,
+            Content = "hi all",
+            ReceivedAtMs = 1_700_000_000_500
+        };
         var template = new RealtimeEvent
         {
             EventId = MessageEventIdFactory.CreateMessageReceivedEventId(1, "g-client-1", 1),
@@ -245,19 +256,7 @@ public sealed class GroupChatTests : IAsyncLifetime
             ActorUserId = 1,
             MessageId = "g-msg-1",
             SessionId = "s1",
-            PayloadJson = JsonSerializer.Serialize(
-                new RealtimeChatMessagePayload
-                {
-                    MessageId = "g-msg-1",
-                    ClientMessageId = "g-client-1",
-                    SenderUserId = 1,
-                    SenderSessionId = "s1",
-                    ReceiverUserId = 0,
-                    ConversationId = conversationId,
-                    Content = "hi all",
-                    ReceivedAtMs = 1_700_000_000_500
-                },
-                RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload),
+            Payload = chatPayload,
             OccurredAtMs = 1_700_000_000_500
         };
 
@@ -270,7 +269,7 @@ public sealed class GroupChatTests : IAsyncLifetime
         await using var connection = await client.GetDataSource().OpenConnectionAsync();
         await using var outbox = new NpgsqlCommand(
             $"""
-             SELECT audience_kind, conversation_id, target_user_ids
+             SELECT audience_kind, conversation_id, target_user_ids, payload_utf8
              FROM {schema.OutboxTableSql}
              WHERE event_type = @type
              """,
@@ -285,6 +284,13 @@ public sealed class GroupChatTests : IAsyncLifetime
                 continue;
             Assert.Equal(conversationId, reader.GetString(1));
             Assert.True(reader.IsDBNull(2));
+            var wireEvent = JsonSerializer.Deserialize(
+                reader.GetFieldValue<byte[]>(3),
+                RealtimeJsonSerializerContext.Default.RealtimeEvent)!;
+            var wirePayload = JsonSerializer.Deserialize(
+                wireEvent.PayloadJson!,
+                RealtimeJsonSerializerContext.Default.RealtimeChatMessagePayload)!;
+            Assert.Equal("hi all", wirePayload.Content);
             hasBroadcast = true;
             break;
         }

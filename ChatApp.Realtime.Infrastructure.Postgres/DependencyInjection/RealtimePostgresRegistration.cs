@@ -27,6 +27,9 @@ public static class RealtimePostgresRegistration
         services.AddSingleton(new RealtimeDatabaseSchema(schema));
         services.RemoveAll<IRealtimeOpsQueryStore>();
         services.AddSingleton<IRealtimeOpsQueryStore, NpgsqlRealtimeOpsQueryStore>();
+        services.RemoveAll<IRelationshipProjectionOpsQueryStore>();
+        services.AddSingleton<IRelationshipProjectionOpsQueryStore,
+            NpgsqlRelationshipProjectionOpsQueryStore>();
 
         // P0-8：消息变更（撤回 / 编辑 / Reaction）统一权限策略，防止离群用户修改旧群消息。
         services.RemoveAll<IConversationMessageMutationPolicy>();
@@ -53,7 +56,8 @@ public static class RealtimePostgresRegistration
                 sp.GetRequiredService<IConversationMessageMutationPolicy>(),
                 sp.GetRequiredService<ILogger<NpgsqlRealtimeMessageStore>>(),
                 sp.GetService<RealtimeMetrics>(),
-                sp.GetRequiredService<ICommandIdempotencyLedger>()));
+                sp.GetRequiredService<ICommandIdempotencyLedger>(),
+                sp.GetRequiredService<IRealtimeOutboxSignal>()));
         }
 
         if (!string.IsNullOrWhiteSpace(connectionString)
@@ -67,7 +71,8 @@ public static class RealtimePostgresRegistration
             services.AddSingleton<IRealtimeConversationStore>(sp => new NpgsqlRealtimeConversationStore(
                 sp.GetRequiredService<RealtimeDatabaseClient>(),
                 sp.GetRequiredService<RealtimeDatabaseSchema>(),
-                sp.GetService<RealtimeMetrics>()));
+                sp.GetService<RealtimeMetrics>(),
+                sp.GetRequiredService<IRealtimeOutboxSignal>()));
             services.RemoveAll<IRealtimeGroupStore>();
             // 审计 Outbox：注入 IGroupOperationAuditStore，使群操作审计在业务事务内写入。
             // Membership periods：注入 IMembershipPeriodStore，使群操作在事务内记录入群/离群 period。
@@ -99,6 +104,14 @@ public static class RealtimePostgresRegistration
             services.AddSingleton<IRealtimeDeviceSyncCursorStore, NpgsqlRealtimeDeviceSyncCursorStore>();
             services.RemoveAll<IRealtimeOutboxStore>();
             services.AddSingleton<IRealtimeOutboxStore, NpgsqlRealtimeOutboxStore>();
+            services.RemoveAll<IRelationshipProjectionStore>();
+            services.AddSingleton<IRelationshipProjectionStore, NpgsqlRelationshipProjectionStore>();
+            services.RemoveAll<IRelationshipProjectionQueryStore>();
+            services.AddSingleton<IRelationshipProjectionQueryStore,
+                NpgsqlRelationshipProjectionQueryStore>();
+            services.RemoveAll<IRelationshipProjectionRebuildStateStore>();
+            services.AddSingleton<IRelationshipProjectionRebuildStateStore,
+                NpgsqlRelationshipProjectionRebuildStateStore>();
             services.RemoveAll<IRealtimeAttachmentStore>();
             services.AddSingleton<IRealtimeAttachmentStore, NpgsqlRealtimeAttachmentStore>();
             services.RemoveAll<IRealtimeReactionStore>();
@@ -107,7 +120,8 @@ public static class RealtimePostgresRegistration
                 sp.GetRequiredService<RealtimeDatabaseClient>(),
                 sp.GetRequiredService<RealtimeDatabaseSchema>(),
                 sp.GetRequiredService<IConversationMessageMutationPolicy>(),
-                sp.GetService<RealtimeMetrics>()));
+                sp.GetService<RealtimeMetrics>(),
+                sp.GetRequiredService<IRealtimeOutboxSignal>()));
             services.RemoveAll<IRealtimeMessageRetentionStore>();
             services.AddSingleton<IRealtimeMessageRetentionStore, NpgsqlRealtimeMessageRetentionStore>();
             services.RemoveAll<IRealtimeReadReceiptStore>();

@@ -22,12 +22,17 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
     public NpgsqlRealtimeConversationStore(
         RealtimeDatabaseClient databaseClient,
         RealtimeDatabaseSchema databaseSchema,
-        RealtimeMetrics? metrics = null)
+        RealtimeMetrics? metrics = null,
+        IRealtimeOutboxSignal? outboxSignal = null)
     {
         _databaseClient = databaseClient;
         _databaseSchema = databaseSchema;
         // Reliability-4：传入 RealtimeMetrics，由 session 在事务提交成功后记录 outbox 入队行数。
-        _sessionFactory = new RealtimeWriteSessionFactory(databaseClient, databaseSchema, metrics);
+        _sessionFactory = new RealtimeWriteSessionFactory(
+            databaseClient,
+            databaseSchema,
+            metrics,
+            outboxSignal);
     }
 
     public async Task<IReadOnlyList<ConversationListItem>> QueryListAsync(
@@ -381,30 +386,31 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
 
         var traceParent = RealtimeTraceContext.CaptureTraceParent();
         var traceState = RealtimeTraceContext.CaptureTraceState();
+        var prefsChangedEvent = ConversationWriteCommands.CreateConversationPrefsChangedEvent(
+            conversationId,
+            userId,
+            type,
+            peerUserId,
+            lastMessageId,
+            lastMessagePreview,
+            lastMessageAtMs,
+            lastSenderUserId,
+            nextPinned,
+            nextPinnedAtMs,
+            nextMuted,
+            nextMutedUntilMs,
+            now,
+            traceParent,
+            traceState);
         var inserted = await OutboxInsertHelper.InsertAsync(
                 session.Connection,
                 session.Transaction,
                 session.Schema,
-                ConversationWriteCommands.CreateConversationPrefsChangedEvent(
-                    conversationId,
-                    userId,
-                    type,
-                    peerUserId,
-                    lastMessageId,
-                    lastMessagePreview,
-                    lastMessageAtMs,
-                    lastSenderUserId,
-                    nextPinned,
-                    nextPinnedAtMs,
-                    nextMuted,
-                    nextMutedUntilMs,
-                    now,
-                    traceParent,
-                    traceState),
+                prefsChangedEvent,
                 session.CancellationToken)
             .ConfigureAwait(false);
         // Reliability-4：累计到 session，由 CommitAsync 在事务提交成功后统一记录到 metrics。
-        session.RecordOutboxInsert(inserted);
+        session.RecordOutboxInsert(inserted, prefsChangedEvent);
 
         await session.CommitAsync().ConfigureAwait(false);
         return new ConversationMemberPrefsResult(
@@ -607,18 +613,12 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                 // 读者自身的未读数变更保持逐用户。
                 delta.AddPerUser(readerUnreadEvent);
 
-                // DEBUG-极限3: trace events before insert
-                var debugEvents = delta.Build();
-                foreach (var de in debugEvents)
-                {
-                    Console.WriteLine($"[DEBUG-极限3-Store] EventId={de.EventId}, Type={de.Type}, AudienceKind={de.AudienceKind}, ConversationId={de.ConversationId}, ExcludeUserId={de.ExcludeUserId}, TargetUserIds={(de.TargetUserIds is null ? "null" : de.TargetUserIds.Length.ToString())}");
-                }
-
+                var groupEvents = delta.Build();
                 groupInserted = await OutboxInsertHelper.InsertManyAsync(
                         session.Connection,
                         session.Transaction,
                         session.Schema,
-                        delta.Build(),
+                        groupEvents,
                         session.CancellationToken)
                     .ConfigureAwait(false);
 
@@ -633,6 +633,7 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                         now,
                         session.CancellationToken)
                     .ConfigureAwait(false);
+                session.RecordOutboxInserts(groupInserted, groupEvents);
             }
             else
             {
@@ -644,9 +645,8 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                         [readerUnreadEvent],
                         session.CancellationToken)
                     .ConfigureAwait(false);
+                session.RecordOutboxInsert(groupInserted, readerUnreadEvent);
             }
-            // Reliability-4：累计到 session，由 CommitAsync 在事务提交成功后统一记录到 metrics。
-            session.RecordOutboxInsert(groupInserted);
         }
         else
         {
@@ -684,7 +684,7 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
                     events,
                     session.CancellationToken)
                 .ConfigureAwait(false);
-            session.RecordOutboxInsert(directInserted);
+            session.RecordOutboxInserts(directInserted, events);
         }
 
         await session.CommitAsync().ConfigureAwait(false);

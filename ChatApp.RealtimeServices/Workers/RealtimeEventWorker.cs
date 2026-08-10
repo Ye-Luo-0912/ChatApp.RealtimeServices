@@ -2,6 +2,7 @@ using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Queueing;
+using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Health;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.RealtimeServices.Options;
@@ -33,6 +34,7 @@ public sealed class RealtimeEventWorker : BackgroundService
 
     private readonly IRealtimeEventConsumer _consumer;
     private readonly IUserAccountDeletedProcessor _accountDeletedProcessor;
+    private readonly IRelationshipProjectionStore _relationshipProjectionStore;
     private readonly IDeadLetterPublisher _deadLetterPublisher;
     private readonly RealtimeReadinessState _readinessState;
     private readonly RealtimeOptions _options;
@@ -42,6 +44,7 @@ public sealed class RealtimeEventWorker : BackgroundService
     public RealtimeEventWorker(
         IRealtimeEventConsumer consumer,
         IUserAccountDeletedProcessor accountDeletedProcessor,
+        IRelationshipProjectionStore relationshipProjectionStore,
         IDeadLetterPublisher deadLetterPublisher,
         RealtimeReadinessState readinessState,
         IOptions<RealtimeOptions> options,
@@ -50,6 +53,7 @@ public sealed class RealtimeEventWorker : BackgroundService
     {
         _consumer = consumer;
         _accountDeletedProcessor = accountDeletedProcessor;
+        _relationshipProjectionStore = relationshipProjectionStore;
         _deadLetterPublisher = deadLetterPublisher;
         _readinessState = readinessState;
         _options = options.Value;
@@ -100,7 +104,21 @@ public sealed class RealtimeEventWorker : BackgroundService
                                 continue;
                             }
 
-                            if (evt.Type == RealtimeEventType.UserAccountDeleted)
+                            if (evt.Type is RealtimeEventType.FriendRequestListChanged
+                                or RealtimeEventType.FriendListChanged
+                                or RealtimeEventType.BlockedListChanged)
+                            {
+                                // Server owns relationship mutations. Its durable Outbox reaches this
+                                // consumer through JetStream, so the shadow read model must be committed
+                                // here before ACK. Applying in Realtime's own Outbox publisher does not
+                                // cover Server-originated events.
+                                await RelationshipProjectionPrePublisher.ApplyAsync(
+                                        evt,
+                                        _relationshipProjectionStore,
+                                        stoppingToken)
+                                    .ConfigureAwait(false);
+                            }
+                            else if (evt.Type == RealtimeEventType.UserAccountDeleted)
                             {
                                 // LongTerm-2：调用处理器写入 tombstone + 入队清理作业，立即返回。
                                 // 重型清理由 AccountCleanupWorker Saga 按 phase 分批推进。
@@ -133,7 +151,7 @@ public sealed class RealtimeEventWorker : BackgroundService
                                 }
                             }
 
-                            // 其它事件类型（网关推送路径已停用）与处理成功的事件：直接 ACK 跳过。
+                            // 其它事件类型（网关推送路径已停用）与处理成功的事件：直接 ACK。
                             await envelope.AckAsync(stoppingToken).ConfigureAwait(false);
                         }
                         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)

@@ -28,13 +28,18 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
         RealtimeDatabaseClient databaseClient,
         RealtimeDatabaseSchema databaseSchema,
         IConversationMessageMutationPolicy mutationPolicy,
-        RealtimeMetrics? metrics = null)
+        RealtimeMetrics? metrics = null,
+        IRealtimeOutboxSignal? outboxSignal = null)
     {
         _databaseClient = databaseClient;
         _databaseSchema = databaseSchema;
         _mutationPolicy = mutationPolicy;
         // Reliability-4：传入 RealtimeMetrics，由 session 在事务提交成功后记录 outbox 入队行数。
-        _sessionFactory = new RealtimeWriteSessionFactory(databaseClient, databaseSchema, metrics);
+        _sessionFactory = new RealtimeWriteSessionFactory(
+            databaseClient,
+            databaseSchema,
+            metrics,
+            outboxSignal);
     }
 
     public async Task<MessageReactionPersistResult> AddAsync(
@@ -670,15 +675,16 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 traceParent,
                 traceState));
 
+            var groupEvents = delta.Build();
             var inserted = await OutboxInsertHelper.InsertManyAsync(
                     session.Connection,
                     session.Transaction,
                     session.Schema,
-                    delta.Build(),
+                    groupEvents,
                     session.CancellationToken)
                 .ConfigureAwait(false);
             // Reliability-4：累计到 session，由 CommitAsync 在事务提交成功后统一记录到 metrics。
-            session.RecordOutboxInsert(inserted);
+            session.RecordOutboxInserts(inserted, groupEvents);
             return;
         }
 
@@ -761,7 +767,7 @@ public sealed class NpgsqlRealtimeReactionStore : IRealtimeReactionStore
                 events,
                 session.CancellationToken)
             .ConfigureAwait(false);
-        session.RecordOutboxInsert(directInserted);
+        session.RecordOutboxInserts(directInserted, events);
     }
 
     private sealed record MessageAccess(

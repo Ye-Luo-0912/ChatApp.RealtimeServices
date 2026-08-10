@@ -31,6 +31,9 @@ public sealed class RealtimeMetrics : IDisposable
     private readonly Counter<long> _outboxDeadCleanupCounter;
     private readonly Counter<long> _outboxDeadArchiveCounter;
     private readonly Counter<long> _outboxStatsFailureCounter;
+    private readonly Counter<long> _outboxHintRequestedCounter;
+    private readonly Counter<long> _outboxHintClaimedCounter;
+    private readonly Counter<long> _outboxRecoveryScanCounter;
     private readonly Counter<long> _idempotencyConflictCounter;
     private readonly Counter<long> _messageRetentionDeletedCounter;
     private readonly Counter<long> _messageRetentionErrorCounter;
@@ -40,6 +43,17 @@ public sealed class RealtimeMetrics : IDisposable
     private readonly Counter<long> _overloadReplyCounter;
     private readonly Counter<long> _shardFallbackCounter;
     private readonly Counter<long> _pushTriggeredCounter;
+    private readonly Counter<long> _relationshipProjectionAppliedCounter;
+    private readonly Counter<long> _relationshipProjectionDuplicateCounter;
+    private readonly Counter<long> _relationshipProjectionGapCounter;
+    private readonly Counter<long> _relationshipProjectionRebuildPassCounter;
+    private readonly Counter<long> _relationshipProjectionRebuildStreamCounter;
+    private readonly Counter<long> _relationshipProjectionRebuildFailureCounter;
+    private readonly Counter<long> _relationshipProjectionRebuildLeaseLostCounter;
+    private readonly Histogram<double> _relationshipProjectionRebuildPassDuration;
+    private readonly Histogram<double> _relationshipProjectionRebuildStreamDuration;
+    private readonly ObservableGauge<long> _relationshipProjectionRebuildActiveGauge;
+    private readonly ObservableGauge<long> _relationshipProjectionRebuildStablePassesGauge;
 
     private long _persisted;
     private long _duplicates;
@@ -59,6 +73,8 @@ public sealed class RealtimeMetrics : IDisposable
     private long _outboxMaxAttempts;
     private long _outboxDead;
     private long _messageRetentionOldestPurgeableAtMs = -1;
+    private long _relationshipProjectionRebuildActive;
+    private long _relationshipProjectionRebuildStablePasses;
 
     public RealtimeMetrics()
     {
@@ -105,6 +121,12 @@ public sealed class RealtimeMetrics : IDisposable
             "realtime.outbox.cleanup.dead.archived");
         _outboxStatsFailureCounter = _meter.CreateCounter<long>(
             "realtime.outbox.stats.failures");
+        _outboxHintRequestedCounter = _meter.CreateCounter<long>(
+            "realtime.outbox.hints.requested");
+        _outboxHintClaimedCounter = _meter.CreateCounter<long>(
+            "realtime.outbox.hints.claimed");
+        _outboxRecoveryScanCounter = _meter.CreateCounter<long>(
+            "realtime.outbox.recovery.scans");
         _idempotencyConflictCounter = _meter.CreateCounter<long>(
             "realtime.messages.idempotency_conflicts");
         _messageRetentionDeletedCounter = _meter.CreateCounter<long>(
@@ -120,7 +142,79 @@ public sealed class RealtimeMetrics : IDisposable
         _overloadReplyCounter = _meter.CreateCounter<long>("realtime.overload.replies");
         _shardFallbackCounter = _meter.CreateCounter<long>("realtime.routing.shard_fallback");
         _pushTriggeredCounter = _meter.CreateCounter<long>("realtime.push.triggered");
+        _relationshipProjectionAppliedCounter = _meter.CreateCounter<long>(
+            "realtime.relationship_projection.applied");
+        _relationshipProjectionDuplicateCounter = _meter.CreateCounter<long>(
+            "realtime.relationship_projection.duplicates");
+        _relationshipProjectionGapCounter = _meter.CreateCounter<long>(
+            "realtime.relationship_projection.gaps");
+        _relationshipProjectionRebuildPassCounter = _meter.CreateCounter<long>(
+            "realtime.relationship_projection.rebuild.passes");
+        _relationshipProjectionRebuildStreamCounter = _meter.CreateCounter<long>(
+            "realtime.relationship_projection.rebuild.streams");
+        _relationshipProjectionRebuildFailureCounter = _meter.CreateCounter<long>(
+            "realtime.relationship_projection.rebuild.failures");
+        _relationshipProjectionRebuildLeaseLostCounter = _meter.CreateCounter<long>(
+            "realtime.relationship_projection.rebuild.lease_lost");
+        _relationshipProjectionRebuildPassDuration = _meter.CreateHistogram<double>(
+            "realtime.relationship_projection.rebuild.pass.duration", "ms");
+        _relationshipProjectionRebuildStreamDuration = _meter.CreateHistogram<double>(
+            "realtime.relationship_projection.rebuild.stream.duration", "ms");
+        _relationshipProjectionRebuildActiveGauge = _meter.CreateObservableGauge<long>(
+            "realtime.relationship_projection.rebuild.active",
+            () => Interlocked.Read(ref _relationshipProjectionRebuildActive));
+        _relationshipProjectionRebuildStablePassesGauge = _meter.CreateObservableGauge<long>(
+            "realtime.relationship_projection.rebuild.stable_passes",
+            () => Interlocked.Read(ref _relationshipProjectionRebuildStablePasses));
     }
+
+    public void RecordRelationshipProjectionApplied() =>
+        _relationshipProjectionAppliedCounter.Add(1);
+
+    public void RecordRelationshipProjectionDuplicate() =>
+        _relationshipProjectionDuplicateCounter.Add(1);
+
+    public void RecordRelationshipProjectionGap() =>
+        _relationshipProjectionGapCounter.Add(1);
+
+    public void SetRelationshipProjectionRebuildActive(bool active) =>
+        Interlocked.Exchange(ref _relationshipProjectionRebuildActive, active ? 1 : 0);
+
+    public void SetRelationshipProjectionRebuildStablePasses(int stablePasses) =>
+        Interlocked.Exchange(ref _relationshipProjectionRebuildStablePasses, stablePasses);
+
+    public void RecordRelationshipProjectionRebuildStream(
+        string outcome,
+        TimeSpan duration)
+    {
+        _relationshipProjectionRebuildStreamCounter.Add(
+            1,
+            new KeyValuePair<string, object?>("outcome", outcome));
+        _relationshipProjectionRebuildStreamDuration.Record(duration.TotalMilliseconds);
+    }
+
+    public void RecordRelationshipProjectionRebuildPass(
+        int stablePasses,
+        TimeSpan duration)
+    {
+        SetRelationshipProjectionRebuildStablePasses(stablePasses);
+        _relationshipProjectionRebuildPassCounter.Add(
+            1,
+            new KeyValuePair<string, object?>(
+                "stable",
+                (stablePasses >= 2).ToString()));
+        _relationshipProjectionRebuildPassDuration.Record(duration.TotalMilliseconds);
+    }
+
+    public void RecordRelationshipProjectionRebuildFailure(string reason) =>
+        _relationshipProjectionRebuildFailureCounter.Add(
+            1,
+            new KeyValuePair<string, object?>("reason", reason));
+
+    public void RecordRelationshipProjectionRebuildLeaseLost(string stage) =>
+        _relationshipProjectionRebuildLeaseLostCounter.Add(
+            1,
+            new KeyValuePair<string, object?>("stage", stage));
 
     public void RecordPersisted()
     {
@@ -196,6 +290,17 @@ public sealed class RealtimeMetrics : IDisposable
         if (count > 0)
             AdjustOutboxPending(count);
     }
+
+    public void RecordOutboxHintClaim(int requested, int claimed)
+    {
+        if (requested > 0)
+            _outboxHintRequestedCounter.Add(requested);
+        if (claimed > 0)
+            _outboxHintClaimedCounter.Add(claimed);
+    }
+
+    public void RecordOutboxRecoveryScan() =>
+        _outboxRecoveryScanCounter.Add(1);
 
     public void RecordOutboxCleanup(int deleted) =>
         _outboxCleanupCounter.Add(deleted);

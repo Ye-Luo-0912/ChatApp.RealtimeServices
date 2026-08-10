@@ -155,43 +155,84 @@ internal static class UserLifecycleAdvisoryLock
         if (userIds.Count == 0)
             return LifecycleGateResult.Active;
 
-        // 去重 + 按 userId 升序排序（避免死锁）
-        var sortedIds = userIds.Distinct().OrderBy(id => id).ToArray();
+        var sortedIds = NormalizeSortedDistinct(userIds);
+        return await AcquireSharedAndCheckActiveCoreAsync(
+            connection,
+            transaction,
+            schema,
+            sortedIds,
+            ct).ConfigureAwait(false);
+    }
 
-        // 在 C# 中预计算 advisory lock 键（namespace XOR user_id），保持与单用户版本
-        // CombineKey 一致，避免 SQL 端 XOR 运算符歧义（PostgreSQL 中 # 为位异或，^ 为幂运算）。
-        var keys = new long[sortedIds.Length];
-        for (var i = 0; i < sortedIds.Length; i++)
-            keys[i] = CombineKey(sortedIds[i]);
+    /// <summary>
+    /// 消息热路径专用双用户入口，避免先构造临时集合再做 LINQ 去重/排序。
+    /// receiverUserId &lt;= 0 时只检查发送方。
+    /// </summary>
+    public static Task<LifecycleGateResult> AcquireSharedAndCheckActiveAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        RealtimeDatabaseSchema schema,
+        long senderUserId,
+        long receiverUserId,
+        CancellationToken ct)
+    {
+        if (receiverUserId <= 0 || receiverUserId == senderUserId)
+            return AcquireSharedAndCheckActiveCoreAsync(
+                connection,
+                transaction,
+                schema,
+                [senderUserId],
+                ct);
 
-        // 一条 SQL 获取全部 advisory locks（UNNEST 保留数组顺序，按 userId 升序获取）
-        await using (var lockCmd = new NpgsqlCommand(
-                         """
-                         SELECT pg_advisory_xact_lock_shared(t.key)
-                         FROM UNNEST(@keys) AS t(key);
-                         """,
-                         connection,
-                         transaction))
-        {
-            lockCmd.Parameters.AddWithValue("keys", keys);
-            await lockCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-        }
+        var sortedIds = senderUserId < receiverUserId
+            ? new[] { senderUserId, receiverUserId }
+            : new[] { receiverUserId, senderUserId };
+        return AcquireSharedAndCheckActiveCoreAsync(
+            connection,
+            transaction,
+            schema,
+            sortedIds,
+            ct);
+    }
 
-        // 一条 SQL 批量查询 tombstone。tombstone 表中仅存在 Deleting/Deleted 行（无 Active 行），
-        // 因此只要返回任意行即表示对应用户非活跃，应拒绝写入。
+    private static async Task<LifecycleGateResult> AcquireSharedAndCheckActiveCoreAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        RealtimeDatabaseSchema schema,
+        long[] sortedIds,
+        CancellationToken ct)
+    {
+        // 单条 SQL 同时按 userId 顺序获取全部共享锁并读取 tombstone，减少一次数据库往返。
+        // MATERIALIZED CTE 保证 volatile advisory-lock 函数在状态读取前完整执行。
         await using var stateCmd = new NpgsqlCommand(
             $"""
-             SELECT user_id, state
-             FROM {schema.UserDeletionTombstonesTableSql}
-             WHERE user_id = ANY(@user_ids);
+             WITH ordered_users AS MATERIALIZED (
+                 SELECT DISTINCT t.user_id
+                 FROM UNNEST(@user_ids) AS t(user_id)
+                 ORDER BY t.user_id
+             ),
+             locked_users AS MATERIALIZED (
+                 SELECT
+                     u.user_id,
+                     pg_advisory_xact_lock_shared((@namespace_key::bigint # u.user_id)) AS lock_result
+                 FROM ordered_users AS u
+             )
+             SELECT l.user_id, tombstone.state, l.lock_result
+             FROM locked_users AS l
+             LEFT JOIN {schema.UserDeletionTombstonesTableSql} AS tombstone
+               ON tombstone.user_id = l.user_id
+             ORDER BY l.user_id;
              """,
             connection,
             transaction);
         stateCmd.Parameters.AddWithValue("user_ids", sortedIds);
+        stateCmd.Parameters.AddWithValue("namespace_key", NamespaceKey);
 
         await using var reader = await stateCmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await reader.ReadAsync(ct).ConfigureAwait(false))
         {
+            if (reader.IsDBNull(1))
+                continue;
             var stateByte = reader.GetByte(1);
             if (stateByte == (byte)UserLifecycleState.Frozen)
                 return LifecycleGateResult.Frozen;
@@ -199,5 +240,28 @@ internal static class UserLifecycleAdvisoryLock
                 return LifecycleGateResult.Deleted;
         }
         return LifecycleGateResult.Active;
+    }
+
+    private static long[] NormalizeSortedDistinct(IReadOnlyCollection<long> userIds)
+    {
+        if (userIds.Count == 1)
+        {
+            foreach (var userId in userIds)
+                return [userId];
+        }
+
+        if (userIds.Count == 2)
+        {
+            using var enumerator = userIds.GetEnumerator();
+            enumerator.MoveNext();
+            var first = enumerator.Current;
+            enumerator.MoveNext();
+            var second = enumerator.Current;
+            if (first == second)
+                return [first];
+            return first < second ? [first, second] : [second, first];
+        }
+
+        return userIds.Distinct().OrderBy(static id => id).ToArray();
     }
 }

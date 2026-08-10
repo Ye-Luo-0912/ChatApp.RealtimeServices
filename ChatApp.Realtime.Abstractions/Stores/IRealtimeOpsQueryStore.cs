@@ -7,6 +7,7 @@ public interface IRealtimeOpsQueryStore
 
     /// <summary>轻量积压：Outbox + 未完成迁移相关行计数 + 附件状态计数（表存在时）。</summary>
     Task<RealtimeOpsBacklogDto> GetBacklogsAsync(CancellationToken ct = default);
+
 }
 
 public sealed record RealtimeMigrationProgressDto(

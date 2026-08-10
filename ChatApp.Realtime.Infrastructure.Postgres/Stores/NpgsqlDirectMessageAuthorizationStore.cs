@@ -42,29 +42,26 @@ public sealed class NpgsqlDirectMessageAuthorizationStore : IDirectMessageAuthor
 
         await using var command = new NpgsqlCommand(
             """
+            WITH user_state AS MATERIALIZED (
+                SELECT
+                    COUNT(*) FILTER (WHERE "Id" = $1) > 0 AS sender_exists,
+                    COUNT(*) FILTER (WHERE "Id" = $2) > 0 AS receiver_exists,
+                    COALESCE(
+                        MAX("FriendRequestPolicy"::int) FILTER (WHERE "Id" = $2),
+                        -1) AS privacy_policy
+                FROM public."AspNetUsers"
+                WHERE "Id" IN ($1, $2)
+            )
             SELECT
-                EXISTS (
-                    SELECT 1
-                    FROM public."AspNetUsers"
-                    WHERE "Id" = $1
-                ) AS sender_exists,
-                EXISTS (
-                    SELECT 1
-                    FROM public."AspNetUsers"
-                    WHERE "Id" = $2
-                ) AS receiver_exists,
+                user_state.sender_exists,
+                user_state.receiver_exists,
                 EXISTS (
                     SELECT 1
                     FROM public."T_BlockRecords"
                     WHERE "BlockerId" = $2
                       AND "BlockedUserId" = $1
                 ) AS is_blocked,
-                COALESCE((
-                    SELECT "FriendRequestPolicy"::int
-                    FROM public."AspNetUsers"
-                    WHERE "Id" = $2
-                    LIMIT 1
-                ), -1) AS privacy_policy,
+                user_state.privacy_policy,
                 (
                     EXISTS (
                         SELECT 1
@@ -80,7 +77,8 @@ public sealed class NpgsqlDirectMessageAuthorizationStore : IDirectMessageAuthor
                           AND "FriendId" = $1
                           AND NOT "IsDeleted"
                     )
-                ) AS are_friends;
+                ) AS are_friends
+            FROM user_state;
             """,
             connection);
         command.Parameters.AddWithValue(NpgsqlDbType.Bigint, senderUserId);

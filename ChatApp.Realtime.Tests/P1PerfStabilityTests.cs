@@ -60,8 +60,8 @@ public sealed class P1PerfStabilityTests : IAsyncLifetime
     public async Task SaveAsync_MaterializesPayloadObjectOnceIntoOutboxJson()
     {
         // P1-4：应用层（DefaultIncomingMessageProcessor）传 Payload 对象，不预先序列化 PayloadJson。
-        // NpgsqlRealtimeMessageStore.SaveAsync 调用 EnrichChatMessagePayload 一次性物化为 PayloadJson，
-        // 写入 Outbox 的 payload_json 应包含完整 ChatMessagePayload。
+        // NpgsqlRealtimeMessageStore.SaveAsync 保留 typed payload，并直接物化为 UTF-8 wire payload；
+        // 不创建中间 PayloadJson UTF-16 字符串。
         var (client, schema) = await CreateDatabaseAsync("realtime_p1_payload_materialize");
         var messageStore = new NpgsqlRealtimeMessageStore(
             client,

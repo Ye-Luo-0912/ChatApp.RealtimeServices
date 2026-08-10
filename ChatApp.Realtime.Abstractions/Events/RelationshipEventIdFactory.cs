@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using ChatApp.Realtime.Abstractions.Relationships;
 
 namespace ChatApp.Realtime.Abstractions.Events;
 
@@ -35,4 +36,31 @@ public static class RelationshipEventIdFactory
     public static string CreateBlockedListChangedEventId(
         long actorUserId, long targetUserId, string action, long occurredAtMs)
         => Hash($"blklistchg:{actorUserId}:{targetUserId}:{action}:{occurredAtMs}");
+
+    /// <summary>
+    /// Server-authoritative projection event. The per-list version is allocated in the
+    /// same transaction as the relationship write, so retries reproduce the same identity
+    /// and distinct committed mutations cannot collide.
+    /// </summary>
+    public static string CreateRelationshipProjectionEventId(
+        long ownerUserId,
+        RelationshipProjectionListType listType,
+        long version)
+        => Hash($"relproj:v1:{ownerUserId}:{(byte)listType}:{version}");
+
+    public static string CreateRelationshipProjectionSnapshotId(
+        long ownerUserId,
+        RelationshipProjectionListType listType,
+        long version,
+        string resourceHash)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(ownerUserId);
+        ArgumentOutOfRangeException.ThrowIfNegative(version);
+        if (!Enum.IsDefined(listType))
+            throw new ArgumentOutOfRangeException(nameof(listType));
+        if (string.IsNullOrWhiteSpace(resourceHash) || resourceHash.Length != 64)
+            throw new ArgumentException("Snapshot resource hash is invalid.", nameof(resourceHash));
+
+        return Hash($"relproj-snapshot:v1:{ownerUserId}:{(byte)listType}:{version}:{resourceHash}");
+    }
 }

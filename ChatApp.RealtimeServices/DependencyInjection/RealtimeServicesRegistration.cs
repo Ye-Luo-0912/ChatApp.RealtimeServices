@@ -1,9 +1,11 @@
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Queueing;
+using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Infrastructure.Core.DependencyInjection;
+using ChatApp.Realtime.Infrastructure.Core.Relationships;
 using ChatApp.Realtime.Infrastructure.Nats.Configuration;
 using ChatApp.Realtime.Infrastructure.Nats.DependencyInjection;
 using ChatApp.Realtime.Infrastructure.Postgres.Configuration;
@@ -33,6 +35,16 @@ public static class RealtimeServicesRegistration
         var databaseOptions = BindDatabaseOptions(configuration);
         var connectionOptions = BindConnectionOptions(configuration);
         var outboxOptions = BindOutboxOptions(configuration);
+        var relationshipProjectionRebuildOptions = BindRelationshipProjectionRebuildOptions(
+            configuration,
+            environment,
+            databaseOptions,
+            connectionOptions);
+        var relationshipProjectionReadOptions = BindRelationshipProjectionReadOptions(
+            configuration,
+            relationshipProjectionRebuildOptions,
+            databaseOptions,
+            connectionOptions);
         ValidateProductionConfiguration(environment, natsOptions, databaseOptions, connectionOptions);
         GateEfCoreMessageStore(environment, databaseOptions);
         var warnings = BuildWarnings(configuration, natsOptions, databaseOptions, connectionOptions);
@@ -45,6 +57,10 @@ public static class RealtimeServicesRegistration
         services.AddSingleton(Microsoft.Extensions.Options.Options.Create(databaseOptions));
         services.AddSingleton(Microsoft.Extensions.Options.Options.Create(connectionOptions));
         services.AddSingleton(Microsoft.Extensions.Options.Options.Create(outboxOptions));
+        services.AddSingleton(Microsoft.Extensions.Options.Options.Create(
+            relationshipProjectionRebuildOptions));
+        services.AddSingleton(Microsoft.Extensions.Options.Options.Create(
+            relationshipProjectionReadOptions));
         services.AddSingleton(BindMessageEditOptions(configuration));
         services.AddSingleton(BindMessageRecallOptions(configuration));
         services.AddSingleton(BindMessageReactionOptions(configuration));
@@ -59,6 +75,9 @@ public static class RealtimeServicesRegistration
         services.AddSingleton(new RealtimeConfigurationWarnings(warnings));
         services.AddSingleton<RealtimeHealthService>();
         services.AddSingleton<RealtimeQueryConcurrencyGate>();
+        services.TryAddSingleton<IRelationshipProjectionSnapshotSource>(
+            UnavailableRelationshipProjectionSnapshotSource.Instance);
+        services.AddSingleton<RelationshipProjectionReconciliationService>();
         // Perf-1：群消息按 ConversationId 分区的策略。默认实现足够，注册为单例。
         services.TryAddSingleton<IMessagePartitionKeySelector, DefaultMessagePartitionKeySelector>();
 
@@ -78,6 +97,12 @@ public static class RealtimeServicesRegistration
         services.AddRealtimeDatabaseInitializer(
             databaseOptions.InitializeSchemaOnStart,
             connectionOptions.RealtimeDatabase);
+        if (relationshipProjectionReadOptions.Enabled)
+        {
+            services.RemoveAll<IRelationshipListQueryProcessor>();
+            services.AddSingleton<IRelationshipListQueryProcessor,
+                ProjectedRelationshipListQueryProcessor>();
+        }
 
         // Perf-2：会话级受众路由目录。有 Garnet/Redis 配置时使用 Redis 实现，
         // 未配置时使用空实现（Publisher 收到 LookupFailure 后回退到 per-user 路由，保证不丢事件）。
@@ -114,6 +139,27 @@ public static class RealtimeServicesRegistration
         services.AddHostedService<MessageRetentionWorker>();
         // LongTerm-1：独立幂等账本 + 用户删除 tombstone 的周期 GC（不阻断就绪）。
         services.AddHostedService<IdempotencyGCWorker>();
+        if (relationshipProjectionRebuildOptions.Enabled)
+        {
+            services.AddHttpClient<
+                    IRelationshipProjectionSnapshotSource,
+                    ServerRelationshipProjectionSnapshotSource>(client =>
+                {
+                    var configuredBaseAddress = new Uri(
+                        relationshipProjectionRebuildOptions.ServerBaseAddress!,
+                        UriKind.Absolute);
+                    client.BaseAddress = configuredBaseAddress.AbsoluteUri.EndsWith(
+                        "/", StringComparison.Ordinal)
+                        ? configuredBaseAddress
+                        : new Uri(configuredBaseAddress.AbsoluteUri + '/', UriKind.Absolute);
+                    client.Timeout = TimeSpan.FromSeconds(
+                        relationshipProjectionRebuildOptions.RequestTimeoutSeconds);
+                    client.DefaultRequestHeaders.Add(
+                        RelationshipProjectionRebuildOptions.ApiKeyHeaderName,
+                        relationshipProjectionRebuildOptions.ApiKey!.Trim());
+                });
+            services.AddHostedService<RelationshipProjectionRebuildWorker>();
+        }
 
         return services;
     }
@@ -280,9 +326,17 @@ public static class RealtimeServicesRegistration
     {
         var options = configuration.GetSection("Outbox").Get<OutboxOptions>() ?? new OutboxOptions();
         if (options.BatchSize <= 0 || options.PublishConcurrency <= 0 || options.PollIntervalMs <= 0
+            || options.RecoveryScanIntervalMs <= 0
+            || options.CompletionBatchSize <= 0 || options.CompletionFlushIntervalMs <= 0
             || options.LeaseSeconds <= 0 || options.MaxRetryDelaySeconds <= 0
             || options.MaxAttempts <= 0 || options.CleanupBatchSize <= 0 || options.CleanupIntervalMs <= 0)
             throw new InvalidOperationException("Outbox 配置值必须大于 0。");
+        if (options.CompletionFlushIntervalMs >= options.LeaseSeconds * 1_000L / 3)
+            throw new InvalidOperationException("Outbox:CompletionFlushIntervalMs 必须小于 lease 的三分之一。");
+        if (options.HintCoalescingWindowMs < 0 || options.HintCoalescingWindowMs > 50)
+            throw new InvalidOperationException("Outbox:HintCoalescingWindowMs 必须在 0..50 毫秒；0 表示关闭。");
+        if (options.HintCoalescingWindowMs >= options.LeaseSeconds * 1_000L / 3)
+            throw new InvalidOperationException("Outbox:HintCoalescingWindowMs 必须小于 lease 的三分之一。");
         if (options.PublishedRetentionHours < 0)
             throw new InvalidOperationException("Outbox:PublishedRetentionHours 不能为负数。");
         if (options.PublishedMaxBatchesPerCycle < 0)
@@ -304,6 +358,88 @@ public static class RealtimeServicesRegistration
             throw new InvalidOperationException("SyncBootstrap:MaxCatchUpGapMs 不能为负数。");
         if (options.RetentionHorizonMs < 0)
             throw new InvalidOperationException("SyncBootstrap:RetentionHorizonMs 不能为负数。");
+        return options;
+    }
+
+    private static RelationshipProjectionRebuildOptions BindRelationshipProjectionRebuildOptions(
+        IConfiguration configuration,
+        IHostEnvironment environment,
+        RealtimeDatabaseOptions databaseOptions,
+        RealtimeConnectionOptions connectionOptions)
+    {
+        var options = configuration
+            .GetSection(RelationshipProjectionRebuildOptions.SectionName)
+            .Get<RelationshipProjectionRebuildOptions>()
+            ?? new RelationshipProjectionRebuildOptions();
+        if (options.PageSize is < 1 or > 500)
+            throw new InvalidOperationException(
+                "RelationshipProjectionRebuild:PageSize 必须在 1..500。");
+        if (options.RequestTimeoutSeconds <= 0
+            || (long)options.LeaseSeconds < (long)options.RequestTimeoutSeconds * 3
+            || options.FailureRetrySeconds <= 0
+            || options.StablePollSeconds <= 0
+            || options.IdlePollMilliseconds is < 100 or > 60_000)
+        {
+            throw new InvalidOperationException(
+                "RelationshipProjectionRebuild 的 timeout/lease/poll 配置无效；lease 至少为 request timeout 的三倍。");
+        }
+
+        if (!options.Enabled)
+            return options;
+        if (string.IsNullOrWhiteSpace(options.ApiKey))
+            throw new InvalidOperationException(
+                "启用关系投影 Rebuilder 时必须配置 RelationshipProjectionRebuild:ApiKey。");
+        if (!Uri.TryCreate(options.ServerBaseAddress, UriKind.Absolute, out var endpoint)
+            || endpoint.Scheme is not ("http" or "https")
+            || !string.IsNullOrEmpty(endpoint.Query)
+            || !string.IsNullOrEmpty(endpoint.Fragment))
+        {
+            throw new InvalidOperationException(
+                "RelationshipProjectionRebuild:ServerBaseAddress 必须是绝对 HTTP(S) URI。");
+        }
+        if (!environment.IsDevelopment()
+            && !environment.IsEnvironment("Testing")
+            && endpoint.Scheme != Uri.UriSchemeHttps)
+        {
+            throw new InvalidOperationException("非开发环境的关系快照源必须使用 HTTPS。");
+        }
+        if (string.IsNullOrWhiteSpace(connectionOptions.RealtimeDatabase)
+            || !databaseOptions.MessageStoreProvider.Equals(
+                "Npgsql",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "关系投影 Rebuilder 仅支持持久化 Npgsql Realtime 数据库。");
+        }
+
+        return options;
+    }
+
+    private static RelationshipProjectionReadOptions BindRelationshipProjectionReadOptions(
+        IConfiguration configuration,
+        RelationshipProjectionRebuildOptions rebuildOptions,
+        RealtimeDatabaseOptions databaseOptions,
+        RealtimeConnectionOptions connectionOptions)
+    {
+        var options = configuration
+            .GetSection(RelationshipProjectionReadOptions.SectionName)
+            .Get<RelationshipProjectionReadOptions>()
+            ?? new RelationshipProjectionReadOptions();
+        if (!options.Enabled)
+            return options;
+        if (!rebuildOptions.Enabled)
+        {
+            throw new InvalidOperationException(
+                "启用关系投影读取前必须启用 RelationshipProjectionRebuild。");
+        }
+        if (string.IsNullOrWhiteSpace(connectionOptions.RealtimeDatabase)
+            || !databaseOptions.MessageStoreProvider.Equals(
+                "Npgsql",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("关系投影读取仅支持持久化 Npgsql 数据库。");
+        }
+
         return options;
     }
 

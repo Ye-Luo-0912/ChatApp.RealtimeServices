@@ -319,4 +319,5 @@ public sealed class NoopRealtimeOpsQueryStore : IRealtimeOpsQueryStore
             "Account cleanup saga / inbox DLQ / blob delete jobs live on ChatApp.Server (/api/admin/account-cleanup-saga, /api/admin/ops).",
             GeneratedAtMs: now));
     }
+
 }

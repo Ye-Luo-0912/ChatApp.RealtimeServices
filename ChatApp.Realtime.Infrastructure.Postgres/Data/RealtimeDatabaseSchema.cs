@@ -1,7 +1,12 @@
+using System.Collections.Concurrent;
+
 namespace ChatApp.Realtime.Infrastructure.Postgres.Data;
 
 public sealed class RealtimeDatabaseSchema
 {
+    private readonly ConcurrentDictionary<string, Lazy<string>> _commandTexts =
+        new(StringComparer.Ordinal);
+
     public RealtimeDatabaseSchema(string schema)
     {
         Schema = string.IsNullOrWhiteSpace(schema) ? "realtime" : schema.Trim();
@@ -31,6 +36,11 @@ public sealed class RealtimeDatabaseSchema
         RelationshipSyncCursorsTableSql = $"{QuotedSchema}.\"relationship_sync_cursors\"";
         RelationshipChangeLogTableSql = $"{QuotedSchema}.\"relationship_change_log\"";
         RelationshipChangeLogSequenceSql = $"{QuotedSchema}.\"relationship_change_seq\"";
+        RelationshipProjectionVersionsTableSql = $"{QuotedSchema}.\"relationship_projection_versions\"";
+        RelationshipProjectionItemsTableSql = $"{QuotedSchema}.\"relationship_projection_items\"";
+        RelationshipProjectionInboxTableSql = $"{QuotedSchema}.\"relationship_projection_inbox\"";
+        RelationshipProjectionSnapshotsTableSql = $"{QuotedSchema}.\"relationship_projection_snapshots\"";
+        RelationshipProjectionRebuildStateTableSql = $"{QuotedSchema}.\"relationship_projection_rebuild_state\"";
     }
 
     public string Schema { get; }
@@ -61,6 +71,29 @@ public sealed class RealtimeDatabaseSchema
     public string RelationshipSyncCursorsTableSql { get; }
     public string RelationshipChangeLogTableSql { get; }
     public string RelationshipChangeLogSequenceSql { get; }
+    public string RelationshipProjectionVersionsTableSql { get; }
+    public string RelationshipProjectionItemsTableSql { get; }
+    public string RelationshipProjectionInboxTableSql { get; }
+    public string RelationshipProjectionSnapshotsTableSql { get; }
+    public string RelationshipProjectionRebuildStateTableSql { get; }
+
+    /// <summary>
+    /// 按 schema 实例缓存只依赖表名的不可变 SQL。factory 必须是 static lambda；
+    /// 这样热路径既不重复插值整段 SQL，也不跨 schema 共享错误表名。
+    /// </summary>
+    internal string GetOrAddCommandText(
+        string key,
+        Func<RealtimeDatabaseSchema, string> factory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
+        ArgumentNullException.ThrowIfNull(factory);
+        return _commandTexts.GetOrAdd(
+            key,
+            static (_, state) => new Lazy<string>(
+                () => state.Factory(state.Schema),
+                LazyThreadSafetyMode.ExecutionAndPublication),
+            (Schema: this, Factory: factory)).Value;
+    }
 
     public static string QuoteIdentifier(string identifier)
     {

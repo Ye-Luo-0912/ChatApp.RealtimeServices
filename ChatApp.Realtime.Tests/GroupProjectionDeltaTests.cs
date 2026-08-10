@@ -49,6 +49,32 @@ public sealed class GroupProjectionDeltaTests
     }
 
     [Fact]
+    public void AddBroadcast_PreservesTypedPayloadAndProtocolMetadata()
+    {
+        var payload = new object();
+        var template = new RealtimeEvent
+        {
+            EventId = "typed-broadcast",
+            Type = RealtimeEventType.MessageReceived,
+            TargetUserId = 101,
+            Payload = payload,
+            OccurredAtMs = 1,
+            ProtocolVersion = 3,
+            AudienceVersion = 9,
+            MinProtocolVersion = 2
+        };
+        var delta = new GroupProjectionDelta(ConversationId);
+
+        delta.AddBroadcast(template);
+
+        var evt = Assert.Single(delta.Build());
+        Assert.Same(payload, evt.Payload);
+        Assert.Equal(3, evt.ProtocolVersion);
+        Assert.Equal(9, evt.AudienceVersion);
+        Assert.Equal(2, evt.MinProtocolVersion);
+    }
+
+    [Fact]
     public void AddBroadcastTo_UsesProvidedSubset_AsTargetUserIds()
     {
         var delta = new GroupProjectionDelta(ConversationId, Members);

@@ -1,4 +1,5 @@
 using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Integration.Outbox;
 using ChatApp.Realtime.Integration.Serialization;
 
@@ -6,6 +7,43 @@ namespace ChatApp.Realtime.Tests;
 
 public sealed class RealtimeIntegrationContractTests
 {
+    [Fact]
+    public void RelationshipProjectionDelta_RoundTripsInsideLegacyNotificationPayload()
+    {
+        var eventId = RelationshipEventIdFactory.CreateRelationshipProjectionEventId(
+            1002, RelationshipProjectionListType.FriendRequests, 7);
+        var original = new RealtimeDomainNotificationPayload
+        {
+            Resource = "friend-request",
+            Action = "Pending",
+            ResourceId = "1001:1002",
+            Message = "hello",
+            Projection = new RelationshipProjectionDelta
+            {
+                EventId = eventId,
+                OwnerUserId = 1002,
+                ListType = RelationshipProjectionListType.FriendRequests,
+                Version = 7,
+                Operation = RelationshipProjectionOperation.Upsert,
+                ResourceId = "1001:1002",
+                SubjectUserId = 1001,
+                ActorUserId = 1001,
+                State = "Pending",
+                Message = "hello",
+                OccurredAtMs = 123
+            }
+        };
+
+        var restored = RealtimeWireSerializer.DeserializeDomainNotification(
+            RealtimeWireSerializer.Serialize(original));
+
+        Assert.NotNull(restored?.Projection);
+        Assert.Equal(eventId, restored.Projection.EventId);
+        Assert.Equal(RelationshipProjectionListType.FriendRequests, restored.Projection.ListType);
+        Assert.Equal(7, restored.Projection.Version);
+        Assert.Equal(RelationshipProjectionOperation.Upsert, restored.Projection.Operation);
+    }
+
     [Fact]
     public void EventWireFormat_RoundTripsAcrossIntegrationBoundary()
     {

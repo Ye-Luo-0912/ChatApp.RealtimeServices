@@ -1,4 +1,5 @@
 using ChatApp.Realtime.Abstractions.Events;
+using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Infrastructure.Postgres.Transactions;
 
 namespace ChatApp.Realtime.Infrastructure.Postgres.Outbox;
@@ -22,14 +23,24 @@ internal sealed class PostgresOutboxWriter
 
     public async Task<int> InsertAsync(RealtimeEvent evt)
     {
+        RealtimeOutboxPreclaim? preclaim = null;
+        // 当前高频单聊事件使用原生 target_user_ids 单行 INSERT；只有该路径预领取，
+        // 批量/冲突路径继续使用原精确认领，避免无法从聚合 row-count 反推逐行结果。
+        if (evt.TargetUserIds is { Length: > 0 }
+            && _session.TryReserveOutboxPreclaim(evt.EventId, out var reserved))
+        {
+            preclaim = reserved;
+        }
+
         var inserted = await OutboxInsertHelper.InsertAsync(
             _session.Connection,
             _session.Transaction,
             _session.Schema,
             evt,
-            _session.CancellationToken).ConfigureAwait(false);
+            _session.CancellationToken,
+            preclaim).ConfigureAwait(false);
         // Reliability-4：累计到 session，由 CommitAsync 在事务提交成功后统一记录到 metrics。
-        _session.RecordOutboxInsert(inserted);
+        _session.RecordOutboxInsert(inserted, evt, preclaim);
         return inserted;
     }
 
@@ -41,7 +52,7 @@ internal sealed class PostgresOutboxWriter
             _session.Schema,
             events,
             _session.CancellationToken).ConfigureAwait(false);
-        _session.RecordOutboxInsert(inserted);
+        _session.RecordOutboxInserts(inserted, events);
         return inserted;
     }
 }

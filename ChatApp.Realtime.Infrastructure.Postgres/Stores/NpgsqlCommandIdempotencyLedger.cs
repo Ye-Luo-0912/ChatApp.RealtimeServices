@@ -15,9 +15,9 @@ namespace ChatApp.Realtime.Infrastructure.Postgres.Stores;
 /// 防止 JetStream replay 将旧命令当作新消息重新写入。
 /// </para>
 /// <para>
-/// P0-3：RecordAsync 使用 ON CONFLICT DO NOTHING RETURNING 保护 canonical 记录。
+/// P0-3：RecordAsync 使用 ON CONFLICT DO NOTHING 保护 canonical 记录。
 /// 首次写入记录 Created；后续重复投递不再覆盖已有 canonical 行——
-/// 通过 RETURNING 是否有行区分首次写入与已存在，已存在时读取 canonical 的
+/// 通过受影响行数区分首次写入与已存在，已存在时读取 canonical 的
 /// content_fingerprint 判断是重放（指纹匹配）还是冲突（指纹不一致）。
 /// 旧实现使用 ON CONFLICT DO UPDATE 会被并发请求用不同内容覆盖原始 canonical 记录。
 /// </para>
@@ -46,7 +46,7 @@ public sealed class NpgsqlCommandIdempotencyLedger(
     /// <summary>
     /// P0-3：读取已有的 canonical 账本记录，用于与当前请求的 fingerprint 比较。
     /// <para>
-    /// 在 RecordAsync 改用 ON CONFLICT DO NOTHING 后，当 INSERT 被跳过时调用此方法
+    /// 在 RecordAsync 使用 ON CONFLICT DO NOTHING 后，当 INSERT 被跳过时调用此方法
     /// 读取已有 canonical 行，以区分真重放（指纹匹配）与内容冲突（指纹不一致）。
     /// 与 <see cref="FindAsync"/> 等价，提供更明确的语义命名供直接调用方使用。
     /// </para>
@@ -186,19 +186,21 @@ public sealed class NpgsqlCommandIdempotencyLedger(
         long receivedAtMs,
         CancellationToken ct)
     {
-        // P0-3：使用 ON CONFLICT DO NOTHING RETURNING 保护 canonical 记录不被覆盖。
+        // P0-3：使用 ON CONFLICT DO NOTHING 保护 canonical 记录不被覆盖。
         // 旧实现使用 ON CONFLICT DO UPDATE 会覆盖已有 canonical 的 content_fingerprint /
         // result_kind / message_id，两个并发请求使用相同 ClientMessageId、不同内容时，
         // 后到请求会覆盖原始 canonical 记录，破坏幂等性判定的权威性。
-        await using var command = new NpgsqlCommand(
-            $"""
-             INSERT INTO {databaseSchema.CommandIdempotencyLedgerTableSql}
+        var commandText = databaseSchema.GetOrAddCommandText(
+            "idempotency-ledger-insert",
+            static schema => $"""
+             INSERT INTO {schema.CommandIdempotencyLedgerTableSql}
                  (sender_user_id, client_message_id, command_id, content_fingerprint,
                   result_kind, message_id, received_at_ms)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (sender_user_id, client_message_id) DO NOTHING
-             RETURNING command_id, content_fingerprint, result_kind, message_id;
-             """,
+             ON CONFLICT (sender_user_id, client_message_id) DO NOTHING;
+             """);
+        await using var command = new NpgsqlCommand(
+            commandText,
             connection,
             transaction);
         command.Parameters.AddWithValue(senderUserId);
@@ -210,20 +212,17 @@ public sealed class NpgsqlCommandIdempotencyLedger(
             (object?)messageId ?? DBNull.Value);
         command.Parameters.AddWithValue(receivedAtMs);
 
-        // P0-3：reader 必须在 ReadCanonicalAsync 之前释放，否则同一连接上会触发
-        // NpgsqlOperationInProgressException（INSERT...RETURNING 0 行时 reader 仍占用连接）。
+        // ExecuteNonQuery 的 1/0 行数即可区分首次写入与 ON CONFLICT 跳过，避免成功热路径
+        // 创建 DataReader、读取 RETURNING 行以及对应 async state machine。
+        var inserted = await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        if (inserted > 0)
         {
-            await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
-            if (await reader.ReadAsync(ct).ConfigureAwait(false))
-            {
-                // RETURNING 有行：首次写入成功（canonical Created），无需进一步处理。
-                logger.LogDebug(
-                    "幂等账本首次写入成功（canonical）。sender={SenderUserId}; clientMessageId={ClientMessageId}; kind={Kind}",
-                    senderUserId,
-                    clientMessageId,
-                    kind);
-                return;
-            }
+            logger.LogDebug(
+                "幂等账本首次写入成功（canonical）。sender={SenderUserId}; clientMessageId={ClientMessageId}; kind={Kind}",
+                senderUserId,
+                clientMessageId,
+                kind);
+            return;
         }
 
         // RETURNING 无行：reader 已释放，可安全读取已存在的 canonical 记录。
@@ -277,14 +276,17 @@ public sealed class NpgsqlCommandIdempotencyLedger(
         string clientMessageId,
         CancellationToken ct)
     {
-        await using var command = new NpgsqlCommand(
-            $"""
+        var commandText = databaseSchema.GetOrAddCommandText(
+            "idempotency-ledger-read",
+            static schema => $"""
              SELECT command_id, content_fingerprint, result_kind, message_id, received_at_ms
-             FROM {databaseSchema.CommandIdempotencyLedgerTableSql}
+             FROM {schema.CommandIdempotencyLedgerTableSql}
              WHERE sender_user_id = $1
                AND client_message_id = $2
              LIMIT 1;
-             """,
+             """);
+        await using var command = new NpgsqlCommand(
+            commandText,
             connection);
         command.Parameters.AddWithValue(senderUserId);
         command.Parameters.AddWithValue(clientMessageId);

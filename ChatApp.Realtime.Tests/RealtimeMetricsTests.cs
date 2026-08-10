@@ -44,6 +44,31 @@ public sealed class RealtimeMetricsTests
             2.9,
             10);
     }
+
+    [Fact]
+    public void RelationshipProjectionRebuildState_IsReportedWithoutStreamIdentifiers()
+    {
+        var measurements = new Dictionary<string, long>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, meterListener) =>
+        {
+            if (instrument.Meter.Name == RealtimeMetrics.MeterName)
+                meterListener.EnableMeasurementEvents(instrument);
+        };
+        listener.SetMeasurementEventCallback<long>(
+            (instrument, measurement, _, _) =>
+                measurements[instrument.Name] = measurement);
+        listener.Start();
+
+        using var metrics = new RealtimeMetrics();
+        metrics.SetRelationshipProjectionRebuildActive(true);
+        metrics.RecordRelationshipProjectionRebuildPass(2, TimeSpan.FromMilliseconds(10));
+
+        listener.RecordObservableInstruments();
+
+        Assert.Equal(1, measurements["realtime.relationship_projection.rebuild.active"]);
+        Assert.Equal(2, measurements["realtime.relationship_projection.rebuild.stable_passes"]);
+    }
 }
 
 /// <summary>

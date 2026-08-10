@@ -94,7 +94,14 @@ public sealed class RealtimeSchemaMigrationRunner
         new Migration052_Relationships(),
         new Migration053_RelationshipSyncCursors(),
         new Migration054_RelationshipChangeLog(),
-        new Migration055_AttachmentStateVersion()
+        new Migration055_AttachmentStateVersion(),
+        new Migration056_OutboxHotClaimUpdates(),
+        new Migration057_RemoveRedundantHotIndexes(),
+        new Migration058_ConversationHotProjectionUpdates(),
+        new Migration059_RemoveRedundantPendingCreatedIndex(),
+        new Migration060_ServerRelationshipProjection(),
+        new Migration061_RelationshipProjectionSnapshots(),
+        new Migration062_RelationshipProjectionRebuilder()
     ];
 
     public async Task MigrateAsync(

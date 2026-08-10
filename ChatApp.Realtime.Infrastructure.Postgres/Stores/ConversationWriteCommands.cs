@@ -646,8 +646,9 @@ internal static class ConversationWriteCommands
         long receivedAtMs,
         CancellationToken ct)
     {
-        await using var command = new NpgsqlCommand(
-            $"""
+        var commandText = schema.GetOrAddCommandText(
+            "allocate-direct-sequence",
+            static schema => $"""
             WITH upsert_conversation AS (
                 INSERT INTO {schema.ConversationsTableSql} (
                     conversation_id, type, created_at_ms, updated_at_ms,
@@ -716,7 +717,9 @@ internal static class ConversationWriteCommands
             SELECT
                 (SELECT last_sequence FROM upsert_conversation) AS conversation_sequence,
                 (SELECT sent_count FROM sender_upsert) AS sender_sequence;
-            """,
+            """);
+        await using var command = new NpgsqlCommand(
+            commandText,
             connection,
             transaction);
         command.Parameters.AddWithValue(conversationId);

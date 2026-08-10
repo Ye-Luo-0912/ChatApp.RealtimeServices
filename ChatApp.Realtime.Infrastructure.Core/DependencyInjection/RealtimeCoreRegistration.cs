@@ -32,7 +32,11 @@ public static class RealtimeCoreRegistration
     {
         services.TryAddSingleton<RealtimeReadinessState>();
         services.TryAddSingleton<RealtimeMetrics>();
-        services.TryAddSingleton<IRealtimeOutboxSignal, RealtimeOutboxSignal>();
+        // 同一有界实例同时承载唤醒与提交后 event-id 提示，避免为每条消息创建任务、
+        // 定时器或独立队列。自定义 IRealtimeOutboxSignal 注册仍可覆盖并自动退化为扫描路径。
+        services.TryAddSingleton<RealtimeOutboxSignal>();
+        services.TryAddSingleton<IRealtimeOutboxSignal>(provider =>
+            provider.GetRequiredService<RealtimeOutboxSignal>());
         services.TryAddSingleton<IRealtimeAuthReader, NoopRealtimeAuthReader>();
         services.TryAddSingleton<IRealtimeStateStore, InMemoryRealtimeStateStore>();
         services.TryAddSingleton<IIncomingMessageProcessor, DefaultIncomingMessageProcessor>();
@@ -51,7 +55,17 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton(new MessageRecallOptions());
         services.TryAddSingleton(new MessageReactionOptions());
         services.TryAddSingleton(BindSyncBootstrapOptions);
-        services.TryAddSingleton<ISyncBootstrapQueryProcessor, DefaultSyncBootstrapQueryProcessor>();
+        // Do not inject the legacy relationship store into the default bootstrap path.
+        // Explicit relationship sync requests fail closed inside the processor until
+        // ChatApp.Server publishes an authoritative projection.
+        services.TryAddSingleton<ISyncBootstrapQueryProcessor>(provider =>
+            new DefaultSyncBootstrapQueryProcessor(
+                provider.GetRequiredService<IRealtimeConversationStore>(),
+                provider.GetRequiredService<IRealtimeMessageHistoryStore>(),
+                provider.GetRequiredService<IRealtimeDeviceSyncCursorStore>(),
+                provider.GetRequiredService<IRealtimeAttachmentStore>(),
+                provider.GetRequiredService<IRealtimeReactionStore>(),
+                provider.GetRequiredService<SyncBootstrapOptions>()));
 
         services.TryAddSingleton<IRealtimeEventPublisher, NoopRealtimeEventPublisher>();
         services.TryAddSingleton<IRealtimeEventConsumer, NoopRealtimeEventConsumer>();
@@ -78,6 +92,11 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IRealtimeGroupStore, NoopRealtimeGroupStore>();
         services.TryAddSingleton<IRealtimeDeviceSyncCursorStore, NoopRealtimeDeviceSyncCursorStore>();
         services.TryAddSingleton<IRealtimeOutboxStore, NoopRealtimeOutboxStore>();
+        services.TryAddSingleton<IRelationshipProjectionStore, UnavailableRelationshipProjectionStore>();
+        services.TryAddSingleton<IRelationshipProjectionQueryStore>(
+            UnavailableRelationshipProjectionQueryStore.Instance);
+        services.TryAddSingleton<IRelationshipProjectionOpsQueryStore>(
+            UnavailableRelationshipProjectionOpsQueryStore.Instance);
         services.TryAddSingleton<IRealtimeMessageRetentionStore, NoopRealtimeMessageRetentionStore>();
         services.TryAddSingleton<IUserDeletionTombstoneStore, NoopUserDeletionTombstoneStore>();
         services.TryAddSingleton<IUserExistenceChecker>(NoopUserExistenceChecker.Instance);
@@ -88,8 +107,13 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IBlockListStore>(NoopBlockListStore.Instance);
         services.TryAddSingleton<IRelationshipStore, NoopRelationshipStore>();
         services.TryAddSingleton<IRelationshipSyncCursorStore, NoopRelationshipSyncCursorStore>();
-        services.TryAddSingleton<IRelationshipCommandProcessor, DefaultRelationshipCommandProcessor>();
-        services.TryAddSingleton<IRelationshipListQueryProcessor, DefaultRelationshipListQueryProcessor>();
+        // ChatApp.Server owns relationship mutations. Keep the NATS worker alive so
+        // legacy TCP callers receive an immediate, explicit failure instead of a
+        // timeout, but never let the default runtime write the legacy realtime tables.
+        services.TryAddSingleton<IRelationshipCommandProcessor>(
+            ServerAuthoritativeRelationshipCommandProcessor.Instance);
+        services.TryAddSingleton<IRelationshipListQueryProcessor>(
+            ServerAuthoritativeRelationshipListQueryProcessor.Instance);
         services.TryAddSingleton<IDirectMessagePolicy>(NoopDirectMessagePolicy.Instance);
         services.TryAddSingleton<IPrivacySettingStore>(NoopPrivacySettingStore.Instance);
         services.TryAddSingleton<IMessageRateLimiter>(NoopMessageRateLimiter.Instance);

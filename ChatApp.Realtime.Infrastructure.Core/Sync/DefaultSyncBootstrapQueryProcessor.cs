@@ -57,6 +57,14 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
         if (validationError is not null)
             return validationError;
 
+        if (query.RelationshipWatermarks is { Count: > 0 } && _relationshipStore is null)
+        {
+            return SyncBootstrapPage.Failed(
+                query.RequestId,
+                "relationship_sync_projection_unavailable",
+                "关系增量同步在 Realtime 权威投影启用前不可用；请通过 ChatApp.Server HTTP API 全量查询关系。");
+        }
+
         var listLimit = Math.Clamp(
             query.ListLimit == 0
                 ? DefaultConversationListQueryProcessor.DefaultPageSize
@@ -487,8 +495,9 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                     HasMore = true,
                     NextCursor = last is not null
                         ? new MessageHistoryCursor(
-                            last.ChangedAtMs > 0 ? last.ChangedAtMs : last.ReceivedAtMs,
-                            last.MessageId)
+                            last.ReceivedAtMs,
+                            last.MessageId,
+                            last.ChangedAtMs > 0 ? last.ChangedAtMs : last.ReceivedAtMs)
                         : null
                 };
                 trimmed = true;
@@ -887,7 +896,10 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
             Items = items,
             HasMore = hasMore,
             NextCursor = hasMore && last is not null
-                ? new MessageHistoryCursor(last.ChangedAtMs > 0 ? last.ChangedAtMs : last.ReceivedAtMs, last.MessageId)
+                ? new MessageHistoryCursor(
+                    last.ReceivedAtMs,
+                    last.MessageId,
+                    last.ChangedAtMs > 0 ? last.ChangedAtMs : last.ReceivedAtMs)
                 : null
         };
     }

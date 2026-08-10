@@ -20,6 +20,14 @@ public sealed class NoopRealtimeOutboxStore : IRealtimeOutboxStore
         return Task.CompletedTask;
     }
 
+    public Task<int> TryMarkPublishedAsync(
+        RealtimeOutboxRecord record,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(0);
+    }
+
     public Task MarkFailedAsync(
         RealtimeOutboxRecord record,
         string error,
