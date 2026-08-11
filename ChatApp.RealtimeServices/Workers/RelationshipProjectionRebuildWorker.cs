@@ -246,7 +246,7 @@ internal sealed class RelationshipProjectionRebuildWorker(
             : ((byte)listType).CompareTo((byte)right.ListType);
     }
 
-    private static string ClassifyError(Exception exception) => exception switch
+    internal static string ClassifyError(Exception exception) => exception switch
     {
         RelationshipProjectionSourceException source =>
             $"source_http_{(int)(source.StatusCode ?? System.Net.HttpStatusCode.InternalServerError)}",

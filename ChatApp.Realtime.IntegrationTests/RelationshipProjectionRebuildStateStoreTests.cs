@@ -75,6 +75,30 @@ public sealed class RelationshipProjectionRebuildStateStoreTests(
         Assert.Null(await store.TryAcquireAsync("instance-e", leaseDuration));
     }
 
+    [Fact]
+    public async Task ExpiredLease_AllowsTakeover_ByAnotherInstance()
+    {
+        var schema = new RealtimeDatabaseSchema("realtime");
+        await ResetStateAsync(schema);
+        await using var client = new RealtimeDatabaseClient(
+            fixture.PostgresConnectionString,
+            NullLogger<RealtimeDatabaseClient>.Instance);
+        var store = new NpgsqlRelationshipProjectionRebuildStateStore(client, schema);
+        var shortLease = TimeSpan.FromSeconds(1);
+
+        var first = Assert.IsType<RelationshipProjectionRebuildLease>(
+            await store.TryAcquireAsync("instance-a", shortLease));
+        Assert.Null(await store.TryAcquireAsync("instance-b", shortLease));
+
+        // Wait for the database-clock lease to expire, then confirm takeover is allowed.
+        await Task.Delay(TimeSpan.FromSeconds(2));
+
+        var takeover = Assert.IsType<RelationshipProjectionRebuildLease>(
+            await store.TryAcquireAsync("instance-b", shortLease));
+        Assert.Equal("instance-b", takeover.LeaseOwner);
+        Assert.False(await store.RenewAsync(first, shortLease));
+    }
+
     private async Task ResetStateAsync(RealtimeDatabaseSchema schema)
     {
         await using var connection = new NpgsqlConnection(fixture.PostgresConnectionString);
