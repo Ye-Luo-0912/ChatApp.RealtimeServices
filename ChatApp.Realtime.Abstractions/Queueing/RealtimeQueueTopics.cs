@@ -21,6 +21,7 @@ public sealed class RealtimeQueueTopics
     public string SyncBootstrapQueries { get; init; } = "chat.sync.bootstrap";
     public string GroupConversations { get; init; } = "chat.group-conversation";
     public string AttachmentFinalize { get; init; } = "chat.attachment-finalize";
+    public string AttachmentScan { get; init; } = "chat.attachment-scan";
     public string RelationshipCommands { get; init; } = "chat.relationship.command";
     public string RelationshipListQueries { get; init; } = "chat.relationship-list.query";
     public string? MessagePersistence { get; init; }

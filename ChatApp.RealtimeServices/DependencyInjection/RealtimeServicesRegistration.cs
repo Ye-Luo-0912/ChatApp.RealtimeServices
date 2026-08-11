@@ -77,6 +77,10 @@ public static class RealtimeServicesRegistration
             provider.GetRequiredService<IRealtimeAttachmentStore>(),
             provider.GetRequiredService<ILogger<AttachmentSweeper>>(),
             TimeSpan.FromDays(attachmentSweepOptions.RetentionDays)));
+        services.TryAddSingleton<IAttachmentScanProcessor>(provider => new AttachmentScanProcessor(
+            provider.GetRequiredService<IRealtimeAttachmentStore>(),
+            provider.GetRequiredService<ILogger<AttachmentScanProcessor>>(),
+            provider.GetService<IObjectStorage>()));
         var idempotencyOptions = BindIdempotencyOptions(configuration);
         services.AddSingleton(Microsoft.Extensions.Options.Options.Create(idempotencyOptions));
         services.AddSingleton(idempotencyOptions);
@@ -137,6 +141,8 @@ public static class RealtimeServicesRegistration
         services.AddHostedService<ConversationSetPrefsWorker>();
         services.AddHostedService<GroupConversationWorker>();
         services.AddHostedService<AttachmentFinalizeWorker>();
+        // P1：附件扫描消费者。消费扫描结果驱动 Uploaded → Scanning → Available | Rejected。
+        services.AddHostedService<AttachmentScanWorker>();
         services.AddHostedService<RelationshipCommandWorker>();
         services.AddHostedService<RelationshipListQueryWorker>();
         services.AddHostedService<MessageRecallWorker>();
@@ -573,6 +579,7 @@ public static class RealtimeServicesRegistration
                 SyncBootstrapQueries = options.Subjects.SyncBootstrapQueries,
                 GroupConversations = options.Subjects.GroupConversations,
                 AttachmentFinalize = options.Subjects.AttachmentFinalize,
+                AttachmentScan = options.Subjects.AttachmentScan,
                 MessagePersistence = options.Subjects.MessagePersistence,
                 DeadLetters = options.Subjects.DeadLetters
             },

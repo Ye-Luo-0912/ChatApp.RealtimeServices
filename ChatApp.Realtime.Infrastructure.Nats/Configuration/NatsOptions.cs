@@ -101,6 +101,7 @@ public sealed class NatsSubjectOptions
     public string SyncBootstrapQueries { get; init; } = "chat.sync.bootstrap";
     public string GroupConversations { get; init; } = "chat.group-conversation";
     public string AttachmentFinalize { get; init; } = "chat.attachment-finalize";
+    public string AttachmentScan { get; init; } = "chat.attachment-scan";
     public string? MessagePersistence { get; init; }
     public string DeadLetters { get; init; } = "chat.dead-letters";
 }

@@ -52,6 +52,8 @@ public static class RealtimeNatsRegistration
         services.AddSingleton<IGroupConversationConsumer, NatsGroupConversationConsumer>();
         services.RemoveAll<IAttachmentFinalizeConsumer>();
         services.AddSingleton<IAttachmentFinalizeConsumer, NatsAttachmentFinalizeConsumer>();
+        services.RemoveAll<IAttachmentScanConsumer>();
+        services.AddSingleton<IAttachmentScanConsumer, NatsAttachmentScanConsumer>();
         services.RemoveAll<IMessageRecallConsumer>();
         services.AddSingleton<IMessageRecallConsumer, NatsMessageRecallConsumer>();
         services.RemoveAll<IMessageEditConsumer>();

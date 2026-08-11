@@ -86,6 +86,7 @@ namespace ChatApp.Realtime.Infrastructure.Core.Serialization;
 [JsonSerializable(typeof(SyncCursorResetReason))]
 [JsonSerializable(typeof(AttachmentFinalizeCommand))]
 [JsonSerializable(typeof(AttachmentFinalizeResult))]
+[JsonSerializable(typeof(AttachmentScanCommand))]
 [JsonSerializable(typeof(RelationshipCommand))]
 [JsonSerializable(typeof(RelationshipCommandResult))]
 [JsonSerializable(typeof(RelationshipListQuery))]

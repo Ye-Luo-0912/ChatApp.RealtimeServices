@@ -45,6 +45,7 @@ Realtime 负责消息、会话、回执、同步投影、Outbox/JetStream 和跨
   - 覆盖 cursor 失效、空页但 HasMore、重复 cursor、编辑/撤回/Reaction 与 mention 的 changed-at 分页；只有整批落库和发布状态一致后才推进水位。
   - Outbox 覆盖 claim/续租/过期恢复、发布成功但完成前崩溃、死信重放与租约 owner/token 校验；门禁报告必须能关联消息、事件、checkpoint 和恢复原因。
 - P1（附件闭环 wiring 已完成，2026-08-11）：未绑定附件过期清理已接入 DI 与后台 worker。新增 `AttachmentSweepOptions`（`AttachmentSweep` 配置节：`Enabled`/`IntervalMs`/`RetentionDays`），`AttachmentSweepWorker`（`PeriodicTimer` 周期调用 `IAttachmentSweeper.SweepAsync`，停用空闲、单轮异常不阻断后续周期），并在 `RealtimeServicesRegistration` 绑定 options、注册 `IAttachmentSweeper→AttachmentSweeper`（保留期取 `RetentionDays`，运行时未注入 `IObjectStorage` 时仅标记状态、物理删除由对象存储兜底）以及 `AddHostedService<AttachmentSweepWorker>`。新增 `AttachmentSweepWorkerTests` 3 例（启用调用/停用空闲/异常存活）。
+- P1（附件扫描闭环 wiring 已完成，2026-08-11）：扫描结果消费已从主题到后台 worker 全链路接通。`NatsSubjectOptions.AttachmentScan`（`chat.attachment-scan`）→ `RealtimeQueueTopics.AttachmentScan` → `RealtimeServicesRegistration.CreateRealtimeQueueOptions` 映射；`AttachmentScanCommand` 已注册到 `RealtimeJsonSerializerContext`；`NatsAttachmentScanConsumer`（`IAttachmentScanConsumer`，fire-and-forget，反序列化失败/空负载丢弃）在 `RealtimeNatsRegistration` 注册；`AttachmentScanWorker`（`IAttachmentScanConsumer`→`IAttachmentScanProcessor.ProcessAsync`，Uploaded → Scanning → Available | Rejected 全程 state_version 条件更新；单命令异常/失败不阻断消费循环，共享并发门 `Mutation` 池过载时跳过命令，命令可重放）在 `RealtimeServicesRegistration` 装配 processor+`AddHostedService`。新增 `AttachmentScanWorkerTests` 4 例（消费并处理/异常存活/Failed 续跑/并发门过载跳过）。
 - P2（二进制评估边界）：Shared 已建立但未启用的 tagged codec 只服务首轮 Client↔Gateway 评估；Realtime 持久化 Outbox/NATS wire 保持现状。只有 TCP 双格式灰度证明收益且能保留历史事件重放、版本识别和可观测性后，才单独评估内部 event wire，禁止与外部协议同批迁移，也不直接复用外部字段号。
 - P2（通话事件）：只保存必要的信令状态、审计和 QoE 汇总，不持久化或经 JetStream 转发音频包；媒体资源计入独立 TURN/SFU 容量模型。
 
@@ -60,5 +61,5 @@ Realtime 负责消息、会话、回执、同步投影、Outbox/JetStream 和跨
 
 聚焦单测/契约测试 → Release 构建 → 短时 admission/smoke；阶段长测与发布 soak 只在功能和数据模型冻结后执行。
 
-当前基线：Release build `0 warning / 0 error`；Unit `318/318`（315 + 3 个 `AttachmentSweepWorkerTests`）、PostgreSQL/Docker Integration
+当前基线：Release build `0 warning / 0 error`；Unit `322/322`（315 + 3 个 `AttachmentSweepWorkerTests` + 4 个 `AttachmentScanWorkerTests`）、PostgreSQL/Docker Integration
 `85/85` 通过（原 70 + 新增 14 个 Rebuilder 编排场景 + 1 个 camelCase 契约回归测试）；关系读/指标/默认门禁聚焦 `14/14`，digest source/Rebuilder/reconcile `7/7`，Ops 查询 `2/2`，投影存储 `8/8`，reconcile gate 脚本 `7/7`。
