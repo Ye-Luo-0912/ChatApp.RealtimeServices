@@ -27,5 +27,6 @@
     <ProjectReference Include="..\ChatApp.Realtime.Infrastructure.Redis\ChatApp.Realtime.Infrastructure.Redis.csproj" />
     <ProjectReference Include="..\ChatApp.Realtime.Integration\ChatApp.Realtime.Integration.csproj" />
     <ProjectReference Include="..\ChatApp.Realtime.Outbox.EntityFrameworkCore\ChatApp.Realtime.Outbox.EntityFrameworkCore.csproj" />
+    <ProjectReference Include="..\ChatApp.RealtimeServices\ChatApp.RealtimeServices.csproj" />
   </ItemGroup>
 </Project>

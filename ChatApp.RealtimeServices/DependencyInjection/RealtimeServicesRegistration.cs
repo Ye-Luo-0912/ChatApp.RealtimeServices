@@ -1,9 +1,11 @@
+using ChatApp.Realtime.Abstractions.Attachments;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Abstractions.Sync;
+using ChatApp.Realtime.Infrastructure.Core.Attachments;
 using ChatApp.Realtime.Infrastructure.Core.DependencyInjection;
 using ChatApp.Realtime.Infrastructure.Core.Relationships;
 using ChatApp.Realtime.Infrastructure.Nats.Configuration;
@@ -20,6 +22,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace ChatApp.RealtimeServices.DependencyInjection;
 
@@ -68,6 +71,12 @@ public static class RealtimeServicesRegistration
         var messageRetentionOptions = BindMessageRetentionOptions(configuration);
         services.AddSingleton(Microsoft.Extensions.Options.Options.Create(messageRetentionOptions));
         services.AddSingleton(messageRetentionOptions);
+        var attachmentSweepOptions = BindAttachmentSweepOptions(configuration);
+        services.AddSingleton(Microsoft.Extensions.Options.Options.Create(attachmentSweepOptions));
+        services.AddSingleton<IAttachmentSweeper>(provider => new AttachmentSweeper(
+            provider.GetRequiredService<IRealtimeAttachmentStore>(),
+            provider.GetRequiredService<ILogger<AttachmentSweeper>>(),
+            TimeSpan.FromDays(attachmentSweepOptions.RetentionDays)));
         var idempotencyOptions = BindIdempotencyOptions(configuration);
         services.AddSingleton(Microsoft.Extensions.Options.Options.Create(idempotencyOptions));
         services.AddSingleton(idempotencyOptions);
@@ -137,6 +146,9 @@ public static class RealtimeServicesRegistration
         services.AddHostedService<OutboxPublisherWorker>();
         services.AddHostedService<OutboxCleanupWorker>();
         services.AddHostedService<MessageRetentionWorker>();
+        // P1：未绑定附件过期清理。周期调用 IAttachmentSweeper.SweepAsync，
+        // 把超过保留期、未绑定消息的 Ticketed/Uploaded/Scanning 附件标记为 Expired。
+        services.AddHostedService<AttachmentSweepWorker>();
         // LongTerm-1：独立幂等账本 + 用户删除 tombstone 的周期 GC（不阻断就绪）。
         services.AddHostedService<IdempotencyGCWorker>();
         if (relationshipProjectionRebuildOptions.Enabled)
@@ -459,6 +471,17 @@ public static class RealtimeServicesRegistration
             throw new InvalidOperationException("MessageRetention:BatchSleepMs 不能为负数。");
         if (options.MaxBatchesPerCycle < 0)
             throw new InvalidOperationException("MessageRetention:MaxBatchesPerCycle 不能为负数。");
+        return options;
+    }
+
+    private static AttachmentSweepOptions BindAttachmentSweepOptions(IConfiguration configuration)
+    {
+        var options = configuration.GetSection(AttachmentSweepOptions.SectionName).Get<AttachmentSweepOptions>()
+            ?? new AttachmentSweepOptions();
+        if (options.RetentionDays < 0)
+            throw new InvalidOperationException("AttachmentSweep:RetentionDays 不能为负数。");
+        if (options.IntervalMs < 0)
+            throw new InvalidOperationException("AttachmentSweep:IntervalMs 不能为负数。");
         return options;
     }
 

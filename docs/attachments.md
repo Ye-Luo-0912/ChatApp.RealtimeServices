@@ -75,6 +75,7 @@ Device cursor upsert persists **only** the last message actually returned in cat
 - EfCore message store does **not** bind attachments (production path is Npgsql); conflict compare treats existing attachments as empty
 - No Ticketed insert API in Realtime yet (Server may insert Confirmed directly after upload confirm)
 - No Abandoned sweeper worker for unbound Ticketed/Confirmed age index → **landed**: Server `AttachmentAbandonedAgeSweeper` (via `AttachmentCleanupWorker`) marks aged unbound Ticketed/Confirmed → Abandoned and enqueues blob delete tombs.
+- Realtime 侧未绑定附件过期清理 → **wired**（2026-08-11）：`AttachmentSweepWorker`（`AttachmentSweep` 配置节，`Enabled`/`IntervalMs`/`RetentionDays`）周期调用 `IAttachmentSweeper.SweepAsync`，把超过保留期、未绑定消息的 Ticketed/Uploaded/Scanning 附件标记为 Expired；已接入 `RealtimeServicesRegistration`（options + `IAttachmentSweeper→AttachmentSweeper` + `AddHostedService`）。默认未注入 `IObjectStorage`，故仅标记状态，物理删除由对象存储/后续 blob purge 兜底。新增 `AttachmentSweepWorkerTests` 3 例。
 - Soft-tombstone then hard-delete / ConversationChanged fanout not implemented (v1 is silent hard-delete)
 - `scripts/realtime-schema.sql` still omits migrations 8–11 DDL history; appends attachments + version 12 for Job bootstrap (retention age index appended as version 20)
 - Multi-device attachment sync beyond message fanout
