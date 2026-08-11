@@ -106,6 +106,53 @@ public sealed class RelationshipProjectionRebuildWorkerTests
     }
 
     [Fact]
+    public async Task ServerSource_DeserializesCamelCaseServerPayload()
+    {
+        // Server 的导出端点以 camelCase 输出（AppJsonContext + ASP.NET Core 默认）。
+        // 该用例锁定 camelCase + 大小写不敏感反序列化，防止 REL-GATE-1 发现的契约回归。
+        var page = new RelationshipProjectionStreamPage(
+            [new RelationshipProjectionStreamDescriptor(
+                42,
+                RelationshipProjectionListType.Friends,
+                3)],
+            false,
+            null,
+            null);
+        var camelJson = JsonSerializer.Serialize(
+            page,
+            new JsonSerializerOptions
+            {
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                TypeInfoResolver = RealtimeJsonSerializerContext.Default
+            });
+        Assert.Contains("\"items\"", camelJson);
+        Assert.DoesNotContain("\"Items\"", camelJson);
+
+        var handler = new RecordingHttpHandler(new Queue<HttpResponseMessage>(
+            [JsonResponse(camelJson)]));
+        using var client = new HttpClient(handler)
+        {
+            BaseAddress = new Uri("https://server.example/internal/")
+        };
+        var source = new ServerRelationshipProjectionSnapshotSource(client);
+
+        var actual = await source.ListStreamsAsync(
+            null,
+            null,
+            25,
+            CancellationToken.None);
+
+        Assert.False(actual.HasMore);
+        var descriptor = Assert.Single(actual.Items);
+        Assert.Equal(42, descriptor.OwnerUserId);
+        Assert.Equal(RelationshipProjectionListType.Friends, descriptor.ListType);
+        Assert.Equal(3, descriptor.Version);
+        Assert.Equal(
+            "/internal/api/ops/relationship-projection/streams?limit=25",
+            handler.Requests[0].PathAndQuery);
+    }
+
+    [Fact]
     public async Task RunLease_ProcessesOrderedPages_CommitsCursor_AndCompletesPass()
     {
         var state = new RecordingStateStore();

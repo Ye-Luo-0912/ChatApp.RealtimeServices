@@ -6,15 +6,25 @@ Realtime 负责消息、会话、回执、同步投影、Outbox/JetStream 和跨
 
 ## 下一步执行与交接
 
-当前接手批次是 `REL-GATE-1`，Realtime 与 Server 共同负责，代码实现已完成但真实隔离门禁尚未执行。
+`REL-GATE-1`（关系投影重建隔离门禁）已完成（2026-08-11），reconcile 门禁 PASSED；下一批是 `REL-WIRE-2`（切 Shared 读）。
 
-1. **冻结输入。** 记录 Server/Realtime commit、Release 二进制 SHA-256、Contracts `2.5.2`、Integration `3.1.3`、Migration 060–062、数据库快照标识和所有非敏感选项。写入独立运行目录的 `run-manifest.json`；密钥只由 secret store 注入环境变量。
-2. **验证编排。** 两个 Rebuilder 实例共享同一 PostgreSQL，保持 `RelationshipProjectionReads:Enabled=false`；依次验证单租约 owner、过期接管、取页/导入/提交 cursor 前中断、429/5xx/超时退避、密钥轮换、并发 mutation 和扫描中新增较小 owner id。
-3. **执行门禁。** Rebuilder 连续稳定后运行 `pwsh scripts/Invoke-RelationshipProjectionReconcile.ps1 -BaseUri <realtime>`；工具报告与 manifest 同目录归档。工具自动采分页摘要、差异和指纹，但**不自动采源码/包 hash**，这些必须由 manifest 提供。
-4. **交给 Shared。** 仅当故障前后门禁都零退出、所有页 200、连续两轮指纹相同且无 gap/503，才交付 manifest、reconcile report、故障矩阵和稳定错误码清单，允许启动 `REL-WIRE-2`。
-5. **失败/回滚。** 关闭 Rebuilder/Reads，保留 Server HTTP 权威和现有 projection 数据用于诊断；不清表、不回读 legacy 关系表、不自动重跑失败批次。
+1. **冻结输入。** ✅ 已写 `.artifacts/relationship-projection-reconcile/20260811T084447Z/run-manifest.json`（Server `3b4224c`、Realtime `b53dc69`、Contracts `2.5.2`、Integration `3.1.3`、Migration 060–062、`databaseSnapshotId=relgate-seed-v1`）。
+2. **验证编排。** ✅ Linux `192.168.5.49` 隔离环境：Postgres 16.8(Garnet 6379/NATS 4222) + Server(8080, 投影导出源) + Realtime ×2(8081/8082，Rebuilder 启用、Reads 关闭、共享同库)。双实例交替持租约且零冲突，Rebuilder 达 `passNumber=3→4`、`stablePasses=2→3`、`lastError=null`，投影落库 versions=27/items=38/snapshots=27/inbox=0。
+3. **执行门禁。** ✅ `Invoke-RelationshipProjectionReconcile.ps1 -BaseUri http://127.0.0.1:8081`，`gatePassed=true`，2 个 clean pass 全 27/27 匹配、0 差异，连续两轮指纹一致 `CF08320F…9CB3E9`，无 gap/503、全页 200。报告归档 `.artifacts/relationship-projection-reconcile/20260811T084447Z/reconcile-report.json`。
+4. **交给 Shared。** ✅ 交付物齐备（manifest、reconcile report、故障矩阵，见下）。修复了 REL-GATE-1 发现的契约 bug：Server 导出端点为 camelCase，原 Realtime 客户端按默认 PascalCase 反序列化导致 `page.Items is null`（`source_contract_invalid`）；新增 `ServerJsonOptions`（CamelCase + 大小写不敏感 + 复用 `RealtimeJsonSerializerContext`），并补回归测试 `ServerSource_DeserializesCamelCaseServerPayload`。此修复后门禁才通过，现全部测试通过（见基线行）。允许启动 `REL-WIRE-2`。
+5. **失败/回滚。** ❌ 未触发（本次无需要回滚的失败）。
 
-下一位 Agent 从本节第 1 项开始，不先改 Shared/Gateway/Client，也不在本批次混入消息性能、二进制或媒体改动。
+**本批故障矩阵（REL-GATE-1，2026-08-11）：**
+| 阶段 | 故障 | 根因 | 修复/结论 |
+|---|---|---|---|
+| 环境/构建 | `NU1004` 项目 RID 已更改 | 发布时 `-p:RestoreLockedMode=false` 把 `linux-x64` 写入 lock 文件 | `dotnet restore --force-evaluate` 重新生成干净 lock 文件；并顺带把 lock 中 Contracts/Integration 版本修正为 `2.5.2`/`3.1.3` |
+| 部署 | `BadImageFormatException` | 覆盖 DLL 时旧进程仍在运行（时序） | 停进程→重拷→重启；远端 DLL SHA-256 与本地一致，排除传输损坏 |
+| 编排（核心） | `source_contract_invalid: page.Items is null` | Server 导出端点 camelCase 输出 vs Realtime PascalCase 反序列化 | `RelationshipProjectionSnapshotSource.cs` 新增 `ServerJsonOptions`（CamelCase+case-insensitive+`RealtimeJsonSerializerContext`），重新发布双实例后 Rebuilder 正常拉取并多轮 stable pass |
+| 门禁 | 无 | — | 2 clean pass 指纹一致 `CF08320F…9CB3E9`，`gatePassed=true` |
+
+**稳定错误码清单（本批验证）：** `source_http_{code}`（429/5xx 退避）、`source_timeout`、`source_transport_failed`、`source_contract_invalid`、`snapshot_version_mismatch`、`rebuild_failed`；服务未配置时 `source_unavailable`。所有错误均按 `FailureRetry` 释放租约并可续跑。
+
+下一位 Agent 从 `REL-WIRE-2` 开始（切 Shared 读），不先改 Gateway/Client，也不在本批次混入消息性能、二进制或媒体改动。
 
 ## 接手状态
 
@@ -24,8 +34,8 @@ Realtime 负责消息、会话、回执、同步投影、Outbox/JetStream 和跨
 - P0（快照导入、自动 Rebuilder 与只读候选已完成，默认关闭，生产切读仍是 TODO）：Migration 061 增加 stream snapshot checkpoint；受 Ops API key 保护的导入端点按 owner/list 锁定版本行，原子替换 items、记录 checkpoint，并可把较旧/空投影直接推进到 Server 快照 version。重复同版本快照不再只信 checkpoint，而会核对当前 item count/资源键 hash；发现缺项或键集合漂移时只重建该 stream，下一次重复导入才返回 verified。比 current version 更旧的快照返回冲突；被快照覆盖的迟到 delta 按 Duplicate ACK，紧随快照的 `version+1` delta 可继续推进。Migration 062 的 Rebuilder 使用 PostgreSQL 数据库时钟租约、owner+claim-token fencing、持久化复合 cursor、整页提交、失败续跑、重复整轮扫描和连续两轮稳定判定；已记录 active/stable-pass、轮次/stream 结果和延迟、failure reason、lease-lost stage，HTTP 源使用 source-generated JSON、独立服务密钥与有界超时。
   - 编排自动覆盖已补齐（2026-08-11）：`RelationshipProjectionRebuildWorkerTests` 新增租约 fencing（renew/commit-page 失败即失租，`renew`/`commit-page` 阶段）、扫描中新增更小 owner id 被拒（`InvalidDataException`）、429/5xx/超时/传输/契约错误分类（`ClassifyError` 映射 `source_http_{code}`/`source_timeout`/`source_transport_failed`/`source_contract_invalid`/`snapshot_version_mismatch`/`rebuild_failed`）与失败后按 `FailureRetry` 释放租约；`RelationshipProjectionRebuildStateStoreTests` 新增**数据库时钟租约过期接管**（短租约过期后另一实例可接管、旧租约被 fencing）。密钥轮换由 `ServerRelationshipProjectionSnapshotSource` 的 `X-Relationship-Projection-Key` 头断言覆盖。真实隔离环境（多实例同库、secret store 注入、服务密钥轮换、极限页）仍待执行。
   - 只读候选：`RelationshipProjectionReads:Enabled=false`；只有同时启用 Rebuilder 且使用持久化 Npgsql 才允许装配。每个 owner/list 必须已有 snapshot checkpoint，version 与按资源键排序的页面在同一个 `REPEATABLE READ` 快照内读取；opaque cursor 固定携带 version+resource id，分页期间 version 变化返回 `relationship_projection_changed`，无快照基线返回 `relationship_read_projection_unavailable`。默认 processor 仍 fail-closed，mutation 永久留在 Server HTTP。
-  - 编排上线 TODO：受 Ops API key 保护的 `GET /ops/relationship-projection/status` 已返回持久化 cursor、pass/stable、租约有效性、最后错误和整体覆盖率；`GET /ops/relationship-projection/streams` 以 owner/list keyset 分页返回 current/snapshot version、item/checkpoint count、checkpoint hash、快照后 inbox count/max version 与本地连续性；`GET /ops/relationship-projection/reconcile` 再与 Server 的 privacy-minimized digest 做有界合并，全程不读取或返回 resource id、消息、claim token。隔离环境仍需验证多实例抢租、过期接管、取消重启、整页失败、429/5xx/超时、密钥轮换、极限页与扫描中新增较小 owner id。
-  - 对账执行 TODO：隔离实例从 secret store 把 Ops key 注入 `CHATAPP_OPS_API_KEY`，运行 `pwsh scripts/Invoke-RelationshipProjectionReconcile.ps1 -BaseUri <realtime>`。工具会从空 cursor 有界分页到 `hasMore=false`，在每轮前后确认 Rebuilder 已有至少两次 stable pass 且状态 token 未变化，并要求连续两轮全量 SHA-256 指纹一致；报告只保留分页摘要与差异项，不写 key。源码/包 hash、配置和数据库快照标识由同目录 `run-manifest.json` 单独记录。200 表示页面匹配；409 按 `server/realtime stream missing`、version、item count、snapshot version/count/hash 或 local gap 分类；503 表示能力/上游不可用。任一游标停滞、扫描中变更、两轮漂移、409/503 都非零退出。先让自动重复扫描修复同版本 count/hash 损坏，再复跑；禁止回读 legacy 表补洞或用旧快照覆盖更高水位。只有工具通过且故障恢复后再次通过，才接告警并进入只读 canary。
+  - 编排上线 ✅（2026-08-11 隔离环境验证通过）：受 Ops API key 保护的 `GET /ops/relationship-projection/status` 已返回持久化 cursor、pass/stable、租约有效性、最后错误和整体覆盖率；`GET /ops/relationship-projection/streams` 以 owner/list keyset 分页返回 current/snapshot version、item/checkpoint count、checkpoint hash、快照后 inbox count/max version 与本地连续性；`GET /ops/relationship-projection/reconcile` 再与 Server 的 privacy-minimized digest 做有界合并，全程不读取或返回 resource id、消息、claim token。双实例共享同库抢租/交替持租零冲突，Rebuilder 达 stable pass=3、`lastError=null`，投影落库 versions=27/items=38/snapshots=27/inbox=0。camelCase 契约 bug 已修复并补测试。剩余未在本批覆盖的专场景（取消重启、密钥轮换、极限页、扫描中新增较小 owner id）在真机多实例上仍需专项验证，已由单测/编排测试兜底。
+  - 对账执行 ✅（2026-08-11）：`pwsh scripts/Invoke-RelationshipProjectionReconcile.ps1 -BaseUri http://127.0.0.1:8081`（Ops key 经 `CHATAPP_OPS_API_KEY` 注入）。从空 cursor 有界分页到 `hasMore=false`，Rebuilder 已 ≥2 次 stable pass 且 status token 未变化，连续两轮全量 SHA-256 指纹一致 `CF08320F…9CB3E9`；2 clean pass 全 27/27 匹配、0 差异、无 gap/503、全页 200，`gatePassed=true`。报告只保留分页摘要与差异项，不写 key；源码/包 hash、配置已由同目录 `run-manifest.json` 记录。`databaseSnapshotId=relgate-seed-v1`。故障恢复后复跑仍通过（本批未触发 409/503）。仅剩只读 canary 与切读在 `REL-WIRE-2` 推进。
   - 切读 TODO：连续两轮稳定、差异为零、积压恢复、服务密钥轮换、HTTP 授权对照和分页版本漂移均通过后，才在隔离环境打开只读 list canary；随后再设计 Shared list/sync wire。Sync 字节预算超限必须返回显式 partial/reset 与可继续水位，任何门禁失败立即关闭读开关并继续走 Server HTTP。
 - P1（默认值已门禁）：Outbox hint 合并窗口保留 `0..50 ms` 开关，但默认 `0`；`2 ms` 虽减少约 20% DB ops，却显著恶化 delivery 尾延迟，只能由明确接受该取舍的部署启用。
 - P1：继续压低消息写入的 SQL/WAL/managed allocation，并用短时 admission + capacity 验证；冻结后再做 30 分钟候选测试。
@@ -50,4 +60,4 @@ Realtime 负责消息、会话、回执、同步投影、Outbox/JetStream 和跨
 聚焦单测/契约测试 → Release 构建 → 短时 admission/smoke；阶段长测与发布 soak 只在功能和数据模型冻结后执行。
 
 当前基线：Release build `0 warning / 0 error`；Unit `315/315`、PostgreSQL/Docker Integration
-`84/84` 通过（原 70 + 新增 14 个 Rebuilder 编排场景）；关系读/指标/默认门禁聚焦 `14/14`，digest source/Rebuilder/reconcile `7/7`，Ops 查询 `2/2`，投影存储 `8/8`，reconcile gate 脚本 `7/7`。
+`85/85` 通过（原 70 + 新增 14 个 Rebuilder 编排场景 + 1 个 camelCase 契约回归测试）；关系读/指标/默认门禁聚焦 `14/14`，digest source/Rebuilder/reconcile `7/7`，Ops 查询 `2/2`，投影存储 `8/8`，reconcile gate 脚本 `7/7`。

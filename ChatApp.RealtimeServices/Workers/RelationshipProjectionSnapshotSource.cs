@@ -55,6 +55,15 @@ internal sealed class UnavailableRelationshipProjectionSnapshotSource
 internal sealed class ServerRelationshipProjectionSnapshotSource(
     HttpClient httpClient) : IRelationshipProjectionSnapshotSource
 {
+    // Server 的导出端点以 camelCase 输出（AppJsonContext + ASP.NET Core 默认），
+    // 此处用 camelCase + 大小写不敏感反序列化以与之匹配。
+    private static readonly JsonSerializerOptions ServerJsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true,
+        TypeInfoResolver = RealtimeJsonSerializerContext.Default,
+    };
+
     public Task<RelationshipProjectionStreamPage> ListStreamsAsync(
         long? afterOwnerUserId,
         RelationshipProjectionListType? afterListType,
@@ -68,38 +77,30 @@ internal sealed class ServerRelationshipProjectionSnapshotSource(
             path += $"&afterListType={((byte)listType).ToString(CultureInfo.InvariantCulture)}";
         }
 
-        return ReadAsync(
-            path,
-            RealtimeJsonSerializerContext.Default.RelationshipProjectionStreamPage,
-            ct);
+        return ReadAsync<RelationshipProjectionStreamPage>(path, ct);
     }
 
     public Task<RelationshipProjectionStreamSnapshot> ReadStreamAsync(
         long ownerUserId,
         RelationshipProjectionListType listType,
         CancellationToken ct) =>
-        ReadAsync(
+        ReadAsync<RelationshipProjectionStreamSnapshot>(
             $"api/ops/relationship-projection/streams/" +
             $"{ownerUserId.ToString(CultureInfo.InvariantCulture)}/" +
             ((byte)listType).ToString(CultureInfo.InvariantCulture),
-            RealtimeJsonSerializerContext.Default.RelationshipProjectionStreamSnapshot,
             ct);
 
     public Task<RelationshipProjectionStreamDigest> ReadDigestAsync(
         long ownerUserId,
         RelationshipProjectionListType listType,
         CancellationToken ct) =>
-        ReadAsync(
+        ReadAsync<RelationshipProjectionStreamDigest>(
             $"api/ops/relationship-projection/streams/" +
             $"{ownerUserId.ToString(CultureInfo.InvariantCulture)}/" +
             $"{((byte)listType).ToString(CultureInfo.InvariantCulture)}/digest",
-            RealtimeJsonSerializerContext.Default.RelationshipProjectionStreamDigest,
             ct);
 
-    private async Task<T> ReadAsync<T>(
-        string path,
-        System.Text.Json.Serialization.Metadata.JsonTypeInfo<T> typeInfo,
-        CancellationToken ct)
+    private async Task<T> ReadAsync<T>(string path, CancellationToken ct)
         where T : class
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, path);
@@ -112,7 +113,8 @@ internal sealed class ServerRelationshipProjectionSnapshotSource(
             throw new RelationshipProjectionSourceException(response.StatusCode);
 
         await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-        return await JsonSerializer.DeserializeAsync(stream, typeInfo, ct).ConfigureAwait(false)
+        return await JsonSerializer.DeserializeAsync<T>(stream, ServerJsonOptions, ct)
+                .ConfigureAwait(false)
             ?? throw new InvalidDataException("Relationship projection source returned a null payload.");
     }
 }
