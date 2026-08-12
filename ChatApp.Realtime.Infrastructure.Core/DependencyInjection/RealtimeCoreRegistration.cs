@@ -100,6 +100,7 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IRelationshipProjectionOpsQueryStore>(
             UnavailableRelationshipProjectionOpsQueryStore.Instance);
         services.TryAddSingleton<IRealtimeMessageRetentionStore, NoopRealtimeMessageRetentionStore>();
+        services.TryAddSingleton<IAccountCleanupJobStore, NoopAccountCleanupJobStore>();
         services.TryAddSingleton<IUserDeletionTombstoneStore, NoopUserDeletionTombstoneStore>();
         services.TryAddSingleton<IUserExistenceChecker>(NoopUserExistenceChecker.Instance);
         services.TryAddSingleton<ICommandIdempotencyLedger, NoopCommandIdempotencyLedger>();
