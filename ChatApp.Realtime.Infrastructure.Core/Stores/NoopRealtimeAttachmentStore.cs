@@ -108,7 +108,13 @@ public sealed class NoopRealtimeAttachmentStore(ILogger<NoopRealtimeAttachmentSt
         string? contentHash,
         string? contentType,
         string? reason,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool isVoice = false,
+        string? voiceCodec = null,
+        string? voiceContainer = null,
+        long? voiceDurationMs = null,
+        int? voiceSampleRateHz = null,
+        short? voiceChannels = null)
     {
         ct.ThrowIfCancellationRequested();
         logger.LogCritical("未配置附件存储，拒绝完成扫描。附件={AttachmentId}", attachmentId);

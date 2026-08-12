@@ -22,7 +22,13 @@ public static class AttachmentRefMapper
                 : AttachmentWireStatus.Scanning,
             DownloadApiHint = record.AttachmentId,
             DownloadToken = null,
-            ThumbnailApiHint = null
+            ThumbnailApiHint = null,
+            IsVoice = record.IsVoice,
+            VoiceCodec = record.VoiceCodec,
+            VoiceContainer = record.VoiceContainer,
+            VoiceDurationMs = record.VoiceDurationMs,
+            VoiceSampleRateHz = record.VoiceSampleRateHz,
+            VoiceChannels = record.VoiceChannels
         };
     }
 

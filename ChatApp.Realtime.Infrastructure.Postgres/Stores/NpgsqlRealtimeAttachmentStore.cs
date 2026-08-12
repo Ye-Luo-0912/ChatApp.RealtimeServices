@@ -86,7 +86,13 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                  created_at_ms,
                  confirmed_at_ms,
                  bound_at_ms,
-                 state_version
+                 state_version,
+                 is_voice,
+                 voice_codec,
+                 voice_container,
+                 voice_duration_ms,
+                 voice_sample_rate_hz,
+                 voice_channels
              )
              VALUES (
                  @attachment_id,
@@ -103,7 +109,13 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                  @created_at_ms,
                  @confirmed_at_ms,
                  NULL,
-                 0
+                 0,
+                 @is_voice,
+                 @voice_codec,
+                 @voice_container,
+                 @voice_duration_ms,
+                 @voice_sample_rate_hz,
+                 @voice_channels
              )
              ON CONFLICT (attachment_id) DO NOTHING;
              """,
@@ -121,6 +133,18 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
             (object?)clientAttachmentId ?? DBNull.Value);
         command.Parameters.AddWithValue("created_at_ms", now);
         command.Parameters.AddWithValue("confirmed_at_ms", confirmedAt);
+        command.Parameters.AddWithValue("is_voice", attachment.IsVoice);
+        command.Parameters.AddWithValue("voice_codec", (object?)attachment.VoiceCodec ?? DBNull.Value);
+        command.Parameters.AddWithValue("voice_container", (object?)attachment.VoiceContainer ?? DBNull.Value);
+        command.Parameters.AddWithValue(
+            "voice_duration_ms",
+            attachment.VoiceDurationMs.HasValue ? (object)attachment.VoiceDurationMs.Value : DBNull.Value);
+        command.Parameters.AddWithValue(
+            "voice_sample_rate_hz",
+            attachment.VoiceSampleRateHz.HasValue ? (object)attachment.VoiceSampleRateHz.Value : DBNull.Value);
+        command.Parameters.AddWithValue(
+            "voice_channels",
+            attachment.VoiceChannels.HasValue ? (object)attachment.VoiceChannels.Value : DBNull.Value);
 
         var affected = await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         if (affected == 0)
@@ -150,7 +174,13 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
             ClientAttachmentId = clientAttachmentId,
             CreatedAtMs = now,
             ConfirmedAtMs = confirmedAt,
-            StateVersion = 0
+            StateVersion = 0,
+            IsVoice = attachment.IsVoice,
+            VoiceCodec = attachment.VoiceCodec,
+            VoiceContainer = attachment.VoiceContainer,
+            VoiceDurationMs = attachment.VoiceDurationMs,
+            VoiceSampleRateHz = attachment.VoiceSampleRateHz,
+            VoiceChannels = attachment.VoiceChannels
         };
     }
 
@@ -187,7 +217,9 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
              RETURNING attachment_id, uploader_user_id, object_key, public_url, content_type,
                        size_bytes, original_name, status, message_id, conversation_id,
                        client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                       content_hash, state_version;
+                       content_hash, state_version,
+                       is_voice, voice_codec, voice_container,
+                       voice_duration_ms, voice_sample_rate_hz, voice_channels;
              """,
             connection);
         command.Parameters.AddWithValue("status", (short)AttachmentStatus.Uploaded);
@@ -241,7 +273,9 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
              RETURNING attachment_id, uploader_user_id, object_key, public_url, content_type,
                        size_bytes, original_name, status, message_id, conversation_id,
                        client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                       content_hash, state_version;
+                       content_hash, state_version,
+                       is_voice, voice_codec, voice_container,
+                       voice_duration_ms, voice_sample_rate_hz, voice_channels;
              """,
             connection);
         command.Parameters.AddWithValue("scanning", (short)AttachmentStatus.Scanning);
@@ -271,7 +305,13 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
         string? contentHash,
         string? contentType,
         string? reason,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool isVoice = false,
+        string? voiceCodec = null,
+        string? voiceContainer = null,
+        long? voiceDurationMs = null,
+        int? voiceSampleRateHz = null,
+        short? voiceChannels = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(attachmentId);
 
@@ -281,6 +321,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
         var hash = string.IsNullOrWhiteSpace(contentHash) ? null : contentHash.Trim();
         var mime = string.IsNullOrWhiteSpace(contentType) ? null : contentType.Trim();
         var rejectReason = string.IsNullOrWhiteSpace(reason) ? null : reason.Trim();
+        var codec = string.IsNullOrWhiteSpace(voiceCodec) ? null : voiceCodec.Trim();
+        var container = string.IsNullOrWhiteSpace(voiceContainer) ? null : voiceContainer.Trim();
 
         await using var connection = await _databaseClient
             .GetDataSource()
@@ -295,6 +337,12 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                  content_hash = COALESCE(@content_hash, content_hash),
                  content_type = COALESCE(@content_type, content_type),
                  original_name = COALESCE(@reason, original_name),
+                 is_voice = @is_voice,
+                 voice_codec = COALESCE(@voice_codec, voice_codec),
+                 voice_container = COALESCE(@voice_container, voice_container),
+                 voice_duration_ms = COALESCE(@voice_duration_ms, voice_duration_ms),
+                 voice_sample_rate_hz = COALESCE(@voice_sample_rate_hz, voice_sample_rate_hz),
+                 voice_channels = COALESCE(@voice_channels, voice_channels),
                  state_version = state_version + 1
              WHERE attachment_id = @attachment_id
                AND status = @scanning
@@ -302,7 +350,9 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
              RETURNING attachment_id, uploader_user_id, object_key, public_url, content_type,
                        size_bytes, original_name, status, message_id, conversation_id,
                        client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                       content_hash, state_version;
+                       content_hash, state_version,
+                       is_voice, voice_codec, voice_container,
+                       voice_duration_ms, voice_sample_rate_hz, voice_channels;
              """,
             connection);
         command.Parameters.AddWithValue("status", (short)targetStatus);
@@ -313,6 +363,18 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
         command.Parameters.AddWithValue("scanning", (short)AttachmentStatus.Scanning);
         command.Parameters.AddWithValue("expected_version", expectedStateVersion);
         command.Parameters.AddWithValue("attachment_id", attachmentId);
+        command.Parameters.AddWithValue("is_voice", isVoice);
+        command.Parameters.AddWithValue("voice_codec", (object?)codec ?? DBNull.Value);
+        command.Parameters.AddWithValue("voice_container", (object?)container ?? DBNull.Value);
+        command.Parameters.AddWithValue(
+            "voice_duration_ms",
+            voiceDurationMs.HasValue ? (object)voiceDurationMs.Value : DBNull.Value);
+        command.Parameters.AddWithValue(
+            "voice_sample_rate_hz",
+            voiceSampleRateHz.HasValue ? (object)voiceSampleRateHz.Value : DBNull.Value);
+        command.Parameters.AddWithValue(
+            "voice_channels",
+            voiceChannels.HasValue ? (object)voiceChannels.Value : DBNull.Value);
 
         await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
         if (await reader.ReadAsync(ct).ConfigureAwait(false))
@@ -377,7 +439,9 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
              SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                     size_bytes, original_name, status, message_id, conversation_id,
                     client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                    content_hash, state_version
+                    content_hash, state_version,
+                    is_voice, voice_codec, voice_container,
+                    voice_duration_ms, voice_sample_rate_hz, voice_channels
              FROM {_databaseSchema.AttachmentsTableSql}
              WHERE message_id IS NULL
                AND status IN (@ticketed, @uploaded, @scanning)
@@ -412,7 +476,7 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
             .ConfigureAwait(false);
         await using var transaction = await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
 
-        var boundRecords = await AttachmentWriteCommands.BindConfirmedToMessageAsync(
+        var bindResult = await AttachmentWriteCommands.BindConfirmedToMessageAsync(
                 connection,
                 transaction,
                 _databaseSchema,
@@ -427,15 +491,16 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
             .Where(id => !string.IsNullOrWhiteSpace(id))
             .Distinct(StringComparer.Ordinal)
             .Count();
-        if (boundRecords.Count != expected)
+        if (!bindResult.Success)
         {
             await transaction.RollbackAsync(ct).ConfigureAwait(false);
             throw new InvalidOperationException(
-                $"附件绑定失败：期望 {expected}，实际 {boundRecords.Count}。");
+                $"附件绑定失败：期望 {expected}，实际 {bindResult.BoundRecords.Count}，" +
+                $"错误码 {bindResult.PrimaryErrorCode.ToStableCode()}。");
         }
 
         await transaction.CommitAsync(ct).ConfigureAwait(false);
-        return boundRecords.Count;
+        return bindResult.BoundRecords.Count;
     }
 
     public async Task<IReadOnlyList<RealtimeAttachmentRecord>> ListByMessageIdsAsync(
@@ -462,7 +527,9 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
              SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                     size_bytes, original_name, status, message_id, conversation_id,
                     client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                    content_hash, state_version
+                    content_hash, state_version,
+                    is_voice, voice_codec, voice_container,
+                    voice_duration_ms, voice_sample_rate_hz, voice_channels
              FROM {_databaseSchema.AttachmentsTableSql}
              WHERE message_id = ANY(@message_ids)
              ORDER BY message_id, created_at_ms, attachment_id;
@@ -493,7 +560,9 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                       size_bytes, original_name, status, message_id, conversation_id,
                       client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                      content_hash, state_version
+                      content_hash, state_version,
+                    is_voice, voice_codec, voice_container,
+                    voice_duration_ms, voice_sample_rate_hz, voice_channels
                FROM {_databaseSchema.AttachmentsTableSql}
                WHERE uploader_user_id = @user_id
                ORDER BY attachment_id
@@ -503,7 +572,9 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                       size_bytes, original_name, status, message_id, conversation_id,
                       client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                      content_hash, state_version
+                      content_hash, state_version,
+                    is_voice, voice_codec, voice_container,
+                    voice_duration_ms, voice_sample_rate_hz, voice_channels
                FROM {_databaseSchema.AttachmentsTableSql}
                WHERE uploader_user_id = @user_id
                  AND attachment_id > @after_id
@@ -677,7 +748,9 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
              SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                     size_bytes, original_name, status, message_id, conversation_id,
                     client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                    content_hash, state_version
+                    content_hash, state_version,
+                    is_voice, voice_codec, voice_container,
+                    voice_duration_ms, voice_sample_rate_hz, voice_channels
              FROM {_databaseSchema.AttachmentsTableSql}
              WHERE attachment_id = @attachment_id;
              """,
@@ -700,7 +773,9 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
              SELECT attachment_id, uploader_user_id, object_key, public_url, content_type,
                     size_bytes, original_name, status, message_id, conversation_id,
                     client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                    content_hash, state_version
+                    content_hash, state_version,
+                    is_voice, voice_codec, voice_container,
+                    voice_duration_ms, voice_sample_rate_hz, voice_channels
              FROM {_databaseSchema.AttachmentsTableSql}
              WHERE uploader_user_id = @uploader_user_id
                AND client_attachment_id = @client_attachment_id;
@@ -744,6 +819,22 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
         ContentHash = reader.FieldCount > 14 && !reader.IsDBNull(14)
             ? reader.GetString(14)
             : null,
-        StateVersion = reader.FieldCount > 15 ? reader.GetInt64(15) : 0
+        StateVersion = reader.FieldCount > 15 ? reader.GetInt64(15) : 0,
+        IsVoice = reader.FieldCount > 16 && reader.GetBoolean(16),
+        VoiceCodec = reader.FieldCount > 17 && !reader.IsDBNull(17)
+            ? reader.GetString(17)
+            : null,
+        VoiceContainer = reader.FieldCount > 18 && !reader.IsDBNull(18)
+            ? reader.GetString(18)
+            : null,
+        VoiceDurationMs = reader.FieldCount > 19 && !reader.IsDBNull(19)
+            ? reader.GetInt64(19)
+            : null,
+        VoiceSampleRateHz = reader.FieldCount > 20 && !reader.IsDBNull(20)
+            ? reader.GetInt32(20)
+            : null,
+        VoiceChannels = reader.FieldCount > 21 && !reader.IsDBNull(21)
+            ? reader.GetInt16(21)
+            : null
     };
 }

@@ -58,6 +58,11 @@ Server 关系增量已能在 JetStream ACK 前原子应用到 projection item/ve
 
 完成标准：正常发送、重复发送、扫描状态变化、撤回、同步恢复、保留期清理和对象回收形成端到端聚焦测试，且不会绕过附件安全状态。
 
+**当前进度（2026-08-13）**：
+- 需求 1/3：Migration065 为 `attachments` 增加 `is_voice` 与 `voice_codec/container/duration_ms/sample_rate_hz/channels` 列，并加 `ck_attachments_voice_metadata` 约束（`is_voice=TRUE` 时这些字段必须非空且为正），Postgres 只存有界语音元数据与对象引用、无音频包列。`RealtimeAttachmentRecord`/`AttachmentRef`/`AttachmentRefMapper` 与 `NpgsqlRealtimeAttachmentStore` 全程携带语音元数据（插入、扫描完成写入、地图到线协议）。
+- 需求 2：`AttachmentWriteCommands.BindConfirmedToMessageAsync` 改为发送前可用性校验——`Available`（或 legacy `Confirmed`）才可绑定，扫描中/拒绝/过期/已绑定冲突/缺失或非本人分别返回 `AttachmentBindErrorCode`（`Scanning/Rejected/Expired/AlreadyBound/NotFound/Forbidden/InvalidState`），任一不可绑定即整体失败、不绑定子集。`SaveAsync` 与 `BindToMessageAsync` 接入带错误码结果，`DefaultIncomingMessageProcessor` 将稳定错误码透传为客户端错误码。
+- 完成标准测试：`VoiceAttachmentBindTests` 11 项集成测试覆盖正常（Available+语音元数据绑定为 Bound 并读回元数据）、legacy Confirmed、重复 attachment id 去重、扫描中/拒绝/过期/已绑定/无效状态/缺失或非本人各自稳定错误码、混合可绑定+扫描整体失败且不绕过安全状态。完整集成套件 112/112 通过，单元套件 332/332 通过。
+
 ### P1：`CALL-CTRL-1` 临时通话信令状态机
 
 1. 以 Server 签发的短期 call grant 为授权输入，实现 invite、ringing、accept、reject、cancel、end、timeout 和 reconnect；使用 call id + command id 幂等、单调 revision 和有界 TTL 处理重复、乱序和断线。

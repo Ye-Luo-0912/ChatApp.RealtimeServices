@@ -32,6 +32,24 @@ public sealed class AttachmentRef
 
     /// <summary>可选缩略图提示（同 DownloadApiHint 语义，路径由 Server 约定）。</summary>
     public string? ThumbnailApiHint { get; init; }
+
+    /// <summary>是否为语音附件。仅语音附件携带语音元数据（不携带音频包）。</summary>
+    public bool IsVoice { get; init; }
+
+    /// <summary>音频编解码器（如 opus、aac）。仅语音附件有值。</summary>
+    public string? VoiceCodec { get; init; }
+
+    /// <summary>音频容器格式（如 ogg、m4a）。仅语音附件有值。</summary>
+    public string? VoiceContainer { get; init; }
+
+    /// <summary>语音时长（毫秒）。仅语音附件有值。</summary>
+    public long? VoiceDurationMs { get; init; }
+
+    /// <summary>采样率（Hz）。仅语音附件有值。</summary>
+    public int? VoiceSampleRateHz { get; init; }
+
+    /// <summary>声道数。仅语音附件有值。</summary>
+    public short? VoiceChannels { get; init; }
 }
 
 /// <summary>附件对客户端的可用性（与库内 Ticketed/Confirmed/Bound 生命周期解耦）。</summary>

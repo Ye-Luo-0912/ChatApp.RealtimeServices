@@ -129,7 +129,7 @@ public sealed class AttachmentSweeperTests
         public Task<AttachmentScanTransitionResult> BeginScanAsync(string attachmentId, long expectedStateVersion, CancellationToken ct = default) =>
             throw new NotSupportedException();
 
-        public Task<AttachmentScanTransitionResult> CompleteScanAsync(string attachmentId, long expectedStateVersion, AttachmentScanVerdict verdict, long sizeBytes, string? contentHash, string? contentType, string? reason, CancellationToken ct = default) =>
+        public Task<AttachmentScanTransitionResult> CompleteScanAsync(string attachmentId, long expectedStateVersion, AttachmentScanVerdict verdict, long sizeBytes, string? contentHash, string? contentType, string? reason, CancellationToken ct = default, bool isVoice = false, string? voiceCodec = null, string? voiceContainer = null, long? voiceDurationMs = null, int? voiceSampleRateHz = null, short? voiceChannels = null) =>
             throw new NotSupportedException();
 
         public Task<IReadOnlyList<RealtimeAttachmentRecord>> ListByMessageIdsAsync(IReadOnlyList<string> messageIds, CancellationToken ct = default) =>

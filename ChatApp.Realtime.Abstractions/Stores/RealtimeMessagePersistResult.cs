@@ -4,7 +4,8 @@ public sealed record RealtimeMessagePersistResult(
     RealtimeMessagePersistKind Kind,
     string MessageId,
     long? ConversationSequence = null,
-    DirectMessageAuthorizationDecision? AuthorizationDecision = null)
+    DirectMessageAuthorizationDecision? AuthorizationDecision = null,
+    AttachmentBindErrorCode? AttachmentBindError = null)
 {
     public bool IsNew => Kind == RealtimeMessagePersistKind.Created;
     public bool IsConflict => Kind == RealtimeMessagePersistKind.ContentConflict;
@@ -22,8 +23,10 @@ public sealed record RealtimeMessagePersistResult(
     public static RealtimeMessagePersistResult Conflict(string messageId) =>
         new(RealtimeMessagePersistKind.ContentConflict, messageId);
 
-    public static RealtimeMessagePersistResult AttachmentBindFailed(string messageId) =>
-        new(RealtimeMessagePersistKind.AttachmentBindFailed, messageId);
+    public static RealtimeMessagePersistResult AttachmentBindFailed(
+        string messageId,
+        AttachmentBindErrorCode errorCode = AttachmentBindErrorCode.None) =>
+        new(RealtimeMessagePersistKind.AttachmentBindFailed, messageId, AttachmentBindError: errorCode);
 
     public static RealtimeMessagePersistResult NotAllowed(string messageId) =>
         new(RealtimeMessagePersistKind.NotAllowed, messageId);

@@ -51,6 +51,7 @@ public interface IRealtimeAttachmentStore
     /// 扫描完成：Scanning(5) → Available(7) 或 Rejected(6)。
     /// 条件更新（<c>WHERE status=Scanning AND state_version=@版本</c>），state_version 递增。
     /// 若版本不匹配（旧扫描结果覆盖新状态）返回失败，绝不覆盖新状态。
+    /// 语音附件扫描通过时，通过 voice* 参数写入有界语音元数据（不写入音频包）。
     /// </summary>
     Task<AttachmentScanTransitionResult> CompleteScanAsync(
         string attachmentId,
@@ -60,7 +61,13 @@ public interface IRealtimeAttachmentStore
         string? contentHash,
         string? contentType,
         string? reason,
-        CancellationToken ct = default);
+        CancellationToken ct = default,
+        bool isVoice = false,
+        string? voiceCodec = null,
+        string? voiceContainer = null,
+        long? voiceDurationMs = null,
+        int? voiceSampleRateHz = null,
+        short? voiceChannels = null);
 
     /// <summary>
     /// 未绑定过期：Ticketed/Uploaded/Scanning → Expired(8)。条件更新（state_version 匹配）。

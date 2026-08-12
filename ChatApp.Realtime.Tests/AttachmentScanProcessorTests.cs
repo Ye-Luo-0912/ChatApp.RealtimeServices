@@ -187,7 +187,13 @@ public sealed class AttachmentScanProcessorTests
             string? contentHash,
             string? contentType,
             string? reason,
-            CancellationToken ct = default)
+            CancellationToken ct = default,
+            bool isVoice = false,
+            string? voiceCodec = null,
+            string? voiceContainer = null,
+            long? voiceDurationMs = null,
+            int? voiceSampleRateHz = null,
+            short? voiceChannels = null)
         {
             if (_current is null || _current.Status != AttachmentStatus.Scanning
                 || _current.StateVersion != expectedStateVersion)

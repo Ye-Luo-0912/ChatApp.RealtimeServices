@@ -25,4 +25,22 @@ public sealed class RealtimeAttachmentRecord
     /// 防止旧扫描结果/旧回调覆盖新状态（ABA 防护）。
     /// </summary>
     public long StateVersion { get; init; }
+
+    /// <summary>是否为语音附件。为 true 时 VoiceCodec/VoiceContainer/VoiceDurationMs/VoiceSampleRateHz/VoiceChannels 必须非空且为正。</summary>
+    public bool IsVoice { get; init; }
+
+    /// <summary>音频编解码器（如 opus、aac）。仅语音附件有值。</summary>
+    public string? VoiceCodec { get; init; }
+
+    /// <summary>音频容器格式（如 ogg、m4a）。仅语音附件有值。</summary>
+    public string? VoiceContainer { get; init; }
+
+    /// <summary>语音时长（毫秒）。仅语音附件有值。</summary>
+    public long? VoiceDurationMs { get; init; }
+
+    /// <summary>采样率（Hz）。仅语音附件有值。</summary>
+    public int? VoiceSampleRateHz { get; init; }
+
+    /// <summary>声道数。仅语音附件有值。</summary>
+    public short? VoiceChannels { get; init; }
 }

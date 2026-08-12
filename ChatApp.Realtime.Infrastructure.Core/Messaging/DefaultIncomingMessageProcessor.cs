@@ -275,16 +275,19 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
 
         if (persisted.IsAttachmentBindFailed)
         {
-            _metrics.RecordProcessingFailure("attachment_bind_failed");
+            var bindError = persisted.AttachmentBindError ?? AttachmentBindErrorCode.None;
+            var stableCode = bindError.ToStableCode();
+            _metrics.RecordProcessingFailure(stableCode);
             _logger.LogWarning(
-                "入站消息附件绑定失败。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}；消息={MessageId}",
+                "入站消息附件绑定失败。客户端消息编号={ClientMessageId}；发送用户={SenderUserId}；消息={MessageId}；错误码={ErrorCode}",
                 record.ClientMessageId,
                 record.SenderUserId,
-                persisted.MessageId);
+                persisted.MessageId,
+                stableCode);
             // 附件绑定失败不记录账本：重试可能成功（附件状态可能变化）。
             return MessageProcessResult.Failed(
-                "attachment_bind_failed",
-                "附件不存在、未确认或不属于发送方，消息未写入。",
+                stableCode,
+                "附件扫描中、被拒绝、已过期、已绑定或不属于发送方，消息未写入。",
                 MessageFailureKind.Permanent);
         }
 

@@ -155,7 +155,13 @@ public sealed class RealtimeHistoryAttachmentEnricherTests
             string? contentHash,
             string? contentType,
             string? reason,
-            CancellationToken ct = default) =>
+            CancellationToken ct = default,
+            bool isVoice = false,
+            string? voiceCodec = null,
+            string? voiceContainer = null,
+            long? voiceDurationMs = null,
+            int? voiceSampleRateHz = null,
+            short? voiceChannels = null) =>
             throw new NotSupportedException();
 
         public Task<bool> MarkExpiredAsync(

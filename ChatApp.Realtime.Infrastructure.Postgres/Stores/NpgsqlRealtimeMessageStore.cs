@@ -348,31 +348,30 @@ public sealed class NpgsqlRealtimeMessageStore :
         IReadOnlyList<AttachmentRef>? boundAttachmentRefs = null;
         if (message.AttachmentIds is { Count: > 0 })
         {
-            var expected = message.AttachmentIds
-                .Where(id => !string.IsNullOrWhiteSpace(id))
-                .Distinct(StringComparer.Ordinal)
-                .Count();
             try
             {
-                var boundRecords = await attachmentWriter
+                var bindResult = await attachmentWriter
                     .BindConfirmedToMessageAsync(
                         message.MessageId,
                         message.ConversationId,
                         message.SenderUserId,
                         message.AttachmentIds)
                     .ConfigureAwait(false);
-                if (boundRecords.Count != expected)
+                if (!bindResult.Success)
                 {
                     await session.RollbackAsync().ConfigureAwait(false);
                     _logger.LogWarning(
-                        "附件绑定失败。消息={MessageId}；期望={Expected}；实际={Bound}",
+                        "附件发送前校验失败。消息={MessageId}；发送用户={SenderUserId}；错误码={ErrorCode}；数量={Count}",
                         message.MessageId,
-                        expected,
-                        boundRecords.Count);
-                    return RealtimeMessagePersistResult.AttachmentBindFailed(message.MessageId);
+                        message.SenderUserId,
+                        bindResult.PrimaryErrorCode.ToStableCode(),
+                        bindResult.Errors.Count);
+                    return RealtimeMessagePersistResult.AttachmentBindFailed(
+                        message.MessageId,
+                        bindResult.PrimaryErrorCode);
                 }
 
-                boundAttachmentRefs = AttachmentRefMapper.FromRecords(boundRecords);
+                boundAttachmentRefs = AttachmentRefMapper.FromRecords(bindResult.BoundRecords);
             }
             catch (InvalidOperationException ex)
             {
@@ -382,7 +381,9 @@ public sealed class NpgsqlRealtimeMessageStore :
                     "附件绑定拒绝。消息={MessageId}；发送用户={SenderUserId}",
                     message.MessageId,
                     message.SenderUserId);
-                return RealtimeMessagePersistResult.AttachmentBindFailed(message.MessageId);
+                return RealtimeMessagePersistResult.AttachmentBindFailed(
+                    message.MessageId,
+                    AttachmentBindErrorCode.InvalidState);
             }
         }
 
