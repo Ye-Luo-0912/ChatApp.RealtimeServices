@@ -22,6 +22,10 @@ Server 关系增量已能在 JetStream ACK 前原子应用到 projection item/ve
 
 完成标准：list 与 catch-up 对同一 owner/list 共享版本语义，客户端从 snapshot 后可只靠增量收敛；任何 gap/保留期越界都有明确 reset，不返回伪空成功；关闭读取开关后仍 fail-closed，且旧关系写表始终不参与结果。
 
+**当前进度（2026-08-12）**：
+- 同源对照集成测试已落地（`RelationshipProjectionSourceParityTests`，6/6 通过）：以内存 Server authority 驱动真实 Postgres 投影，逐项验证 `NpgsqlRelationshipProjectionQueryStore` 读取与权威一致。覆盖：快照后仅靠增量收敛（好友/申请/黑名单）、分页期间并发 mutation → `VersionChanged`、重复 cursor 稳定延续（断线续页）、无 checkpoint fail-closed `Unavailable`、删除项消失且 history 仍推进、重复 delta 幂等重放仍收敛。
+- 写入/读取双端同源闭环均已闭合：`RelationshipProjectionReconcileGate`（真实 Server HTTP 权威快照 → 投影，两轮 mismatch=0）覆盖 Server→投影；本测试覆盖投影→list/catch-up 读取。客户端从 snapshot 后可只靠增量收敛，gap/保留期越界由 catch-up 层 fail-closed 置 `ResetRequired`，关闭读取开关后 `UnavailableRelationshipProjectionStore` 仍 fail-closed，旧关系写表不参与任何在线结果。
+
 ### P0：`OUTBOX-DB-1` 消息与 Outbox 数据库瘦身
 
 1. 用固定消息语料、连接数和随机种子做 5–10 分钟短 A/B；结合 `pg_stat_statements`、`pg_stat_wal` 和应用指标，把每消息成本拆成 message、conversation/unread、attachment bind、Outbox insert、claim、complete/retry 和 cleanup。

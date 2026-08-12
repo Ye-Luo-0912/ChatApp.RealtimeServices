@@ -183,6 +183,36 @@ public sealed class RelationshipProjectionSourceParityTests
                                            && entry.ResourceId == "doomed");
     }
 
+    [Fact]
+    public async Task RepeatedDelta_IsIdempotentWithinCatchUp_AndStillConverges()
+    {
+        var owner = NextOwner();
+        var authority = new TestServerAuthority(owner);
+        authority.Set(RelationshipProjectionListType.Friends, "idem-a", "Accepted");
+        authority.Set(RelationshipProjectionListType.Friends, "idem-b", "Accepted");
+
+        var (store, query) = CreateStores();
+        await SeedSnapshotAsync(store, authority, RelationshipProjectionListType.Friends);
+        await CatchUpFromAuthorityAsync(store, authority, RelationshipProjectionListType.Friends);
+
+        // 跨进程重试/重复投递会重放同一 delta：必须幂等（Duplicate），不得重复计数或破坏版本连续性。
+        var delta = authority
+            .DeltasAfter(RelationshipProjectionListType.Friends, 0)
+            .OrderBy(static d => d.Version)
+            .First();
+        foreach (var _ in Enumerable.Range(0, 3))
+        {
+            var result = await store.ApplyAsync(delta);
+            Assert.True(
+                result is RelationshipProjectionApplyResult.Applied
+                    or RelationshipProjectionApplyResult.Duplicate,
+                $"Replaying v{delta.Version} must be idempotent, got {result}.");
+        }
+
+        // 幂等重放后客户端仍能只靠一份权威状态收敛，且与 Server 权威逐项一致。
+        await AssertParityAsync(owner, authority, query, RelationshipProjectionListType.Friends);
+    }
+
     private static readonly RelationshipProjectionListType[] AllListTypes =
     [
         RelationshipProjectionListType.Friends,
