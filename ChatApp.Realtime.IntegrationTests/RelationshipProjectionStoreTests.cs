@@ -478,6 +478,42 @@ public sealed class RelationshipProjectionStoreTests
     }
 
     [Fact]
+    public async Task RetentionFloor_ReflectsLowestRetainedVersionPerList()
+    {
+        await using var client = CreateClient();
+        var schema = new RealtimeDatabaseSchema("realtime");
+        var store = new NpgsqlRelationshipProjectionStore(client, schema);
+        const long owner = 9_100_014;
+
+        // No history yet: floor is 0.
+        Assert.Equal(0, await store.GetRetentionFloorAsync(
+            owner, RelationshipProjectionListType.Friends));
+
+        var first = CreateDelta(
+            owner,
+            RelationshipProjectionListType.Friends,
+            1,
+            RelationshipProjectionOperation.Upsert,
+            resourceId: "friend-1");
+        var second = CreateDelta(
+            owner,
+            RelationshipProjectionListType.Friends,
+            2,
+            RelationshipProjectionOperation.Upsert,
+            resourceId: "friend-2");
+        Assert.Equal(RelationshipProjectionApplyResult.Applied, await store.ApplyAsync(first));
+        Assert.Equal(RelationshipProjectionApplyResult.Applied, await store.ApplyAsync(second));
+
+        // Floor is the lowest retained version for the Friends stream.
+        Assert.Equal(1, await store.GetRetentionFloorAsync(
+            owner, RelationshipProjectionListType.Friends));
+
+        // Floor is per (owner, list): a different list with no history stays at 0.
+        Assert.Equal(0, await store.GetRetentionFloorAsync(
+            owner, RelationshipProjectionListType.BlockedUsers));
+    }
+
+    [Fact]
     public async Task Gap_RollsBackHistoryTogetherWithItemAndInbox()
     {
         await using var client = CreateClient();

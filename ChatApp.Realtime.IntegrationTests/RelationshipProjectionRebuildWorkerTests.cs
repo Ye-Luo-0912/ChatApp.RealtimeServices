@@ -518,6 +518,12 @@ public sealed class RelationshipProjectionRebuildWorkerTests
             int limit,
             CancellationToken ct = default) =>
             throw new NotSupportedException();
+
+        public Task<long> GetRetentionFloorAsync(
+            long ownerUserId,
+            RelationshipProjectionListType listType,
+            CancellationToken ct = default) =>
+            Task.FromResult(0L);
     }
 
     private sealed class RecordingStateStore : IRelationshipProjectionRebuildStateStore

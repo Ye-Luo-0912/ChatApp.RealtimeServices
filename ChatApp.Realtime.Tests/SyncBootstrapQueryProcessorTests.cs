@@ -2,6 +2,7 @@ using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Messaging.History;
 using ChatApp.Realtime.Abstractions.Protocol;
+using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
@@ -1253,6 +1254,171 @@ public sealed class SyncBootstrapQueryProcessorTests
             $"序列化后字节数 {byteCount} 超过硬上限 {DefaultSyncBootstrapQueryProcessor.MaximumResponseBytes}（seed={seed}）");
     }
 
+    [Fact]
+    public async Task ProcessAsync_ReadsRelationshipCatchUpFromProjectionHistory()
+    {
+        var projection = new RecordingRelationshipProjectionStore(
+            friends:
+            [
+                HistoryEntry(RelationshipProjectionListType.Friends, 1, RelationshipProjectionOperation.Upsert, "f1", 100),
+                HistoryEntry(RelationshipProjectionListType.Friends, 2, RelationshipProjectionOperation.Upsert, "f2", 200),
+                HistoryEntry(RelationshipProjectionListType.Friends, 3, RelationshipProjectionOperation.Delete, "f1", 300)
+            ]);
+        var processor = CreateProcessor(
+            new CapturingConversationStore([]),
+            new CapturingHistoryStore("dm:1:2", []),
+            new NoopDeviceCursorStore(),
+            relationshipProjectionStore: projection);
+
+        var page = await processor.ProcessAsync(new SyncBootstrapQuery
+        {
+            RequestId = "sync-rel-proj",
+            UserId = 42,
+            MaxConversationsWithHistory = 5,
+            RelationshipListLimit = 10,
+            RelationshipWatermarks =
+            [
+                new RelationshipSyncWatermark
+                {
+                    ListType = RelationshipListType.Friends,
+                    AfterSequence = 1
+                }
+            ]
+        });
+
+        Assert.True(page.Succeeded);
+        Assert.NotNull(page.RelationshipCatchUps);
+        var catchUp = Assert.Single(
+            page.RelationshipCatchUps!.Where(c => c.ListType == RelationshipListType.Friends));
+        Assert.False(catchUp.ResetRequired);
+        Assert.Equal(2, catchUp.Changes.Count);
+        // 水位推进到返回条目的最大投影 version（per-list）。
+        Assert.Equal(3, catchUp.NextSequence);
+        Assert.Equal(1, catchUp.RetentionFloorSequence);
+        Assert.Equal(2, catchUp.Changes[0].ChangeSequence);
+        Assert.Equal(RelationshipChangeOperation.Delete, catchUp.Changes[1].Operation);
+        Assert.Equal("f1", catchUp.Changes[1].ResourceId);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_RelationshipResetWhenClientBelowRetentionFloor()
+    {
+        var projection = new RecordingRelationshipProjectionStore(
+            friends:
+            [
+                HistoryEntry(RelationshipProjectionListType.Friends, 2, RelationshipProjectionOperation.Upsert, "f2", 200),
+                HistoryEntry(RelationshipProjectionListType.Friends, 3, RelationshipProjectionOperation.Upsert, "f3", 300)
+            ],
+            floor: 5);
+        var processor = CreateProcessor(
+            new CapturingConversationStore([]),
+            new CapturingHistoryStore("dm:1:2", []),
+            new NoopDeviceCursorStore(),
+            relationshipProjectionStore: projection);
+
+        var page = await processor.ProcessAsync(new SyncBootstrapQuery
+        {
+            RequestId = "sync-rel-reset",
+            UserId = 42,
+            MaxConversationsWithHistory = 5,
+            RelationshipListLimit = 10,
+            RelationshipWatermarks =
+            [
+                new RelationshipSyncWatermark
+                {
+                    ListType = RelationshipListType.Friends,
+                    AfterSequence = 1
+                }
+            ]
+        });
+
+        Assert.True(page.Succeeded);
+        Assert.NotNull(page.RelationshipCatchUps);
+        var catchUp = Assert.Single(
+            page.RelationshipCatchUps!.Where(c => c.ListType == RelationshipListType.Friends));
+        Assert.Equal(5, catchUp.RetentionFloorSequence);
+        Assert.True(catchUp.ResetRequired);
+        Assert.Equal("beyond_retention", catchUp.ResetReason);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_RelationshipCatchUpHasMoreWhenHistoryExceedsLimit()
+    {
+        var projection = new RecordingRelationshipProjectionStore(
+            friends: Enumerable.Range(1, 6)
+                .Select(v => HistoryEntry(RelationshipProjectionListType.Friends, v, RelationshipProjectionOperation.Upsert, $"f{v}", v * 100))
+                .ToArray());
+        var processor = CreateProcessor(
+            new CapturingConversationStore([]),
+            new CapturingHistoryStore("dm:1:2", []),
+            new NoopDeviceCursorStore(),
+            relationshipProjectionStore: projection);
+
+        var page = await processor.ProcessAsync(new SyncBootstrapQuery
+        {
+            RequestId = "sync-rel-more",
+            UserId = 42,
+            MaxConversationsWithHistory = 5,
+            RelationshipListLimit = 5,
+            RelationshipWatermarks =
+            [
+                new RelationshipSyncWatermark
+                {
+                    ListType = RelationshipListType.Friends,
+                    AfterSequence = 0
+                }
+            ]
+        });
+
+        Assert.True(page.Succeeded);
+        Assert.NotNull(page.RelationshipCatchUps);
+        var relCatchUps = page.RelationshipCatchUps!;
+        var catchUp = Assert.Single(relCatchUps.Where(c => c.ListType == RelationshipListType.Friends));
+        Assert.True(catchUp.HasMore);
+        Assert.Equal(5, catchUp.Changes.Count);
+        Assert.Equal(5, catchUp.NextSequence);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_RelationshipProjectionQueryFailure_FailsClosedInsteadOfFalseSuccess()
+    {
+        var projection = new RecordingRelationshipProjectionStore(
+            friends:
+            [
+                HistoryEntry(RelationshipProjectionListType.Friends, 1, RelationshipProjectionOperation.Upsert, "f1", 100)
+            ],
+            throwOnQuery: true);
+        var processor = CreateProcessor(
+            new CapturingConversationStore([]),
+            new CapturingHistoryStore("dm:1:2", []),
+            new NoopDeviceCursorStore(),
+            relationshipProjectionStore: projection);
+
+        var page = await processor.ProcessAsync(new SyncBootstrapQuery
+        {
+            RequestId = "sync-rel-proj-fail",
+            UserId = 42,
+            MaxConversationsWithHistory = 5,
+            RelationshipWatermarks =
+            [
+                new RelationshipSyncWatermark
+                {
+                    ListType = RelationshipListType.Friends,
+                    AfterSequence = 1
+                }
+            ]
+        });
+
+        Assert.True(page.Succeeded);
+        Assert.NotNull(page.RelationshipCatchUps);
+        var relCatchUps = page.RelationshipCatchUps!;
+        var catchUp = Assert.Single(relCatchUps.Where(c => c.ListType == RelationshipListType.Friends));
+        // 投影查询失败必须 fail-closed：标记 ResetRequired 让客户端全量重建，而非静默返回空成功。
+        Assert.True(catchUp.ResetRequired);
+        Assert.Equal("projection_unavailable", catchUp.ResetReason);
+        Assert.Empty(catchUp.Changes);
+    }
+
     private static string BuildEscapedString(Random rng, int length)
     {
         // 包含大量引号、反斜杠、控制字符——JSON 转义后字节数会明显大于原字符串。
@@ -1263,18 +1429,41 @@ public sealed class SyncBootstrapQueryProcessorTests
         return new string(chars);
     }
 
+    private static RelationshipProjectionHistoryEntry HistoryEntry(
+        RelationshipProjectionListType listType,
+        long version,
+        RelationshipProjectionOperation operation,
+        string resourceId,
+        long occurredAtMs) => new()
+    {
+        OwnerUserId = 42,
+        ListType = listType,
+        Version = version,
+        EventId = $"evt-{listType}-{version}",
+        Operation = operation,
+        ResourceId = resourceId,
+        SubjectUserId = 100 + version,
+        ActorUserId = 42,
+        State = operation == RelationshipProjectionOperation.Delete ? null : "Accepted",
+        OccurredAtMs = occurredAtMs
+    };
+
     private static DefaultSyncBootstrapQueryProcessor CreateProcessor(
         CapturingConversationStore conversationStore,
         CapturingHistoryStore historyStore,
         IRealtimeDeviceSyncCursorStore deviceStore,
-        SyncBootstrapOptions? options = null) =>
+        SyncBootstrapOptions? options = null,
+        IRelationshipProjectionStore? relationshipProjectionStore = null,
+        IRelationshipSyncCursorStore? relationshipCursorStore = null) =>
         new(
             conversationStore,
             historyStore,
             deviceStore,
             new NoopRealtimeAttachmentStore(NullLogger<NoopRealtimeAttachmentStore>.Instance),
             new NoopRealtimeReactionStore(NullLogger<NoopRealtimeReactionStore>.Instance),
-            options);
+            options,
+            relationshipProjectionStore,
+            relationshipCursorStore);
 
     private sealed class CapturingConversationStore : IRealtimeConversationStore
     {
@@ -1648,5 +1837,68 @@ public sealed class SyncBootstrapQueryProcessorTests
 
         public Task<long> DeleteInactiveAsync(long inactiveBeforeMs, int batchSize, CancellationToken ct = default) =>
             Task.FromResult(0L);
+    }
+
+    private sealed class RecordingRelationshipProjectionStore : IRelationshipProjectionStore
+    {
+        private readonly Dictionary<RelationshipProjectionListType, IReadOnlyList<RelationshipProjectionHistoryEntry>> _historyByList;
+        private readonly Dictionary<RelationshipProjectionListType, long> _floorByList;
+        private readonly bool _throwOnQuery;
+
+        public RecordingRelationshipProjectionStore(
+            IReadOnlyList<RelationshipProjectionHistoryEntry>? friends = null,
+            IReadOnlyList<RelationshipProjectionHistoryEntry>? friendRequests = null,
+            IReadOnlyList<RelationshipProjectionHistoryEntry>? blocked = null,
+            long floor = 0,
+            bool throwOnQuery = false)
+        {
+            _throwOnQuery = throwOnQuery;
+            _historyByList = new Dictionary<RelationshipProjectionListType, IReadOnlyList<RelationshipProjectionHistoryEntry>>
+            {
+                [RelationshipProjectionListType.Friends] = friends ?? [],
+                [RelationshipProjectionListType.FriendRequests] = friendRequests ?? [],
+                [RelationshipProjectionListType.BlockedUsers] = blocked ?? []
+            };
+            _floorByList = new Dictionary<RelationshipProjectionListType, long>();
+            foreach (var (listType, history) in _historyByList)
+            {
+                _floorByList[listType] = floor > 0
+                    ? floor
+                    : (history.Count == 0 ? 0 : history[0].Version);
+            }
+        }
+
+        public Task<RelationshipProjectionApplyResult> ApplyAsync(
+            RelationshipProjectionDelta delta,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<RelationshipProjectionSnapshotApplyResult> ApplySnapshotAsync(
+            RelationshipProjectionStreamSnapshot snapshot,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<IReadOnlyList<RelationshipProjectionHistoryEntry>> QueryHistoryAsync(
+            long ownerUserId,
+            RelationshipProjectionListType listType,
+            long fromVersionExclusive,
+            int limit,
+            CancellationToken ct = default)
+        {
+            if (_throwOnQuery)
+                return Task.FromException<IReadOnlyList<RelationshipProjectionHistoryEntry>>(
+                    new InvalidOperationException("projection store unavailable"));
+            var entries = _historyByList[listType]
+                .Where(e => e.Version > fromVersionExclusive)
+                .Take(limit)
+                .ToArray();
+            return Task.FromResult<IReadOnlyList<RelationshipProjectionHistoryEntry>>(entries);
+        }
+
+        public Task<long> GetRetentionFloorAsync(
+            long ownerUserId,
+            RelationshipProjectionListType listType,
+            CancellationToken ct = default) =>
+            Task.FromResult(_floorByList[listType]);
     }
 }

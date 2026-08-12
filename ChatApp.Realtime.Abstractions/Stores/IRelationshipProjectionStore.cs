@@ -41,6 +41,17 @@ public interface IRelationshipProjectionStore
         long fromVersionExclusive,
         int limit,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns the lowest <see cref="RelationshipProjectionHistoryEntry.Version"/> still retained
+    /// for the (owner, list) stream, or 0 when no history is retained. A client watermark below
+    /// this floor cannot converge incrementally and must be reset. This mirrors the legacy
+    /// retention-floor semantics but is scoped per (owner, list).
+    /// </summary>
+    Task<long> GetRetentionFloorAsync(
+        long ownerUserId,
+        RelationshipProjectionListType listType,
+        CancellationToken ct = default);
 }
 
 public sealed class RelationshipProjectionGapException : InvalidOperationException

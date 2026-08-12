@@ -9,6 +9,7 @@ using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Infrastructure.Core.Conversations;
 using ChatApp.Realtime.Infrastructure.Core.Messaging;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
+using ChatApp.Realtime.Infrastructure.Core.Stores;
 
 namespace ChatApp.Realtime.Infrastructure.Core.Sync;
 
@@ -25,7 +26,7 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
     private readonly IRealtimeDeviceSyncCursorStore _deviceCursorStore;
     private readonly IRealtimeAttachmentStore _attachmentStore;
     private readonly IRealtimeReactionStore _reactionStore;
-    private readonly IRelationshipStore? _relationshipStore;
+    private readonly IRelationshipProjectionStore? _relationshipProjectionStore;
     private readonly IRelationshipSyncCursorStore? _relationshipCursorStore;
     private readonly SyncBootstrapOptions _options;
 
@@ -36,7 +37,7 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
         IRealtimeAttachmentStore attachmentStore,
         IRealtimeReactionStore reactionStore,
         SyncBootstrapOptions? options = null,
-        IRelationshipStore? relationshipStore = null,
+        IRelationshipProjectionStore? relationshipProjectionStore = null,
         IRelationshipSyncCursorStore? relationshipCursorStore = null)
     {
         _conversationStore = conversationStore;
@@ -44,7 +45,7 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
         _deviceCursorStore = deviceCursorStore;
         _attachmentStore = attachmentStore;
         _reactionStore = reactionStore;
-        _relationshipStore = relationshipStore;
+        _relationshipProjectionStore = relationshipProjectionStore;
         _relationshipCursorStore = relationshipCursorStore;
         _options = options ?? new SyncBootstrapOptions();
     }
@@ -57,7 +58,9 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
         if (validationError is not null)
             return validationError;
 
-        if (query.RelationshipWatermarks is { Count: > 0 } && _relationshipStore is null)
+        if (query.RelationshipWatermarks is { Count: > 0 }
+            && (_relationshipProjectionStore is null
+                || _relationshipProjectionStore is UnavailableRelationshipProjectionStore))
         {
             return SyncBootstrapPage.Failed(
                 query.RequestId,
@@ -298,32 +301,35 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
     }
 
     /// <summary>
-    /// 构造关系列表增量同步结果。
+    /// 构造关系列表增量同步结果，数据源为 Server 权威的关系投影 change history。
+    /// <para>
+    /// 水位语义：按 (owner, list) 的 <c>version</c> 维度推进（非全局单调序号）。
+    /// 客户端在 <see cref="RelationshipSyncWatermark.AfterSequence"/> 中携带每个列表的
+    /// 已确认版本；服务端通过 <see cref="IRelationshipProjectionStore.QueryHistoryAsync"/>
+    /// 读取严格大于该版本的变更，并返回该列表仍保留的最旧版本作为
+    /// <see cref="RelationshipCatchUp.RetentionFloorSequence"/>。
+    /// </para>
     /// <para>
     /// 水位来源优先级：
     /// 1) 客户端在 query.RelationshipWatermarks 中显式传入的水位；
     /// 2) 设备级持久化游标（query.DeviceIdHash 提供）。
     /// </para>
     /// <para>
-    /// 服务端过滤：Friends / FriendRequests 在 SQL 中按 created_at_ms &gt; after 过滤；
-    /// BlockedUsers 表无变更时间戳，返回全量列表，由客户端按本地缓存 diff。
-    /// </para>
-    /// <para>
-    /// 新水位：取返回 items 中最大的 CreatedAtMs（无 items 时保留原水位）。
-    /// BlockedUsers 的 NewAfterChangedAtMs 始终为 0（无法推进水位）。
+    /// 新水位：取返回条目中最大的 <see cref="RelationshipChangeLogEntry.ChangeSequence"/>（即投影 version），
+    /// 无返回时保持原水位。客户端水位早于保留水位时无法增量同步，置 ResetRequired。
     /// </para>
     /// </summary>
     private async Task<List<RelationshipCatchUp>> BuildRelationshipCatchUpsAsync(
         SyncBootstrapQuery query, int listLimit, CancellationToken ct)
     {
-        if (_relationshipStore is null)
+        if (_relationshipProjectionStore is null)
             return [];
 
         var relLimit = query.RelationshipListLimit is int rl && rl > 0
             ? Math.Clamp(rl, 1, MaximumListLimit)
             : listLimit;
 
-        // 1) 解析 afterSequence-by-listType 映射
+        // 1) 解析 afterSequence-by-listType 映射（per-list 版本水位）
         var afterSequenceByListType = new Dictionary<byte, long>();
         var clientWatermarks = query.RelationshipWatermarks;
         if (clientWatermarks is { Count: > 0 })
@@ -352,17 +358,21 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
         foreach (var listType in listTypes)
         {
             ct.ThrowIfCancellationRequested();
+            if (!TryMapListType(listType, out var projectionListType))
+                continue;
+
             afterSequenceByListType.TryGetValue((byte)listType, out var afterSequence);
 
-            IReadOnlyList<RelationshipChangeLogEntry> changes;
+            IReadOnlyList<RelationshipProjectionHistoryEntry> history;
             long floorSequence;
             try
             {
-                changes = await _relationshipStore
-                    .ListChangesAsync(query.UserId, listType, afterSequence, relLimit + 1, ct)
+                // 取 relLimit+1 判定是否还有更多；QueryHistoryAsync 上限 200，relLimit ≤ 100。
+                history = await _relationshipProjectionStore
+                    .QueryHistoryAsync(query.UserId, projectionListType, afterSequence, relLimit + 1, ct)
                     .ConfigureAwait(false);
-                floorSequence = await _relationshipStore
-                    .GetRelationshipRetentionFloorAsync(query.UserId, listType, ct)
+                floorSequence = await _relationshipProjectionStore
+                    .GetRetentionFloorAsync(query.UserId, projectionListType, ct)
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -371,8 +381,10 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
             }
             catch
             {
-                // 关系列表查询失败不应导致整个 SyncBootstrap 失败：降级为空 catch-up。
-                // 客户端会保留旧水位，下次 bootstrap 再尝试。
+                // 关系列表查询失败不应导致整个 SyncBootstrap 失败，但也不能返回伪空成功：
+                // 若静默返回空 catch-up（ResetRequired=false），客户端会保留旧水位并误以为已收敛。
+                // 改为 fail-closed——标记 ResetRequired，让客户端丢弃本地该列表状态、经全量 list 重建。
+                // BuildRelationshipCursorsToPersist 会跳过 ResetRequired，不会推进已失效水位。
                 result.Add(new RelationshipCatchUp
                 {
                     ListType = listType,
@@ -381,20 +393,24 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
                     NextCursor = null,
                     NextSequence = afterSequence,
                     RetentionFloorSequence = 0,
-                    ResetRequired = false,
-                    ResetReason = null
+                    ResetRequired = true,
+                    ResetReason = "projection_unavailable"
                 });
                 continue;
             }
 
             // 服务端已按 LIMIT relLimit+1 取数；超过 size 表示有更多
             var size = relLimit;
-            var hasMore = changes.Count > size;
-            var page = hasMore ? changes.Take(size).ToArray() : changes;
+            var hasMore = history.Count > size;
+            var page = hasMore ? history.Take(size).ToArray() : history;
 
-            // 新水位：返回条目的最大 ChangeSequence（无返回时保持原水位）
+            var changes = new List<RelationshipChangeLogEntry>(page.Count);
+            foreach (var entry in page)
+                changes.Add(MapHistoryToChangeLog(entry));
+
+            // 新水位：返回条目的最大投影 version（无返回时保持原水位）
             long nextSequence = afterSequence;
-            foreach (var chg in page)
+            foreach (var chg in changes)
             {
                 if (chg.ChangeSequence > nextSequence)
                     nextSequence = chg.ChangeSequence;
@@ -405,7 +421,7 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
             result.Add(new RelationshipCatchUp
             {
                 ListType = listType,
-                Changes = page,
+                Changes = changes,
                 HasMore = hasMore,
                 NextCursor = null, // 当前实现不支持分页游标：单次返回 relLimit 条
                 NextSequence = nextSequence,
@@ -417,6 +433,43 @@ public sealed class DefaultSyncBootstrapQueryProcessor : ISyncBootstrapQueryProc
 
         return result;
     }
+
+    private static bool TryMapListType(
+        RelationshipListType source,
+        out RelationshipProjectionListType target)
+    {
+        target = source switch
+        {
+            RelationshipListType.Friends => RelationshipProjectionListType.Friends,
+            RelationshipListType.FriendRequests => RelationshipProjectionListType.FriendRequests,
+            RelationshipListType.BlockedUsers => RelationshipProjectionListType.BlockedUsers,
+            _ => default
+        };
+        return Enum.IsDefined(source);
+    }
+
+    /// <summary>
+    /// 将强类型投影 change history 条目映射为 wire 友好的变更日志条目。
+    /// <see cref="RelationshipChangeLogEntry.ChangeSequence"/> 承载该 (owner, list) 的
+    /// 投影 <see cref="RelationshipProjectionHistoryEntry.Version"/>（per-list 语义）。
+    /// </summary>
+    private static RelationshipChangeLogEntry MapHistoryToChangeLog(
+        RelationshipProjectionHistoryEntry entry) => new()
+    {
+        ChangeSequence = entry.Version,
+        Operation = entry.Operation == RelationshipProjectionOperation.Delete
+            ? RelationshipChangeOperation.Delete
+            : RelationshipChangeOperation.Upsert,
+        ResourceId = entry.ResourceId,
+        // SubjectUserId 是列表中的 peer（与 legacy 变更日志的 UserId 语义一致）。
+        UserId = entry.SubjectUserId,
+        Status = entry.State,
+        Message = entry.Message,
+        // 投影 history 无独立建立时间，沿用变更发生时间。
+        CreatedAtMs = entry.OccurredAtMs,
+        OccurredAtMs = entry.OccurredAtMs,
+        RequestId = null
+    };
 
     /// <summary>
     /// 仅持久化实际返回了条目且非 BlockedUsers（无水位语义）的 catch-up 新水位。

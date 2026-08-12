@@ -41,4 +41,14 @@ public sealed class UnavailableRelationshipProjectionStore : IRelationshipProjec
         return Task.FromException<IReadOnlyList<RelationshipProjectionHistoryEntry>>(
             new InvalidOperationException("Relationship projection store is unavailable."));
     }
+
+    public Task<long> GetRetentionFloorAsync(
+        long ownerUserId,
+        RelationshipProjectionListType listType,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromException<long>(
+            new InvalidOperationException("Relationship projection store is unavailable."));
+    }
 }

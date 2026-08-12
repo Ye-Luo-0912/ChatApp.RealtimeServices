@@ -65,7 +65,9 @@ public static class RealtimeCoreRegistration
                 provider.GetRequiredService<IRealtimeDeviceSyncCursorStore>(),
                 provider.GetRequiredService<IRealtimeAttachmentStore>(),
                 provider.GetRequiredService<IRealtimeReactionStore>(),
-                provider.GetRequiredService<SyncBootstrapOptions>()));
+                provider.GetRequiredService<SyncBootstrapOptions>(),
+                provider.GetService<IRelationshipProjectionStore>(),
+                provider.GetService<IRelationshipSyncCursorStore>()));
 
         services.TryAddSingleton<IRealtimeEventPublisher, NoopRealtimeEventPublisher>();
         services.TryAddSingleton<IRealtimeEventConsumer, NoopRealtimeEventConsumer>();

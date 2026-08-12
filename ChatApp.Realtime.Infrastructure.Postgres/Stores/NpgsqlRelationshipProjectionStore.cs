@@ -688,6 +688,32 @@ public sealed class NpgsqlRelationshipProjectionStore : IRelationshipProjectionS
         return entries;
     }
 
+    public async Task<long> GetRetentionFloorAsync(
+        long ownerUserId,
+        RelationshipProjectionListType listType,
+        CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(ownerUserId);
+        if (!Enum.IsDefined(listType))
+            throw new ArgumentOutOfRangeException(nameof(listType));
+
+        var sql = _schema.GetOrAddCommandText(
+            "relationship-projection-retention-floor",
+            static schema => $"""
+                SELECT COALESCE(MIN("version"), 0)
+                FROM {schema.RelationshipProjectionHistoryTableSql}
+                WHERE "owner_user_id" = @owner_user_id
+                  AND "list_type" = @list_type;
+                """);
+        await using var connection = await _databaseClient
+            .GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(sql, connection);
+        command.Parameters.AddWithValue("owner_user_id", NpgsqlDbType.Bigint, ownerUserId);
+        command.Parameters.AddWithValue("list_type", NpgsqlDbType.Smallint, (short)listType);
+        var result = await command.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return result is long value ? value : 0L;
+    }
+
     private async Task<int> AdvanceStreamAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
