@@ -186,5 +186,13 @@ public sealed class RelationshipProjectionPrePublisherTests
             RelationshipProjectionStreamSnapshot snapshot,
             CancellationToken ct = default) =>
             throw new NotSupportedException();
+
+        public Task<IReadOnlyList<RelationshipProjectionHistoryEntry>> QueryHistoryAsync(
+            long ownerUserId,
+            RelationshipProjectionListType listType,
+            long fromVersionExclusive,
+            int limit,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 }

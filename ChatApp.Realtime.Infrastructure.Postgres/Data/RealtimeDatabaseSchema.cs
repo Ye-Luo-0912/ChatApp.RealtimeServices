@@ -41,6 +41,7 @@ public sealed class RealtimeDatabaseSchema
         RelationshipProjectionInboxTableSql = $"{QuotedSchema}.\"relationship_projection_inbox\"";
         RelationshipProjectionSnapshotsTableSql = $"{QuotedSchema}.\"relationship_projection_snapshots\"";
         RelationshipProjectionRebuildStateTableSql = $"{QuotedSchema}.\"relationship_projection_rebuild_state\"";
+        RelationshipProjectionHistoryTableSql = $"{QuotedSchema}.\"relationship_projection_history\"";
     }
 
     public string Schema { get; }
@@ -76,6 +77,7 @@ public sealed class RealtimeDatabaseSchema
     public string RelationshipProjectionInboxTableSql { get; }
     public string RelationshipProjectionSnapshotsTableSql { get; }
     public string RelationshipProjectionRebuildStateTableSql { get; }
+    public string RelationshipProjectionHistoryTableSql { get; }
 
     /// <summary>
     /// 按 schema 实例缓存只依赖表名的不可变 SQL。factory 必须是 static lambda；

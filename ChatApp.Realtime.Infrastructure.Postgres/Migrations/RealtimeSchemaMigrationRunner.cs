@@ -101,7 +101,8 @@ public sealed class RealtimeSchemaMigrationRunner
         new Migration059_RemoveRedundantPendingCreatedIndex(),
         new Migration060_ServerRelationshipProjection(),
         new Migration061_RelationshipProjectionSnapshots(),
-        new Migration062_RelationshipProjectionRebuilder()
+        new Migration062_RelationshipProjectionRebuilder(),
+        new Migration063_RelationshipProjectionHistory()
     ];
 
     public async Task MigrateAsync(

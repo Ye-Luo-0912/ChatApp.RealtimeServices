@@ -510,6 +510,14 @@ public sealed class RelationshipProjectionRebuildWorkerTests
             Snapshots.Add(snapshot);
             return Task.FromResult(RelationshipProjectionSnapshotApplyResult.Applied);
         }
+
+        public Task<IReadOnlyList<RelationshipProjectionHistoryEntry>> QueryHistoryAsync(
+            long ownerUserId,
+            RelationshipProjectionListType listType,
+            long fromVersionExclusive,
+            int limit,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 
     private sealed class RecordingStateStore : IRelationshipProjectionRebuildStateStore

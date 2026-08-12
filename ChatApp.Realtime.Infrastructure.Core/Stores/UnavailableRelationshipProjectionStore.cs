@@ -29,4 +29,16 @@ public sealed class UnavailableRelationshipProjectionStore : IRelationshipProjec
         return Task.FromException<RelationshipProjectionSnapshotApplyResult>(
             new InvalidOperationException("Relationship projection store is unavailable."));
     }
+
+    public Task<IReadOnlyList<RelationshipProjectionHistoryEntry>> QueryHistoryAsync(
+        long ownerUserId,
+        RelationshipProjectionListType listType,
+        long fromVersionExclusive,
+        int limit,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromException<IReadOnlyList<RelationshipProjectionHistoryEntry>>(
+            new InvalidOperationException("Relationship projection store is unavailable."));
+    }
 }

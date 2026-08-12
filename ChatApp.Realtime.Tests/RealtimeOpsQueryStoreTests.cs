@@ -90,6 +90,8 @@ public sealed class RealtimeOpsQueryStoreTests : IAsyncLifetime
                 connection, null, schema, CancellationToken.None);
             await new Migration062_RelationshipProjectionRebuilder().ApplyAsync(
                 connection, null, schema, CancellationToken.None);
+            await new Migration063_RelationshipProjectionHistory().ApplyAsync(
+                connection, null, schema, CancellationToken.None);
         }
 
         var projectionStore = new NpgsqlRelationshipProjectionStore(client, schema);

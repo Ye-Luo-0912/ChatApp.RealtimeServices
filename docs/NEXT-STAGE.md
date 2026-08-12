@@ -4,62 +4,73 @@
 
 Realtime 负责消息、会话、回执、同步投影、Outbox/JetStream 和跨 Gateway 事件；数据库与消息队列的一致性语义必须显式、可重放。
 
-## 下一步执行与交接
+## 已完成前置
 
-`REL-GATE-1`（关系投影重建隔离门禁）已完成（2026-08-11），reconcile 门禁 PASSED；下一批是 `REL-WIRE-2`（切 Shared 读）。
+Server 关系增量已能在 JetStream ACK 前原子应用到 projection item/version/inbox；重复事件幂等、版本 gap 回滚，snapshot/checkpoint、数据库时钟租约 Rebuilder 和 digest 对账已完成基础验证。snapshot-gated list processor 已存在但默认关闭；消息 changed-at 分页、超预算空页和重复 cursor 的韧性测试已补齐。下一阶段从投影 list + catch-up 的同源闭环开始，不恢复旧关系表为在线权威。
 
-1. **冻结输入。** ✅ 已写 `.artifacts/relationship-projection-reconcile/20260811T084447Z/run-manifest.json`（Server `3b4224c`、Realtime `b53dc69`、Contracts `2.5.2`、Integration `3.1.3`、Migration 060–062、`databaseSnapshotId=relgate-seed-v1`）。
-2. **验证编排。** ✅ Linux `192.168.5.49` 隔离环境：Postgres 16.8(Garnet 6379/NATS 4222) + Server(8080, 投影导出源) + Realtime ×2(8081/8082，Rebuilder 启用、Reads 关闭、共享同库)。双实例交替持租约且零冲突，Rebuilder 达 `passNumber=3→4`、`stablePasses=2→3`、`lastError=null`，投影落库 versions=27/items=38/snapshots=27/inbox=0。
-3. **执行门禁。** ✅ `Invoke-RelationshipProjectionReconcile.ps1 -BaseUri http://127.0.0.1:8081`，`gatePassed=true`，2 个 clean pass 全 27/27 匹配、0 差异，连续两轮指纹一致 `CF08320F…9CB3E9`，无 gap/503、全页 200。报告归档 `.artifacts/relationship-projection-reconcile/20260811T084447Z/reconcile-report.json`。
-4. **交给 Shared。** ✅ 交付物齐备（manifest、reconcile report、故障矩阵，见下）。修复了 REL-GATE-1 发现的契约 bug：Server 导出端点为 camelCase，原 Realtime 客户端按默认 PascalCase 反序列化导致 `page.Items is null`（`source_contract_invalid`）；新增 `ServerJsonOptions`（CamelCase + 大小写不敏感 + 复用 `RealtimeJsonSerializerContext`），并补回归测试 `ServerSource_DeserializesCamelCaseServerPayload`。此修复后门禁才通过，现全部测试通过（见基线行）。允许启动 `REL-WIRE-2`。
-5. **失败/回滚。** ❌ 未触发（本次无需要回滚的失败）。
+## 下一阶段 TODO
 
-**本批故障矩阵（REL-GATE-1，2026-08-11）：**
-| 阶段 | 故障 | 根因 | 修复/结论 |
-|---|---|---|---|
-| 环境/构建 | `NU1004` 项目 RID 已更改 | 发布时 `-p:RestoreLockedMode=false` 把 `linux-x64` 写入 lock 文件 | `dotnet restore --force-evaluate` 重新生成干净 lock 文件；并顺带把 lock 中 Contracts/Integration 版本修正为 `2.5.2`/`3.1.3` |
-| 部署 | `BadImageFormatException` | 覆盖 DLL 时旧进程仍在运行（时序） | 停进程→重拷→重启；远端 DLL SHA-256 与本地一致，排除传输损坏 |
-| 编排（核心） | `source_contract_invalid: page.Items is null` | Server 导出端点 camelCase 输出 vs Realtime PascalCase 反序列化 | `RelationshipProjectionSnapshotSource.cs` 新增 `ServerJsonOptions`（CamelCase+case-insensitive+`RealtimeJsonSerializerContext`），重新发布双实例后 Rebuilder 正常拉取并多轮 stable pass |
-| 门禁 | 无 | — | 2 clean pass 指纹一致 `CF08320F…9CB3E9`，`gatePassed=true` |
+### P0：`REL-READ-3` 关系投影 list + catch-up 同源闭环
 
-**稳定错误码清单（本批验证）：** `source_http_{code}`（429/5xx 退避）、`source_timeout`、`source_transport_failed`、`source_contract_invalid`、`snapshot_version_mismatch`、`rebuild_failed`；服务未配置时 `source_unavailable`。所有错误均按 `FailureRetry` 释放租约并可续跑。
+当前 list 开关可以切到 `ProjectedRelationshipListQueryProcessor`，但同步 bootstrap 不能重新注入 legacy `IRelationshipStore` 来补增量。list、catch-up、reset 和设备水位必须来自同一套 Server 权威投影。
 
-下一位 Agent 从 `REL-WIRE-2` 开始（切 Shared 读），不先改 Gateway/Client，也不在本批次混入消息性能、二进制或媒体改动。
+1. 为每个 owner/list 建立显式的版本化 change history（或语义等价的持久化历史），与 projection item、version 和 inbox 在应用 delta 的同一事务内提交；以 owner/list/version 唯一约束保证重复事件不重复产生变更。
+2. list 从 snapshot checkpoint + 当前 version 读取；catch-up 只读投影 history，并提供 retention floor。旧 Realtime `friendships/friend_requests` 只能作为待删除历史数据，不能参与在线结果或 gap 修复。
+3. 对 list/sync 统一处理 unavailable、projection changed、gap、invalid cursor、retention exceeded、request too large 和 bad request；opaque cursor 只承诺继续或明确失效，不泄漏数据库主键、checkpoint 或内部事件编码。
+4. 严格执行响应字节预算：超预算返回显式 partial/reset 与可继续水位，不能静默截断；用于重试的服务端水位只能在整页选定并完成预算裁剪后推进，客户端显式水位始终优先。
+5. 用 Server HTTP 权威列表逐项对照好友、申请、黑名单；覆盖 snapshot 期间并发 mutation、重复/乱序 delta、gap 后重建、分页 version 变化、空页但 HasMore、重复 cursor、断线续页、无 checkpoint 和授权失败。
 
-## 接手状态
+完成标准：list 与 catch-up 对同一 owner/list 共享版本语义，客户端从 snapshot 后可只靠增量收敛；任何 gap/保留期越界都有明确 reset，不返回伪空成功；关闭读取开关后仍 fail-closed，且旧关系写表始终不参与结果。
 
-- P0（在线入口已收口）：默认关系 mutation/list/sync 均 fail-closed，旧表不再是在线权威。
-- P0（版本化增量消费已完成）：`RelationshipProjectionDelta v1` 已进入 `ChatApp.Realtime.Contracts 2.5.2`，序列化边界由 `ChatApp.Realtime.Integration 3.1.3` 提供；Server Outbox 经 JetStream 到达 `RealtimeEventWorker` 后先校验 envelope，再在 PostgreSQL 单事务内提交 projection item、owner/list version 和 event inbox，成功后才 ACK。Realtime 自有 Outbox 的 pre-publisher 只作为第二道一致性守卫，不再被误认为 Server 生产链路。重复 event id 返回 Duplicate，只有 `current+1` 可推进，gap 会回滚并进入现有 NAK/重投/DLQ 路径；applied/duplicate/gap 均有独立指标。
-  - `relationship_projection_items/versions/inbox` 由 Migration 060 建立；测试覆盖 upsert→重复→delete、并发重复 exactly-once、断档全回滚、旧无 Projection 通知兼容和 typed UTF-8 Outbox 路径。默认关系 mutation/list/sync 仍 fail-closed，旧 `realtime.friendships/friend_requests` 不恢复在线权威。
-- P0（快照导入、自动 Rebuilder 与只读候选已完成，默认关闭，生产切读仍是 TODO）：Migration 061 增加 stream snapshot checkpoint；受 Ops API key 保护的导入端点按 owner/list 锁定版本行，原子替换 items、记录 checkpoint，并可把较旧/空投影直接推进到 Server 快照 version。重复同版本快照不再只信 checkpoint，而会核对当前 item count/资源键 hash；发现缺项或键集合漂移时只重建该 stream，下一次重复导入才返回 verified。比 current version 更旧的快照返回冲突；被快照覆盖的迟到 delta 按 Duplicate ACK，紧随快照的 `version+1` delta 可继续推进。Migration 062 的 Rebuilder 使用 PostgreSQL 数据库时钟租约、owner+claim-token fencing、持久化复合 cursor、整页提交、失败续跑、重复整轮扫描和连续两轮稳定判定；已记录 active/stable-pass、轮次/stream 结果和延迟、failure reason、lease-lost stage，HTTP 源使用 source-generated JSON、独立服务密钥与有界超时。
-  - 编排自动覆盖已补齐（2026-08-11）：`RelationshipProjectionRebuildWorkerTests` 新增租约 fencing（renew/commit-page 失败即失租，`renew`/`commit-page` 阶段）、扫描中新增更小 owner id 被拒（`InvalidDataException`）、429/5xx/超时/传输/契约错误分类（`ClassifyError` 映射 `source_http_{code}`/`source_timeout`/`source_transport_failed`/`source_contract_invalid`/`snapshot_version_mismatch`/`rebuild_failed`）与失败后按 `FailureRetry` 释放租约；`RelationshipProjectionRebuildStateStoreTests` 新增**数据库时钟租约过期接管**（短租约过期后另一实例可接管、旧租约被 fencing）。密钥轮换由 `ServerRelationshipProjectionSnapshotSource` 的 `X-Relationship-Projection-Key` 头断言覆盖。真实隔离环境（多实例同库、secret store 注入、服务密钥轮换、极限页）仍待执行。
-  - 只读候选：`RelationshipProjectionReads:Enabled=false`；只有同时启用 Rebuilder 且使用持久化 Npgsql 才允许装配。每个 owner/list 必须已有 snapshot checkpoint，version 与按资源键排序的页面在同一个 `REPEATABLE READ` 快照内读取；opaque cursor 固定携带 version+resource id，分页期间 version 变化返回 `relationship_projection_changed`，无快照基线返回 `relationship_read_projection_unavailable`。默认 processor 仍 fail-closed，mutation 永久留在 Server HTTP。
-  - 编排上线 ✅（2026-08-11 隔离环境验证通过）：受 Ops API key 保护的 `GET /ops/relationship-projection/status` 已返回持久化 cursor、pass/stable、租约有效性、最后错误和整体覆盖率；`GET /ops/relationship-projection/streams` 以 owner/list keyset 分页返回 current/snapshot version、item/checkpoint count、checkpoint hash、快照后 inbox count/max version 与本地连续性；`GET /ops/relationship-projection/reconcile` 再与 Server 的 privacy-minimized digest 做有界合并，全程不读取或返回 resource id、消息、claim token。双实例共享同库抢租/交替持租零冲突，Rebuilder 达 stable pass=3、`lastError=null`，投影落库 versions=27/items=38/snapshots=27/inbox=0。camelCase 契约 bug 已修复并补测试。剩余未在本批覆盖的专场景（取消重启、密钥轮换、极限页、扫描中新增较小 owner id）在真机多实例上仍需专项验证，已由单测/编排测试兜底。
-  - 对账执行 ✅（2026-08-11）：`pwsh scripts/Invoke-RelationshipProjectionReconcile.ps1 -BaseUri http://127.0.0.1:8081`（Ops key 经 `CHATAPP_OPS_API_KEY` 注入）。从空 cursor 有界分页到 `hasMore=false`，Rebuilder 已 ≥2 次 stable pass 且 status token 未变化，连续两轮全量 SHA-256 指纹一致 `CF08320F…9CB3E9`；2 clean pass 全 27/27 匹配、0 差异、无 gap/503、全页 200，`gatePassed=true`。报告只保留分页摘要与差异项，不写 key；源码/包 hash、配置已由同目录 `run-manifest.json` 记录。`databaseSnapshotId=relgate-seed-v1`。故障恢复后复跑仍通过（本批未触发 409/503）。仅剩只读 canary 与切读在 `REL-WIRE-2` 推进。
-  - 切读 TODO：连续两轮稳定、差异为零、积压恢复、服务密钥轮换、HTTP 授权对照和分页版本漂移均通过后，才在隔离环境打开只读 list canary；随后再设计 Shared list/sync wire。Sync 字节预算超限必须返回显式 partial/reset 与可继续水位，任何门禁失败立即关闭读开关并继续走 Server HTTP。
-- P1（默认值已门禁）：Outbox hint 合并窗口保留 `0..50 ms` 开关，但默认 `0`；`2 ms` 虽减少约 20% DB ops，却显著恶化 delivery 尾延迟，只能由明确接受该取舍的部署启用。
-- P1：继续压低消息写入的 SQL/WAL/managed allocation，并用短时 admission + capacity 验证；冻结后再做 30 分钟候选测试。
-  - 每轮先用 trace/数据库采样确认 Top 路径，只改变一个批处理、SQL 或索引因素；共享仅限线程安全连接池、不可变 metadata 和有界 worker，不跨事务复用 command/reader/写会话。
-  - 完成标准：同快照 A/B 的 ACK/投递、重复/漏投、Outbox/JetStream/死信均正确，SQL/WAL/分配有稳定收益且 p95/p99、CPU 和 GC 不回退；短测不过不进入长测。
-- P1：补 sync reset/编辑/反应/提及的端到端恢复，以及 Outbox lease、死信和投影重放门禁。
-  - 覆盖 cursor 失效、空页但 HasMore、重复 cursor、编辑/撤回/Reaction 与 mention 的 changed-at 分页；只有整批落库和发布状态一致后才推进水位。
-  - Outbox 覆盖 claim/续租/过期恢复、发布成功但完成前崩溃、死信重放与租约 owner/token 校验；门禁报告必须能关联消息、事件、checkpoint 和恢复原因。
-- P1（附件闭环 wiring 已完成，2026-08-11）：未绑定附件过期清理已接入 DI 与后台 worker。新增 `AttachmentSweepOptions`（`AttachmentSweep` 配置节：`Enabled`/`IntervalMs`/`RetentionDays`），`AttachmentSweepWorker`（`PeriodicTimer` 周期调用 `IAttachmentSweeper.SweepAsync`，停用空闲、单轮异常不阻断后续周期），并在 `RealtimeServicesRegistration` 绑定 options、注册 `IAttachmentSweeper→AttachmentSweeper`（保留期取 `RetentionDays`，运行时未注入 `IObjectStorage` 时仅标记状态、物理删除由对象存储兜底）以及 `AddHostedService<AttachmentSweepWorker>`。新增 `AttachmentSweepWorkerTests` 3 例（启用调用/停用空闲/异常存活）。
-- P1（附件扫描闭环 wiring 已完成，2026-08-11）：扫描结果消费已从主题到后台 worker 全链路接通。`NatsSubjectOptions.AttachmentScan`（`chat.attachment-scan`）→ `RealtimeQueueTopics.AttachmentScan` → `RealtimeServicesRegistration.CreateRealtimeQueueOptions` 映射；`AttachmentScanCommand` 已注册到 `RealtimeJsonSerializerContext`；`NatsAttachmentScanConsumer`（`IAttachmentScanConsumer`，fire-and-forget，反序列化失败/空负载丢弃）在 `RealtimeNatsRegistration` 注册；`AttachmentScanWorker`（`IAttachmentScanConsumer`→`IAttachmentScanProcessor.ProcessAsync`，Uploaded → Scanning → Available | Rejected 全程 state_version 条件更新；单命令异常/失败不阻断消费循环，共享并发门 `Mutation` 池过载时跳过命令，命令可重放）在 `RealtimeServicesRegistration` 装配 processor+`AddHostedService`。新增 `AttachmentScanWorkerTests` 4 例（消费并处理/异常存活/Failed 续跑/并发门过载跳过）。
-- P2（二进制评估边界）：Shared 已建立但未启用的 tagged codec 只服务首轮 Client↔Gateway 评估；Realtime 持久化 Outbox/NATS wire 保持现状。只有 TCP 双格式灰度证明收益且能保留历史事件重放、版本识别和可观测性后，才单独评估内部 event wire，禁止与外部协议同批迁移，也不直接复用外部字段号。
-- P2（通话事件）：只保存必要的信令状态、审计和 QoE 汇总，不持久化或经 JetStream 转发音频包；媒体资源计入独立 TURN/SFU 容量模型。
+### P0：`OUTBOX-DB-1` 消息与 Outbox 数据库瘦身
 
-## 功能路线
+1. 用固定消息语料、连接数和随机种子做 5–10 分钟短 A/B；结合 `pg_stat_statements`、`pg_stat_wal` 和应用指标，把每消息成本拆成 message、conversation/unread、attachment bind、Outbox insert、claim、complete/retry 和 cleanup。
+2. 先按总时间、calls、rows、WAL bytes 排出 Top SQL，再一次只修改一个批处理、SQL 或索引因素。优先评估减少重复读取、合并同事务写入、有界批量 claim/complete、部分索引，以及避免无变化 UPDATE。
+3. 检查 Outbox 状态更新的 HOT 比例、fillfactor、dead tuples、autovacuum、已完成行清理和索引增长；只有数据量与查询模式证明必要时才评估分区，不能先用复杂分区掩盖高写放大。
+4. 保持 claim owner/token fencing、ACK-after-commit、数据库唯一约束幂等和单批隔离；一个重复或失败事件不得让无关行被完成、删除或进入死信。
+5. 热路径共享仅限线程安全连接池、不可变 metadata、source-generated serializer 和有界 worker；不得跨事务共享 connection 上的 command/reader、写会话或可变批次。
 
-语音消息作为带元数据的附件消息进入现有消息/Outbox 流程；实时通话只承载临时信令、在线状态和审计事件，媒体由 WebRTC/TURN/SFU 处理，不经 Postgres/JetStream 转发音频包。
+完成标准：逐消息 SQL、WAL 或 managed allocation 至少一项有可重复收益；ACK/跨 Gateway 投递、重复/漏投、JetStream backlog、死信、p95/p99、CPU 和 GC 均不回退。短测不满足正确性时立即撤销该单项优化。
 
-## 性能边界
+### P0：`OUTBOX-RECOVERY-1` 租约、崩溃与死信重放
 
-可共享连接池、source-generated serializer、有界 worker 和不可变配置；不得跨事务共享 command/reader/`DbContext`，池化对象必须有清晰归还与清零规则。
+1. 补齐 claim、续租、租约过期接管和 owner/token fencing；旧 worker 在失租后不得完成、重试或删除记录。
+2. 覆盖“消息已发布但数据库完成前崩溃”，依靠稳定 event id 和消费者幂等收敛，不自动重试完成状态不明确的非幂等操作。
+3. 死信重放必须记录原 event id、尝试次数、失败分类、操作者/原因和新 checkpoint；重放单条不能改变无关记录，成功后可从消息、事件、checkpoint 追到恢复结果。
+4. 增加积压年龄、claim 冲突、续租失败、重复投递、重放结果的低基数指标；日志不记录消息正文、附件地址或凭据。
+
+完成标准：进程在 claim 后、发布后、完成前任一点退出都可通过测试重现并安全收敛；无永久 Pending、无越权完成、无不可解释的重复或漏投。
+
+### P1：`VOICE-MSG-1` 语音附件消息闭环
+
+1. 语音作为带 codec/container、duration、sample rate、channels 和 size 元数据的附件消息进入现有上传、扫描、绑定、消息和 Outbox 流程。
+2. 发送前再次确认附件为 `Available` 且归属/绑定合法；重复命令使用 client message id 和 attachment id 幂等，扫描中、拒绝、过期和已绑定冲突返回稳定错误。
+3. PostgreSQL 与 JetStream 仅保存有界元数据、对象引用和状态事件，不保存或转发音频包；历史、同步、撤回和保留清理必须复用普通附件消息语义。
+
+完成标准：正常发送、重复发送、扫描状态变化、撤回、同步恢复、保留期清理和对象回收形成端到端聚焦测试，且不会绕过附件安全状态。
+
+### P1：`CALL-CTRL-1` 临时通话信令状态机
+
+1. 以 Server 签发的短期 call grant 为授权输入，实现 invite、ringing、accept、reject、cancel、end、timeout 和 reconnect；使用 call id + command id 幂等、单调 revision 和有界 TTL 处理重复、乱序和断线。
+2. SDP/ICE 只允许在受预算限制的临时信令路径转发，不进入 PostgreSQL、持久化 Outbox 或 JetStream 历史；审计只保存参与者、状态、时间、失败分类和必要 QoE 汇总。
+3. 明确多设备竞态、双方同时挂断、邀请过期、黑名单/权限变化和 Gateway 切换语义；结束或超时后立即清理临时路由状态。
+4. 音频媒体由 WebRTC/STUN/TURN/SFU 承载。Realtime 不转发 UDP 音频包，不实现自定义重传、拥塞控制或媒体加密层。
+
+完成标准：状态迁移表与错误语义固定，重复/乱序/超时/重连均可测试且终态唯一；控制面故障不泄漏长期会话，不让媒体回落到数据库或消息队列。
+
+## 跨仓衔接
+
+1. **Server → Realtime：** Server 提供唯一关系权威、安全策略和短期 call grant；Realtime 只消费投影/命令，不反向写 Server 业务表。
+2. **Realtime → Shared：** Realtime 固定 list/catch-up、partial/reset 和通话状态机语义后，向 Shared 提交稳定字段、错误和预算；投影表、租约、digest、JetStream subject 与数据库序号不进入外部 wire。
+3. **Shared → Gateway：** Shared 统一外部协议；Gateway 只做显式 mapper、连接鉴权、能力协商和路由，不复制 Realtime DTO 或承载媒体。
+4. **Gateway → Client：** Client 整页事务应用关系投影、用显式水位恢复；通话 UI/设备、WebRTC 协商和媒体播放属于 Client，TURN/SFU 是独立媒体面。
+
+## 本阶段非目标
+
+- 不迁移 Realtime 持久化 Outbox/NATS wire 到新的二进制格式；外部二进制评估与内部事件格式分批进行。
+- 不恢复旧关系 mutation/list/sync，不让 Redis、JetStream 或客户端缓存成为关系权威。
+- 不在 Postgres、Outbox、JetStream 或 TCP Gateway 中转音频媒体。
 
 ## 验证顺序
 
-聚焦单测/契约测试 → Release 构建 → 短时 admission/smoke；阶段长测与发布 soak 只在功能和数据模型冻结后执行。
-
-当前基线：Release build `0 warning / 0 error`；Unit `322/322`（315 + 3 个 `AttachmentSweepWorkerTests` + 4 个 `AttachmentScanWorkerTests`）、PostgreSQL/Docker Integration
-`85/85` 通过（原 70 + 新增 14 个 Rebuilder 编排场景 + 1 个 camelCase 契约回归测试）；关系读/指标/默认门禁聚焦 `14/14`，digest source/Rebuilder/reconcile `7/7`，Ops 查询 `2/2`，投影存储 `8/8`，reconcile gate 脚本 `7/7`。
+聚焦单测/契约测试 → PostgreSQL 集成测试 → Release 配置构建 → 固定快照的 5–10 分钟 admission/capacity 短 A/B。本阶段以闭环正确性和热点收益为止，不安排长时稳定性测试。

@@ -27,6 +27,20 @@ public interface IRelationshipProjectionStore
     Task<RelationshipProjectionSnapshotApplyResult> ApplySnapshotAsync(
         RelationshipProjectionStreamSnapshot snapshot,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// Reads the versioned change history strictly after <paramref name="fromVersionExclusive"/>,
+    /// ordered ascending by version and bounded by <paramref name="limit"/>. Used as the
+    /// catch-up source of truth so a client can converge from a snapshot without the legacy
+    /// relationship tables. <paramref name="fromVersionExclusive"/> must be non-negative and
+    /// <paramref name="limit"/> must be in [1, 200].
+    /// </summary>
+    Task<IReadOnlyList<RelationshipProjectionHistoryEntry>> QueryHistoryAsync(
+        long ownerUserId,
+        RelationshipProjectionListType listType,
+        long fromVersionExclusive,
+        int limit,
+        CancellationToken ct = default);
 }
 
 public sealed class RelationshipProjectionGapException : InvalidOperationException

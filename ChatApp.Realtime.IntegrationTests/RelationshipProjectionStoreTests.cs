@@ -391,6 +391,114 @@ public sealed class RelationshipProjectionStoreTests
             refreshed.Items.Select(static item => item.ResourceId));
     }
 
+    [Fact]
+    public async Task Apply_WritesVersionedHistoryAtomically_AndCatchUpReadsStrictlyAfter()
+    {
+        await using var client = CreateClient();
+        var schema = new RealtimeDatabaseSchema("realtime");
+        var store = new NpgsqlRelationshipProjectionStore(client, schema);
+        const long owner = 9_100_011;
+
+        var first = CreateDelta(
+            owner,
+            RelationshipProjectionListType.Friends,
+            1,
+            RelationshipProjectionOperation.Upsert,
+            resourceId: "friend-1");
+        var second = CreateDelta(
+            owner,
+            RelationshipProjectionListType.Friends,
+            2,
+            RelationshipProjectionOperation.Upsert,
+            resourceId: "friend-2");
+        Assert.Equal(RelationshipProjectionApplyResult.Applied, await store.ApplyAsync(first));
+        Assert.Equal(RelationshipProjectionApplyResult.Applied, await store.ApplyAsync(second));
+
+        // Catch-up from the first version returns the delta that is strictly after it.
+        var catchUp = await store.QueryHistoryAsync(
+            owner,
+            RelationshipProjectionListType.Friends,
+            fromVersionExclusive: 1,
+            limit: 10);
+        var entry = Assert.Single(catchUp);
+        Assert.Equal(2, entry.Version);
+        Assert.Equal("friend-2", entry.ResourceId);
+        Assert.Equal(RelationshipProjectionOperation.Upsert, entry.Operation);
+        Assert.Equal(second.EventId, entry.EventId);
+        Assert.Equal(second.SubjectUserId, entry.SubjectUserId);
+
+        // Catch-up from the current version is empty.
+        Assert.Empty(await store.QueryHistoryAsync(
+            owner,
+            RelationshipProjectionListType.Friends,
+            fromVersionExclusive: 2,
+            limit: 10));
+
+        // History count matches applied deltas (atomic with item/inbox/version).
+        await using var connection = new NpgsqlConnection(_fixture.PostgresConnectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT
+                 (SELECT COUNT(*) FROM {schema.RelationshipProjectionHistoryTableSql}
+                  WHERE "owner_user_id" = @owner AND "list_type" = @list_type),
+                 (SELECT "current_version" FROM {schema.RelationshipProjectionVersionsTableSql}
+                  WHERE "owner_user_id" = @owner AND "list_type" = @list_type);
+             """,
+            connection);
+        command.Parameters.AddWithValue("owner", owner);
+        command.Parameters.AddWithValue("list_type", (short)RelationshipProjectionListType.Friends);
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(2, reader.GetInt64(0));
+        Assert.Equal(2, reader.GetInt64(1));
+    }
+
+    [Fact]
+    public async Task DuplicateApply_DoesNotRepeatHistoryEntry()
+    {
+        await using var client = CreateClient();
+        var schema = new RealtimeDatabaseSchema("realtime");
+        var store = new NpgsqlRelationshipProjectionStore(client, schema);
+        const long owner = 9_100_012;
+        var delta = CreateDelta(
+            owner,
+            RelationshipProjectionListType.BlockedUsers,
+            1,
+            RelationshipProjectionOperation.Upsert);
+
+        Assert.Equal(RelationshipProjectionApplyResult.Applied, await store.ApplyAsync(delta));
+        Assert.Equal(RelationshipProjectionApplyResult.Duplicate, await store.ApplyAsync(delta));
+
+        Assert.Single(await store.QueryHistoryAsync(
+            owner,
+            RelationshipProjectionListType.BlockedUsers,
+            fromVersionExclusive: 0,
+            limit: 10));
+    }
+
+    [Fact]
+    public async Task Gap_RollsBackHistoryTogetherWithItemAndInbox()
+    {
+        await using var client = CreateClient();
+        var schema = new RealtimeDatabaseSchema("realtime");
+        var store = new NpgsqlRelationshipProjectionStore(client, schema);
+        const long owner = 9_100_013;
+        var gap = CreateDelta(
+            owner,
+            RelationshipProjectionListType.FriendRequests,
+            2,
+            RelationshipProjectionOperation.Upsert);
+
+        await Assert.ThrowsAsync<RelationshipProjectionGapException>(() => store.ApplyAsync(gap));
+
+        Assert.Empty(await store.QueryHistoryAsync(
+            owner,
+            RelationshipProjectionListType.FriendRequests,
+            fromVersionExclusive: 0,
+            limit: 10));
+    }
+
     private RealtimeDatabaseClient CreateClient() => new(
         _fixture.PostgresConnectionString,
         NullLogger<RealtimeDatabaseClient>.Instance);

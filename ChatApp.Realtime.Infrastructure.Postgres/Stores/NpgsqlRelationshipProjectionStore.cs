@@ -104,6 +104,7 @@ public sealed class NpgsqlRelationshipProjectionStore : IRelationshipProjectionS
                 .ConfigureAwait(false);
             if (updated != 1)
                 throw new InvalidOperationException("Relationship projection stream version was not advanced.");
+            await InsertHistoryAsync(connection, transaction, delta, ct).ConfigureAwait(false);
 
             await transaction.CommitAsync(ct).ConfigureAwait(false);
             _metrics?.RecordRelationshipProjectionApplied();
@@ -596,6 +597,95 @@ public sealed class NpgsqlRelationshipProjectionStore : IRelationshipProjectionS
             NpgsqlDbType.Bigint,
             DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
         await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
+    private async Task InsertHistoryAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        RelationshipProjectionDelta delta,
+        CancellationToken ct)
+    {
+        var sql = _schema.GetOrAddCommandText(
+            "relationship-projection-insert-history",
+            static schema => $"""
+                INSERT INTO {schema.RelationshipProjectionHistoryTableSql}
+                    ("owner_user_id", "list_type", "version", "event_id", "operation",
+                     "resource_id", "subject_user_id", "actor_user_id", "state",
+                     "message", "occurred_at_ms")
+                VALUES
+                    (@owner_user_id, @list_type, @version, @event_id, @operation,
+                     @resource_id, @subject_user_id, @actor_user_id, @state,
+                     @message, @occurred_at_ms);
+                """);
+        await using var command = new NpgsqlCommand(sql, connection, transaction);
+        AddStreamParameters(command, delta);
+        command.Parameters.AddWithValue("version", NpgsqlDbType.Bigint, delta.Version);
+        command.Parameters.AddWithValue("event_id", NpgsqlDbType.Varchar, delta.EventId);
+        command.Parameters.AddWithValue("operation", NpgsqlDbType.Smallint, (short)delta.Operation);
+        command.Parameters.AddWithValue("resource_id", NpgsqlDbType.Varchar, delta.ResourceId);
+        command.Parameters.AddWithValue("subject_user_id", NpgsqlDbType.Bigint, delta.SubjectUserId);
+        command.Parameters.AddWithValue("actor_user_id", NpgsqlDbType.Bigint, delta.ActorUserId);
+        command.Parameters.AddWithValue("state", NpgsqlDbType.Varchar, (object?)delta.State ?? DBNull.Value);
+        command.Parameters.AddWithValue("message", NpgsqlDbType.Varchar, (object?)delta.Message ?? DBNull.Value);
+        command.Parameters.AddWithValue("occurred_at_ms", NpgsqlDbType.Bigint, delta.OccurredAtMs);
+        await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<RelationshipProjectionHistoryEntry>> QueryHistoryAsync(
+        long ownerUserId,
+        RelationshipProjectionListType listType,
+        long fromVersionExclusive,
+        int limit,
+        CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(ownerUserId);
+        if (!Enum.IsDefined(listType))
+            throw new ArgumentOutOfRangeException(nameof(listType));
+        if (fromVersionExclusive < 0)
+            throw new ArgumentOutOfRangeException(nameof(fromVersionExclusive));
+        if (limit is < 1 or > 200)
+            throw new ArgumentOutOfRangeException(nameof(limit));
+
+        var sql = _schema.GetOrAddCommandText(
+            "relationship-projection-query-history",
+            static schema => $"""
+                SELECT "version", "event_id", "operation", "resource_id", "subject_user_id",
+                       "actor_user_id", "state", "message", "occurred_at_ms"
+                FROM {schema.RelationshipProjectionHistoryTableSql}
+                WHERE "owner_user_id" = @owner_user_id
+                  AND "list_type" = @list_type
+                  AND "version" > @from_version
+                ORDER BY "version"
+                LIMIT @limit;
+                """);
+        await using var connection = await _databaseClient
+            .GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(sql, connection);
+        command.Parameters.AddWithValue("owner_user_id", NpgsqlDbType.Bigint, ownerUserId);
+        command.Parameters.AddWithValue("list_type", NpgsqlDbType.Smallint, (short)listType);
+        command.Parameters.AddWithValue("from_version", NpgsqlDbType.Bigint, fromVersionExclusive);
+        command.Parameters.AddWithValue("limit", NpgsqlDbType.Integer, limit);
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        var entries = new List<RelationshipProjectionHistoryEntry>(limit);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            entries.Add(new RelationshipProjectionHistoryEntry
+            {
+                OwnerUserId = ownerUserId,
+                ListType = listType,
+                Version = reader.GetInt64(0),
+                EventId = reader.GetString(1),
+                Operation = (RelationshipProjectionOperation)reader.GetInt16(2),
+                ResourceId = reader.GetString(3),
+                SubjectUserId = reader.GetInt64(4),
+                ActorUserId = reader.GetInt64(5),
+                State = reader.IsDBNull(6) ? null : reader.GetString(6),
+                Message = reader.IsDBNull(7) ? null : reader.GetString(7),
+                OccurredAtMs = reader.GetInt64(8)
+            });
+        }
+
+        return entries;
     }
 
     private async Task<int> AdvanceStreamAsync(
