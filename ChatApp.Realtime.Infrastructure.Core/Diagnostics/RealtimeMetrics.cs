@@ -34,6 +34,9 @@ public sealed class RealtimeMetrics : IDisposable
     private readonly Counter<long> _outboxHintRequestedCounter;
     private readonly Counter<long> _outboxHintClaimedCounter;
     private readonly Counter<long> _outboxRecoveryScanCounter;
+    private readonly Counter<long> _outboxClaimConflictCounter;
+    private readonly Counter<long> _outboxLeaseRenewFailureCounter;
+    private readonly Counter<long> _outboxReplayResultCounter;
     private readonly Counter<long> _idempotencyConflictCounter;
     private readonly Counter<long> _messageRetentionDeletedCounter;
     private readonly Counter<long> _messageRetentionErrorCounter;
@@ -127,6 +130,12 @@ public sealed class RealtimeMetrics : IDisposable
             "realtime.outbox.hints.claimed");
         _outboxRecoveryScanCounter = _meter.CreateCounter<long>(
             "realtime.outbox.recovery.scans");
+        _outboxClaimConflictCounter = _meter.CreateCounter<long>(
+            "realtime.outbox.claim_conflicts");
+        _outboxLeaseRenewFailureCounter = _meter.CreateCounter<long>(
+            "realtime.outbox.lease_renew_failures");
+        _outboxReplayResultCounter = _meter.CreateCounter<long>(
+            "realtime.outbox.replay.result");
         _idempotencyConflictCounter = _meter.CreateCounter<long>(
             "realtime.messages.idempotency_conflicts");
         _messageRetentionDeletedCounter = _meter.CreateCounter<long>(
@@ -301,6 +310,31 @@ public sealed class RealtimeMetrics : IDisposable
 
     public void RecordOutboxRecoveryScan() =>
         _outboxRecoveryScanCounter.Add(1);
+
+    /// <summary>
+    /// OUTBOX-RECOVERY-1-4：记录一次认领冲突。<paramref name="reason"/> 低位基数取值，
+    /// 如 <c>lease_held</c>（try_claim 命中他人持有）、<c>not_ready</c>（retry 未到）等。
+    /// </summary>
+    public void RecordOutboxClaimConflict(string reason) =>
+        _outboxClaimConflictCounter.Add(
+            1,
+            new KeyValuePair<string, object?>("reason", reason));
+
+    /// <summary>OUTBOX-RECOVERY-1-4：记录一次续租失败（claim_token 失效或行已发布）。</summary>
+    /// <param name="reason">低位基数原因：<c>lease_lost</c> / <c>already_published</c> / <c>unknown</c>。</param>
+    public void RecordOutboxLeaseRenewFailure(string reason) =>
+        _outboxLeaseRenewFailureCounter.Add(
+            1,
+            new KeyValuePair<string, object?>("reason", reason));
+
+    /// <summary>
+    /// OUTBOX-RECOVERY-1-4：记录一次死信重放结果。<paramref name="result"/> 低位基数取值，
+    /// 如 <c>success</c> / <c>already_not_dead</c> / <c>not_found</c>。
+    /// </summary>
+    public void RecordOutboxReplayResult(string result) =>
+        _outboxReplayResultCounter.Add(
+            1,
+            new KeyValuePair<string, object?>("result", result));
 
     public void RecordOutboxCleanup(int deleted) =>
         _outboxCleanupCounter.Add(deleted);

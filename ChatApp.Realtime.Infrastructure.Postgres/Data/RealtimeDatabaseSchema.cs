@@ -27,6 +27,7 @@ public sealed class RealtimeDatabaseSchema
         MembershipPeriodsTableSql = $"{QuotedSchema}.\"conversation_membership_periods\"";
         AccountCleanupJobsTableSql = $"{QuotedSchema}.\"account_cleanup_jobs\"";
         OutboxTableSql = $"{QuotedSchema}.\"outbox\"";
+        OutboxReplayAuditTableSql = $"{QuotedSchema}.\"outbox_replay_audit\"";
         SchemaMigrationsTableSql = $"{QuotedSchema}.\"schema_migrations\"";
         SchemaMigrationCheckpointsTableSql = $"{QuotedSchema}.\"schema_migration_checkpoints\"";
 
@@ -63,6 +64,7 @@ public sealed class RealtimeDatabaseSchema
     public string MembershipPeriodsTableSql { get; }
     public string AccountCleanupJobsTableSql { get; }
     public string OutboxTableSql { get; }
+    public string OutboxReplayAuditTableSql { get; }
     public string SchemaMigrationsTableSql { get; }
     public string SchemaMigrationCheckpointsTableSql { get; }
 

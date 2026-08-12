@@ -79,6 +79,28 @@ public interface IRealtimeOutboxStore
         CancellationToken ct = default);
 
     /// <summary>
+    /// OUTBOX-RECOVERY-1-3：带审计的死信重放。在单个事务内将该死信重置为 Pending，
+    /// 并写入 <c>outbox_replay_audit</c> 记录原 event id、尝试次数、失败分类、操作者/原因
+    /// 与新 checkpoint。任何一步失败事务整体回滚，保证重放结果可被审计追踪。
+    /// 返回是否找到 Dead 行并完成重置。
+    /// </summary>
+    Task<bool> ReplayDeadWithAuditAsync(
+        string eventId,
+        string @operator,
+        string? reason,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// OUTBOX-RECOVERY-1-3：分页查询死信重放审计记录，按重放时间倒序。
+    /// <paramref name="eventId"/> 非空时仅返回该事件的重放记录。
+    /// </summary>
+    Task<IReadOnlyList<RealtimeOutboxReplayAudit>> ListReplayAuditsAsync(
+        string? eventId,
+        int offset,
+        int limit,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// 删除已发布且早于 cutoff 的 Outbox 行（分区友好的批量删除）。
     /// </summary>
     Task<int> CleanupPublishedAsync(
@@ -228,3 +250,16 @@ public sealed record DeadOutboxRow(
     long NextAttemptAtMs,
     string? LastError,
     string PayloadJson);
+
+/// <summary>
+/// OUTBOX-RECOVERY-1-3：一次运维死信重放审计记录。持久化在 <c>outbox_replay_audit</c>，
+/// 记录原 event id、重放前尝试次数/失败原因、操作者/原因与新 checkpoint，供事后追查。
+/// </summary>
+public sealed record RealtimeOutboxReplayAudit(
+    string EventId,
+    long ReplayedAtMs,
+    int PriorAttemptCount,
+    string? PriorLastError,
+    string Operator,
+    string? Reason,
+    long NewCheckpointMs);

@@ -2,6 +2,7 @@ using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Stores;
+using ChatApp.Realtime.Infrastructure.Core.Diagnostics;
 using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
@@ -19,13 +20,16 @@ public sealed class NpgsqlRealtimeOutboxStore :
 {
     private readonly RealtimeDatabaseClient _databaseClient;
     private readonly RealtimeDatabaseSchema _databaseSchema;
+    private readonly RealtimeMetrics? _metrics;
 
     public NpgsqlRealtimeOutboxStore(
         RealtimeDatabaseClient databaseClient,
-        RealtimeDatabaseSchema databaseSchema)
+        RealtimeDatabaseSchema databaseSchema,
+        RealtimeMetrics? metrics = null)
     {
         _databaseClient = databaseClient;
         _databaseSchema = databaseSchema;
+        _metrics = metrics;
     }
 
     public async ValueTask<IRealtimeOutboxClaimSession> OpenClaimSessionAsync(
@@ -610,6 +614,168 @@ public sealed class NpgsqlRealtimeOutboxStore :
             replayed.Add(reader.GetString(0));
 
         return replayed;
+    }
+
+    /// <summary>
+    /// OUTBOX-RECOVERY-1-3：带审计的死信重放。在单个事务内锁定并读取 Dead 行，
+    /// 重置为 Pending 并写入 <c>outbox_replay_audit</c>。未找到 Dead 行时事务回滚、
+    /// 不产生审计记录，返回 false；仅当 Dead 行被成功重置且审计写入成功才提交。
+    /// </summary>
+    public async Task<bool> ReplayDeadWithAuditAsync(
+        string eventId,
+        string @operator,
+        string? reason,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(eventId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(@operator);
+        eventId = eventId.Trim();
+        @operator = @operator.Trim();
+        if (@operator.Length > 128)
+            throw new ArgumentException("操作者标识过长（上限 128）。", nameof(@operator));
+        if (reason is { Length: > 512 })
+            reason = reason[..512];
+
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        await using var connection = await _databaseClient.GetDataSource()
+            .OpenConnectionAsync(ct).ConfigureAwait(false);
+        await using var transaction = await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
+
+        // 1) 锁定并读取 Dead 行的历史（attempt_count / last_error），确保并发重放串行化。
+        int? priorAttemptCount;
+        string? priorLastError;
+        bool found;
+        await using (var readCommand = new NpgsqlCommand(
+            $"""
+             SELECT attempt_count, last_error
+             FROM {_databaseSchema.OutboxTableSql}
+             WHERE event_id = @event_id
+               AND status = {(short)RealtimeOutboxStatus.Dead}
+             FOR UPDATE
+             """,
+            connection,
+            transaction))
+        {
+            readCommand.Parameters.AddWithValue("event_id", eventId);
+            await using var reader = await readCommand.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            found = await reader.ReadAsync(ct).ConfigureAwait(false);
+            if (found)
+            {
+                priorAttemptCount = reader.GetInt32(0);
+                priorLastError = reader.IsDBNull(1) ? null : reader.GetString(1);
+            }
+            else
+            {
+                priorAttemptCount = null;
+                priorLastError = null;
+            }
+        }
+
+        // 必须在 reader 释放后再回滚，避免 "command already in progress"。
+        if (!found)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            _metrics?.RecordOutboxReplayResult("not_found");
+            return false;
+        }
+
+        // 2) 重置为 Pending（与 ReplayDeadBatchAsync 相同的字段语义）。
+        await using (var resetCommand = new NpgsqlCommand(
+            $"""
+             UPDATE {_databaseSchema.OutboxTableSql}
+             SET status = {(short)RealtimeOutboxStatus.Pending},
+                 published_at_ms = NULL,
+                 attempt_count = 0,
+                 next_attempt_at_ms = @now,
+                 locked_by = NULL,
+                 locked_until_ms = NULL,
+                 last_error = NULL
+             WHERE event_id = @event_id
+             """,
+            connection,
+            transaction))
+        {
+            resetCommand.Parameters.AddWithValue("now", now);
+            resetCommand.Parameters.AddWithValue("event_id", eventId);
+            await resetCommand.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+
+        // 3) 写入审计记录（原 event id、尝试次数、失败分类、操作者/原因、新 checkpoint）。
+        await using (var auditCommand = new NpgsqlCommand(
+            $"""
+             INSERT INTO {_databaseSchema.OutboxReplayAuditTableSql}
+                 ("event_id", "replayed_at_ms", "prior_attempt_count",
+                  "prior_last_error", "operator", "reason", "new_checkpoint_ms")
+             VALUES (@event_id, @replayed_at, @prior_attempt_count,
+                     @prior_last_error, @operator, @reason, @new_checkpoint)
+             """,
+            connection,
+            transaction))
+        {
+            auditCommand.Parameters.AddWithValue("event_id", eventId);
+            auditCommand.Parameters.AddWithValue("replayed_at", now);
+            auditCommand.Parameters.AddWithValue("prior_attempt_count", priorAttemptCount!.Value);
+            auditCommand.Parameters.AddWithValue(
+                "prior_last_error",
+                priorLastError is null ? DBNull.Value : priorLastError);
+            auditCommand.Parameters.AddWithValue("operator", @operator);
+            auditCommand.Parameters.AddWithValue(
+                "reason",
+                reason is null ? DBNull.Value : reason);
+            auditCommand.Parameters.AddWithValue("new_checkpoint", now);
+            await auditCommand.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+
+        await transaction.CommitAsync(ct).ConfigureAwait(false);
+        _metrics?.RecordOutboxReplayResult("success");
+        return true;
+    }
+
+    /// <summary>
+    /// OUTBOX-RECOVERY-1-3：分页查询死信重放审计记录，按重放时间倒序。
+    /// </summary>
+    public async Task<IReadOnlyList<RealtimeOutboxReplayAudit>> ListReplayAuditsAsync(
+        string? eventId,
+        int offset,
+        int limit,
+        CancellationToken ct = default)
+    {
+        offset = Math.Max(0, offset);
+        limit = Math.Clamp(limit, 1, 200);
+
+        await using var connection = await _databaseClient.GetDataSource()
+            .OpenConnectionAsync(ct).ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT "event_id", "replayed_at_ms", "prior_attempt_count",
+                    "prior_last_error", "operator", "reason", "new_checkpoint_ms"
+             FROM {_databaseSchema.OutboxReplayAuditTableSql}
+             WHERE (@event_id IS NULL OR "event_id" = @event_id)
+             ORDER BY "replayed_at_ms" DESC
+             OFFSET @offset
+             LIMIT @limit;
+             """,
+            connection);
+        command.Parameters.AddWithValue("offset", offset);
+        command.Parameters.AddWithValue("limit", limit);
+        var eventIdParam = command.Parameters.Add("event_id", NpgsqlTypes.NpgsqlDbType.Text);
+        eventIdParam.Value = string.IsNullOrWhiteSpace(eventId) ? DBNull.Value : eventId.Trim();
+
+        var items = new List<RealtimeOutboxReplayAudit>(limit);
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            items.Add(new RealtimeOutboxReplayAudit(
+                reader.GetString(0),
+                reader.GetInt64(1),
+                reader.GetInt32(2),
+                reader.IsDBNull(3) ? null : reader.GetString(3),
+                reader.GetString(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                reader.GetInt64(6)));
+        }
+
+        return items;
     }
 
     public async Task<int> CleanupPublishedAsync(

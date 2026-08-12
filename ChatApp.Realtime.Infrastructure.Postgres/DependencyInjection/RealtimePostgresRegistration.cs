@@ -103,7 +103,11 @@ public static class RealtimePostgresRegistration
             services.RemoveAll<IRealtimeDeviceSyncCursorStore>();
             services.AddSingleton<IRealtimeDeviceSyncCursorStore, NpgsqlRealtimeDeviceSyncCursorStore>();
             services.RemoveAll<IRealtimeOutboxStore>();
-            services.AddSingleton<IRealtimeOutboxStore, NpgsqlRealtimeOutboxStore>();
+            // OUTBOX-RECOVERY-1-4：注入 RealtimeMetrics，由 store 记录 claim 冲突 / 重放结果。
+            services.AddSingleton<IRealtimeOutboxStore>(sp => new NpgsqlRealtimeOutboxStore(
+                sp.GetRequiredService<RealtimeDatabaseClient>(),
+                sp.GetRequiredService<RealtimeDatabaseSchema>(),
+                sp.GetService<RealtimeMetrics>()));
             services.RemoveAll<IRelationshipProjectionStore>();
             services.AddSingleton<IRelationshipProjectionStore, NpgsqlRelationshipProjectionStore>();
             services.RemoveAll<IRelationshipProjectionQueryStore>();

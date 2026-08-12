@@ -45,6 +45,11 @@ Server 关系增量已能在 JetStream ACK 前原子应用到 projection item/ve
 
 完成标准：进程在 claim 后、发布后、完成前任一点退出都可通过测试重现并安全收敛；无永久 Pending、无越权完成、无不可解释的重复或漏投。
 
+**当前进度（2026-08-13）**：
+- 需求 3：新增 `outbox_replay_audit` 审计表（Migration064，schema 属性 `OutboxReplayAuditTableSql`）。`IRealtimeOutboxStore` 增加 `ReplayDeadWithAuditAsync`（单事务内锁定 Dead 行 → 重置 Pending → 写审计，任一步失败整体回滚）与 `ListReplayAuditsAsync`（按 event_id 过滤、时间倒序分页）。Noop 返回 not-applicable，Npgsql 原子实现。审计记录原 event id、重放前尝试次数、失败分类、操作者/原因与新 checkpoint。
+- 需求 4：`RealtimeMetrics` 增加 `realtime.outbox.claim_conflicts` / `realtime.outbox.lease_renew_failures` / `realtime.outbox.replay.result` 低基数指标；store（重放结果）与 worker（续租失败）已接入，日志不含消息正文/附件/凭据。
+- 需求 2/3 测试：`OutboxRecoveryAuditTests` 6 项集成测试覆盖重放审计原子性、单条隔离、非 Dead/缺失返回 false 不写审计、崩溃后（发布后/完成后）收敛到 Published 无永久 Pending、审计过滤与时间倒序。完整集成套件 101/101 通过，单元套件 332/332 通过。
+
 ### P1：`VOICE-MSG-1` 语音附件消息闭环
 
 1. 语音作为带 codec/container、duration、sample rate、channels 和 size 元数据的附件消息进入现有上传、扫描、绑定、消息和 Outbox 流程。

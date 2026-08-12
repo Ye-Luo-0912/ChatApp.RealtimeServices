@@ -6,14 +6,14 @@ namespace ChatApp.Realtime.Tests;
 public sealed class PerformanceMigrationCatalogTests
 {
     [Fact]
-    public void DefaultCatalog_EndsWithRelationshipProjectionHistoryMigration()
+    public void DefaultCatalog_EndsWithOutboxReplayAuditMigration()
     {
         var migrations = RealtimeSchemaMigrationRunner.DefaultMigrations();
 
-        var migration = Assert.IsType<Migration063_RelationshipProjectionHistory>(migrations[^1]);
-        Assert.Equal(63, migration.Version);
+        var migration = Assert.IsType<Migration064_OutboxReplayAudit>(migrations[^1]);
+        Assert.Equal(64, migration.Version);
         Assert.True(((IRealtimeSchemaMigration)migration).RequiresTransaction);
-        Assert.IsType<Migration062_RelationshipProjectionRebuilder>(migrations[^2]);
+        Assert.IsType<Migration063_RelationshipProjectionHistory>(migrations[^2]);
         Assert.Equal(
             migrations.Count,
             migrations.Select(item => item.Version).Distinct().Count());

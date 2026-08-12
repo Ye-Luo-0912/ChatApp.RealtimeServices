@@ -625,6 +625,8 @@ public sealed class OutboxPublisherWorker : BackgroundService
         if (renewed >= state.Records.Count)
             return true;
 
+        // OUTBOX-RECOVERY-1-4：续租失败（claim_token 失效或行已发布）记录低基数指标。
+        _metrics.RecordOutboxLeaseRenewFailure("lease_lost");
         _logger.LogWarning(
             "Outbox lease 续租部分失败：{Renewed}/{Total}，本批次将停止完成状态写入。",
             renewed,

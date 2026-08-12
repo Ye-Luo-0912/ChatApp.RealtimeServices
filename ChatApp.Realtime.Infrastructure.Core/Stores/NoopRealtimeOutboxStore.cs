@@ -99,6 +99,26 @@ public sealed class NoopRealtimeOutboxStore : IRealtimeOutboxStore
         return Task.FromResult<IReadOnlyList<string>>([]);
     }
 
+    public Task<bool> ReplayDeadWithAuditAsync(
+        string eventId,
+        string @operator,
+        string? reason,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult(false);
+    }
+
+    public Task<IReadOnlyList<RealtimeOutboxReplayAudit>> ListReplayAuditsAsync(
+        string? eventId,
+        int offset,
+        int limit,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        return Task.FromResult<IReadOnlyList<RealtimeOutboxReplayAudit>>([]);
+    }
+
     public Task<int> CleanupPublishedAsync(
         long publishedBeforeMs,
         int batchSize,

@@ -102,7 +102,8 @@ public sealed class RealtimeSchemaMigrationRunner
         new Migration060_ServerRelationshipProjection(),
         new Migration061_RelationshipProjectionSnapshots(),
         new Migration062_RelationshipProjectionRebuilder(),
-        new Migration063_RelationshipProjectionHistory()
+        new Migration063_RelationshipProjectionHistory(),
+        new Migration064_OutboxReplayAudit()
     ];
 
     public async Task MigrateAsync(
