@@ -225,6 +225,22 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     }
 
     /// <summary>
+    /// 调整 outbox 表的 fillfactor，用于 A/B 验证 HOT 命中率与排水 WAL 的关系。
+    /// <para>
+    /// fillfactor 只影响改变之后新插入行所在的页；已存在的行/页不受影响。
+    /// 因此 A/B 须按「先 ALTER → 再插入 → 再排水」的顺序各跑一个配置。
+    /// </para>
+    /// </summary>
+    public async Task SetOutboxFillfactorAsync(int fillfactor, CancellationToken ct = default)
+    {
+        await using var connection = await Client.GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
+        await using var cmd = new NpgsqlCommand(
+            $"ALTER TABLE {Schema.OutboxTableSql} SET (fillfactor = {fillfactor});",
+            connection);
+        await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// 用固定语料 + 固定随机种子驱动真实 <see cref="NpgsqlRealtimeMessageStore.SaveAsync"/>
     /// 热路径 <paramref name="count"/> 条消息。每条消息使用独立会话/客户端编号，避免幂等命中。
     /// </summary>

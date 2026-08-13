@@ -105,7 +105,8 @@ public sealed class RealtimeSchemaMigrationRunner
         new Migration063_RelationshipProjectionHistory(),
         new Migration064_OutboxReplayAudit(),
         new Migration065_VoiceAttachmentMetadata(),
-        new Migration066_RemoveLegacyUserHistoryIndexes()
+        new Migration066_RemoveLegacyUserHistoryIndexes(),
+        new Migration067_OutboxHotDrainFillfactor()
     ];
 
     public async Task MigrateAsync(
