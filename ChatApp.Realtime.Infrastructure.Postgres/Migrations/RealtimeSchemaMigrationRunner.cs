@@ -104,7 +104,8 @@ public sealed class RealtimeSchemaMigrationRunner
         new Migration062_RelationshipProjectionRebuilder(),
         new Migration063_RelationshipProjectionHistory(),
         new Migration064_OutboxReplayAudit(),
-        new Migration065_VoiceAttachmentMetadata()
+        new Migration065_VoiceAttachmentMetadata(),
+        new Migration066_RemoveLegacyUserHistoryIndexes()
     ];
 
     public async Task MigrateAsync(
