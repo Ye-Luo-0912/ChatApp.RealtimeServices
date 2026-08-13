@@ -1,5 +1,6 @@
 using System.Text;
 using ChatApp.Realtime.IntegrationTests.Measurement;
+using Npgsql;
 
 namespace ChatApp.Realtime.IntegrationTests;
 
@@ -154,6 +155,308 @@ public sealed class OutboxDbMeasurementTests
     }
 
     /// <summary>
+    /// OUTBOX-DB-1 需求 2：A/B 对比两种完成模式的完整排水生命周期 WAL。
+    /// <para>
+    /// 生产默认 <c>PublishedRetentionHours = 0</c> 走 delete-on-complete
+    /// （<see cref="IRealtimeOutboxCompactionStore.DeleteClaimedPublishedBatchAsync"/>），
+    /// 且 <c>OutboxCleanupWorker</c> 不运行；保留模式（&gt;0）走
+    /// <see cref="IRealtimeOutboxStore.MarkPublishedBatchAsync"/> + 后续 cleanup。
+    /// A（保留）：claim + MarkPublished + cleanup（完整生命周期，结束为空表）；
+    /// B（即删）：claim + DeleteClaimedPublished（完整生命周期，结束为空表）。
+    /// 以 pg_stat_statements 语句级 wal_bytes 归因，A/B 同容器顺序运行、仅完成模式不同。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task OutboxDrain_CompleteModeAb_ReportsWalDiff()
+    {
+        await using var harness = new PostgresPerfHarness();
+        await harness.InitializeAsync();
+
+        // 预热并排空（delete-on-complete），避免残留 pending 干扰后续窗口归因。
+        await harness.RunSaveWorkloadAsync(200, Seed);
+        await harness.RunOutboxDrainDeleteAsync(batches: 4, batchSize: 50);
+
+        // A：保留模式完整生命周期（claim + MarkPublished + cleanup）。
+        await harness.RunSaveWorkloadAsync(MessageCount, Seed + 50);
+        var aBefore = await harness.SnapshotAsync();
+        var aCompleted = await harness.RunOutboxDrainAsync(MessageCount / 50, batchSize: 50);
+        var aMid = await harness.SnapshotAsync();
+        var aCleaned = await harness.RunOutboxCleanupAsync();
+        var aAfter = await harness.SnapshotAsync();
+        var aDrain = PostgresPerfDiffCalculator.Diff(aBefore, aMid);
+        var aCleanup = PostgresPerfDiffCalculator.Diff(aMid, aAfter);
+        var aTotal = PostgresPerfDiffCalculator.Diff(aBefore, aAfter);
+
+        // B：delete-on-complete 模式完整生命周期（claim + DeleteClaimedPublished）。
+        await harness.RunSaveWorkloadAsync(MessageCount, Seed + 60);
+        var bBefore = await harness.SnapshotAsync();
+        var bCompleted = await harness.RunOutboxDrainDeleteAsync(MessageCount / 50, batchSize: 50);
+        var bAfter = await harness.SnapshotAsync();
+        var bDrain = PostgresPerfDiffCalculator.Diff(bBefore, bAfter);
+
+        Assert.True(aCompleted > 0, "A 配置应完成至少一批排水。");
+        Assert.True(bCompleted > 0, "B 配置应完成至少一批排水。");
+        Assert.True(aCleaned > 0, "A 配置 cleanup 应清除已发布行。");
+
+        await WriteCompleteModeAbReportAsync(
+            aDrain, aCleanup, bDrain,
+            (int)aCompleted, (int)aCleaned, (int)bCompleted);
+    }
+
+    /// <summary>
+    /// OUTBOX-DB-1 需求 2：claim 路径 WAL 分解诊断。
+    /// <para>
+    /// 在 delete-on-complete（生产默认）模式下，claim 语句是排水路径的主要 WAL 项
+    /// （基线约 850–870 WAL 字节/消息、5+ WAL 记录/消息——远超单条 HOT 更新应有的 1 条记录）。
+    /// 本测试用 CHECKPOINT 隔离 FPI（full page image）混杂因素：窗口 A「先 CHECKPOINT 再排水」
+    /// 近似生产稳态（页已落盘、无需整页镜像），窗口 B 直接排水（容器冷页，可能触发 FPI），
+    /// 并配合表级 HOT 命中率（hot_updates/updates）定位 claim 是 HOT 还是 non-HOT。
+    /// 报告写入 <c>docs/measurements/outbox-db-claim-wal-breakdown.md</c>。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task OutboxClaim_WalBreakdown_ReportsFpiAndHot()
+    {
+        await using var harness = new PostgresPerfHarness();
+        await harness.InitializeAsync();
+
+        // 预热并排空（delete-on-complete），避免残留 pending 干扰后续窗口归因。
+        await harness.RunSaveWorkloadAsync(200, Seed);
+        await harness.RunOutboxDrainDeleteAsync(batches: 4, batchSize: 50);
+
+        // A：先 CHECKPOINT 再排水（稳态页，无 FPI 混杂）。
+        await harness.RunSaveWorkloadAsync(MessageCount, Seed + 70);
+        await harness.RunCheckpointAsync();
+        var aBefore = await harness.SnapshotAsync();
+        var aCompleted = await harness.RunOutboxDrainDeleteAsync(MessageCount / 50, batchSize: 50);
+        var aAfter = await harness.SnapshotAsync();
+        var aDiff = PostgresPerfDiffCalculator.Diff(aBefore, aAfter);
+
+        // B：不 CHECKPOINT 直接排水（容器冷页，排水可能触发 FPI）。
+        await harness.RunSaveWorkloadAsync(MessageCount, Seed + 80);
+        var bBefore = await harness.SnapshotAsync();
+        var bCompleted = await harness.RunOutboxDrainDeleteAsync(MessageCount / 50, batchSize: 50);
+        var bAfter = await harness.SnapshotAsync();
+        var bDiff = PostgresPerfDiffCalculator.Diff(bBefore, bAfter);
+
+        Assert.True(aCompleted > 0, "A 配置应完成至少一批排水。");
+        Assert.True(bCompleted > 0, "B 配置应完成至少一批排水。");
+
+        await WriteClaimBreakdownReportAsync(
+            aDiff, (int)aCompleted,
+            bDiff, (int)bCompleted);
+    }
+
+    /// <summary>
+    /// OUTBOX-DB-1 需求 2：A/B 验证 delete-on-complete（生产默认）模式下更低 fillfactor
+    /// 对 claim HOT 命中率与排水 WAL 的影响。
+    /// <para>
+    /// claim 只更新非索引列（locked_by/claim_token/locked_until_ms/attempt_count），理论上可 HOT，
+    /// 但 HOT 要求新版本落在旧版本同页、页内需同时容纳旧+新版本。按页填充率模型
+    /// HOT 命中率 ≈ (100 - fillfactor) / fillfactor：fillfactor=75 时约 33%（实测 30–40%），
+    /// 其余行 non-HOT 需维护全部索引并产生 5+ WAL 记录/消息；fillfactor=50 时模型预测
+    /// 单次 claim（delete-on-complete 每行只 claim 一次）可逼近 100% HOT。
+    /// 本测试用 A/B（75 vs 50）实测 claim/complete 语句级 WAL 与 outbox 表 HOT 命中率，
+    /// 报告写入 <c>docs/measurements/outbox-db-fillfactor-hot-ab.md</c>。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task OutboxDrain_FillfactorHotAb_ReportsWalAndHot()
+    {
+        await using var harness = new PostgresPerfHarness();
+        await harness.InitializeAsync();
+
+        // 预热并排空（delete-on-complete），避免残留 pending 干扰后续窗口归因。
+        await harness.RunSaveWorkloadAsync(200, Seed);
+        await harness.RunOutboxDrainDeleteAsync(batches: 4, batchSize: 50);
+
+        // A：fillfactor=75（Migration067 当前默认）。
+        await harness.SetOutboxFillfactorAsync(75);
+        await harness.TruncateOutboxAsync();
+        await harness.RunSaveWorkloadAsync(MessageCount, Seed + 110);
+        await harness.RunCheckpointAsync();
+        var aBefore = await harness.SnapshotAsync();
+        var aCompleted = await harness.RunOutboxDrainDeleteAsync(MessageCount / 50, batchSize: 50);
+        var aAfter = await harness.SnapshotAsync();
+        var aDiff = PostgresPerfDiffCalculator.Diff(aBefore, aAfter);
+
+        // B：fillfactor=50，为单次 claim 的整页 HOT 版本链预留 50% 页内空间。
+        await harness.SetOutboxFillfactorAsync(50);
+        await harness.TruncateOutboxAsync();
+        await harness.RunSaveWorkloadAsync(MessageCount, Seed + 120);
+        await harness.RunCheckpointAsync();
+        var bBefore = await harness.SnapshotAsync();
+        var bCompleted = await harness.RunOutboxDrainDeleteAsync(MessageCount / 50, batchSize: 50);
+        var bAfter = await harness.SnapshotAsync();
+        var bDiff = PostgresPerfDiffCalculator.Diff(bBefore, bAfter);
+
+        Assert.True(aCompleted > 0, "A 配置应完成至少一批排水。");
+        Assert.True(bCompleted > 0, "B 配置应完成至少一批排水。");
+
+        await WriteFillfactorHotAbReportAsync(
+            aDiff, (int)aCompleted, 75,
+            bDiff, (int)bCompleted, 50);
+    }
+
+    /// <summary>
+    /// OUTBOX-DB-1 需求 2：回归验证 Migration069 将 outbox 表 fillfactor 落到 50。
+    /// <para>
+    /// 全新容器经 <see cref="Measurement.PostgresPerfHarness.InitializeAsync"/> 完整跑一遍默认迁移目录，
+    /// 应看到 outbox 表 <c>reloptions</c> 含 <c>fillfactor=50</c>（A/B 实测排水 WAL 降 57% 的最终落点），
+    /// 且未再次回退为 Migration067 的 75。这是「迁移产物可复现」的守卫，防止后续迁移误改。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task MigrationCatalog_OutboxFillfactorEndsAt50()
+    {
+        await using var harness = new PostgresPerfHarness();
+        await harness.InitializeAsync();
+
+        await using var connection = await harness.Client.GetDataSource().OpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            """
+            SELECT COALESCE(c.reloptions, ARRAY[]::text[])
+            FROM pg_class AS c
+            INNER JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE n.nspname = @schema_name
+              AND c.relname = 'outbox';
+            """,
+            connection);
+        cmd.Parameters.AddWithValue("schema_name", harness.Schema.Schema);
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync(), "默认迁移后 outbox 表应存在。");
+        var relOptions = reader.GetFieldValue<string[]>(0);
+        Assert.Contains("fillfactor=50", relOptions);
+        Assert.DoesNotContain(relOptions, o => o.StartsWith("fillfactor=") && o != "fillfactor=50");
+    }
+
+    /// <summary>
+    /// 归因 claim 语句（CTE candidates + UPDATE）的窗口增量明细。
+    /// </summary>
+    private static PgStatementDiff? ClaimStatement(PostgresPerfDiff diff) =>
+        diff.Statements.FirstOrDefault(s =>
+            s.Query.Contains("candidates AS MATERIALIZED", StringComparison.OrdinalIgnoreCase)
+            && s.Query.Contains("UPDATE", StringComparison.OrdinalIgnoreCase));
+
+    private static async Task WriteClaimBreakdownReportAsync(
+        PostgresPerfDiff aDiff,
+        int aCompleted,
+        PostgresPerfDiff bDiff,
+        int bCompleted)
+    {
+        var reportDir = ResolveDocsMeasurementsDir();
+        Directory.CreateDirectory(reportDir);
+        var reportPath = Path.Combine(reportDir, "outbox-db-claim-wal-breakdown.md");
+
+        var aClaim = ClaimStatement(aDiff);
+        var bClaim = ClaimStatement(bDiff);
+
+        var sb = new StringBuilder();
+        sb.AppendLine("# OUTBOX-DB-1 claim 路径 WAL 分解（FPI 隔离 + HOT 命中率）");
+        sb.AppendLine();
+        sb.AppendLine($"> 生成时间：{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC；语料固定、随机种子 {Seed}；" +
+                       $"每配置 inbound {MessageCount} 条消息、delete-on-complete 排水 {MessageCount} 条。");
+        sb.AppendLine();
+        sb.AppendLine("| 配置 | claim WAL/消息 | claim WAL 记录/消息 | claim FPI/消息 | claim FPI 字节估算/消息 |");
+        sb.AppendLine("|---|---|---|---|---|");
+        if (aClaim is not null && aClaim.Rows > 0)
+        {
+            sb.AppendLine($"| A：先 CHECKPOINT 再排水（稳态页） | {aClaim.WalBytes / aClaim.Rows:N0} | {aClaim.WalRecords / (double)aClaim.Rows:N1} | {aClaim.WalFpi / (double)aClaim.Rows:N2} | {aClaim.WalFpi * 8192L / aClaim.Rows:N0} |");
+        }
+
+        if (bClaim is not null && bClaim.Rows > 0)
+        {
+            sb.AppendLine($"| B：直接排水（容器冷页） | {bClaim.WalBytes / bClaim.Rows:N0} | {bClaim.WalRecords / (double)bClaim.Rows:N1} | {bClaim.WalFpi / (double)bClaim.Rows:N2} | {bClaim.WalFpi * 8192L / bClaim.Rows:N0} |");
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("> 以 pg_stat_statements 语句级 wal_bytes/wal_records/wal_fpi 归因，A/B 同容器顺序运行、语料同种子前缀不同；");
+        sb.AppendLine("> FPI 字节估算按 8KB/页 折算；A 在排水前强制 CHECKPOINT，使排水窗口内页已落盘、近似生产稳态（无 FPI）；");
+        sb.AppendLine("> B 不 CHECKPOINT，直接排水（冷页首次修改可能触发整页镜像）。");
+        sb.AppendLine();
+
+        sb.Append(PostgresPerfReporter.Render(aDiff, aCompleted, "A：先 CHECKPOINT 再排水（稳态页）"));
+        sb.AppendLine();
+        sb.Append(PostgresPerfReporter.Render(bDiff, bCompleted, "B：直接排水（容器冷页）"));
+
+        await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
+    }
+
+    /// <summary>
+    /// 归因 complete/删除语句（DELETE ... UNNEST）的窗口增量明细。
+    /// </summary>
+    private static PgStatementDiff? DeleteStatement(PostgresPerfDiff diff) =>
+        diff.Statements.FirstOrDefault(s =>
+            s.Query.Contains("DELETE", StringComparison.OrdinalIgnoreCase)
+            && s.Query.Contains("UNNEST", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>outbox 表的窗口内 HOT 命中率（hot_updates / updates，百分比）。</summary>
+    private static double? OutboxHotRate(PostgresPerfDiff diff)
+    {
+        var outbox = diff.Tables.FirstOrDefault(t => t.TableName == "outbox");
+        if (outbox is null || outbox.Updates <= 0)
+        {
+            return null;
+        }
+
+        return outbox.HotUpdates * 100.0 / outbox.Updates;
+    }
+
+    private static async Task WriteFillfactorHotAbReportAsync(
+        PostgresPerfDiff aDiff,
+        int aCompleted,
+        int aFillfactor,
+        PostgresPerfDiff bDiff,
+        int bCompleted,
+        int bFillfactor)
+    {
+        var reportDir = ResolveDocsMeasurementsDir();
+        Directory.CreateDirectory(reportDir);
+        var reportPath = Path.Combine(reportDir, "outbox-db-fillfactor-hot-ab.md");
+
+        var aClaim = ClaimStatement(aDiff);
+        var bClaim = ClaimStatement(bDiff);
+        var aDelete = DeleteStatement(aDiff);
+        var bDelete = DeleteStatement(bDiff);
+        var aHot = OutboxHotRate(aDiff);
+        var bHot = OutboxHotRate(bDiff);
+
+        var sb = new StringBuilder();
+        sb.AppendLine("# OUTBOX-DB-1 fillfactor A/B（delete-on-complete 排水，HOT 命中率）");
+        sb.AppendLine();
+        sb.AppendLine($"> 生成时间：{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC；语料固定、随机种子 {Seed}；" +
+                       $"每配置 inbound {MessageCount} 条消息、delete-on-complete 排水 {MessageCount} 条；" +
+                       "两窗口前均 TRUNCATE outbox 从空表起始。");
+        sb.AppendLine();
+        sb.AppendLine("| 配置 | claim WAL/消息 | claim WAL 记录/消息 | complete(删除) WAL/消息 | 排水合计 WAL/消息 | outbox HOT 命中率 |");
+        sb.AppendLine("|---|---|---|---|---|---|");
+        if (aClaim is not null && aClaim.Rows > 0)
+        {
+            var aDeleteWal = aDelete is not null && aDelete.Rows > 0 ? aDelete.WalBytes / aDelete.Rows : 0;
+            sb.AppendLine($"| fillfactor={aFillfactor}（A） | {aClaim.WalBytes / aClaim.Rows:N0} | {aClaim.WalRecords / (double)aClaim.Rows:N1} | {aDeleteWal:N0} | {aClaim.WalBytes / aClaim.Rows + aDeleteWal:N0} | {(aHot is null ? "—" : aHot.Value.ToString("N0") + "%")} |");
+        }
+
+        if (bClaim is not null && bClaim.Rows > 0)
+        {
+            var bDeleteWal = bDelete is not null && bDelete.Rows > 0 ? bDelete.WalBytes / bDelete.Rows : 0;
+            sb.AppendLine($"| fillfactor={bFillfactor}（B） | {bClaim.WalBytes / bClaim.Rows:N0} | {bClaim.WalRecords / (double)bClaim.Rows:N1} | {bDeleteWal:N0} | {bClaim.WalBytes / bClaim.Rows + bDeleteWal:N0} | {(bHot is null ? "—" : bHot.Value.ToString("N0") + "%")} |");
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("> 以 pg_stat_statements 语句级 wal_bytes/wal_records 归因，A/B 同容器顺序运行、仅 fillfactor 不同；");
+        sb.AppendLine("> HOT 命中率 = hot_updates / updates（排水窗口内 outbox 表），按页填充率模型 HOT ≈ (100 − fillfactor) / fillfactor；");
+        sb.AppendLine("> fillfactor 只影响改变之后新插入行所在的页，先 ALTER 再 TRUNCATE 再插入，保证 A/B 各窗口页布局符合其 fillfactor。");
+        sb.AppendLine();
+
+        sb.Append(PostgresPerfReporter.Render(aDiff, aCompleted, $"A：fillfactor={aFillfactor}（delete-on-complete 排水）"));
+        sb.AppendLine();
+        sb.Append(PostgresPerfReporter.Render(bDiff, bCompleted, $"B：fillfactor={bFillfactor}（delete-on-complete 排水）"));
+
+        await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
+    }
+
+    /// <summary>
     /// 归因 <c>INSERT ... "messages"</c> 语句的窗口增量，按 rows 折算每消息 WAL。
     /// <paramref name="useRecords"/> 为 true 时返回 wal_records，否则返回 wal_bytes。
     /// </summary>
@@ -175,11 +478,21 @@ public sealed class OutboxDbMeasurementTests
     private static long PerMessageWalBytes(PostgresPerfDiff diff, bool isClaim)
     {
         // pg_stat_statements 将参数占位化为 $1/$2，因此按稳定的 SQL 文本而非参数名匹配。
-        var matches = diff.Statements.Where(s => isClaim
-            ? s.Query.Contains("candidates AS MATERIALIZED", StringComparison.OrdinalIgnoreCase)
-              && s.Query.Contains("UPDATE", StringComparison.OrdinalIgnoreCase)
-            : s.Query.Contains("published_at_ms", StringComparison.OrdinalIgnoreCase)
-              && s.Query.Contains("UNNEST", StringComparison.OrdinalIgnoreCase));
+        return PerMessageWalBytes(diff, query => isClaim
+            ? query.Contains("candidates AS MATERIALIZED", StringComparison.OrdinalIgnoreCase)
+              && query.Contains("UPDATE", StringComparison.OrdinalIgnoreCase)
+            : query.Contains("published_at_ms", StringComparison.OrdinalIgnoreCase)
+              && query.Contains("UNNEST", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// 按 SQL 文本谓词归因窗口内匹配语句的 WAL 字节，并按 rows 折算每消息。
+    /// </summary>
+    private static long PerMessageWalBytes(PostgresPerfDiff diff, Func<string, bool> match)
+    {
+        var matches = diff.Statements
+            .Where(s => match(s.Query))
+            .ToList();
         var rows = matches.Sum(s => s.Rows);
         return rows > 0 ? matches.Sum(s => s.WalBytes) / rows : 0;
     }
@@ -208,6 +521,57 @@ public sealed class OutboxDbMeasurementTests
         sb.AppendLine($"| fillfactor=75（B） | {bClaim:N0} | {bComplete:N0} | {bClaim + bComplete:N0} |");
         sb.AppendLine();
         sb.AppendLine("> 以 pg_stat_statements 语句级 wal_bytes / rows 归因，A/B 同容器顺序运行，仅 fillfactor 不同。");
+
+        await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
+    }
+
+    private static async Task WriteCompleteModeAbReportAsync(
+        PostgresPerfDiff aDrain,
+        PostgresPerfDiff aCleanup,
+        PostgresPerfDiff bDrain,
+        int aCompleted,
+        int aCleaned,
+        int bCompleted)
+    {
+        // claim / complete / cleanup / delete 按稳定 SQL 文本归因（pg_stat_statements 参数占位化）。
+        var aClaim = PerMessageWalBytes(aDrain, isClaim: true);
+        var aComplete = PerMessageWalBytes(
+            aDrain,
+            q => q.Contains("published_at_ms", StringComparison.OrdinalIgnoreCase)
+                 && q.Contains("UNNEST", StringComparison.OrdinalIgnoreCase));
+        var aCleanupWal = PerMessageWalBytes(
+            aCleanup,
+            q => q.Contains("ctid IN", StringComparison.OrdinalIgnoreCase));
+        var bClaim = PerMessageWalBytes(bDrain, isClaim: true);
+        var bDelete = PerMessageWalBytes(
+            bDrain,
+            q => q.Contains("DELETE", StringComparison.OrdinalIgnoreCase)
+                 && q.Contains("UNNEST", StringComparison.OrdinalIgnoreCase));
+
+        var reportDir = ResolveDocsMeasurementsDir();
+        Directory.CreateDirectory(reportDir);
+        var reportPath = Path.Combine(reportDir, "outbox-db-complete-mode-ab.md");
+
+        var sb = new StringBuilder();
+        sb.AppendLine("# OUTBOX-DB-1 完成模式 A/B（排水完整生命周期 WAL）");
+        sb.AppendLine();
+        sb.AppendLine($"> 生成时间：{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC；语料固定、随机种子 {Seed}；" +
+                       $"每配置 inbound {MessageCount} 条消息、排水 {MessageCount} 条。");
+        sb.AppendLine();
+        sb.AppendLine("| 配置 | claim WAL/消息 | complete WAL/消息 | 后续 cleanup WAL/消息 | 排水生命周期合计 WAL/消息 |");
+        sb.AppendLine("|---|---|---|---|---|");
+        sb.AppendLine($"| 保留（A：claim+MarkPublished+cleanup） | {aClaim:N0} | {aComplete:N0} | {aCleanupWal:N0} | {aClaim + aComplete + aCleanupWal:N0} |");
+        sb.AppendLine($"| 即删（B：claim+DeleteClaimed，生产默认） | {bClaim:N0} | {bDelete:N0} | — | {bClaim + bDelete:N0} |");
+        sb.AppendLine();
+        sb.AppendLine("> 以 pg_stat_statements 语句级 wal_bytes / rows 归因，A/B 同容器顺序运行、仅完成模式不同；");
+        sb.AppendLine("> A 为保留模式完整生命周期（claim + MarkPublished + 全量 cleanup，清理清空 Published 行）；");
+        sb.AppendLine("> B 为生产默认 delete-on-complete（claim + DeleteClaimedPublished），无中间 Published 态、无 cleanup。");
+        sb.AppendLine();
+        sb.Append(PostgresPerfReporter.Render(aDrain, aCompleted, "A：保留模式（claim + MarkPublished）"));
+        sb.AppendLine();
+        sb.Append(PostgresPerfReporter.Render(aCleanup, aCleaned, "A：后续 cleanup（删除 Published 行）"));
+        sb.AppendLine();
+        sb.Append(PostgresPerfReporter.Render(bDrain, bCompleted, "B：delete-on-complete（claim + DeleteClaimedPublished）"));
 
         await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
     }

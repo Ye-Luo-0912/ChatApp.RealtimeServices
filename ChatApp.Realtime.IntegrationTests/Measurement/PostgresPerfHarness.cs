@@ -187,6 +187,16 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     public async Task<IReadOnlyList<PgTableStat>> SnapshotTablesAsync(CancellationToken ct = default)
     {
         await using var connection = await Client.GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
+        // pg_stat_* 统计收集器异步滞后，短窗口下表级增量可能为 0；先强制冲刷待处理统计并
+        // 短暂等待 stats collector 落库，使 pg_stat_user_tables 反映到当前时刻，A/B 窗口的
+        // updates/hot_updates/deletes 才可归因。
+        await using (var flush = new NpgsqlCommand(
+                         "SELECT pg_stat_force_next_flush(), pg_sleep(0.2);",
+                         connection))
+        {
+            await flush.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+
         await using var cmd = new NpgsqlCommand(
             """
             SELECT relname, COALESCE(n_tup_ins, 0), COALESCE(n_tup_upd, 0), COALESCE(n_tup_del, 0),
@@ -241,6 +251,21 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     }
 
     /// <summary>
+    /// 强制一次 CHECKPOINT，把已被修改过的脏页全部落盘并记入已写 WAL 段。
+    /// <para>
+    /// 用于隔离 FPI（full page image）混杂因素：CHECKPOINT 之后对同一页的再次修改
+    /// 不再需要整页镜像，因此「先 CHECKPOINT 再排水」窗口测得的 claim/complete WAL
+    /// 近似生产稳态（页早已落盘、无需 FPI），与「冷页」窗口对照即可归因 FPI 占比。
+    /// </para>
+    /// </summary>
+    public async Task RunCheckpointAsync(CancellationToken ct = default)
+    {
+        await using var connection = await Client.GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
+        await using var cmd = new NpgsqlCommand("CHECKPOINT;", connection);
+        await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// 清空 messages 表，用于 A/B 两窗口从相同的空表起始（相同页分配模式），隔离
     /// 「表随窗口增长导致页分配/页分裂差异」这一混杂因素。TRUNCATE 同时清掉全部行与
     /// 全部索引项；单测试容器内无并发访问，安全。
@@ -254,6 +279,25 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
         await using var connection = await Client.GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
         await using var cmd = new NpgsqlCommand(
             $"TRUNCATE TABLE {Schema.MessagesTableSql} CASCADE;",
+            connection);
+        await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 清空 outbox 表，用于 A/B 两窗口从相同的空表起始（相同页分配模式），隔离
+    /// 「上一窗口排水残留的死元组/页分配模式影响下一窗口」这一混杂因素。
+    /// outbox 无外键引用（outbox_replay_audit 为独立审计表），TRUNCATE 安全；
+    /// CASCADE 用于防御未来新增引用。
+    /// <para>
+    /// 必须先设置 fillfactor 再 TRUNCATE：TRUNCATE 清空全部页，此后新插入的行
+    /// 才会按最新 fillfactor 分配页。
+    /// </para>
+    /// </summary>
+    public async Task TruncateOutboxAsync(CancellationToken ct = default)
+    {
+        await using var connection = await Client.GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
+        await using var cmd = new NpgsqlCommand(
+            $"TRUNCATE TABLE {Schema.OutboxTableSql} CASCADE;",
             connection);
         await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
@@ -374,6 +418,10 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     /// <summary>
     /// 驱动 Outbox 认领 + 批量完成的排水热路径 <paramref name="batches"/> 批、每批
     /// <paramref name="batchSize"/> 条。用于测量 claim / complete 的 SQL 与 WAL 成本。
+    /// <para>
+    /// 该路径对应 <c>PublishedRetentionHours &gt; 0</c> 的保留模式：claim 后把行置为
+    /// Published，由 <c>OutboxCleanupWorker</c> 在稍后统一清理。
+    /// </para>
     /// </summary>
     public async Task<long> RunOutboxDrainAsync(
         int batches,
@@ -394,6 +442,58 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
         }
 
         return completed;
+    }
+
+    /// <summary>
+    /// 驱动 Outbox 认领 + 立即删除的排水热路径（delete-on-complete），<paramref name="batches"/> 批、
+    /// 每批 <paramref name="batchSize"/> 条。对应生产默认 <c>PublishedRetentionHours = 0</c> 的
+    /// 完成模式：claim 后直接删除行，不保留 Published 状态、不触发 cleanup worker。
+    /// 与 <see cref="RunOutboxDrainAsync"/>（保留模式）对照归因两种完成模式的 WAL 成本。
+    /// </summary>
+    public async Task<long> RunOutboxDrainDeleteAsync(
+        int batches,
+        int batchSize,
+        CancellationToken ct = default)
+    {
+        long completed = 0;
+        for (var b = 0; b < batches; b++)
+        {
+            var claimed = await OutboxStore.ClaimBatchAsync("perf-worker", batchSize, TimeSpan.FromSeconds(30), ct)
+                .ConfigureAwait(false);
+            if (claimed.Count == 0)
+            {
+                break;
+            }
+
+            completed += await OutboxStore.DeleteClaimedPublishedBatchAsync(claimed, ct).ConfigureAwait(false);
+        }
+
+        return completed;
+    }
+
+    /// <summary>
+    /// 清除所有已发布（Published）行，模拟 <c>OutboxCleanupWorker</c> 的一次全量清理。
+    /// 用于保留模式完整排水生命周期测量（claim + MarkPublished + 后续 cleanup）。
+    /// 以未来时间戳为 cutoff 循环删除直到清空，返回累计删除行数。
+    /// </summary>
+    public async Task<long> RunOutboxCleanupAsync(int batchSize = 10_000, CancellationToken ct = default)
+    {
+        long cleaned = 0;
+        var cutoff = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + 1;
+        while (true)
+        {
+            var affected = await OutboxStore
+                .CleanupPublishedAsync(cutoff, batchSize, ct)
+                .ConfigureAwait(false);
+            if (affected == 0)
+            {
+                break;
+            }
+
+            cleaned += affected;
+        }
+
+        return cleaned;
     }
 
     public async ValueTask DisposeAsync()

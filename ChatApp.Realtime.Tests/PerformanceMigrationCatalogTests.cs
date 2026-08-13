@@ -6,14 +6,14 @@ namespace ChatApp.Realtime.Tests;
 public sealed class PerformanceMigrationCatalogTests
 {
     [Fact]
-    public void DefaultCatalog_EndsWithRemoveUnusedReplyForwardIndexesMigration()
+    public void DefaultCatalog_EndsWithOutboxHotDrainFillfactor50Migration()
     {
         var migrations = RealtimeSchemaMigrationRunner.DefaultMigrations();
 
-        var migration = Assert.IsType<Migration068_RemoveUnusedReplyForwardIndexes>(migrations[^1]);
-        Assert.Equal(68, migration.Version);
-        Assert.False(((IRealtimeSchemaMigration)migration).RequiresTransaction);
-        Assert.IsType<Migration067_OutboxHotDrainFillfactor>(migrations[^2]);
+        var migration = Assert.IsType<Migration069_OutboxHotDrainFillfactor50>(migrations[^1]);
+        Assert.Equal(69, migration.Version);
+        Assert.IsType<Migration068_RemoveUnusedReplyForwardIndexes>(migrations[^2]);
+        Assert.False(((IRealtimeSchemaMigration)migrations[^2]).RequiresTransaction);
         Assert.Equal(
             migrations.Count,
             migrations.Select(item => item.Version).Distinct().Count());
