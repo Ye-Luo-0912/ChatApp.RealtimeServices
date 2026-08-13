@@ -98,6 +98,80 @@ public sealed class OutboxDbMeasurementTests
             bClaim, bComplete, (int)bCompleted);
     }
 
+    /// <summary>
+    /// OUTBOX-DB-1 需求 2：A/B 验证剔除 <c>ix_messages_reply_to</c> / <c>ix_messages_forwarded_from</c>
+    /// 两个部分索引对 messages 插入写放大的影响。
+    /// <para>
+    /// 两个部分索引（WHERE reply_to_message_id / forwarded_from_message_id IS NOT NULL）由
+    /// Migration013/015 随字段创建，但代码库无任何读取路径按这两列过滤/排序/连接，仅贡献
+    /// 插入（与撤回置 NULL）的索引写放大。A/B 使用带回复/转发引用的语料（每 4 条 1 条携带
+    /// reply_to_*+forwarded_from_*），让部分索引在 A 配置下真实写入、B 配置下被剔除，
+    /// 以 INSERT messages 语句级 wal_bytes/wal_records 归因。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task MessagesIndexAb_ReportsWalDiff()
+    {
+        await using var harness = new PostgresPerfHarness();
+        await harness.InitializeAsync();
+
+        // 预热（含引用语料）并排空，避免残留 pending 干扰后续窗口归因。
+        await harness.RunSaveWorkloadAsync(200, Seed, replyEvery: 4);
+        await harness.RunOutboxDrainAsync(batches: 4, batchSize: 50);
+
+        // A：两个部分索引存在（Migration013/015 定义的迁移后状态）。
+        // 两窗口前都 TRUNCATE messages，使 A/B 从相同的空表起始（相同页分配模式），
+        // 隔离「表随窗口增长导致页分配/页分裂差异」这一混杂因素。
+        await harness.TruncateMessagesAsync();
+        var aBefore = await harness.SnapshotAsync();
+        await harness.RunSaveWorkloadAsync(MessageCount, Seed + 30, replyEvery: 4);
+        var aAfter = await harness.SnapshotAsync();
+        var aDiff = PostgresPerfDiffCalculator.Diff(aBefore, aAfter);
+
+        // B：剔除两个部分索引后，同样从空表起始重跑。
+        await harness.DropReplyForwardIndexesAsync();
+        await harness.TruncateMessagesAsync();
+        var bBefore = await harness.SnapshotAsync();
+        await harness.RunSaveWorkloadAsync(MessageCount, Seed + 40, replyEvery: 4);
+        var bAfter = await harness.SnapshotAsync();
+        var bDiff = PostgresPerfDiffCalculator.Diff(bBefore, bAfter);
+
+        // 还原 schema 与迁移目录一致（容器内部不影响其它测试）。
+        await harness.CreateReplyForwardIndexesAsync();
+
+        Assert.True(aDiff.Wal.WalBytes > 0, "A 配置应产生 WAL 写入。");
+        Assert.True(bDiff.Wal.WalBytes > 0, "B 配置应产生 WAL 写入。");
+
+        var aInsertBytes = InsertMessagesWalPerMessage(aDiff, useRecords: false);
+        var aInsertRecords = InsertMessagesWalPerMessage(aDiff, useRecords: true);
+        var bInsertBytes = InsertMessagesWalPerMessage(bDiff, useRecords: false);
+        var bInsertRecords = InsertMessagesWalPerMessage(bDiff, useRecords: true);
+
+        await WriteIndexAbReportAsync(
+            aDiff, bDiff,
+            aInsertBytes, aInsertRecords,
+            bInsertBytes, bInsertRecords);
+    }
+
+    /// <summary>
+    /// 归因 <c>INSERT ... "messages"</c> 语句的窗口增量，按 rows 折算每消息 WAL。
+    /// <paramref name="useRecords"/> 为 true 时返回 wal_records，否则返回 wal_bytes。
+    /// </summary>
+    private static long InsertMessagesWalPerMessage(PostgresPerfDiff diff, bool useRecords)
+    {
+        var matches = diff.Statements.Where(s =>
+            s.Query.Contains("INSERT INTO", StringComparison.OrdinalIgnoreCase)
+            && s.Query.Contains("\"messages\"", StringComparison.OrdinalIgnoreCase)).ToList();
+        var rows = matches.Sum(s => s.Rows);
+        if (rows <= 0)
+        {
+            return 0;
+        }
+
+        var wal = useRecords ? matches.Sum(s => s.WalRecords) : matches.Sum(s => s.WalBytes);
+        return wal / rows;
+    }
+
     private static long PerMessageWalBytes(PostgresPerfDiff diff, bool isClaim)
     {
         // pg_stat_statements 将参数占位化为 $1/$2，因此按稳定的 SQL 文本而非参数名匹配。
@@ -134,6 +208,42 @@ public sealed class OutboxDbMeasurementTests
         sb.AppendLine($"| fillfactor=75（B） | {bClaim:N0} | {bComplete:N0} | {bClaim + bComplete:N0} |");
         sb.AppendLine();
         sb.AppendLine("> 以 pg_stat_statements 语句级 wal_bytes / rows 归因，A/B 同容器顺序运行，仅 fillfactor 不同。");
+
+        await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
+    }
+
+    private static async Task WriteIndexAbReportAsync(
+        PostgresPerfDiff aDiff,
+        PostgresPerfDiff bDiff,
+        long aInsertBytes,
+        long aInsertRecords,
+        long bInsertBytes,
+        long bInsertRecords)
+    {
+        var reportDir = ResolveDocsMeasurementsDir();
+        Directory.CreateDirectory(reportDir);
+        var reportPath = Path.Combine(reportDir, "outbox-db-index-ab.md");
+
+        var sb = new StringBuilder();
+        sb.AppendLine("# OUTBOX-DB-1 索引 A/B（messages 插入写放大）");
+        sb.AppendLine();
+        sb.AppendLine($"> 生成时间：{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC；语料固定、随机种子 {Seed}；" +
+                       $"每配置 inbound {MessageCount} 条消息，其中约 1/4 携带 reply_to_*+forwarded_from_* 引用；" +
+                       "两窗口前均 TRUNCATE messages 从空表起始。");
+        sb.AppendLine();
+        sb.AppendLine("| 配置 | 全局 WAL 字节/消息 | INSERT messages WAL 字节/消息 | INSERT messages WAL 记录/消息 |");
+        sb.AppendLine("|---|---|---|---|");
+        sb.AppendLine($"| 索引存在（A） | {aDiff.Wal.WalBytes / MessageCount:N0} | {aInsertBytes:N0} | {aInsertRecords:N0} |");
+        sb.AppendLine($"| 索引剔除（B） | {bDiff.Wal.WalBytes / MessageCount:N0} | {bInsertBytes:N0} | {bInsertRecords:N0} |");
+        sb.AppendLine();
+        sb.AppendLine("> 以 pg_stat_statements 语句级 wal_bytes / wal_records 归因，A/B 同容器顺序运行，");
+        sb.AppendLine("> 仅 `ix_messages_reply_to` / `ix_messages_forwarded_from` 两个部分索引的存在性不同；");
+        sb.AppendLine("> INSERT messages 归因匹配 `INSERT INTO ... \"messages\"` 语句并按 rows 折算。");
+        sb.AppendLine();
+
+        sb.Append(PostgresPerfReporter.Render(aDiff, MessageCount, "A：索引存在"));
+        sb.AppendLine();
+        sb.Append(PostgresPerfReporter.Render(bDiff, MessageCount, "B：索引剔除"));
 
         await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
     }

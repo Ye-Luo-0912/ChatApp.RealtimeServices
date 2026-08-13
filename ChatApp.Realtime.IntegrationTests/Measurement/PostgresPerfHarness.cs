@@ -241,13 +241,85 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     }
 
     /// <summary>
+    /// 清空 messages 表，用于 A/B 两窗口从相同的空表起始（相同页分配模式），隔离
+    /// 「表随窗口增长导致页分配/页分裂差异」这一混杂因素。TRUNCATE 同时清掉全部行与
+    /// 全部索引项；单测试容器内无并发访问，安全。
+    /// <para>
+    /// messages 被部分表外键引用，需 CASCADE；压测语料中这些引用表（message_reactions /
+    /// message_state 等）均为空，级联清空无副作用。
+    /// </para>
+    /// </summary>
+    public async Task TruncateMessagesAsync(CancellationToken ct = default)
+    {
+        await using var connection = await Client.GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
+        await using var cmd = new NpgsqlCommand(
+            $"TRUNCATE TABLE {Schema.MessagesTableSql} CASCADE;",
+            connection);
+        await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 剔除 <c>ix_messages_reply_to</c> / <c>ix_messages_forwarded_from</c> 两个从未被查询使用的
+    /// 部分索引，用于 A/B 验证其对 messages 插入写放大的影响。
+    /// </summary>
+    public async Task DropReplyForwardIndexesAsync(CancellationToken ct = default)
+    {
+        await using var connection = await Client.GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
+        foreach (var indexName in new[] { "ix_messages_reply_to", "ix_messages_forwarded_from" })
+        {
+            await using var cmd = new NpgsqlCommand(
+                $"DROP INDEX IF EXISTS {Schema.QuotedSchema}.\"{indexName}\";",
+                connection);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// 重建 <c>ix_messages_reply_to</c> / <c>ix_messages_forwarded_from</c>，恢复
+    /// <see cref="Migration013_MessageReply"/> / <see cref="Migration015_MessageForward"/>
+    /// 定义的部分索引（A/B 结束后的还原操作，保持容器 schema 与迁移目录一致）。
+    /// </summary>
+    public async Task CreateReplyForwardIndexesAsync(CancellationToken ct = default)
+    {
+        await using var connection = await Client.GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
+        await using (var cmd = new NpgsqlCommand(
+            $"""
+             CREATE INDEX IF NOT EXISTS "ix_messages_reply_to"
+             ON {Schema.MessagesTableSql} ("reply_to_message_id")
+             WHERE "reply_to_message_id" IS NOT NULL;
+             """,
+            connection))
+        {
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+
+        await using (var cmd = new NpgsqlCommand(
+            $"""
+             CREATE INDEX IF NOT EXISTS "ix_messages_forwarded_from"
+             ON {Schema.MessagesTableSql} ("forwarded_from_message_id")
+             WHERE "forwarded_from_message_id" IS NOT NULL;
+             """,
+            connection))
+        {
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
     /// 用固定语料 + 固定随机种子驱动真实 <see cref="NpgsqlRealtimeMessageStore.SaveAsync"/>
     /// 热路径 <paramref name="count"/> 条消息。每条消息使用独立会话/客户端编号，避免幂等命中。
+    /// <para>
+    /// 当 <paramref name="replyEvery"/> &gt; 0 时，每第 <c>replyEvery</c> 条消息携带
+    /// reply_to_*/forwarded_from_* 引用（模拟含回复/转发引用的真实消息流），用于归因
+    /// <c>ix_messages_reply_to</c> / <c>ix_messages_forwarded_from</c> 两个部分索引的写放大；
+    /// 默认 0 保持纯消息语料，与既有基线一致。
+    /// </para>
     /// </summary>
     public async Task RunSaveWorkloadAsync(
         int count,
         int seed,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        int replyEvery = 0)
     {
         var rng = new Random(seed);
         long sender = 10_000_000_001;
@@ -259,6 +331,9 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
             // 消息 id / 客户端 id / 事件 id 均带种子前缀，避免预热与测量两段窗口
             // 使用相同 id 但内容不同而触发幂等内容冲突。
             var messageId = $"perf-{seed}-{i:D6}";
+            // 每 replyEvery 条消息带回复/转发引用（引用目标仅作展示性引用，无需真实存在，
+            // 存储层不做存在性校验），使部分索引在这些行上产生写放大。
+            var isReferenced = replyEvery > 0 && i % replyEvery == 0;
             var message = new RealtimeMessageRecord
             {
                 MessageId = messageId,
@@ -269,7 +344,12 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
                 ConversationId = conversationId,
                 Content = "perf-content-" + rng.Next(10_000),
                 ReceivedAtMs = 1_700_000_000_000L + i,
+                ReplyToMessageId = isReferenced ? $"perf-reply-{seed}-{i:D6}" : null,
+                ReplyToSenderUserId = isReferenced ? sender : null,
+                ForwardedFromMessageId = isReferenced ? $"perf-fwd-{seed}-{i:D6}" : null,
+                ForwardedFromSenderUserId = isReferenced ? sender : null,
             };
+
             var evt = new RealtimeEvent
             {
                 EventId = $"perf-evt-{seed}-{i:D6}",
