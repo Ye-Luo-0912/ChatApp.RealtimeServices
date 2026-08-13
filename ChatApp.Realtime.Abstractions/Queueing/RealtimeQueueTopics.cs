@@ -26,4 +26,13 @@ public sealed class RealtimeQueueTopics
     public string RelationshipListQueries { get; init; } = "chat.relationship-list.query";
     public string? MessagePersistence { get; init; }
     public string DeadLetters { get; init; } = "chat.dead-letters";
+
+    /// <summary>
+    /// 通话即时信令（SDP/ICE）Core NATS subject。零持久化：绝不进入 JetStream 流、
+    /// PostgreSQL 或持久化 Outbox。仅网关在内存中订阅转发。
+    /// </summary>
+    public string CallSignals { get; init; } = "chat.call-signals";
+
+    /// <summary>通话信令命令（invite/accept/…）Core NATS subject。零持久化。</summary>
+    public string CallCommands { get; init; } = "chat.call-commands";
 }

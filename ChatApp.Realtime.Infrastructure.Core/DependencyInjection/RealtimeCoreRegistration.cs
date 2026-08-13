@@ -16,7 +16,9 @@ using ChatApp.Realtime.Infrastructure.Core.Health;
 using ChatApp.Realtime.Infrastructure.Core.Messaging;
 using ChatApp.Realtime.Infrastructure.Core.Messaging.History;
 using ChatApp.Realtime.Infrastructure.Core.Relationships;
+using ChatApp.Realtime.Abstractions.Calls;
 using ChatApp.Realtime.Abstractions.Sync;
+using ChatApp.Realtime.Infrastructure.Core.Calls;
 using ChatApp.Realtime.Infrastructure.Core.State;
 using ChatApp.Realtime.Infrastructure.Core.Stores;
 using ChatApp.Realtime.Infrastructure.Core.Sync;
@@ -120,6 +122,19 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IDirectMessagePolicy>(NoopDirectMessagePolicy.Instance);
         services.TryAddSingleton<IPrivacySettingStore>(NoopPrivacySettingStore.Instance);
         services.TryAddSingleton<IMessageRateLimiter>(NoopMessageRateLimiter.Instance);
+
+        // ---- CALL-CTRL-1：临时通话信令状态机 ----
+        // 通话 SDP/ICE 只经临时信令路径转发，绝不进入 PostgreSQL / 持久化 Outbox / JetStream。
+        // 默认内存临时状态存储 + 空转发器 + 默认 grant 校验；生产由 Redis/NATS 覆盖。
+        services.TryAddSingleton<CallPolicyOptions>(new CallPolicyOptions());
+        services.TryAddSingleton<CallMetrics>();
+        services.TryAddSingleton<ICallStateStore, InMemoryCallStateStore>();
+        services.TryAddSingleton<ICallAuditStore, InMemoryCallAuditStore>();
+        services.TryAddSingleton<ICallGrantVerifier, DefaultCallGrantVerifier>();
+        services.TryAddSingleton<ICallSignalForwarder>(NoopCallSignalForwarder.Instance);
+        services.TryAddSingleton<TimeProvider>(TimeProvider.System);
+        services.TryAddSingleton<ICallControlProcessor, DefaultCallControlProcessor>();
+        services.TryAddSingleton<ICallControlConsumer>(NoopCallControlConsumer.Instance);
 
         return services;
     }

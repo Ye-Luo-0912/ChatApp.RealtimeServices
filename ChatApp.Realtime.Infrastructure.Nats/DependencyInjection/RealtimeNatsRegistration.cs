@@ -1,4 +1,5 @@
 using ChatApp.Realtime.Abstractions.Attachments;
+using ChatApp.Realtime.Abstractions.Calls;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Relationships;
 using ChatApp.Realtime.Abstractions.Events;
@@ -66,6 +67,13 @@ public static class RealtimeNatsRegistration
         services.AddSingleton<IRelationshipCommandConsumer, NatsRelationshipCommandConsumer>();
         services.RemoveAll<IRelationshipListQueryConsumer>();
         services.AddSingleton<IRelationshipListQueryConsumer, NatsRelationshipListQueryConsumer>();
+
+        // CALL-CTRL-1：通话即时信令（SDP/ICE）经 Core NATS 零持久化 subject 转发/消费。
+        // 绝不进入 JetStream 流、PostgreSQL 或持久化 Outbox。命令消费即处理（request/reply）。
+        services.RemoveAll<ICallSignalForwarder>();
+        services.AddSingleton<ICallSignalForwarder, NatsCallSignalForwarder>();
+        services.RemoveAll<ICallControlConsumer>();
+        services.AddSingleton<ICallControlConsumer, NatsCallControlConsumer>();
 
         // Reliability-4：Null* 目录始终注册（查询路径的 IGatewayDirectory 依赖注入需要）。
         // Null* 仅暴露私有构造函数 + 静态 Instance（单例），不能用 TryAddSingleton<TImpl>

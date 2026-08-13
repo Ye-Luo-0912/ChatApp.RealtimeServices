@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using ChatApp.Realtime.Abstractions.Calls;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
@@ -100,6 +101,12 @@ namespace ChatApp.Realtime.Infrastructure.Core.Serialization;
 [JsonSerializable(typeof(List<RelationshipCatchUp>))]
 [JsonSerializable(typeof(RelationshipSyncCursor))]
 [JsonSerializable(typeof(List<RelationshipSyncCursor>))]
+[JsonSerializable(typeof(CallCommand))]
+[JsonSerializable(typeof(CallSignalEnvelope))]
+[JsonSerializable(typeof(CallProcessResult))]
+[JsonSerializable(typeof(CallStateSnapshot))]
+[JsonSerializable(typeof(CallGrant))]
+[JsonSerializable(typeof(CallAuditEntry))]
 public sealed partial class RealtimeJsonSerializerContext : JsonSerializerContext
 {
 }

@@ -104,6 +104,12 @@ public sealed class NatsSubjectOptions
     public string AttachmentScan { get; init; } = "chat.attachment-scan";
     public string? MessagePersistence { get; init; }
     public string DeadLetters { get; init; } = "chat.dead-letters";
+
+    /// <summary>通话即时信令（SDP/ICE）Core NATS subject（零持久化）。</summary>
+    public string CallSignals { get; init; } = "chat.call-signals";
+
+    /// <summary>通话信令命令 Core NATS subject（零持久化）。</summary>
+    public string CallCommands { get; init; } = "chat.call-commands";
 }
 
 public sealed class JetStreamOptions

@@ -1,6 +1,8 @@
+using ChatApp.Realtime.Abstractions.Calls;
 using ChatApp.Realtime.Abstractions.Diagnostics;
 using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.State;
+using ChatApp.Realtime.Infrastructure.Redis.Calls;
 using ChatApp.Realtime.Infrastructure.Redis.Clients;
 using ChatApp.Realtime.Infrastructure.Redis.Routing;
 using ChatApp.Realtime.Infrastructure.Redis.State;
@@ -32,6 +34,11 @@ public static class RealtimeRedisRegistration
         services.TryAddSingleton<RoutingMetrics>();
         services.TryAddSingleton<IGatewayDirectory, RedisGatewayDirectory>();
         services.TryAddSingleton<IWatcherGatewayDirectory, RedisWatcherGatewayDirectory>();
+
+        // CALL-CTRL-1：通话临时状态存储覆盖为 Redis/Garnet（TTL + CAS 原子迁移）。
+        // 仍只保存控制元数据，绝不保存 SDP/ICE 载荷。
+        services.RemoveAll<ICallStateStore>();
+        services.AddSingleton<ICallStateStore, RedisCallStateStore>();
 
         return services;
     }

@@ -149,6 +149,8 @@ public static class RealtimeServicesRegistration
         services.AddHostedService<MessageEditWorker>();
         services.AddHostedService<MessageReactionWorker>();
         services.AddHostedService<ConversationSyncBootstrapWorker>();
+        // CALL-CTRL-1：通话信令命令消费（Core NATS 零持久化，消费即处理）。
+        services.AddHostedService<CallControlWorker>();
         services.AddHostedService<OutboxPublisherWorker>();
         services.AddHostedService<OutboxCleanupWorker>();
         services.AddHostedService<MessageRetentionWorker>();
@@ -581,7 +583,9 @@ public static class RealtimeServicesRegistration
                 AttachmentFinalize = options.Subjects.AttachmentFinalize,
                 AttachmentScan = options.Subjects.AttachmentScan,
                 MessagePersistence = options.Subjects.MessagePersistence,
-                DeadLetters = options.Subjects.DeadLetters
+                DeadLetters = options.Subjects.DeadLetters,
+                CallSignals = options.Subjects.CallSignals,
+                CallCommands = options.Subjects.CallCommands
             },
             RealtimeEventsShardSubjectPattern = shardPattern,
             ShardPublishParallelism = options.Routing.ShardPublishParallelism

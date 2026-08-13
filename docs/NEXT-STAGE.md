@@ -72,6 +72,13 @@ Server 关系增量已能在 JetStream ACK 前原子应用到 projection item/ve
 
 完成标准：状态迁移表与错误语义固定，重复/乱序/超时/重连均可测试且终态唯一；控制面故障不泄漏长期会话，不让媒体回落到数据库或消息队列。
 
+**当前进度（2026-08-13）**：
+- 需求 1/2/3：以短期 call grant 为授权输入，实现完整临时通话信令状态机。`CallCommandType`（Invite/Ringing/Accept/Reject/Cancel/End/Reconnect/Timeout）驱动 `CallState`（Idle→Ringing→Active→Ended），终态唯一、终态后任意命令被拒。`DefaultCallControlProcessor` 用 call id + command id 幂等、单调 revision（乱序/陈旧拒绝）与有界 TTL 处理重复、乱序和断线；`DefaultCallControlProcessor` 逻辑超时（Ringing→Missed / Active→TimedOut）与存储 TTL（Ringing/Active/Ended 各带 `CleanupGraceMs`）分离，超时后清理临时路由状态。
+- 授权：`ICallGrantVerifier` 校验 grant 归属/参与方/过期/签名，过期与非参与方分别返回 `GrantExpired` / `GrantInvalid`；`NatsCallControlConsumer` 从 NATS 头提取可信身份，`CallControlWorker` 校验 actor 与身份头一致，不匹配 fail-closed 返回 `GrantInvalid`。
+- 需求 2（零持久化）：SDP/ICE 仅经 `NatsCallSignalForwarder` 在 Core NATS 的 `chat.call-signals` 非持久化 subject 转发，`MaxSdpBytes` 预算超限 fail-closed 拒绝；命令经 `chat.call-commands` 消费即处理、失败即 NACK，不进入 JetStream/PostgreSQL/Outbox。审计 `InMemoryCallAuditStore` 只存参与者、状态、时间与失败分类。音频媒体不落入任何持久层。
+- 实现与接入：`InMemoryCallStateStore`（ConcurrentDictionary + 注入时钟）、`RedisCallStateStore`（Garnet Lua CAS + TTL）、`CallMetrics`（低基数迁移/失败/超时）。`CallControlWorker` 作为宿主托管服务消费 Core NATS 命令并回发结果。
+- 测试：`CallStateMachineTests` + `DefaultCallControlProcessorTests` 单测覆盖迁移表、幂等重放、乱序/陈旧 revision、逻辑超时、重连、终态唯一、SDP 不持久化、授权过期、预算。`CallControlLifecycleTests` 5 项集成测试经宿主 DI + Core NATS 驱动完整生命周期（Invite→Accept→End 状态收敛）、重复 command id 幂等且不重复转发、身份头不匹配/过期 grant/非参与方 fail-closed、以及零持久化（JetStream 无 call 流、Postgres 无 call 表）。完整集成套件 117/117 通过，单元套件 375/375 通过。
+
 ## 跨仓衔接
 
 1. **Server → Realtime：** Server 提供唯一关系权威、安全策略和短期 call grant；Realtime 只消费投影/命令，不反向写 Server 业务表。
