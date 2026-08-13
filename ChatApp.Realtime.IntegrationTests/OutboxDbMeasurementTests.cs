@@ -378,6 +378,51 @@ public sealed class OutboxDbMeasurementTests
     }
 
     /// <summary>
+    /// OUTBOX-DB-1 需求 2：A/B 验证「合并同事务写入」为单条 super-bundle CTE 的往返收益。
+    /// <para>
+    /// 生产合并路径（<see cref="Measurement.PostgresPerfHarness.RunMergedSaveWorkloadAsync"/>）
+    /// 每次 SaveAsync 仍是 2 条数据语句：admission CTE（生命周期/授权/幂等 + 会话与 member 写入 +
+    /// 序号分配）与 bundle CTE（message + outbox + ledger 写入）。B 用单条 super-bundle CTE
+    /// 把这两个同事务写入合并（复用 <c>write_gate</c> 门控与 <c>upsert_conversation</c> /
+    /// <c>sender_upsert</c> 序号分配，让 message INSERT 直接取 <c>last_sequence</c> /
+    /// <c>sent_count</c>），热路径数据往返 2 → 1。
+    /// 以 pg_stat_statements 语句级 calls 折算每条消息平均 SQL 往返数，并对照 WAL/耗时。
+    /// 报告写入 <c>docs/measurements/outbox-db-super-bundle-ab.md</c>。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task SaveAsync_SuperBundleAb_ReportsRoundTripSavings()
+    {
+        await using var harness = new PostgresPerfHarness();
+        await harness.InitializeAsync();
+        // super-bundle 复用合并路径的 direct_authorization 判定，需先播种授权关系。
+        await harness.SeedAuthTablesAsync();
+
+        // 预热两路径的连接池与 plan cache；该段不纳入测量窗口。
+        await harness.RunMergedSaveWorkloadAsync(200, Seed);
+        await harness.RunSuperBundleWorkloadAsync(200, Seed + 1);
+
+        // A：生产合并（admission CTE + bundle，2 条数据语句）。
+        var aBefore = await harness.SnapshotAsync();
+        await harness.RunMergedSaveWorkloadAsync(MessageCount, Seed + 200);
+        var aAfter = await harness.SnapshotAsync();
+        var aDiff = PostgresPerfDiffCalculator.Diff(aBefore, aAfter);
+
+        // B：super-bundle（合并同事务写入为单条 CTE）。
+        var bBefore = await harness.SnapshotAsync();
+        await harness.RunSuperBundleWorkloadAsync(MessageCount, Seed + 210);
+        var bAfter = await harness.SnapshotAsync();
+        var bDiff = PostgresPerfDiffCalculator.Diff(bBefore, bAfter);
+
+        Assert.True(aDiff.Wal.WalBytes > 0, "A 配置应产生 WAL 写入。");
+        Assert.True(bDiff.Wal.WalBytes > 0, "B 配置应产生 WAL 写入。");
+        Assert.True(aDiff.Statements.Sum(s => s.Calls) > 0, "A 配置应产生 SQL 调用。");
+        Assert.True(bDiff.Statements.Sum(s => s.Calls) > 0, "B 配置应产生 SQL 调用。");
+
+        await WriteSuperBundleAbReportAsync(aDiff, bDiff);
+    }
+
+    /// <summary>
     /// OUTBOX-DB-1 需求 2：A/B 验证 claim/complete 的「有界批量上限」对每消息往返/事务开销的影响。
     /// <para>
     /// claim/delete 均为单语句（`FOR UPDATE ... SKIP LOCKED ... LIMIT @batch_size` /
@@ -768,6 +813,47 @@ public sealed class OutboxDbMeasurementTests
         sb.AppendLine();
         sb.Append(PerMessageStatementTable(bDiff, MessageCount));
         sb.Append(PostgresPerfReporter.Render(bDiff, MessageCount, "B：合并（admission+序号分配单条 CTE）"));
+
+        await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
+    }
+
+    private static async Task WriteSuperBundleAbReportAsync(
+        PostgresPerfDiff aDiff,
+        PostgresPerfDiff bDiff)
+    {
+        var reportDir = ResolveDocsMeasurementsDir();
+        Directory.CreateDirectory(reportDir);
+        var reportPath = Path.Combine(reportDir, "outbox-db-super-bundle-ab.md");
+
+        var sb = new StringBuilder();
+        sb.AppendLine("# OUTBOX-DB-1 合并同事务写入 A/B（super-bundle 单条 CTE）");
+        sb.AppendLine();
+        sb.AppendLine($"> 生成时间：{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC；语料固定、随机种子 {Seed}；" +
+                       $"每配置 inbound {MessageCount} 条消息。");
+        sb.AppendLine();
+        sb.AppendLine("| 配置 | 热路径 SQL/消息 | SQL 往返/消息 | 总执行时间/消息(ms) | WAL 字节/消息 | WAL 记录/消息 |");
+        sb.AppendLine("|---|---|---|---|---|---|");
+        sb.AppendLine($"| A：合并（admission CTE + bundle，2 条数据语句） | {HotPathStatementCount(aDiff, MessageCount)} | {TotalCallsPerMessage(aDiff, MessageCount):N1} | {TotalExecMsPerMessage(aDiff, MessageCount):N2} | {aDiff.Wal.WalBytes / MessageCount:N0} | {aDiff.Wal.WalRecords / (double)MessageCount:N1} |");
+        sb.AppendLine($"| B：super-bundle（合并为单条 CTE） | {HotPathStatementCount(bDiff, MessageCount)} | {TotalCallsPerMessage(bDiff, MessageCount):N1} | {TotalExecMsPerMessage(bDiff, MessageCount):N2} | {bDiff.Wal.WalBytes / MessageCount:N0} | {bDiff.Wal.WalRecords / (double)MessageCount:N1} |");
+        sb.AppendLine();
+        sb.AppendLine("> 以 pg_stat_statements 语句级 calls/wal_bytes 归因，A/B 同容器顺序运行、仅写入合并程度不同；");
+        sb.AppendLine("> 确定性收益是每次消息的数据路径 SQL −1（热路径 2 条 → 1 条）：B 把生产合并路径的 admission CTE");
+        sb.AppendLine("> （生命周期/授权/幂等 + 会话与 member 写入 + 序号分配）与 bundle CTE（message + outbox + ledger）");
+        sb.AppendLine("> 合并为单条语句，热路径数据往返 2 → 1；两路径写入行集完全相同（conversations / members / messages /");
+        sb.AppendLine("> outbox / command_idempotency_ledger 各 1 行），故 WAL 列预期接近，收益集中于往返削减；");
+        sb.AppendLine("> SQL 往返/消息含连接会话管理语句，短窗口下随连接池复用有 ±0.1 级波动，以热路径语句数为权威归因。");
+        sb.AppendLine();
+
+        sb.AppendLine("## A：合并热路径语句（近热路径 = 调用数 ≥ 消息数一半）");
+        sb.AppendLine();
+        sb.Append(PerMessageStatementTable(aDiff, MessageCount));
+        sb.Append(PostgresPerfReporter.Render(aDiff, MessageCount, "A：合并（admission CTE + bundle）"));
+        sb.AppendLine();
+
+        sb.AppendLine("## B：super-bundle 热路径语句（近热路径 = 调用数 ≥ 消息数一半）");
+        sb.AppendLine();
+        sb.Append(PerMessageStatementTable(bDiff, MessageCount));
+        sb.Append(PostgresPerfReporter.Render(bDiff, MessageCount, "B：super-bundle（合并同事务写入为单条 CTE）"));
 
         await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
     }

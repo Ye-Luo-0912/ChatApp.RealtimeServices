@@ -1,7 +1,9 @@
+using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Events;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Stores;
+using ChatApp.Realtime.Infrastructure.Core.Serialization;
 using ChatApp.Realtime.Infrastructure.Postgres.Clients;
 using ChatApp.Realtime.Infrastructure.Postgres.Data;
 using ChatApp.Realtime.Infrastructure.Postgres.Messaging;
@@ -9,6 +11,7 @@ using ChatApp.Realtime.Infrastructure.Postgres.Migrations;
 using ChatApp.Realtime.Infrastructure.Postgres.Stores;
 using Microsoft.Extensions.Logging.Abstractions;
 using Npgsql;
+using NpgsqlTypes;
 using DotNet.Testcontainers.Builders;
 using Testcontainers.PostgreSql;
 
@@ -46,11 +49,19 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     /// <summary>初始化完成后到重试放弃的时长。</summary>
     private static readonly TimeSpan ConnectRetryWindow = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// 生命周期 advisory lock 命名空间键。与
+    /// <c>UserLifecycleAdvisoryLock.NamespaceKey</c>（internal）保持一致；
+    /// super-bundle CTE 直接以 <c>$1</c> 参数携带该键，供测试访问。
+    /// </summary>
+    private const long LifecycleNamespaceKey = 0x5553_4552_4C49_4645L;
+
     private RealtimeDatabaseClient? _client;
     private RealtimeDatabaseSchema? _schema;
     private NpgsqlRealtimeMessageStore? _messageStore;
     private NpgsqlRealtimeMessageStore? _mergedMessageStore;
     private NpgsqlRealtimeOutboxStore? _outboxStore;
+    private string? _superBundleCommandText;
 
     public string SchemaName { get; } = $"perf_{Guid.NewGuid():N}"[..17];
 
@@ -464,6 +475,432 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
         int replyEvery = 0)
         => RunSaveWorkloadCoreAsync(MergedMessageStore, count, seed, ct, replyEvery);
 
+    /// <summary>
+    /// 用同一固定语料直接驱动「合并同事务写入」的单条 super-bundle CTE 热路径。
+    /// <para>
+    /// 生产合并路径（<see cref="RunMergedSaveWorkloadAsync"/>）每次 SaveAsync 仍是 2 条数据语句：
+    /// admission CTE（生命周期/授权/幂等 + 会话与 member 写入 + 序号分配）与 bundle CTE
+    /// （message + outbox + ledger 写入）。本方法把这两个同事务写入合并为单条 CTE——
+    /// 复用 admission 的 <c>write_gate</c> 门控与 <c>upsert_conversation</c> / <c>sender_upsert</c>
+    /// 序号分配，让 message INSERT 直接取 <c>last_sequence</c> / <c>sent_count</c>，
+    /// 用于 A/B 量化「合并同事务写入」为单条语句后的往返收益（热路径 2 → 1 条）。
+    /// </para>
+    /// <para>
+    /// 驱动语义与 SaveAsync 合并路径一致：每条消息开连接/事务 → 单条 super-bundle → 提交；
+    /// advisory lock 随事务提交释放；<c>write_gate</c> 为空（生命周期/授权/幂等命中）时不产生
+    /// 任何写入；message 幂等冲突时 outbox/ledger 不产生孤立行。语料 id 带种子前缀避免跨窗口幂等冲突。
+    /// </para>
+    /// </summary>
+    public async Task RunSuperBundleWorkloadAsync(
+        int count,
+        int seed,
+        CancellationToken ct = default)
+    {
+        var commandText = _superBundleCommandText ??= BuildSuperBundleCommandText(Schema);
+        var rng = new Random(seed);
+        long sender = 10_000_000_001;
+        long receiver = 10_000_000_002;
+        var conversationId = ConversationId.CreateDirect(sender, receiver);
+
+        for (var i = 0; i < count; i++)
+        {
+            // 消息 id / 客户端 id / 事件 id 均带种子前缀，避免预热与测量两段窗口
+            // 使用相同 id 但内容不同而触发幂等内容冲突。
+            var messageId = $"perf-sb-{seed}-{i:D6}";
+            var message = new RealtimeMessageRecord
+            {
+                MessageId = messageId,
+                ClientMessageId = $"perf-client-{seed}-{i:D6}",
+                SenderUserId = sender,
+                SenderSessionId = "session-perf",
+                ReceiverUserId = receiver,
+                ConversationId = conversationId,
+                Content = "perf-content-" + rng.Next(10_000),
+                ReceivedAtMs = 1_700_000_000_000L + i,
+            };
+
+            var evt = new RealtimeEvent
+            {
+                EventId = $"perf-evt-{seed}-{i:D6}",
+                Type = RealtimeEventType.MessageReceived,
+                TargetUserId = receiver,
+                ActorUserId = sender,
+                MessageId = messageId,
+                SessionId = "session-perf",
+                OccurredAtMs = 1_700_000_000_000L + i,
+                PayloadJson = """{"v":1}""",
+            };
+
+            var outcome = await ExecuteSuperBundleAsync(commandText, message, evt, ct).ConfigureAwait(false);
+            if (!outcome.MessageInserted)
+            {
+                throw new InvalidOperationException(
+                    $"super-bundle CTE 未按预期创建消息 {messageId}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// 生成「合并同事务写入」的 super-bundle CTE：把生产合并路径（<see cref="RunMergedSaveWorkloadAsync"/>）
+    /// 每次 SaveAsync 的 2 条数据语句（admission CTE + bundle CTE）合并为单条语句，热路径往返 2 → 1。
+    /// <para>
+    /// 前段与 <c>message-write-admission-direct-sequence</c> 完全一致：ordered_users → locked_users →
+    /// lifecycle → canonical → direct_user_state → direct_authorization → write_gate → upsert_conversation
+    /// → ensure_receiver → sender_upsert；后段让 message INSERT 直接读取 upsert_conversation 的
+    /// <c>last_sequence</c> 与 sender_upsert 的 <c>sent_count</c>（取代 bundle 的 $19/$20 参数），
+    /// 再以 inserted_message 为数据源写 outbox 与幂等账本。advisory lock 随单语句隐式事务提交释放；
+    /// write_gate 为空（生命周期/授权/幂等命中）时，upsert/sender 与 message 均不产生行，与 SaveAsync 一致。
+    /// </para>
+    /// </summary>
+    private static string BuildSuperBundleCommandText(RealtimeDatabaseSchema schema)
+    {
+        var conversations = schema.ConversationsTableSql;
+        var members = schema.ConversationMembersTableSql;
+        var tombstone = schema.UserDeletionTombstonesTableSql;
+        var ledger = schema.CommandIdempotencyLedgerTableSql;
+        var messages = schema.MessagesTableSql;
+        var outbox = schema.OutboxTableSql;
+
+        return $"""
+            WITH ordered_users AS MATERIALIZED (
+                SELECT DISTINCT t.user_id
+                FROM (VALUES ($2), ($3)) AS t(user_id)
+                WHERE t.user_id > 0
+                ORDER BY t.user_id
+            ),
+            locked_users AS MATERIALIZED (
+                SELECT u.user_id
+                FROM ordered_users AS u
+                WHERE pg_advisory_xact_lock_shared(
+                    ($1::bigint # u.user_id)) IS NULL
+            ),
+            lifecycle AS MATERIALIZED (
+                SELECT COALESCE(MAX(tombstone.state), 0)::smallint AS state
+                FROM locked_users AS locked
+                LEFT JOIN {tombstone} AS tombstone
+                  ON tombstone.user_id = locked.user_id
+            ),
+            canonical AS MATERIALIZED (
+                SELECT command_id, content_fingerprint, result_kind, message_id, received_at_ms
+                FROM {ledger}
+                WHERE sender_user_id = $2
+                  AND client_message_id = $4
+                LIMIT 1
+            ),
+            direct_user_state AS MATERIALIZED (
+                SELECT
+                    COUNT(*) FILTER (WHERE "Id" = $2) > 0 AS sender_exists,
+                    COUNT(*) FILTER (WHERE "Id" = $3) > 0 AS receiver_exists,
+                    COALESCE(
+                        MAX("FriendRequestPolicy"::int) FILTER (WHERE "Id" = $3),
+                        -1) AS privacy_policy
+                FROM public."AspNetUsers"
+                WHERE "Id" IN ($2, $3)
+            ),
+            direct_authorization AS MATERIALIZED (
+                SELECT CASE
+                    WHEN NOT direct_user_state.sender_exists THEN 1
+                    WHEN NOT direct_user_state.receiver_exists THEN 2
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM public."T_BlockRecords"
+                        WHERE "BlockerId" = $3
+                          AND "BlockedUserId" = $2
+                    ) THEN 3
+                    WHEN direct_user_state.privacy_policy = 2 THEN 4
+                    WHEN NOT (
+                        EXISTS (
+                            SELECT 1
+                            FROM public."T_UserFriendEntry"
+                            WHERE "UserId" = $2
+                              AND "FriendId" = $3
+                              AND NOT "IsDeleted"
+                        )
+                        AND EXISTS (
+                            SELECT 1
+                            FROM public."T_UserFriendEntry"
+                            WHERE "UserId" = $3
+                              AND "FriendId" = $2
+                              AND NOT "IsDeleted"
+                        )
+                    ) THEN 5
+                    ELSE 0
+                END::smallint AS decision
+                FROM direct_user_state
+            ),
+            write_gate AS MATERIALIZED (
+                SELECT 1
+                FROM lifecycle
+                CROSS JOIN direct_authorization
+                WHERE lifecycle.state = 0
+                  AND direct_authorization.decision = 0
+                  AND NOT EXISTS (SELECT 1 FROM canonical)
+            ),
+            upsert_conversation AS (
+                INSERT INTO {conversations} (
+                    conversation_id, type, created_at_ms, updated_at_ms,
+                    last_message_id, last_message_preview, last_message_at_ms,
+                    last_sender_user_id, last_sequence
+                )
+                SELECT
+                    $5, $9, $6, $6,
+                    $7, $8, $6,
+                    $2, 1
+                FROM write_gate
+                ON CONFLICT (conversation_id) DO UPDATE SET
+                    last_sequence = {conversations}.last_sequence + 1,
+                    last_message_id = CASE
+                        WHEN {conversations}.last_message_at_ms IS NULL
+                             OR ({conversations}.last_message_at_ms,
+                                 {conversations}.last_message_id)
+                                < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
+                        THEN EXCLUDED.last_message_id
+                        ELSE {conversations}.last_message_id
+                    END,
+                    last_message_preview = CASE
+                        WHEN {conversations}.last_message_at_ms IS NULL
+                             OR ({conversations}.last_message_at_ms,
+                                 {conversations}.last_message_id)
+                                < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
+                        THEN EXCLUDED.last_message_preview
+                        ELSE {conversations}.last_message_preview
+                    END,
+                    last_message_at_ms = CASE
+                        WHEN {conversations}.last_message_at_ms IS NULL
+                             OR ({conversations}.last_message_at_ms,
+                                 {conversations}.last_message_id)
+                                < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
+                        THEN EXCLUDED.last_message_at_ms
+                        ELSE {conversations}.last_message_at_ms
+                    END,
+                    last_sender_user_id = CASE
+                        WHEN {conversations}.last_message_at_ms IS NULL
+                             OR ({conversations}.last_message_at_ms,
+                                 {conversations}.last_message_id)
+                                < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
+                        THEN EXCLUDED.last_sender_user_id
+                        ELSE {conversations}.last_sender_user_id
+                    END,
+                    updated_at_ms = EXCLUDED.updated_at_ms
+                RETURNING last_sequence
+            ),
+            ensure_receiver AS (
+                INSERT INTO {members} (
+                    conversation_id, user_id, peer_user_id, joined_at_ms, last_message_at_ms
+                )
+                SELECT $5, $3, $2, $6, $6
+                FROM upsert_conversation
+                ON CONFLICT (conversation_id, user_id) DO NOTHING
+            ),
+            sender_upsert AS (
+                INSERT INTO {members} (
+                    conversation_id, user_id, peer_user_id, joined_at_ms, last_message_at_ms, sent_count
+                )
+                SELECT $5, $2, $3, $6, $6, 1
+                FROM upsert_conversation
+                ON CONFLICT (conversation_id, user_id) DO UPDATE SET
+                    sent_count = {members}.sent_count + 1,
+                    last_message_at_ms = $6
+                RETURNING sent_count
+            ),
+            inserted_message AS MATERIALIZED (
+                INSERT INTO {messages} (
+                    message_id, client_message_id, sender_user_id, sender_session_id,
+                    receiver_user_id, conversation_id, content, content_fingerprint,
+                    received_at_ms, created_at_ms, reply_to_message_id,
+                    reply_to_sender_user_id, reply_to_preview, forwarded_from_message_id,
+                    forwarded_from_sender_user_id, forwarded_from_preview,
+                    mentioned_user_ids, mentioned_roles, edit_version, changed_at_ms,
+                    conversation_sequence, sender_sequence
+                )
+                SELECT
+                    $7, $4, $2, $10,
+                    $3, $5, $11, $12,
+                    $6, $13, $14,
+                    $15, $16, $17,
+                    $18, $19,
+                    $20, $21, 1, $6,
+                    upsert_conversation.last_sequence,
+                    sender_upsert.sent_count
+                FROM write_gate
+                CROSS JOIN upsert_conversation
+                CROSS JOIN sender_upsert
+                ON CONFLICT (sender_user_id, client_message_id) DO NOTHING
+                RETURNING message_id
+            ),
+            inserted_outbox AS MATERIALIZED (
+                INSERT INTO {outbox} (
+                    event_id, payload_json, payload_utf8, target_user_id, event_type, status,
+                    created_at_ms, next_attempt_at_ms, attempt_count, target_user_ids,
+                    audience_kind, conversation_id, exclude_user_id, trace_parent, trace_state,
+                    occurred_at_ms, locked_by, locked_until_ms, claim_token
+                )
+                SELECT
+                    $22, NULL, $23, $24, $25, $26,
+                    $13, COALESCE($35, $13), $27, $28,
+                    $29, $5, NULLIF($30, 0),
+                    $31, $32, $33,
+                    $34, $35, $36
+                FROM inserted_message
+                ON CONFLICT (event_id) DO NOTHING
+                RETURNING event_id
+            ),
+            inserted_ledger AS MATERIALIZED (
+                INSERT INTO {ledger} (
+                    sender_user_id, client_message_id, command_id, content_fingerprint,
+                    result_kind, message_id, received_at_ms
+                )
+                SELECT
+                    $2, $4, $7, $12,
+                    $38, $7, $6
+                FROM inserted_message
+                WHERE $37
+                ON CONFLICT (sender_user_id, client_message_id) DO NOTHING
+                RETURNING sender_user_id
+            )
+            SELECT
+                (SELECT last_sequence FROM upsert_conversation) AS conversation_sequence,
+                (SELECT sent_count FROM sender_upsert) AS sender_sequence,
+                (CASE WHEN EXISTS (SELECT 1 FROM inserted_message) THEN 1 ELSE 0 END)
+                    + (CASE WHEN EXISTS (SELECT 1 FROM inserted_outbox) THEN 2 ELSE 0 END)
+                    + (CASE WHEN EXISTS (SELECT 1 FROM inserted_ledger) THEN 4 ELSE 0 END)
+                    AS write_flags,
+                lifecycle.state,
+                canonical.command_id,
+                direct_authorization.decision
+            FROM lifecycle
+            LEFT JOIN canonical ON TRUE
+            CROSS JOIN direct_authorization;
+            """;
+    }
+
+    /// <summary>
+    /// 在独立连接上执行单条 super-bundle CTE（单语句隐式事务，advisory lock 随语句提交释放）。
+    /// 参数顺序与 <see cref="BuildSuperBundleCommandText"/> 的 $1..$38 一一对应：$1..$9 为 admission
+    /// （锁/生命周期/授权/幂等 canonical + 会话序号分配），$10..$21 为 message，$22..$36 为 outbox，
+    /// $37..$38 为幂等账本（写开关 + 结果类型）。
+    /// </summary>
+    private async Task<SuperBundleWriteOutcome> ExecuteSuperBundleAsync(
+        string commandText,
+        RealtimeMessageRecord message,
+        RealtimeEvent evt,
+        CancellationToken ct)
+    {
+        var fingerprint = RealtimeMessageFingerprint.Compute(
+            message.ReceiverUserId,
+            message.Content,
+            message.AttachmentIds,
+            message.ConversationId,
+            message.ReplyToMessageId,
+            message.ForwardedFromMessageId,
+            message.MentionedUserIds,
+            message.MentionedRoles,
+            message.ReplyToSenderUserId,
+            message.ReplyToPreview,
+            message.ForwardedFromSenderUserId,
+            message.ForwardedFromPreview);
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var payloadUtf8 = RealtimeEventWireSerializer.SerializeToUtf8Bytes(evt);
+
+        await using var connection = await Client.GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(commandText, connection);
+
+        // $1..$9：admission（与 MessageWriteAdmissionReader.AcquireDirectAndAllocateSequenceAsync 一致）。
+        command.Parameters.AddWithValue(NpgsqlDbType.Bigint, LifecycleNamespaceKey);
+        command.Parameters.AddWithValue(NpgsqlDbType.Bigint, message.SenderUserId);
+        command.Parameters.AddWithValue(NpgsqlDbType.Bigint, message.ReceiverUserId);
+        command.Parameters.AddWithValue(NpgsqlDbType.Text, message.ClientMessageId);
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Text,
+            (object?)message.ConversationId ?? DBNull.Value);
+        command.Parameters.AddWithValue(NpgsqlDbType.Bigint, message.ReceivedAtMs);
+        command.Parameters.AddWithValue(NpgsqlDbType.Text, message.MessageId);
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Text,
+            ConversationId.CreatePreview(message.Content));
+        command.Parameters.AddWithValue(NpgsqlDbType.Smallint, (short)ConversationType.Direct);
+
+        // $10..$21：message（与 MessageCreateBundleWriter.AddMessageParameters 一致，序号参数下沉为 CTE）。
+        command.Parameters.AddWithValue(NpgsqlDbType.Text, message.SenderSessionId);
+        command.Parameters.AddWithValue(NpgsqlDbType.Text, message.Content);
+        command.Parameters.AddWithValue(NpgsqlDbType.Text, fingerprint);
+        command.Parameters.AddWithValue(NpgsqlDbType.Bigint, now);
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Text,
+            (object?)message.ReplyToMessageId ?? DBNull.Value);
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Bigint,
+            (object?)message.ReplyToSenderUserId ?? DBNull.Value);
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Text,
+            (object?)message.ReplyToPreview ?? DBNull.Value);
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Text,
+            (object?)message.ForwardedFromMessageId ?? DBNull.Value);
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Bigint,
+            (object?)message.ForwardedFromSenderUserId ?? DBNull.Value);
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Text,
+            (object?)message.ForwardedFromPreview ?? DBNull.Value);
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Array | NpgsqlDbType.Bigint,
+            message.MentionedUserIds is { Count: > 0 }
+                ? message.MentionedUserIds.ToArray()
+                : DBNull.Value);
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Array | NpgsqlDbType.Text,
+            message.MentionedRoles is { Count: > 0 }
+                ? message.MentionedRoles.ToArray()
+                : DBNull.Value);
+
+        // $22..$36：outbox（与 MessageCreateBundleWriter.AddOutboxParameters 一致，无预领取；
+        // conversation_id 复用 admission 的 $5，不在此重复绑定）。
+        command.Parameters.AddWithValue(NpgsqlDbType.Text, evt.EventId);
+        command.Parameters.AddWithValue(NpgsqlDbType.Bytea, payloadUtf8);
+        command.Parameters.AddWithValue(NpgsqlDbType.Bigint, evt.TargetUserId);
+        command.Parameters.AddWithValue(NpgsqlDbType.Smallint, (short)evt.Type);
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Smallint,
+            (short)RealtimeOutboxStatus.Pending);
+        command.Parameters.AddWithValue(NpgsqlDbType.Integer, 0); // attempt_count（无预领取）
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Array | NpgsqlDbType.Bigint,
+            (object?)evt.TargetUserIds ?? DBNull.Value);
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Smallint,
+            (short)(evt.AudienceKind ?? 0));
+        command.Parameters.AddWithValue(NpgsqlDbType.Bigint, evt.ExcludeUserId ?? 0L); // $30
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Text,
+            (object?)evt.TraceParent ?? DBNull.Value); // $31
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Text,
+            (object?)evt.TraceState ?? DBNull.Value); // $32
+        command.Parameters.AddWithValue(NpgsqlDbType.Bigint, evt.OccurredAtMs); // $33
+        command.Parameters.AddWithValue(NpgsqlDbType.Text, DBNull.Value); // $34 locked_by（无预领取）
+        command.Parameters.AddWithValue(NpgsqlDbType.Bigint, DBNull.Value); // $35 locked_until_ms
+        command.Parameters.AddWithValue(NpgsqlDbType.Text, DBNull.Value); // $36 claim_token
+
+        // $37..$38：幂等账本（写开关 + 结果类型）。
+        command.Parameters.AddWithValue(NpgsqlDbType.Boolean, true); // writeLedger
+        command.Parameters.AddWithValue(
+            NpgsqlDbType.Smallint,
+            (short)IdempotencyLedgerResultKind.Created);
+
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+            throw new InvalidOperationException("super-bundle CTE 未返回结果行。");
+
+        return new SuperBundleWriteOutcome(
+            ConversationSequence: reader.IsDBNull(0) ? null : reader.GetInt64(0),
+            SenderSequence: reader.IsDBNull(1) ? null : reader.GetInt64(1),
+            WriteFlags: reader.GetInt32(2),
+            LifecycleState: reader.GetInt16(3),
+            LedgerCommandId: reader.IsDBNull(4) ? null : reader.GetString(4),
+            AuthorizationDecision: reader.IsDBNull(5) ? (short)-1 : reader.GetInt16(5));
+    }
+
     private async Task RunSaveWorkloadCoreAsync(
         NpgsqlRealtimeMessageStore store,
         int count,
@@ -611,4 +1048,23 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
 
         await _container.DisposeAsync().ConfigureAwait(false);
     }
+}
+
+/// <summary>
+/// 单条 super-bundle CTE 的执行结果：会话序号、写入标志与 admission 判读，供
+/// <see cref="PostgresPerfHarness.ExecuteSuperBundleAsync"/> 返回以校验写入语义与幂等性。
+/// </summary>
+internal readonly record struct SuperBundleWriteOutcome(
+    long? ConversationSequence,
+    long? SenderSequence,
+    int WriteFlags,
+    short LifecycleState,
+    string? LedgerCommandId,
+    short AuthorizationDecision)
+{
+    public bool MessageInserted => (WriteFlags & 1) != 0;
+
+    public bool OutboxInserted => (WriteFlags & 2) != 0;
+
+    public bool LedgerInserted => (WriteFlags & 4) != 0;
 }
