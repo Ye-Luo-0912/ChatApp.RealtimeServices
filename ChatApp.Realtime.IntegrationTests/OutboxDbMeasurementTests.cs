@@ -378,6 +378,50 @@ public sealed class OutboxDbMeasurementTests
     }
 
     /// <summary>
+    /// OUTBOX-DB-1 需求 2：A/B 验证 claim/complete 的「有界批量上限」对每消息往返/事务开销的影响。
+    /// <para>
+    /// claim/delete 均为单语句（`FOR UPDATE ... SKIP LOCKED ... LIMIT @batch_size` /
+    /// `DELETE ... USING UNNEST`），批量上限只改变每条消息的平均往返次数与事务提交次数
+    /// （autocommit 下每语句一个事务）：A 用批量上限 1（每条消息独立 claim+delete 往返），
+    /// B 用有界批量上限 200（单事务/单 claim 跨度可控）。以 pg_stat_statements 语句级 calls
+    /// 折算每消息排水往返数与 WAL/耗时。报告写入 <c>docs/measurements/outbox-db-batch-size-ab.md</c>。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task OutboxDrain_BatchSizeAb_ReportsRoundTripSavings()
+    {
+        await using var harness = new PostgresPerfHarness();
+        await harness.InitializeAsync();
+
+        // 预热两批量上限的连接池/plan cache；该段不纳入测量窗口。
+        await harness.RunSaveWorkloadAsync(200, Seed);
+        await harness.RunOutboxDrainDeleteAsync(200, 50);
+        await harness.RunSaveWorkloadAsync(200, Seed + 1);
+        await harness.RunOutboxDrainDeleteAsync(200, 200);
+
+        // A：批量上限 1（每条消息独立 claim+delete）。
+        await harness.RunSaveWorkloadAsync(MessageCount, Seed + 320);
+        var aBefore = await harness.SnapshotAsync();
+        var aCompleted = await harness.RunOutboxDrainDeleteAsync(MessageCount, 1);
+        var aAfter = await harness.SnapshotAsync();
+        var aDiff = PostgresPerfDiffCalculator.Diff(aBefore, aAfter);
+
+        // B：有界批量上限 200（单事务跨度可控）。
+        await harness.RunSaveWorkloadAsync(MessageCount, Seed + 330);
+        var bBefore = await harness.SnapshotAsync();
+        var bCompleted = await harness.RunOutboxDrainDeleteAsync(MessageCount / 200, 200);
+        var bAfter = await harness.SnapshotAsync();
+        var bDiff = PostgresPerfDiffCalculator.Diff(bBefore, bAfter);
+
+        Assert.Equal(MessageCount, aCompleted);
+        Assert.Equal(MessageCount, bCompleted);
+        Assert.True(aDiff.Statements.Sum(s => s.Calls) > 0, "A 配置应产生排水 SQL 调用。");
+        Assert.True(bDiff.Statements.Sum(s => s.Calls) > 0, "B 配置应产生排水 SQL 调用。");
+
+        await WriteBatchSizeAbReportAsync(aDiff, bDiff);
+    }
+
+    /// <summary>
     /// 归因 claim 语句（CTE candidates + UPDATE）的窗口增量明细。
     /// </summary>
     private static PgStatementDiff? ClaimStatement(PostgresPerfDiff diff) =>
@@ -726,6 +770,97 @@ public sealed class OutboxDbMeasurementTests
         sb.Append(PostgresPerfReporter.Render(bDiff, MessageCount, "B：合并（admission+序号分配单条 CTE）"));
 
         await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
+    }
+
+    private static async Task WriteBatchSizeAbReportAsync(
+        PostgresPerfDiff aDiff,
+        PostgresPerfDiff bDiff)
+    {
+        var reportDir = ResolveDocsMeasurementsDir();
+        Directory.CreateDirectory(reportDir);
+        var reportPath = Path.Combine(reportDir, "outbox-db-batch-size-ab.md");
+
+        var sb = new StringBuilder();
+        sb.AppendLine("# OUTBOX-DB-1 有界批量 claim/complete A/B（批量上限对每消息往返/事务开销的影响）");
+        sb.AppendLine();
+        sb.AppendLine($"> 生成时间：{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC；语料固定、随机种子 {Seed}；" +
+                       $"delete-on-complete 排水 {MessageCount} 条。");
+        sb.AppendLine();
+        sb.AppendLine("| 批量上限 | 排水 SQL 往返/消息 | 排水耗时/消息(ms) | 排水 WAL 字节/消息 | claim 调用 | delete 调用 |");
+        sb.AppendLine("|---|---|---|---|---|---|");
+        sb.AppendLine($"| A：1（每条消息独立 claim+delete） | {DrainRoundTripsPerMessage(aDiff, MessageCount):N2} | {DrainExecMsPerMessage(aDiff, MessageCount):N2} | {DrainWalBytesPerMessage(aDiff, MessageCount):N0} | {ClaimCalls(aDiff)} | {DeleteCalls(aDiff)} |");
+        sb.AppendLine($"| B：200（有界批量，单事务跨度可控） | {DrainRoundTripsPerMessage(bDiff, MessageCount):N2} | {DrainExecMsPerMessage(bDiff, MessageCount):N2} | {DrainWalBytesPerMessage(bDiff, MessageCount):N0} | {ClaimCalls(bDiff)} | {DeleteCalls(bDiff)} |");
+        sb.AppendLine();
+        sb.AppendLine("> 以 pg_stat_statements 语句级 calls/wal_bytes 归因，A/B 同容器顺序运行、仅 claim/complete 批量上限不同；");
+        sb.AppendLine("> claim/delete 均为单语句（`FOR UPDATE ... SKIP LOCKED ... LIMIT @batch_size` / `DELETE ... USING UNNEST`），");
+        sb.AppendLine("> 批量上限只改变每条消息的平均往返次数与事务提交次数（autocommit 下每语句一个事务）：批量越大、");
+        sb.AppendLine("> 每消息往返与提交开销越低，而上限本身保证单事务/单 claim 跨度有界，积压时不会形成失控大事务。");
+        sb.AppendLine();
+
+        sb.AppendLine("## A：批量上限 1 的排水语句");
+        sb.AppendLine();
+        sb.Append(DrainStatementTable(aDiff, MessageCount));
+        sb.Append(PostgresPerfReporter.Render(aDiff, MessageCount, "A：批量上限 1（往返最频繁）"));
+        sb.AppendLine();
+
+        sb.AppendLine("## B：批量上限 200 的排水语句");
+        sb.AppendLine();
+        sb.Append(DrainStatementTable(bDiff, MessageCount));
+        sb.Append(PostgresPerfReporter.Render(bDiff, MessageCount, "B：有界批量上限 200"));
+
+        await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
+    }
+
+    /// <summary>排水窗口内 claim/delete 语句的总调用次数（即排水往返总数）。</summary>
+    private static long DrainRoundTrips(PostgresPerfDiff diff) =>
+        diff.Statements.Where(IsDrainStatement).Sum(s => s.Calls);
+
+    /// <summary>每条消息的排水往返数（claim+delete 调用数 / 消息数）。</summary>
+    private static double DrainRoundTripsPerMessage(PostgresPerfDiff diff, int messageCount) =>
+        messageCount > 0 ? DrainRoundTrips(diff) / (double)messageCount : 0;
+
+    /// <summary>排水语句的总执行时间按消息数折算（ms/消息）。</summary>
+    private static double DrainExecMsPerMessage(PostgresPerfDiff diff, int messageCount) =>
+        messageCount > 0 ? diff.Statements.Where(IsDrainStatement).Sum(s => s.TotalExecMs) / messageCount : 0;
+
+    /// <summary>排水语句的总 WAL 字节按消息数折算（字节/消息）。</summary>
+    private static double DrainWalBytesPerMessage(PostgresPerfDiff diff, int messageCount) =>
+        messageCount > 0 ? diff.Statements.Where(IsDrainStatement).Sum(s => s.WalBytes) / (double)messageCount : 0;
+
+    /// <summary>claim 语句调用数（`FOR UPDATE ... SKIP LOCKED ... LIMIT` 的 UPDATE）。</summary>
+    private static long ClaimCalls(PostgresPerfDiff diff) =>
+        diff.Statements.Where(IsClaimStatement).Sum(s => s.Calls);
+
+    /// <summary>delete-on-complete 语句调用数（`DELETE ... USING UNNEST`）。</summary>
+    private static long DeleteCalls(PostgresPerfDiff diff) =>
+        diff.Statements.Where(IsDeleteStatement).Sum(s => s.Calls);
+
+    private static bool IsClaimStatement(PgStatementDiff s) =>
+        s.Query.Contains("candidates AS MATERIALIZED", StringComparison.OrdinalIgnoreCase)
+        && s.Query.Contains("UPDATE", StringComparison.OrdinalIgnoreCase)
+        && s.Query.Contains("SKIP LOCKED", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsDeleteStatement(PgStatementDiff s) =>
+        s.Query.Contains("DELETE FROM", StringComparison.OrdinalIgnoreCase)
+        && s.Query.Contains("UNNEST", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsDrainStatement(PgStatementDiff s) =>
+        IsClaimStatement(s) || IsDeleteStatement(s);
+
+    /// <summary>渲染排水路径（claim/delete）语句的每消息成本表。</summary>
+    private static string DrainStatementTable(PostgresPerfDiff diff, int messageCount)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("| 语句 | 调用 | 调用/消息 | exec/消息(ms) | wal_bytes/调用 | sql 片段 |");
+        sb.AppendLine("|---|---|---|---|---|---|");
+        foreach (var s in diff.Statements.Where(IsDrainStatement).OrderByDescending(s => s.WalBytes))
+        {
+            var sql = s.Query.Length > 72 ? s.Query[..72] + "…" : s.Query;
+            sb.AppendLine($"| {s.Calls:N0} | {s.Calls / (double)messageCount:N2} | {s.TotalExecMs / messageCount:N3} | {(s.Calls > 0 ? s.WalBytes / s.Calls : 0):N0} | `{SanitizeMd(sql)}` |");
+        }
+
+        sb.AppendLine();
+        return sb.ToString();
     }
 
     /// <summary>
