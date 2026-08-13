@@ -1,5 +1,6 @@
 using System.Text;
 using ChatApp.Realtime.IntegrationTests.Measurement;
+using ChatApp.Realtime.Infrastructure.Postgres.Stores;
 using Npgsql;
 
 namespace ChatApp.Realtime.IntegrationTests;
@@ -332,6 +333,51 @@ public sealed class OutboxDbMeasurementTests
     }
 
     /// <summary>
+    /// OUTBOX-DB-1 需求 2：A/B 验证 admission 合并对「重复读取/往返」的削减。
+    /// <para>
+    /// A 为 fallback 路径（<c>idempotencyLedger: null</c>）：生命周期读取、账本读取、
+    /// 会话序号分配是 3 条独立 SQL（每次 SaveAsync 约 3 次往返 + bundle）。
+    /// B 为生产合并路径（注入 <see cref="NpgsqlCommandIdempotencyLedger"/>）：admission 命令
+    /// 用单条 CTE 把「生命周期锁/状态 + canonical 账本读取 + 事务内授权 + 会话序号分配」
+    /// 合并为一条 SQL，每次 SaveAsync 约 2 次往返 + bundle。
+    /// 以 pg_stat_statements 语句级 calls 折算每条消息平均 SQL 往返数，并对照 WAL/耗时。
+    /// 报告写入 <c>docs/measurements/outbox-db-admission-merge-ab.md</c>。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task SaveAsync_AdmissionMergeAb_ReportsRoundTripSavings()
+    {
+        await using var harness = new PostgresPerfHarness();
+        await harness.InitializeAsync();
+        // 合并路径的 direct_authorization 读取 public."AspNetUsers"/"T_BlockRecords"/
+        // "T_UserFriendEntry"，需先播种语料用户的授权关系使判定为 Allowed。
+        await harness.SeedAuthTablesAsync();
+
+        // 预热两路径的连接池与 plan cache；该段不纳入测量窗口。
+        await harness.RunSaveWorkloadAsync(200, Seed);
+        await harness.RunMergedSaveWorkloadAsync(200, Seed + 1);
+
+        // A：fallback（lifecycle admission + 序号分配 + bundle 三次往返）。
+        var aBefore = await harness.SnapshotAsync();
+        await harness.RunSaveWorkloadAsync(MessageCount, Seed + 200);
+        var aAfter = await harness.SnapshotAsync();
+        var aDiff = PostgresPerfDiffCalculator.Diff(aBefore, aAfter);
+
+        // B：生产合并（admission+序号分配单条 CTE + bundle 两次往返）。
+        var bBefore = await harness.SnapshotAsync();
+        await harness.RunMergedSaveWorkloadAsync(MessageCount, Seed + 210);
+        var bAfter = await harness.SnapshotAsync();
+        var bDiff = PostgresPerfDiffCalculator.Diff(bBefore, bAfter);
+
+        Assert.True(aDiff.Wal.WalBytes > 0, "A 配置应产生 WAL 写入。");
+        Assert.True(bDiff.Wal.WalBytes > 0, "B 配置应产生 WAL 写入。");
+        Assert.True(aDiff.Statements.Sum(s => s.Calls) > 0, "A 配置应产生 SQL 调用。");
+        Assert.True(bDiff.Statements.Sum(s => s.Calls) > 0, "B 配置应产生 SQL 调用。");
+
+        await WriteAdmissionMergeAbReportAsync(aDiff, bDiff);
+    }
+
+    /// <summary>
     /// 归因 claim 语句（CTE candidates + UPDATE）的窗口增量明细。
     /// </summary>
     private static PgStatementDiff? ClaimStatement(PostgresPerfDiff diff) =>
@@ -641,6 +687,90 @@ public sealed class OutboxDbMeasurementTests
 
         await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
     }
+
+    private static async Task WriteAdmissionMergeAbReportAsync(
+        PostgresPerfDiff aDiff,
+        PostgresPerfDiff bDiff)
+    {
+        var reportDir = ResolveDocsMeasurementsDir();
+        Directory.CreateDirectory(reportDir);
+        var reportPath = Path.Combine(reportDir, "outbox-db-admission-merge-ab.md");
+
+        var sb = new StringBuilder();
+        sb.AppendLine("# OUTBOX-DB-1 admission 合并 A/B（减少重复读取/往返）");
+        sb.AppendLine();
+        sb.AppendLine($"> 生成时间：{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC；语料固定、随机种子 {Seed}；" +
+                       $"每配置 inbound {MessageCount} 条消息。");
+        sb.AppendLine();
+        sb.AppendLine("| 配置 | 热路径 SQL/消息 | SQL 往返/消息 | 总执行时间/消息(ms) | WAL 字节/消息 | WAL 记录/消息 |");
+        sb.AppendLine("|---|---|---|---|---|---|");
+        sb.AppendLine($"| A：fallback（lifecycle admission + 序号分配 + bundle） | {HotPathStatementCount(aDiff, MessageCount)} | {TotalCallsPerMessage(aDiff, MessageCount):N1} | {TotalExecMsPerMessage(aDiff, MessageCount):N2} | {aDiff.Wal.WalBytes / MessageCount:N0} | {aDiff.Wal.WalRecords / (double)MessageCount:N1} |");
+        sb.AppendLine($"| B：合并（admission+序号分配单条 CTE + bundle） | {HotPathStatementCount(bDiff, MessageCount)} | {TotalCallsPerMessage(bDiff, MessageCount):N1} | {TotalExecMsPerMessage(bDiff, MessageCount):N2} | {bDiff.Wal.WalBytes / MessageCount:N0} | {bDiff.Wal.WalRecords / (double)MessageCount:N1} |");
+        sb.AppendLine();
+        sb.AppendLine("> 以 pg_stat_statements 语句级 calls/wal_bytes 归因，A/B 同容器顺序运行、仅 admission/序号分配路径不同；");
+        sb.AppendLine("> 确定性收益是每次消息的 SQL 往返 −1（热路径 3 条 → 2 条）：B 把「生命周期读取 + canonical 账本读取 +");
+        sb.AppendLine("> 事务内授权 + 会话序号分配」合并为单条 CTE，消除 fallback 的独立 `upsert_conversation` 序号分配往返；");
+        sb.AppendLine("> WAL 列不可直接对比：B 额外承担幂等账本 canonical 插入（`command_idempotency_ledger` 每消息 1 行，A 完全没有），");
+        sb.AppendLine("> 且短窗口下 WAL 字节/消息随容器页分配有 ±10% 级波动，故以语句级 calls 与热路径语句数为权威归因。");
+        sb.AppendLine();
+
+        sb.AppendLine("## A：fallback 热路径语句（近热路径 = 调用数 ≥ 消息数一半）");
+        sb.AppendLine();
+        sb.Append(PerMessageStatementTable(aDiff, MessageCount));
+        sb.Append(PostgresPerfReporter.Render(aDiff, MessageCount, "A：fallback（独立 SQL 更多）"));
+        sb.AppendLine();
+
+        sb.AppendLine("## B：合并热路径语句（近热路径 = 调用数 ≥ 消息数一半）");
+        sb.AppendLine();
+        sb.Append(PerMessageStatementTable(bDiff, MessageCount));
+        sb.Append(PostgresPerfReporter.Render(bDiff, MessageCount, "B：合并（admission+序号分配单条 CTE）"));
+
+        await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
+    }
+
+    /// <summary>
+    /// 统计窗口内每条消息都执行的「数据路径」语句数（INSERT INTO messages / conversations /
+    /// pg_advisory_xact_lock_shared 生命周期），用于对照 A/B 各自的热路径往返结构。
+    /// 排除 BEGIN/COMMIT/SET/RESET/DISCARD 等 Npgsql 会话管理语句（连接池复用后不随每条消息出现）。
+    /// </summary>
+    private static int HotPathStatementCount(PostgresPerfDiff diff, int messageCount) =>
+        diff.Statements.Count(s =>
+            s.Calls >= messageCount / 2
+            && (s.Query.Contains("INSERT INTO", StringComparison.OrdinalIgnoreCase)
+                || s.Query.Contains("pg_advisory_xact_lock_shared", StringComparison.OrdinalIgnoreCase)
+                || s.Query.Contains("upsert_conversation", StringComparison.OrdinalIgnoreCase)));
+
+    /// <summary>窗口内全部语句的总调用次数按消息数折算，即每条消息平均触发的 SQL 往返数。</summary>
+    private static double TotalCallsPerMessage(PostgresPerfDiff diff, int messageCount) =>
+        messageCount > 0 ? diff.Statements.Sum(s => s.Calls) / (double)messageCount : 0;
+
+    /// <summary>窗口内全部语句的总执行时间按消息数折算（ms/消息）。</summary>
+    private static double TotalExecMsPerMessage(PostgresPerfDiff diff, int messageCount) =>
+        messageCount > 0 ? diff.Statements.Sum(s => s.TotalExecMs) / messageCount : 0;
+
+    /// <summary>
+    /// 渲染近热路径语句（调用数 ≥ 消息数一半）的 per-message 成本表，
+    /// 用于对照 A/B 各自的 SQL 往返结构。
+    /// </summary>
+    private static string PerMessageStatementTable(PostgresPerfDiff diff, int messageCount)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("| 调用 | 调用/消息 | exec/消息(ms) | wal_records/消息 | wal_bytes/调用 | sql 片段 |");
+        sb.AppendLine("|---|---|---|---|---|---|");
+        foreach (var s in diff.Statements
+                     .Where(s => s.Calls >= messageCount / 2)
+                     .OrderByDescending(s => s.WalBytes))
+        {
+            var sql = s.Query.Length > 72 ? s.Query[..72] + "…" : s.Query;
+            sb.AppendLine($"| {s.Calls:N0} | {s.Calls / (double)messageCount:N1} | {s.TotalExecMs / messageCount:N2} | {s.WalRecords / (double)messageCount:N1} | {(s.Calls > 0 ? s.WalBytes / s.Calls : 0):N0} | `{SanitizeMd(sql)}` |");
+        }
+
+        sb.AppendLine();
+        return sb.ToString();
+    }
+
+    private static string SanitizeMd(string sql) =>
+        sql.Replace("|", "\\|", StringComparison.Ordinal).ReplaceLineEndings(" ");
 
     private static string ResolveDocsMeasurementsDir()
     {

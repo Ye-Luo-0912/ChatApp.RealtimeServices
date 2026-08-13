@@ -49,6 +49,7 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     private RealtimeDatabaseClient? _client;
     private RealtimeDatabaseSchema? _schema;
     private NpgsqlRealtimeMessageStore? _messageStore;
+    private NpgsqlRealtimeMessageStore? _mergedMessageStore;
     private NpgsqlRealtimeOutboxStore? _outboxStore;
 
     public string SchemaName { get; } = $"perf_{Guid.NewGuid():N}"[..17];
@@ -99,6 +100,21 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
             metrics: null,
             idempotencyLedger: null,
             outboxSignal: null);
+        // 生产合并路径：注入 Npgsql 账本后，SaveAsync 走
+        // MessageWriteAdmissionReader.AcquireDirectAndAllocateSequenceAsync，把生命周期读取、
+        // 账本 canonical 读取、事务内授权与会话序号分配合并为单条 CTE，消除 fallback 的
+        // ordered_users + upsert_conversation 两次独立往返。
+        _mergedMessageStore = new NpgsqlRealtimeMessageStore(
+            _client,
+            _schema,
+            new PostgresConversationMessageMutationPolicy(NullLogger<PostgresConversationMessageMutationPolicy>.Instance),
+            NullLogger<NpgsqlRealtimeMessageStore>.Instance,
+            metrics: null,
+            idempotencyLedger: new NpgsqlCommandIdempotencyLedger(
+                _client,
+                _schema,
+                NullLogger<NpgsqlCommandIdempotencyLedger>.Instance),
+            outboxSignal: null);
         _outboxStore = new NpgsqlRealtimeOutboxStore(_client, _schema);
     }
 
@@ -112,6 +128,64 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
             .MigrateAsync(connection).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// 创建并播种生产合并路径所需的事务内授权表（<c>public."AspNetUsers"</c> /
+    /// <c>public."T_BlockRecords"</c> / <c>public."T_UserFriendEntry"</c>），并让语料中的
+    /// 发送/接收用户（10_000_000_001 / 10_000_000_002）成为互加好友且非禁止陌生人策略，
+    /// 使 <see cref="MessageWriteAdmissionReader.AcquireDirectAndAllocateSequenceAsync"/>
+    /// 的 <c>direct_authorization</c> 判定为 Allowed。
+    /// </summary>
+    public async Task SeedAuthTablesAsync(CancellationToken ct = default)
+    {
+        await using var connection = await Client.GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
+        await using (var cmd = new NpgsqlCommand(
+            """
+            CREATE TABLE IF NOT EXISTS public."AspNetUsers"
+            (
+                "Id" bigint PRIMARY KEY,
+                "FriendRequestPolicy" smallint NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS public."T_BlockRecords"
+            (
+                "BlockerId" bigint NOT NULL,
+                "BlockedUserId" bigint NOT NULL,
+                PRIMARY KEY ("BlockerId", "BlockedUserId")
+            );
+
+            CREATE TABLE IF NOT EXISTS public."T_UserFriendEntry"
+            (
+                "UserId" bigint NOT NULL,
+                "FriendId" bigint NOT NULL,
+                "IsDeleted" boolean NOT NULL DEFAULT FALSE,
+                PRIMARY KEY ("UserId", "FriendId")
+            );
+            """,
+            connection))
+        {
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+
+        // FriendRequestPolicy=1（RequireVerification）≠ 2（NoStrangers），配合互加好友，
+        // direct_authorization 判定 privacy_policy≠2 且双向好友存在 → decision=0（Allowed）。
+        await using (var cmd = new NpgsqlCommand(
+            """
+            INSERT INTO public."AspNetUsers" ("Id", "FriendRequestPolicy") VALUES
+                (10000000001, 1),
+                (10000000002, 1)
+            ON CONFLICT ("Id") DO NOTHING;
+
+            INSERT INTO public."T_UserFriendEntry" ("UserId", "FriendId", "IsDeleted") VALUES
+                (10000000001, 10000000002, FALSE),
+                (10000000002, 10000000001, FALSE)
+            ON CONFLICT ("UserId", "FriendId") DO NOTHING;
+            """,
+            connection))
+        {
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+    }
+
     public RealtimeDatabaseClient Client =>
         _client ?? throw new InvalidOperationException("Harness 未初始化。");
 
@@ -120,6 +194,13 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
 
     public NpgsqlRealtimeMessageStore MessageStore =>
         _messageStore ?? throw new InvalidOperationException("Harness 未初始化。");
+
+    /// <summary>
+    /// 生产合并路径的 store：注入 <see cref="NpgsqlCommandIdempotencyLedger"/> 后，
+    /// <see cref="NpgsqlRealtimeMessageStore.SaveAsync"/> 走单条 admission+序号 CTE。
+    /// </summary>
+    public NpgsqlRealtimeMessageStore MergedMessageStore =>
+        _mergedMessageStore ?? throw new InvalidOperationException("Harness 未初始化。");
 
     public NpgsqlRealtimeOutboxStore OutboxStore =>
         _outboxStore ?? throw new InvalidOperationException("Harness 未初始化。");
@@ -353,17 +434,42 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     /// 用固定语料 + 固定随机种子驱动真实 <see cref="NpgsqlRealtimeMessageStore.SaveAsync"/>
     /// 热路径 <paramref name="count"/> 条消息。每条消息使用独立会话/客户端编号，避免幂等命中。
     /// <para>
+    /// 该路径使用 fallback store（<c>idempotencyLedger: null</c>）：生命周期读取与序号分配是
+    /// <c>ordered_users</c> + <c>upsert_conversation</c> 两条独立 SQL，用于与生产合并路径
+    /// （<see cref="RunMergedSaveWorkloadAsync"/>）对照「减少重复读取/往返」的收益。
+    /// </para>
+    /// <para>
     /// 当 <paramref name="replyEvery"/> &gt; 0 时，每第 <c>replyEvery</c> 条消息携带
     /// reply_to_*/forwarded_from_* 引用（模拟含回复/转发引用的真实消息流），用于归因
     /// <c>ix_messages_reply_to</c> / <c>ix_messages_forwarded_from</c> 两个部分索引的写放大；
     /// 默认 0 保持纯消息语料，与既有基线一致。
     /// </para>
     /// </summary>
-    public async Task RunSaveWorkloadAsync(
+    public Task RunSaveWorkloadAsync(
         int count,
         int seed,
         CancellationToken ct = default,
         int replyEvery = 0)
+        => RunSaveWorkloadCoreAsync(MessageStore, count, seed, ct, replyEvery);
+
+    /// <summary>
+    /// 用同一固定语料驱动生产合并路径（<see cref="MergedMessageStore"/>）的 SaveAsync 热路径。
+    /// 生命周期读取、账本 canonical 读取、事务内授权与会话序号分配在单条 CTE 内完成，
+    /// 用于与 fallback（<see cref="RunSaveWorkloadAsync"/>）对照。
+    /// </summary>
+    public Task RunMergedSaveWorkloadAsync(
+        int count,
+        int seed,
+        CancellationToken ct = default,
+        int replyEvery = 0)
+        => RunSaveWorkloadCoreAsync(MergedMessageStore, count, seed, ct, replyEvery);
+
+    private async Task RunSaveWorkloadCoreAsync(
+        NpgsqlRealtimeMessageStore store,
+        int count,
+        int seed,
+        CancellationToken ct,
+        int replyEvery)
     {
         var rng = new Random(seed);
         long sender = 10_000_000_001;
@@ -406,7 +512,7 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
                 PayloadJson = """{"v":1}""",
             };
 
-            var result = await MessageStore.SaveAsync(message, evt, ct).ConfigureAwait(false);
+            var result = await store.SaveAsync(message, evt, ct).ConfigureAwait(false);
             if (result.Kind != RealtimeMessagePersistKind.Created)
             {
                 throw new InvalidOperationException(
