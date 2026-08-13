@@ -36,6 +36,11 @@ Server 关系增量已能在 JetStream ACK 前原子应用到 projection item/ve
 
 完成标准：逐消息 SQL、WAL 或 managed allocation 至少一项有可重复收益；ACK/跨 Gateway 投递、重复/漏投、JetStream backlog、死信、p95/p99、CPU 和 GC 均不回退。短测不满足正确性时立即撤销该单项优化。
 
+**当前进度（2026-08-13）**：
+- 需求 1（PG 级测量基石）：新增 `Measurement/PostgresPerfHarness`——以 `shared_preload_libraries=pg_stat_statements` + `pg_stat_statements.track=top` 启动真实 PostgreSQL 16 Testcontainer，端口等待 + 连接重试消除就绪竞态；`SnapshotAsync` 采集 `pg_stat_statements`（按 queryid 聚合的 calls/time/rows/blks/WAL）、`pg_stat_wal` 与 `pg_stat_user_tables` 前后快照。`.WithCommand` 只传 `-c` 参数（镜像 entrypoint 自动附加 `postgres`，带前导可致 `postgres postgres ...` 启动失败）。
+- 固定语料/随机种子驱动真实 `NpgsqlRealtimeMessageStore.SaveAsync` 热路径（message + conversation/unread + outbox insert），消息/客户端/事件 id 带种子前缀避免预热与测量窗口幂等内容冲突；再驱动 Outbox claim + complete 排水。`PostgresPerfDiffCalculator` 按 queryid/表名对齐求窗口增量。
+- 报告：`OutboxDbMeasurementTests` 单测生成 `docs/measurements/outbox-db-baseline.md`（A/B 用 A 基线），按每消息拆分 WAL 字节/记录、Top SQL（按耗时与 WAL 双排序）、表级 HOT/死元组。基线验证运行通过（2000 条 inbound：每消息 2,949 WAL 字节 / 21.8 WAL 记录；`INSERT messages` 5.2MB、`upsert_conversation` 705KB；conversation_members/conversations 各 1,966 次 HOT 更新；outbox 1,966 插入）。注意 `pg_stat_*` 统计收集器存在异步滞后，超短窗口下全局 WAL 增量可能为 0，A/B 应以更长窗口（5–10 分钟）为准并以语句级 WAL 为权威归因。
+
 ### P0：`OUTBOX-RECOVERY-1` 租约、崩溃与死信重放
 
 1. 补齐 claim、续租、租约过期接管和 owner/token fencing；旧 worker 在失租后不得完成、重试或删除记录。
