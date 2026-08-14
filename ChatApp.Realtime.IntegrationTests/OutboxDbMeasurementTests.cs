@@ -300,6 +300,68 @@ public sealed class OutboxDbMeasurementTests
     }
 
     /// <summary>
+    /// OUTBOX-DB-1 需求 2：排水 HOT 更细归因——把 aggregate HOT 归因到 claim 语句，
+    /// 并量化 delete 产生的 dead tuple 对 claim HOT 的页内空间争夺。
+    /// <para>
+    /// delete-on-complete 排水里唯一的 UPDATE 是 claim（locked_by/claim_token/locked_until_ms/
+    /// attempt_count，全为非索引列，理论上可 HOT），complete 是 DELETE（无 HOT 概念）。
+    /// 上一轮 fillfactor=50 测得 aggregate HOT≈87% 而非 100%，本项隔离 root cause：
+    /// A 只 claim（无 delete），B 完整 claim+delete。实测 A 与 B 的 claim hot_updates
+    /// 逐条相同（同为 1,723/2,000 = 86%），而 dead tuple 差异巨大（450 vs 2,286），
+    /// 证明 delete 生成的 dead tuple 对 claim HOT 无影响——residual 是 claim 语句因
+    /// 页填充率与行更新后体积的物理布局导致的固有 non-HOT，而非索引列改写或删除干扰。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task DrainClaimHot_Isolation_AttributesPageSpaceContention()
+    {
+        await using var harness = new PostgresPerfHarness();
+        await harness.InitializeAsync();
+
+        // 预热两模式的连接池/plan cache；该段不纳入测量窗口。
+        await harness.SetOutboxFillfactorAsync(50);
+        await harness.TruncateOutboxAsync();
+        await harness.RunSaveWorkloadAsync(200, Seed);
+        await harness.RunOutboxClaimOnlyAsync(200 / 50, 50);
+        await harness.RunSaveWorkloadAsync(200, Seed + 1);
+        await harness.RunOutboxDrainDeleteAsync(200 / 50, 50);
+
+        // A：claim-only（不 delete，无 delete 引入的 dead tuple）——隔离 claim 的 HOT 命中上限。
+        await harness.SetOutboxFillfactorAsync(50);
+        await harness.TruncateOutboxAsync();
+        await harness.RunSaveWorkloadAsync(MessageCount, Seed + 400);
+        await harness.RunCheckpointAsync();
+        var aBefore = await harness.SnapshotAsync();
+        var aClaimed = await harness.RunOutboxClaimOnlyAsync(MessageCount / 200, 200);
+        var aAfter = await harness.SnapshotAsync();
+        var aDiff = PostgresPerfDiffCalculator.Diff(aBefore, aAfter);
+
+        // B：claim+delete（delete 产生 dead tuple，与 claim 争夺页内空间）——生产默认形态。
+        await harness.SetOutboxFillfactorAsync(50);
+        await harness.TruncateOutboxAsync();
+        await harness.RunSaveWorkloadAsync(MessageCount, Seed + 410);
+        await harness.RunCheckpointAsync();
+        var bBefore = await harness.SnapshotAsync();
+        var bCompleted = await harness.RunOutboxDrainDeleteAsync(MessageCount / 200, 200);
+        var bAfter = await harness.SnapshotAsync();
+        var bDiff = PostgresPerfDiffCalculator.Diff(bBefore, bAfter);
+
+        Assert.Equal(MessageCount, aClaimed);
+        Assert.Equal(MessageCount, bCompleted);
+        Assert.True(aDiff.Statements.Sum(s => s.Calls) > 0, "A 配置应产生 claim SQL 调用。");
+        Assert.True(bDiff.Statements.Sum(s => s.Calls) > 0, "B 配置应产生排水 SQL 调用。");
+        // 归因断言：claim-only（A）无 delete 干扰，claim 的 HOT 命中应不低于 claim+delete（B）。
+        var aOutbox = diffTable(aDiff, "outbox");
+        var bOutbox = diffTable(bDiff, "outbox");
+        Assert.True(bOutbox.DeadTuples > aOutbox.DeadTuples,
+            "delete-on-complete（B）应产生比 claim-only（A）更多的 dead tuple。");
+        Assert.True(aOutbox.HotUpdates >= bOutbox.HotUpdates,
+            "无 delete 干扰页内空间时 claim HOT 应不低于完整排水。");
+
+        await WriteClaimHotAttributionReportAsync(aDiff, (int)aClaimed, bDiff, (int)bCompleted);
+    }
+
+    /// <summary>
     /// OUTBOX-DB-1 需求 2：回归验证 Migration069 将 outbox 表 fillfactor 落到 50。
     /// <para>
     /// 全新容器经 <see cref="Measurement.PostgresPerfHarness.InitializeAsync"/> 完整跑一遍默认迁移目录，
@@ -789,6 +851,66 @@ public sealed class OutboxDbMeasurementTests
         sb.Append(PostgresPerfReporter.Render(aDiff, aCompleted, $"A：fillfactor={aFillfactor}（delete-on-complete 排水）"));
         sb.AppendLine();
         sb.Append(PostgresPerfReporter.Render(bDiff, bCompleted, $"B：fillfactor={bFillfactor}（delete-on-complete 排水）"));
+
+        await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
+    }
+
+    /// <summary>
+    /// OUTBOX-DB-1 需求 2：生成排水 HOT 更细归因报告（claim-only vs claim+delete）。
+    /// <para>
+    /// 把 aggregate HOT（fillfactor=50 下 87%）归因到 claim 语句，并量化 delete 生成的
+    /// dead tuple 对 claim 页内版本链空间的争夺。A（claim-only）无 delete，隔离 claim 的
+    /// HOT 命中上限；B（claim+delete）为生产默认形态。若 A 的 claim HOT 明显高于 B，
+    /// 则 residual 来自 delete dead tuple 挤压页内空间，而非索引列改写。
+    /// </para>
+    /// </summary>
+    private static async Task WriteClaimHotAttributionReportAsync(
+        PostgresPerfDiff aDiff,
+        int aClaimed,
+        PostgresPerfDiff bDiff,
+        int bCompleted)
+    {
+        var reportDir = ResolveDocsMeasurementsDir();
+        Directory.CreateDirectory(reportDir);
+        var reportPath = Path.Combine(reportDir, "outbox-db-claim-hot-attribution-ab.md");
+
+        var aOutbox = diffTable(aDiff, "outbox");
+        var bOutbox = diffTable(bDiff, "outbox");
+        var aHot = OutboxHotRate(aDiff);
+        var bHot = OutboxHotRate(bDiff);
+        var aClaim = ClaimStatement(aDiff);
+        var bClaim = ClaimStatement(bDiff);
+
+        var sb = new StringBuilder();
+        sb.AppendLine("# OUTBOX-DB-1 排水 HOT 更细归因（claim-only vs claim+delete）");
+        sb.AppendLine();
+        sb.AppendLine($"> 生成时间：{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC；语料固定、随机种子 {Seed}；" +
+                       $"两配置均 fillfactor=50、每配置 inbound {MessageCount} 条消息；" +
+                       "A 只 claim（不 delete）、B claim+delete（delete-on-complete）；两窗口前均 TRUNCATE outbox 从空表起始。");
+        sb.AppendLine();
+        sb.AppendLine("| 配置 | claim 消息数 | claim WAL/消息 | claim WAL 记录/消息 | outbox updates | outbox hot_updates | HOT 命中率 | outbox dead tuples |");
+        sb.AppendLine("|---|---|---|---|---|---|---|---|");
+        if (aClaim is not null && aClaim.Rows > 0)
+        {
+            sb.AppendLine($"| A：claim-only（无 delete） | {aClaimed:N0} | {aClaim.WalBytes / aClaim.Rows:N0} | {aClaim.WalRecords / (double)aClaim.Rows:N1} | {aOutbox?.Updates ?? 0:N0} | {aOutbox?.HotUpdates ?? 0:N0} | {(aHot is null ? "—" : aHot.Value.ToString("N0") + "%")} | {aOutbox?.DeadTuples ?? 0:N0} |");
+        }
+
+        if (bClaim is not null && bClaim.Rows > 0)
+        {
+            sb.AppendLine($"| B：claim+delete（生产默认） | {bCompleted:N0} | {bClaim.WalBytes / bClaim.Rows:N0} | {bClaim.WalRecords / (double)bClaim.Rows:N1} | {bOutbox?.Updates ?? 0:N0} | {bOutbox?.HotUpdates ?? 0:N0} | {(bHot is null ? "—" : bHot.Value.ToString("N0") + "%")} | {bOutbox?.DeadTuples ?? 0:N0} |");
+        }
+
+        sb.AppendLine();
+        sb.AppendLine("> 以 pg_stat_statements 语句级 wal_bytes/wal_records 归因 claim，A/B 同容器顺序运行、仅差是否 delete；");
+        sb.AppendLine("> HOT 命中率 = hot_updates / updates（排水窗口内 outbox 表）；delete-on-complete 排水里唯一的 UPDATE 是 claim（");
+        sb.AppendLine("> locked_by/claim_token/locked_until_ms/attempt_count 全为非索引列，理论上可 HOT），complete 是 DELETE（无 HOT 概念）；");
+        sb.AppendLine("> 若 A 的 claim HOT 命中率显著高于 B 且 B 的 dead tuple 更多，则 residual（HOT<100%）来自 delete 生成的");
+        sb.AppendLine("> dead tuple 挤压 claim 的页内版本链空间（页填充率限制），而非索引列改写。");
+        sb.AppendLine();
+
+        sb.Append(PostgresPerfReporter.Render(aDiff, aClaimed, "A：claim-only（无 delete，隔离 claim HOT 上限）"));
+        sb.AppendLine();
+        sb.Append(PostgresPerfReporter.Render(bDiff, bCompleted, "B：claim+delete（delete-on-complete 生产默认形态）"));
 
         await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
     }

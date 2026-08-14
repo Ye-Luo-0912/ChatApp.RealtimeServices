@@ -1345,6 +1345,36 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     }
 
     /// <summary>
+    /// 只驱动 Outbox 认领（不删除、不 complete），用于把排水 HOT 归因到 claim 语句本身。
+    /// <para>
+    /// delete-on-complete 排水里唯一的 UPDATE 是 claim（locked_by/claim_token/locked_until_ms/
+    /// attempt_count，全为非索引列），complete 是 DELETE（无 HOT 概念）。本方法在「不产生由
+    /// delete 引入的 dead tuple」的前提下单独跑 claim，从而隔离 claim 的 HOT 命中上限，并与
+    /// <see cref="RunOutboxDrainDeleteAsync"/>（有 delete 干扰页内空间）对照归因 residual。
+    /// </para>
+    /// </summary>
+    public async Task<long> RunOutboxClaimOnlyAsync(
+        int batches,
+        int batchSize,
+        CancellationToken ct = default)
+    {
+        long claimed = 0;
+        for (var b = 0; b < batches; b++)
+        {
+            var got = await OutboxStore.ClaimBatchAsync("perf-worker", batchSize, TimeSpan.FromSeconds(30), ct)
+                .ConfigureAwait(false);
+            if (got.Count == 0)
+            {
+                break;
+            }
+
+            claimed += got.Count;
+        }
+
+        return claimed;
+    }
+
+    /// <summary>
     /// 清除所有已发布（Published）行，模拟 <c>OutboxCleanupWorker</c> 的一次全量清理。
     /// 用于保留模式完整排水生命周期测量（claim + MarkPublished + 后续 cleanup）。
     /// 以未来时间戳为 cutoff 循环删除直到清空，返回累计删除行数。
