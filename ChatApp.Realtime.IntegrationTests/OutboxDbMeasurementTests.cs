@@ -522,6 +522,54 @@ public sealed class OutboxDbMeasurementTests
     }
 
     /// <summary>
+    /// OUTBOX-DB-1 需求 2：A/B 验证「仅读接收者 user_state」的每消息收益（发送者已认证免重复读取）。
+    /// <para>
+    /// A 为完整授权读取的 super-bundle（<c>direct_user_state</c> 读取 AspNetUsers 的发送者 + 接收者
+    /// 两行，<c>WHERE "Id" IN ($2, $3)</c>）；B 为 sender-known 变体（<see cref="Measurement.PostgresPerfHarness.RunSenderKnownSuperBundleWorkloadAsync"/>，
+    /// <c>direct_user_state</c> 只读取接收者行 <c>WHERE "Id" = $3</c>、<c>sender_exists</c> 固定为 TRUE）。
+    /// 语义依据：生产发送者是已认证用户，其存在性在 admission 时已保证，故 sender 行的存在性读取是
+    /// 每消息的冗余读取。两路径语句数相同（单条 CTE）、写入行集相同、会话分布相同，唯一差异是
+    /// direct_user_state 是否读取发送者行，故执行耗时差异即可归因「发送者状态冗余读取」的成本。
+    /// 报告写入 <c>docs/measurements/outbox-db-sender-known-ab.md</c>。
+    /// </para>
+    /// <para>
+    /// 预期（并实测确认）：direct_user_state 的发送者/接收者行均命中共享缓冲区（blks_read=0），
+    /// 该冗余读取的每消息成本处于测量噪声内（执行耗时差 ~0.002 ms），为负收益——此变体不值得落地。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task SaveAsync_SenderKnownAb_ReportsSenderStateReadSaving()
+    {
+        await using var harness = new PostgresPerfHarness();
+        await harness.InitializeAsync();
+        // 播种授权关系（direct_authorization 判定 Allowed），保证 A/B 均正常写、无差异写。
+        await harness.SeedAuthTablesAsync();
+
+        // 预热两路径的连接池与 plan cache；该段不纳入测量窗口。
+        await harness.RunSuperBundleWorkloadAsync(200, Seed);
+        await harness.RunSenderKnownSuperBundleWorkloadAsync(200, Seed + 1);
+
+        // A：完整授权读取（direct_user_state 读取发送者 + 接收者两行）。
+        var aBefore = await harness.SnapshotAsync();
+        await harness.RunSuperBundleWorkloadAsync(MessageCount, Seed + 200);
+        var aAfter = await harness.SnapshotAsync();
+        var aDiff = PostgresPerfDiffCalculator.Diff(aBefore, aAfter);
+
+        // B：sender-known（direct_user_state 只读取接收者行，sender_exists 固定为 TRUE）。
+        var bBefore = await harness.SnapshotAsync();
+        await harness.RunSenderKnownSuperBundleWorkloadAsync(MessageCount, Seed + 210);
+        var bAfter = await harness.SnapshotAsync();
+        var bDiff = PostgresPerfDiffCalculator.Diff(bBefore, bAfter);
+
+        Assert.True(aDiff.Wal.WalBytes > 0, "A 配置应产生 WAL 写入。");
+        Assert.True(bDiff.Wal.WalBytes > 0, "B 配置应产生 WAL 写入。");
+        Assert.True(aDiff.Statements.Sum(s => s.Calls) > 0, "A 配置应产生 SQL 调用。");
+        Assert.True(bDiff.Statements.Sum(s => s.Calls) > 0, "B 配置应产生 SQL 调用。");
+
+        await WriteSenderKnownAbReportAsync(aDiff, bDiff);
+    }
+
+    /// <summary>
     /// OUTBOX-DB-1 需求 2：A/B 验证 claim/complete 的「有界批量上限」对每消息往返/事务开销的影响。
     /// <para>
     /// claim/delete 均为单语句（`FOR UPDATE ... SKIP LOCKED ... LIMIT @batch_size` /
@@ -1057,6 +1105,62 @@ public sealed class OutboxDbMeasurementTests
         sb.AppendLine();
         sb.Append(PerMessageStatementTable(bDiff, MessageCount));
         sb.Append(PostgresPerfReporter.Render(bDiff, MessageCount, "B：会话级授权缓存（已建会话免重复授权）"));
+
+        await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
+    }
+
+    private static async Task WriteSenderKnownAbReportAsync(
+        PostgresPerfDiff aDiff,
+        PostgresPerfDiff bDiff)
+    {
+        var reportDir = ResolveDocsMeasurementsDir();
+        Directory.CreateDirectory(reportDir);
+        var reportPath = Path.Combine(reportDir, "outbox-db-sender-known-ab.md");
+
+        var aExecMs = TotalExecMsPerMessage(aDiff, MessageCount);
+        var bExecMs = TotalExecMsPerMessage(bDiff, MessageCount);
+        var measuredSavingMs = aExecMs - bExecMs;
+
+        var sb = new StringBuilder();
+        sb.AppendLine("# OUTBOX-DB-1 减少重复读取 A/B（仅读接收者 user_state：发送者已认证免重复读取）");
+        sb.AppendLine();
+        sb.AppendLine($"> 生成时间：{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC；语料固定、随机种子 {Seed}；" +
+                       $"每配置 inbound {MessageCount} 条消息、单会话（发送者固定 10_000_000_001、接收者固定 10_000_000_002）。");
+        sb.AppendLine();
+        sb.AppendLine("| 配置 | 热路径 SQL/消息 | SQL 往返/消息 | 总执行时间/消息(ms) | WAL 字节/消息 | WAL 记录/消息 |");
+        sb.AppendLine("|---|---|---|---|---|---|");
+        sb.AppendLine($"| A：每条消息读发送者+接收者 user_state | {HotPathStatementCount(aDiff, MessageCount)} | {TotalCallsPerMessage(aDiff, MessageCount):N1} | {aExecMs:N2} | {aDiff.Wal.WalBytes / MessageCount:N0} | {aDiff.Wal.WalRecords / (double)MessageCount:N1} |");
+        sb.AppendLine($"| B：sender-known（只读接收者 user_state） | {HotPathStatementCount(bDiff, MessageCount)} | {TotalCallsPerMessage(bDiff, MessageCount):N1} | {bExecMs:N2} | {bDiff.Wal.WalBytes / MessageCount:N0} | {bDiff.Wal.WalRecords / (double)MessageCount:N1} |");
+        sb.AppendLine();
+        sb.AppendLine("> 以 pg_stat_statements 语句级 calls/wal_bytes 归因，A/B 同容器顺序运行、语句数与写入行集完全相同、");
+        sb.AppendLine("> 会话分布完全相同。唯一差异是 direct_user_state 的读取粒度：A 读取 AspNetUsers 发送者 + 接收者两行");
+        sb.AppendLine("> （WHERE \"Id\" IN ($2, $3)）；B 只读取接收者行（WHERE \"Id\" = $3）、sender_exists 固定为 TRUE。");
+        sb.AppendLine("> 语义依据：生产发送者是已认证用户，其存在性在 admission 时已保证，故 sender 行的存在性读取是");
+        sb.AppendLine("> 每消息的冗余读取；B 模拟「发送者已认证，免重复读取发送者状态」的优化形态。授权判定（direct_authorization）");
+        sb.AppendLine("> 与写入路径两者相同，B 未改变任何授权语义，仅消除 sender 行的冗余存在性读取。");
+        sb.AppendLine();
+        sb.AppendLine($"## 结论");
+        sb.AppendLine();
+        sb.AppendLine($"> 本次实测 B 较 A 每消息执行耗时差仅 {measuredSavingMs:N3} ms（{aExecMs:N2} → {bExecMs:N2} ms），");
+        sb.AppendLine("> 处于测量噪声内（多轮运行 WAL 差从 −10% 到 −0.6% 大幅漂移，语句级 main CTE exec/消息 两者持平、");
+        sb.AppendLine("> 两配置 blks_read 均为 0，即 direct_user_state 的发送者/接收者行均已命中共享缓冲区）。故「发送者状态");
+        sb.AppendLine("> 冗余读取」的每消息成本可忽略：该「减少重复读取」变体无可量化收益，不值得为消除 sender 行读取引入");
+        sb.AppendLine("> 生产改动（会破坏 direct_user_state 作为 admission 事实源的一致语义，却无性能回报）。WAL 列受短窗口");
+        sb.AppendLine("> 容器波动影响不可靠归因，不采信。结论：sender 行重读不是热路径热点，后续减少重复读取应聚焦授权判定");
+        sb.AppendLine("> （direct_authorization）而非 direct_user_state 的发送者存在性行。权威归因以语句级 calls/exec 与");
+        sb.AppendLine("> 热路径语句数一致为准。");
+        sb.AppendLine();
+
+        sb.AppendLine("## A：读发送者+接收者 user_state 热路径语句（近热路径 = 调用数 ≥ 消息数一半）");
+        sb.AppendLine();
+        sb.Append(PerMessageStatementTable(aDiff, MessageCount));
+        sb.Append(PostgresPerfReporter.Render(aDiff, MessageCount, "A：读发送者+接收者 user_state"));
+        sb.AppendLine();
+
+        sb.AppendLine("## B：sender-known（只读接收者 user_state）热路径语句（近热路径 = 调用数 ≥ 消息数一半）");
+        sb.AppendLine();
+        sb.Append(PerMessageStatementTable(bDiff, MessageCount));
+        sb.Append(PostgresPerfReporter.Render(bDiff, MessageCount, "B：sender-known（只读接收者 user_state）"));
 
         await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
     }

@@ -63,6 +63,7 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     private NpgsqlRealtimeOutboxStore? _outboxStore;
     private string? _superBundleCommandText;
     private string? _noAuthSuperBundleCommandText;
+    private string? _senderKnownSuperBundleCommandText;
 
     public string SchemaName { get; } = $"perf_{Guid.NewGuid():N}"[..17];
 
@@ -546,6 +547,22 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
         int conversationCount = 1)
         => RunSessionAuthCacheWorkloadCoreAsync(count, seed, conversationCount, ct);
 
+    /// <summary>
+    /// 用同一固定语料驱动「仅读接收者 user_state」的 sender-known 热路径。
+    /// <para>
+    /// 与 <see cref="RunSuperBundleWorkloadAsync"/> 语句数相同、写入行集完全相同，唯一差异是
+    /// <c>direct_user_state</c> 只读取接收者的 AspNetUsers 行（<c>WHERE "Id" = $3</c>），发送者行
+    /// 不再读取、<c>sender_exists</c> 固定为 TRUE。语义依据：生产发送者是已认证用户，其存在性在
+    /// admission 时已保证，故 sender 行的存在性读取是每消息的冗余读取。模拟生产「发送者已认证，
+    /// 免重复读取发送者状态」的优化形态。
+    /// </para>
+    /// </summary>
+    public Task RunSenderKnownSuperBundleWorkloadAsync(
+        int count,
+        int seed,
+        CancellationToken ct = default)
+        => RunSenderKnownSuperBundleWorkloadCoreAsync(count, seed, ct);
+
     private async Task RunSuperBundleWorkloadCoreAsync(
         int count,
         int seed,
@@ -599,6 +616,30 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
             {
                 throw new InvalidOperationException(
                     $"会话级授权缓存 CTE 未按预期创建消息 {message.MessageId}");
+            }
+        }
+    }
+
+    private async Task RunSenderKnownSuperBundleWorkloadCoreAsync(
+        int count,
+        int seed,
+        CancellationToken ct)
+    {
+        var commandText = _senderKnownSuperBundleCommandText ??= BuildSenderKnownSuperBundleCommandText(Schema);
+        var rng = new Random(seed);
+        var sender = 10_000_000_001L;
+        var receiver = 10_000_000_002L;
+        var conversationId = ConversationId.CreateDirect(sender, receiver);
+
+        for (var i = 0; i < count; i++)
+        {
+            var (message, evt) = BuildSuperBundleCorpusItem(seed, i, sender, receiver, conversationId, rng);
+
+            var outcome = await ExecuteSuperBundleAsync(commandText, message, evt, ct).ConfigureAwait(false);
+            if (!outcome.MessageInserted)
+            {
+                throw new InvalidOperationException(
+                    $"sender-known super-bundle CTE 未按预期创建消息 {message.MessageId}");
             }
         }
     }
@@ -689,9 +730,20 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     private static string BuildNoAuthSuperBundleCommandText(RealtimeDatabaseSchema schema)
         => BuildSuperBundleCommandTextCore(schema, includeAuthorization: false);
 
+    /// <summary>
+    /// 生成「仅读接收者 user_state」的 sender-known super-bundle CTE：与
+    /// <see cref="BuildSuperBundleCommandText"/> 语句数相同、写入行集相同，唯一差异是
+    /// <c>direct_user_state</c> 只读取接收者 AspNetUsers 行（<c>WHERE "Id" = $3</c>），发送者行
+    /// 不再读取、<c>sender_exists</c> 固定为 TRUE（生产发送者是已认证用户，其存在性在 admission
+    /// 时已保证）。用于 A/B 量化「发送者状态冗余读取」的每消息成本。
+    /// </summary>
+    private static string BuildSenderKnownSuperBundleCommandText(RealtimeDatabaseSchema schema)
+        => BuildSuperBundleCommandTextCore(schema, includeAuthorization: true, senderKnown: true);
+
     private static string BuildSuperBundleCommandTextCore(
         RealtimeDatabaseSchema schema,
-        bool includeAuthorization)
+        bool includeAuthorization,
+        bool senderKnown = false)
     {
         var conversations = schema.ConversationsTableSql;
         var members = schema.ConversationMembersTableSql;
@@ -702,19 +754,34 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
 
         // 授权读取段（direct_user_state + direct_authorization，4 处表读取）仅
         // includeAuthorization 时出现；否则 write_gate 只按生命周期 + 幂等 canonical 门控。
+        // senderKnown 时 direct_user_state 只读取接收者行（WHERE "Id" = $3），发送者行不再读取、
+        // sender_exists 固定为 TRUE（生产发送者是已认证用户，其存在性在 admission 时已保证）。
         var userStateCte = includeAuthorization
-            ? $"""
-              direct_user_state AS MATERIALIZED (
-                  SELECT
-                      COUNT(*) FILTER (WHERE "Id" = $2) > 0 AS sender_exists,
-                      COUNT(*) FILTER (WHERE "Id" = $3) > 0 AS receiver_exists,
-                      COALESCE(
-                          MAX("FriendRequestPolicy"::int) FILTER (WHERE "Id" = $3),
-                          -1) AS privacy_policy
-                  FROM public."AspNetUsers"
-                  WHERE "Id" IN ($2, $3)
-              ),
-              """
+            ? senderKnown
+                ? $"""
+                   direct_user_state AS MATERIALIZED (
+                       SELECT
+                           TRUE AS sender_exists,
+                           COUNT(*) FILTER (WHERE "Id" = $3) > 0 AS receiver_exists,
+                           COALESCE(
+                               MAX("FriendRequestPolicy"::int) FILTER (WHERE "Id" = $3),
+                               -1) AS privacy_policy
+                       FROM public."AspNetUsers"
+                       WHERE "Id" = $3
+                   ),
+                   """
+                : $"""
+                  direct_user_state AS MATERIALIZED (
+                      SELECT
+                          COUNT(*) FILTER (WHERE "Id" = $2) > 0 AS sender_exists,
+                          COUNT(*) FILTER (WHERE "Id" = $3) > 0 AS receiver_exists,
+                          COALESCE(
+                              MAX("FriendRequestPolicy"::int) FILTER (WHERE "Id" = $3),
+                              -1) AS privacy_policy
+                      FROM public."AspNetUsers"
+                      WHERE "Id" IN ($2, $3)
+                  ),
+                  """
             : "";
         var authorizationCte = includeAuthorization
             ? $"""
