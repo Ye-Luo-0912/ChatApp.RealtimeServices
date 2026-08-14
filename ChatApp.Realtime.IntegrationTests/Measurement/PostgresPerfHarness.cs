@@ -64,6 +64,7 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     private string? _superBundleCommandText;
     private string? _noAuthSuperBundleCommandText;
     private string? _senderKnownSuperBundleCommandText;
+    private string? _naiveSuperBundleCommandText;
 
     public string SchemaName { get; } = $"perf_{Guid.NewGuid():N}"[..17];
 
@@ -563,6 +564,36 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
         CancellationToken ct = default)
         => RunSenderKnownSuperBundleWorkloadCoreAsync(count, seed, ct);
 
+    /// <summary>
+    /// 用「会话头高水位乱序」语料驱动生产带 CASE 守卫的 super-bundle 热路径（B 配置）。
+    /// <para>
+    /// 语料：第 0 条消息以极高 <c>received_at_ms</c> 建立会话头高水位，后续消息 <c>received_at_ms</c>
+    /// 均低于该高水位 → 会话头的 <c>last_message_*</c（含被 <c>ix_conversations_last_message_list</c>
+    /// 索引的 <c>last_message_at_ms</c>）不再推进。带 CASE 守卫的生产 upsert 会保留这些列 → 更新为
+    /// HOT、不触发索引维护；用于 A/B 量化「避免无变化 UPDATE（会话头列）」的收益。
+    /// </para>
+    /// </summary>
+    public Task RunOutOfOrderGuardedWorkloadAsync(
+        int count,
+        int seed,
+        CancellationToken ct = default)
+        => RunOutOfOrderWorkloadCoreAsync(count, seed, guardConversationHeader: true, ct);
+
+    /// <summary>
+    /// 用「会话头高水位乱序」语料驱动无条件覆盖会话头列的 super-bundle 热路径（A 配置）。
+    /// <para>
+    /// 与 <see cref="RunOutOfOrderGuardedWorkloadAsync"/> 语料完全相同、写入行集完全相同，唯一差异是
+    /// 会话 upsert 无条件覆盖 <c>last_message_id/preview/at_ms/sender_user_id</c>（无 CASE 守卫），
+    /// 使被索引的 <c>last_message_at_ms</c> 每消息改变 → 更新为 non-HOT、每次触发索引维护。
+    /// 模拟「若不做无变化 UPDATE 守卫」的基线，用于对照守卫保留索引列后 HOT 命中的收益。
+    /// </para>
+    /// </summary>
+    public Task RunOutOfOrderNaiveWorkloadAsync(
+        int count,
+        int seed,
+        CancellationToken ct = default)
+        => RunOutOfOrderWorkloadCoreAsync(count, seed, guardConversationHeader: false, ct);
+
     private async Task RunSuperBundleWorkloadCoreAsync(
         int count,
         int seed,
@@ -645,6 +676,43 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     }
 
     /// <summary>
+    /// 驱动「会话头高水位乱序」语料：第 0 条消息以极高 <c>received_at_ms</c> 建立会话头高水位，
+    /// 后续消息 <c>received_at_ms</c> 均低于该高水位 → 会话头（<c>last_message_at_ms</c> 等）不再推进。
+    /// <paramref name="guardConversationHeader"/> 决定会话 upsert 是否用 CASE 守卫保留会话头列
+    /// （true = 生产带守卫，B；false = 无条件覆盖，A）。
+    /// </summary>
+    private async Task RunOutOfOrderWorkloadCoreAsync(
+        int count,
+        int seed,
+        bool guardConversationHeader,
+        CancellationToken ct)
+    {
+        var commandText = guardConversationHeader
+            ? _superBundleCommandText ??= BuildSuperBundleCommandText(Schema)
+            : _naiveSuperBundleCommandText ??= BuildNaiveSuperBundleCommandText(Schema);
+        var rng = new Random(seed);
+        var sender = 10_000_000_001L;
+        var receiver = 10_000_000_002L;
+        var conversationId = ConversationId.CreateDirect(sender, receiver);
+        const long baseAt = 1_700_000_000_000L;
+        const long highWatermark = baseAt + 1_000_000L;
+
+        for (var i = 0; i < count; i++)
+        {
+            // 第 0 条为会话头高水位；后续消息均低于高水位，使会话头不再推进（乱序压力）。
+            var at = i == 0 ? highWatermark : baseAt + i;
+            var (message, evt) = BuildSuperBundleCorpusItem(seed, i, sender, receiver, conversationId, rng, at);
+
+            var outcome = await ExecuteSuperBundleAsync(commandText, message, evt, ct).ConfigureAwait(false);
+            if (!outcome.MessageInserted)
+            {
+                throw new InvalidOperationException(
+                    $"乱序语料 super-bundle CTE 未按预期创建消息 {message.MessageId}");
+            }
+        }
+    }
+
+    /// <summary>
     /// 计算语料中第 <paramref name="i"/> 条消息所属会话槽位的发送者/接收者/会话 id。
     /// <para>
     /// 消息按连续块分布到 <paramref name="conversationCount"/> 个会话：接收者 =
@@ -675,9 +743,11 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
         long sender,
         long receiver,
         string conversationId,
-        Random rng)
+        Random rng,
+        long? receivedAtMs = null)
     {
         var messageId = $"perf-sb-{seed}-{i:D6}";
+        var receivedAt = receivedAtMs ?? 1_700_000_000_000L + i;
         var message = new RealtimeMessageRecord
         {
             MessageId = messageId,
@@ -687,7 +757,7 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
             ReceiverUserId = receiver,
             ConversationId = conversationId,
             Content = "perf-content-" + rng.Next(10_000),
-            ReceivedAtMs = 1_700_000_000_000L + i,
+            ReceivedAtMs = receivedAt,
         };
 
         var evt = new RealtimeEvent
@@ -698,7 +768,7 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
             ActorUserId = sender,
             MessageId = messageId,
             SessionId = "session-perf",
-            OccurredAtMs = 1_700_000_000_000L + i,
+            OccurredAtMs = receivedAt,
             PayloadJson = """{"v":1}""",
         };
 
@@ -740,10 +810,22 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     private static string BuildSenderKnownSuperBundleCommandText(RealtimeDatabaseSchema schema)
         => BuildSuperBundleCommandTextCore(schema, includeAuthorization: true, senderKnown: true);
 
+    /// <summary>
+    /// 生成「无条件覆盖会话头列」的 naive super-bundle CTE：与
+    /// <see cref="BuildSuperBundleCommandText"/> 语句数相同、写入行集相同，唯一差异是
+    /// 会话 upsert 无 CASE 守卫——无条件覆盖 <c>last_message_id/preview/at_ms/sender_user_id</c>，
+    /// 使被 <c>ix_conversations_last_message_list</c> 索引的 <c>last_message_at_ms</c> 每消息改变 →
+    /// 更新为 non-HOT、每次触发索引维护。模拟「若不做无变化 UPDATE 守卫」的基线，用于 A/B 量化
+    /// 生产 CASE 守卫保留索引列后 HOT 命中的收益。
+    /// </summary>
+    private static string BuildNaiveSuperBundleCommandText(RealtimeDatabaseSchema schema)
+        => BuildSuperBundleCommandTextCore(schema, includeAuthorization: true, guardConversationHeader: false);
+
     private static string BuildSuperBundleCommandTextCore(
         RealtimeDatabaseSchema schema,
         bool includeAuthorization,
-        bool senderKnown = false)
+        bool senderKnown = false,
+        bool guardConversationHeader = true)
     {
         var conversations = schema.ConversationsTableSql;
         var members = schema.ConversationMembersTableSql;
@@ -838,6 +920,52 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
             ? "\n            CROSS JOIN direct_authorization;"
             : ";";
 
+        // 会话头（last_message_*）的 SET 片段：guardConversationHeader=true 时用生产 CASE 守卫——
+        // 仅当新消息的 (last_message_at_ms, last_message_id) 元组大于当前会话头时才覆盖，否则保留旧值
+        // （避免对索引列 last_message_at_ms 的无变化写入，使其可走 HOT）；false 时无条件覆盖（naive 基线，
+        // 每次改写索引列 → non-HOT + 索引维护）。
+        var headerSetFragment = guardConversationHeader
+            ? $"""
+               last_message_id = CASE
+                   WHEN {conversations}.last_message_at_ms IS NULL
+                        OR ({conversations}.last_message_at_ms,
+                            {conversations}.last_message_id)
+                           < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
+                   THEN EXCLUDED.last_message_id
+                   ELSE {conversations}.last_message_id
+               END,
+               last_message_preview = CASE
+                   WHEN {conversations}.last_message_at_ms IS NULL
+                        OR ({conversations}.last_message_at_ms,
+                            {conversations}.last_message_id)
+                           < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
+                   THEN EXCLUDED.last_message_preview
+                   ELSE {conversations}.last_message_preview
+               END,
+               last_message_at_ms = CASE
+                   WHEN {conversations}.last_message_at_ms IS NULL
+                        OR ({conversations}.last_message_at_ms,
+                            {conversations}.last_message_id)
+                           < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
+                   THEN EXCLUDED.last_message_at_ms
+                   ELSE {conversations}.last_message_at_ms
+               END,
+               last_sender_user_id = CASE
+                   WHEN {conversations}.last_message_at_ms IS NULL
+                        OR ({conversations}.last_message_at_ms,
+                            {conversations}.last_message_id)
+                           < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
+                   THEN EXCLUDED.last_sender_user_id
+                   ELSE {conversations}.last_sender_user_id
+               END,
+               """
+            : $"""
+              last_message_id = EXCLUDED.last_message_id,
+              last_message_preview = EXCLUDED.last_message_preview,
+              last_message_at_ms = EXCLUDED.last_message_at_ms,
+              last_sender_user_id = EXCLUDED.last_sender_user_id,
+              """;
+
         return $"""
             WITH ordered_users AS MATERIALIZED (
                 SELECT DISTINCT t.user_id
@@ -883,38 +1011,7 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
                 FROM write_gate
                 ON CONFLICT (conversation_id) DO UPDATE SET
                     last_sequence = {conversations}.last_sequence + 1,
-                    last_message_id = CASE
-                        WHEN {conversations}.last_message_at_ms IS NULL
-                             OR ({conversations}.last_message_at_ms,
-                                 {conversations}.last_message_id)
-                                < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
-                        THEN EXCLUDED.last_message_id
-                        ELSE {conversations}.last_message_id
-                    END,
-                    last_message_preview = CASE
-                        WHEN {conversations}.last_message_at_ms IS NULL
-                             OR ({conversations}.last_message_at_ms,
-                                 {conversations}.last_message_id)
-                                < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
-                        THEN EXCLUDED.last_message_preview
-                        ELSE {conversations}.last_message_preview
-                    END,
-                    last_message_at_ms = CASE
-                        WHEN {conversations}.last_message_at_ms IS NULL
-                             OR ({conversations}.last_message_at_ms,
-                                 {conversations}.last_message_id)
-                                < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
-                        THEN EXCLUDED.last_message_at_ms
-                        ELSE {conversations}.last_message_at_ms
-                    END,
-                    last_sender_user_id = CASE
-                        WHEN {conversations}.last_message_at_ms IS NULL
-                             OR ({conversations}.last_message_at_ms,
-                                 {conversations}.last_message_id)
-                                < (EXCLUDED.last_message_at_ms, EXCLUDED.last_message_id)
-                        THEN EXCLUDED.last_sender_user_id
-                        ELSE {conversations}.last_sender_user_id
-                    END,
+                    {headerSetFragment}
                     updated_at_ms = EXCLUDED.updated_at_ms
                 RETURNING last_sequence
             ),

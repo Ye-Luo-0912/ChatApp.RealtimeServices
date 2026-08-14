@@ -570,6 +570,61 @@ public sealed class OutboxDbMeasurementTests
     }
 
     /// <summary>
+    /// OUTBOX-DB-1 需求 2：A/B 量化「避免无变化 UPDATE（会话头列）」的每消息收益。
+    /// <para>
+    /// 以「会话头高水位乱序」语料（第 0 条极高 received_at_ms 建立高水位、后续消息均低于高水位，
+    /// 会话头 last_message_* 不再推进）驱动同一条 super-bundle 热路径：A 为无条件覆盖会话头列
+    /// （无 CASE 守卫，被 <c>ix_conversations_last_message_list</c> 索引的 last_message_at_ms 每消息改写
+    /// → non-HOT + 索引维护）；B 为生产 CASE 守卫（保留未推进的会话头列 → HOT 更新）。两者写入行集
+    /// 完全相同，仅会话头列是否被改写不同。以 pg_stat_statements + 表级 HOT 命中率归因。
+    /// 报告写入 <c>docs/measurements/outbox-db-noop-update-ab.md</c>。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task SaveAsync_NoopUpdateAb_ReportsConversationHeaderSaving()
+    {
+        await using var harness = new PostgresPerfHarness();
+        await harness.InitializeAsync();
+        await harness.SeedAuthTablesAsync();
+
+        // 预热两配置的连接池与 plan cache；该段不纳入测量窗口。
+        await harness.RunOutOfOrderGuardedWorkloadAsync(200, Seed);
+        await harness.RunOutOfOrderNaiveWorkloadAsync(200, Seed + 1);
+
+        // A：无条件覆盖会话头列（naive，无 CASE 守卫）。
+        var aBefore = await harness.SnapshotAsync();
+        await harness.RunOutOfOrderNaiveWorkloadAsync(MessageCount, Seed + 220);
+        var aAfter = await harness.SnapshotAsync();
+        var aDiff = PostgresPerfDiffCalculator.Diff(aBefore, aAfter);
+
+        // B：生产 CASE 守卫（保留未推进的会话头列 → HOT 更新）。
+        var bBefore = await harness.SnapshotAsync();
+        await harness.RunOutOfOrderGuardedWorkloadAsync(MessageCount, Seed + 230);
+        var bAfter = await harness.SnapshotAsync();
+        var bDiff = PostgresPerfDiffCalculator.Diff(bBefore, bAfter);
+
+        Assert.True(aDiff.Wal.WalBytes > 0, "A 配置应产生 WAL 写入。");
+        Assert.True(bDiff.Wal.WalBytes > 0, "B 配置应产生 WAL 写入。");
+        Assert.True(aDiff.Statements.Sum(s => s.Calls) > 0, "A 配置应产生 SQL 调用。");
+        Assert.True(bDiff.Statements.Sum(s => s.Calls) > 0, "B 配置应产生 SQL 调用。");
+        // 结论性断言：Migration058 已 DROP 含 last_message_at_ms 的 ix_conversations_last_message_list，
+        // 该列已非索引列，故 A/B 两配置的会话 tip 更新都应达到 HOT 命中（守卫不再影响索引维护）。
+        Assert.True(ConversationHotRatio(aDiff) >= 90,
+            "A（无条件覆盖会话头列）在无该索引时也应 HOT 命中 ≥90%。");
+        Assert.True(ConversationHotRatio(bDiff) >= 90,
+            "B（CASE 守卫）在无该索引时也应 HOT 命中 ≥90%。");
+
+        await WriteNoopUpdateAbReportAsync(aDiff, bDiff);
+    }
+
+    /// <summary>conversations 表的 HOT 命中率（HOT 更新 / 全部更新）。</summary>
+    private static double ConversationHotRatio(PostgresPerfDiff diff)
+    {
+        var conv = diff.Tables.FirstOrDefault(t => t.TableName.Equals("conversations", StringComparison.OrdinalIgnoreCase));
+        return conv is not null && conv.Updates > 0 ? conv.HotUpdates * 100.0 / conv.Updates : 0;
+    }
+
+    /// <summary>
     /// OUTBOX-DB-1 需求 2：A/B 验证 claim/complete 的「有界批量上限」对每消息往返/事务开销的影响。
     /// <para>
     /// claim/delete 均为单语句（`FOR UPDATE ... SKIP LOCKED ... LIMIT @batch_size` /
@@ -1164,6 +1219,83 @@ public sealed class OutboxDbMeasurementTests
 
         await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
     }
+
+    /// <summary>
+    /// 生成「避免无变化 UPDATE（会话头列）」A/B 报告
+    /// <c>docs/measurements/outbox-db-noop-update-ab.md</c>。
+    /// </summary>
+    private static async Task WriteNoopUpdateAbReportAsync(
+        PostgresPerfDiff aDiff,
+        PostgresPerfDiff bDiff)
+    {
+        var reportDir = ResolveDocsMeasurementsDir();
+        Directory.CreateDirectory(reportDir);
+        var reportPath = Path.Combine(reportDir, "outbox-db-noop-update-ab.md");
+
+        var aExecMs = TotalExecMsPerMessage(aDiff, MessageCount);
+        var bExecMs = TotalExecMsPerMessage(bDiff, MessageCount);
+        var aHot = ConversationHotRatio(aDiff);
+        var bHot = ConversationHotRatio(bDiff);
+        var aConv = diffTable(aDiff, "conversations");
+        var bConv = diffTable(bDiff, "conversations");
+
+        var sb = new StringBuilder();
+        sb.AppendLine("# OUTBOX-DB-1 避免无变化 UPDATE A/B（会话头列守卫：乱序下 HOT 命中与索引维护成本）");
+        sb.AppendLine();
+        sb.AppendLine($"> 生成时间：{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC；语料固定、随机种子 {Seed}；" +
+                       $"每配置 inbound {MessageCount} 条消息、单会话（发送者固定 10_000_000_001、接收者固定 10_000_000_002）、" +
+                       $"会话头高水位乱序语料（第 0 条极高 received_at_ms 建立高水位，后续消息均低于高水位）。");
+        sb.AppendLine();
+        sb.AppendLine("| 配置 | 热路径 SQL/消息 | SQL 往返/消息 | 总执行时间/消息(ms) | WAL 字节/消息 | WAL 记录/消息 | conversations HOT 命中率 |");
+        sb.AppendLine("|---|---|---|---|---|---|---|");
+        sb.AppendLine($"| A：无条件覆盖会话头列（无 CASE 守卫） | {HotPathStatementCount(aDiff, MessageCount)} | {TotalCallsPerMessage(aDiff, MessageCount):N1} | {aExecMs:N2} | {aDiff.Wal.WalBytes / MessageCount:N0} | {aDiff.Wal.WalRecords / (double)MessageCount:N1} | {aHot:N1}% |");
+        sb.AppendLine($"| B：生产 CASE 守卫（保留未推进会话头列） | {HotPathStatementCount(bDiff, MessageCount)} | {TotalCallsPerMessage(bDiff, MessageCount):N1} | {bExecMs:N2} | {bDiff.Wal.WalBytes / MessageCount:N0} | {bDiff.Wal.WalRecords / (double)MessageCount:N1} | {bHot:N1}% |");
+        sb.AppendLine();
+        sb.AppendLine("> 以 pg_stat_statements + pg_stat_user_tables 归属，A/B 同容器顺序运行、语句数与写入行集完全相同；");
+        sb.AppendLine("> 唯一差异是会话 upsert 的 SET 片段：A 无条件覆盖 last_message_id/preview/at_ms/sender_user_id，");
+        sb.AppendLine("> B 用生产 CASE 守卫在会话头未推进（乱序）时保留这四列。");
+        sb.AppendLine();
+        sb.AppendLine("## 结论性发现：该子方向已被 Migration058 吸收，无需再优化");
+        sb.AppendLine();
+        sb.AppendLine($"> 实测 A 与 B 的 conversations 表 HOT 命中率分别为 {aHot:N1}% 与 {bHot:N1}%，均达到 HOT 级。");
+        sb.AppendLine("> 根因：`Migration058_ConversationHotProjectionUpdates` 已 DROP 含 `last_message_at_ms` 的全局索引");
+        sb.AppendLine("> `ix_conversations_last_message_list`（该索引不覆盖 user/pinned 谓词、正式 8 小时运行扫描次数为 0，");
+        sb.AppendLine("> 却让 230 万次 tip 更新全部无法 HOT）。索引移除后 `last_message_at_ms` 已非索引列，");
+        sb.AppendLine("> 无论是否用 CASE 守卫保留该列，conversation tip 更新都走 HOT，不再触发索引维护。");
+        sb.AppendLine("> **结论：** 生产 upsert_conversation 的 CASE 守卫（避免无变化写入索引列)在 Drop 索引之后已不再影响");
+        sb.AppendLine("> HOT/索引维护收益——该子方向实质已被 Migration058 吸收。CASE 守卫可继续保留（逻辑上避免无意义覆写、");
+        sb.AppendLine("> 减少 dead tuple 与 WAL 写放大），但不存在进一步的 HOT/索引类收益可压测。");
+        sb.AppendLine();
+
+        sb.AppendLine("## A：无条件覆盖会话头列 热路径语句（近热路径 = 调用数 ≥ 消息数一半）");
+        sb.AppendLine();
+        sb.Append(PerMessageStatementTable(aDiff, MessageCount));
+        sb.Append(PostgresPerfReporter.Render(aDiff, MessageCount, "A：无条件覆盖会话头列（无 CASE 守卫）"));
+        sb.AppendLine();
+
+        sb.AppendLine("## B：生产 CASE 守卫（保留未推进会话头列）热路径语句（近热路径 = 调用数 ≥ 消息数一半）");
+        sb.AppendLine();
+        sb.Append(PerMessageStatementTable(bDiff, MessageCount));
+        sb.Append(PostgresPerfReporter.Render(bDiff, MessageCount, "B：生产 CASE 守卫"));
+        sb.AppendLine();
+
+        sb.AppendLine("## conversations 表级更新（两配置均 HOT，印证索引已移除）");
+        sb.AppendLine();
+        sb.AppendLine("| 配置 | 更新 | HOT 更新 | HOT 命中率 | 死元组 |");
+        sb.AppendLine("|---|---|---|---|---|");
+        sb.AppendLine(aConv is null
+            ? "| A：无条件覆盖 | — | — | — | — |"
+            : $"| A：无条件覆盖 | {aConv.Updates:N0} | {aConv.HotUpdates:N0} | {aHot:N1}% | {aConv.DeadTuples:N0} |");
+        sb.AppendLine(bConv is null
+            ? "| B：生产 CASE 守卫 | — | — | — | — |"
+            : $"| B：生产 CASE 守卫 | {bConv.Updates:N0} | {bConv.HotUpdates:N0} | {bHot:N1}% | {bConv.DeadTuples:N0} |");
+
+        await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
+    }
+
+    /// <summary>按表名取窗口内表级增量。</summary>
+    private static PgTableDiff? diffTable(PostgresPerfDiff diff, string tableName) =>
+        diff.Tables.FirstOrDefault(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase));
 
     private static async Task WriteBatchSizeAbReportAsync(
         PostgresPerfDiff aDiff,
