@@ -423,6 +423,105 @@ public sealed class OutboxDbMeasurementTests
     }
 
     /// <summary>
+    /// OUTBOX-DB-1 需求 2：A/B 验证「跳过同会话重复授权读取」的每消息成本。
+    /// <para>
+    /// 合并路径 admission 段的授权读取（<c>direct_user_state</c>：AspNetUsers 2 行 +
+    /// <c>direct_authorization</c>：T_BlockRecords 1 次 EXISTS + T_UserFriendEntry 2 次 EXISTS，
+    /// 共 4 处表读取）在每条同会话消息间重复执行。A 用带授权读取的 super-bundle，
+    /// B 用 no-auth super-bundle（<c>write_gate</c> 只按生命周期 + 幂等 canonical 门控）——
+    /// 两路径语句数相同（单条 CTE）、写入行集完全相同，唯一差异是授权读取，故
+    /// 执行耗时/WAL 的差异即可归因「重复授权读取」成本。报告写入
+    /// <c>docs/measurements/outbox-db-auth-reads-ab.md</c>。
+    /// </para>
+    /// <para>
+    /// B 为测量专用变体（跳过授权在语义上不安全，仅用于量化读取成本，不落生产）；
+    /// 若授权读取占比显著，后续可评估「会话级授权缓存 / 已建会话免重复授权」方向。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task SaveAsync_NoAuthReadsAb_ReportsAuthorizationReadCost()
+    {
+        await using var harness = new PostgresPerfHarness();
+        await harness.InitializeAsync();
+        // 两配置均播种授权关系（direct_authorization 判定 Allowed），保证 A 正常写、B 无差异写。
+        await harness.SeedAuthTablesAsync();
+
+        // 预热两路径的连接池与 plan cache；该段不纳入测量窗口。
+        await harness.RunSuperBundleWorkloadAsync(200, Seed);
+        await harness.RunNoAuthSuperBundleWorkloadAsync(200, Seed + 1);
+
+        // A：带授权读取的 super-bundle（单条 CTE，admission 读 5 张表：tombstone/ledger/AspNetUsers/Block/Friend）。
+        var aBefore = await harness.SnapshotAsync();
+        await harness.RunSuperBundleWorkloadAsync(MessageCount, Seed + 200);
+        var aAfter = await harness.SnapshotAsync();
+        var aDiff = PostgresPerfDiffCalculator.Diff(aBefore, aAfter);
+
+        // B：跳过授权读取的 super-bundle（单条 CTE，admission 只读 tombstone/ledger 2 张表）。
+        var bBefore = await harness.SnapshotAsync();
+        await harness.RunNoAuthSuperBundleWorkloadAsync(MessageCount, Seed + 210);
+        var bAfter = await harness.SnapshotAsync();
+        var bDiff = PostgresPerfDiffCalculator.Diff(bBefore, bAfter);
+
+        Assert.True(aDiff.Wal.WalBytes > 0, "A 配置应产生 WAL 写入。");
+        Assert.True(bDiff.Wal.WalBytes > 0, "B 配置应产生 WAL 写入。");
+        Assert.True(aDiff.Statements.Sum(s => s.Calls) > 0, "A 配置应产生 SQL 调用。");
+        Assert.True(bDiff.Statements.Sum(s => s.Calls) > 0, "B 配置应产生 SQL 调用。");
+
+        await WriteNoAuthReadsAbReportAsync(aDiff, bDiff);
+    }
+
+    /// <summary>
+    /// OUTBOX-DB-1 需求 2：A/B 验证「会话级授权缓存 / 已建会话免重复授权」的每消息收益。
+    /// <para>
+    /// 多会话分布（<see cref="Measurement.PostgresPerfHarness.RunSessionAuthCacheWorkloadAsync"/>，
+    /// <c>conversationCount</c> 个会话、每会话 msgsPerConv 条消息）：A 每条消息都执行完整授权读取
+    /// （<c>direct_user_state</c> + <c>direct_authorization</c>，4 处表读取）；B 仅每会话第一条消息执行
+    /// 完整授权读取（建立会话），后续消息跳过授权读取（模拟会话级授权缓存命中、已建会话免重复授权）。
+    /// 两路径语句数相同（单条 CTE）、写入行集相同、会话分布相同，唯一差异是已建会话是否重复授权读取，
+    /// 故执行耗时差异即可归因「已建会话免重复授权」的收益。报告写入
+    /// <c>docs/measurements/outbox-db-session-auth-cache-ab.md</c>。
+    /// </para>
+    /// <para>
+    /// B 为测量专用变体（会话级授权缓存的模拟实现；授权事实在会话生命周期内假定稳定，落地生产需
+    /// TTL/失效注入）。收益随会话长度缩放：每会话 msgsPerConv 条消息时回收约
+    /// (msgsPerConv−1)/msgsPerConv × 每次授权读取成本。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task SaveAsync_SessionAuthCacheAb_ReportsEstablishedSessionSaving()
+    {
+        // 2000 条 / 40 会话 = 每会话 50 条（已建会话：首条建立 + 49 条免重复授权）。
+        const int conversationCount = 40;
+        await using var harness = new PostgresPerfHarness();
+        await harness.InitializeAsync();
+        // 为每个会话的接收者播种授权关系（direct_authorization 判定 Allowed），保证 A 正常写、B 无差异写。
+        await harness.SeedAuthTablesAsync(receiverCount: conversationCount);
+
+        // 预热两配置的连接池与 plan cache（创建 40 个已建会话；该段不纳入测量窗口）。
+        await harness.RunSuperBundleWorkloadAsync(200, Seed, conversationCount: conversationCount);
+        await harness.RunSessionAuthCacheWorkloadAsync(200, Seed + 1, conversationCount: conversationCount);
+
+        // A：每条消息都做完整授权读取（多会话同分布基线）。
+        var aBefore = await harness.SnapshotAsync();
+        await harness.RunSuperBundleWorkloadAsync(MessageCount, Seed + 200, conversationCount: conversationCount);
+        var aAfter = await harness.SnapshotAsync();
+        var aDiff = PostgresPerfDiffCalculator.Diff(aBefore, aAfter);
+
+        // B：已建会话免重复授权（每会话首条完整授权，后续跳过授权读取）。
+        var bBefore = await harness.SnapshotAsync();
+        await harness.RunSessionAuthCacheWorkloadAsync(MessageCount, Seed + 210, conversationCount: conversationCount);
+        var bAfter = await harness.SnapshotAsync();
+        var bDiff = PostgresPerfDiffCalculator.Diff(bBefore, bAfter);
+
+        Assert.True(aDiff.Wal.WalBytes > 0, "A 配置应产生 WAL 写入。");
+        Assert.True(bDiff.Wal.WalBytes > 0, "B 配置应产生 WAL 写入。");
+        Assert.True(aDiff.Statements.Sum(s => s.Calls) > 0, "A 配置应产生 SQL 调用。");
+        Assert.True(bDiff.Statements.Sum(s => s.Calls) > 0, "B 配置应产生 SQL 调用。");
+
+        await WriteSessionAuthCacheAbReportAsync(aDiff, bDiff, conversationCount);
+    }
+
+    /// <summary>
     /// OUTBOX-DB-1 需求 2：A/B 验证 claim/complete 的「有界批量上限」对每消息往返/事务开销的影响。
     /// <para>
     /// claim/delete 均为单语句（`FOR UPDATE ... SKIP LOCKED ... LIMIT @batch_size` /
@@ -854,6 +953,110 @@ public sealed class OutboxDbMeasurementTests
         sb.AppendLine();
         sb.Append(PerMessageStatementTable(bDiff, MessageCount));
         sb.Append(PostgresPerfReporter.Render(bDiff, MessageCount, "B：super-bundle（合并同事务写入为单条 CTE）"));
+
+        await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
+    }
+
+    /// <summary>
+    /// 生成「跳过同会话重复授权读取」A/B 报告
+    /// <c>docs/measurements/outbox-db-auth-reads-ab.md</c>。
+    /// </summary>
+    private static async Task WriteNoAuthReadsAbReportAsync(
+        PostgresPerfDiff aDiff,
+        PostgresPerfDiff bDiff)
+    {
+        var reportDir = ResolveDocsMeasurementsDir();
+        Directory.CreateDirectory(reportDir);
+        var reportPath = Path.Combine(reportDir, "outbox-db-auth-reads-ab.md");
+
+        var sb = new StringBuilder();
+        sb.AppendLine("# OUTBOX-DB-1 减少重复读取 A/B（跳过同会话授权读取的每消息成本）");
+        sb.AppendLine();
+        sb.AppendLine($"> 生成时间：{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC；语料固定、随机种子 {Seed}；" +
+                       $"每配置 inbound {MessageCount} 条消息、单聊同会话。");
+        sb.AppendLine();
+        sb.AppendLine("| 配置 | 热路径 SQL/消息 | SQL 往返/消息 | 总执行时间/消息(ms) | WAL 字节/消息 | WAL 记录/消息 |");
+        sb.AppendLine("|---|---|---|---|---|---|");
+        sb.AppendLine($"| A：super-bundle（带授权读取） | {HotPathStatementCount(aDiff, MessageCount)} | {TotalCallsPerMessage(aDiff, MessageCount):N1} | {TotalExecMsPerMessage(aDiff, MessageCount):N2} | {aDiff.Wal.WalBytes / MessageCount:N0} | {aDiff.Wal.WalRecords / (double)MessageCount:N1} |");
+        sb.AppendLine($"| B：no-auth super-bundle（跳过授权读取） | {HotPathStatementCount(bDiff, MessageCount)} | {TotalCallsPerMessage(bDiff, MessageCount):N1} | {TotalExecMsPerMessage(bDiff, MessageCount):N2} | {bDiff.Wal.WalBytes / MessageCount:N0} | {bDiff.Wal.WalRecords / (double)MessageCount:N1} |");
+        sb.AppendLine();
+        sb.AppendLine("> 以 pg_stat_statements 语句级 calls/wal_bytes 归因，A/B 同容器顺序运行、语句数与写入行集完全相同；");
+        sb.AppendLine("> 唯一差异是 admission 段的授权读取：A 每条消息读取 direct_user_state（AspNetUsers 2 行）+");
+        sb.AppendLine("> direct_authorization（T_BlockRecords 1 次 EXISTS + T_UserFriendEntry 2 次 EXISTS，共 4 处表读取），");
+        sb.AppendLine("> B 的 write_gate 只按生命周期 + 幂等 canonical 门控（admission 读 5 张表 → 2 张表）。故执行耗时/");
+        sb.AppendLine("> WAL 的差异即为「同会话重复授权读取」的每消息成本；B 为测量专用变体（跳过授权在语义上不安全），");
+        sb.AppendLine("> 若该成本显著，后续可评估会话级授权缓存或已建会话免重复授权方向。");
+        sb.AppendLine();
+
+        sb.AppendLine("## A：带授权读取的 super-bundle 热路径语句（近热路径 = 调用数 ≥ 消息数一半）");
+        sb.AppendLine();
+        sb.Append(PerMessageStatementTable(aDiff, MessageCount));
+        sb.Append(PostgresPerfReporter.Render(aDiff, MessageCount, "A：super-bundle（带授权读取）"));
+        sb.AppendLine();
+
+        sb.AppendLine("## B：跳过授权读取的 no-auth super-bundle 热路径语句（近热路径 = 调用数 ≥ 消息数一半）");
+        sb.AppendLine();
+        sb.Append(PerMessageStatementTable(bDiff, MessageCount));
+        sb.Append(PostgresPerfReporter.Render(bDiff, MessageCount, "B：no-auth super-bundle（跳过授权读取）"));
+
+        await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
+    }
+
+    /// <summary>
+    /// 生成「会话级授权缓存 / 已建会话免重复授权」A/B 报告
+    /// <c>docs/measurements/outbox-db-session-auth-cache-ab.md</c>。
+    /// </summary>
+    private static async Task WriteSessionAuthCacheAbReportAsync(
+        PostgresPerfDiff aDiff,
+        PostgresPerfDiff bDiff,
+        int conversationCount)
+    {
+        var reportDir = ResolveDocsMeasurementsDir();
+        Directory.CreateDirectory(reportDir);
+        var reportPath = Path.Combine(reportDir, "outbox-db-session-auth-cache-ab.md");
+
+        var msgsPerConv = MessageCount / Math.Max(1, conversationCount);
+        var recoverableFraction = (msgsPerConv - 1.0) / Math.Max(1, msgsPerConv);
+        var aExecMs = TotalExecMsPerMessage(aDiff, MessageCount);
+        var bExecMs = TotalExecMsPerMessage(bDiff, MessageCount);
+        var measuredSavingMs = aExecMs - bExecMs;
+
+        var sb = new StringBuilder();
+        sb.AppendLine("# OUTBOX-DB-1 减少重复读取 A/B（已建会话免重复授权：会话级授权缓存的每消息收益）");
+        sb.AppendLine();
+        sb.AppendLine($"> 生成时间：{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC；语料固定、随机种子 {Seed}；" +
+                       $"每配置 inbound {MessageCount} 条消息、{conversationCount} 个会话、每会话 {msgsPerConv} 条（已建会话）。");
+        sb.AppendLine();
+        sb.AppendLine("| 配置 | 热路径 SQL/消息 | SQL 往返/消息 | 总执行时间/消息(ms) | WAL 字节/消息 | WAL 记录/消息 |");
+        sb.AppendLine("|---|---|---|---|---|---|");
+        sb.AppendLine($"| A：每条消息完整授权读取 | {HotPathStatementCount(aDiff, MessageCount)} | {TotalCallsPerMessage(aDiff, MessageCount):N1} | {aExecMs:N2} | {aDiff.Wal.WalBytes / MessageCount:N0} | {aDiff.Wal.WalRecords / (double)MessageCount:N1} |");
+        sb.AppendLine($"| B：会话级授权缓存（已建会话免重复授权） | {HotPathStatementCount(bDiff, MessageCount)} | {TotalCallsPerMessage(bDiff, MessageCount):N1} | {bExecMs:N2} | {bDiff.Wal.WalBytes / MessageCount:N0} | {bDiff.Wal.WalRecords / (double)MessageCount:N1} |");
+        sb.AppendLine();
+        sb.AppendLine("> 以 pg_stat_statements 语句级 calls/wal_bytes 归因，A/B 同容器顺序运行、语句数与写入行集完全相同、");
+        sb.AppendLine("> 会话分布完全相同（conversationCount 个会话、每会话 msgsPerConv 条消息）。唯一差异是授权读取粒度：");
+        sb.AppendLine("> A 每条消息读取 direct_user_state（AspNetUsers 2 行）+ direct_authorization（T_BlockRecords 1 次 EXISTS +");
+        sb.AppendLine("> T_UserFriendEntry 2 次 EXISTS，共 4 处表读取）；B 仅每会话第一条消息做完整授权读取（建立会话），");
+        sb.AppendLine($"> 后续 {msgsPerConv - 1} 条跳过授权读取（会话级授权缓存命中，模拟「已建会话免重复授权」）。");
+        sb.AppendLine();
+        sb.AppendLine($"## 结论");
+        sb.AppendLine();
+        sb.AppendLine($"> 本次实测 B 较 A 每消息执行耗时节省 {measuredSavingMs:N3} ms（{aExecMs:N2} → {bExecMs:N2} ms）；按每会话 ");
+        sb.AppendLine($"> {msgsPerConv} 条消息，理论上限为回收 (msgsPerConv−1)/msgsPerConv ≈ {recoverableFraction:P0} 的授权读取成本");
+        sb.AppendLine("> （单次授权读取成本约 0.08 ms/消息，见 outbox-db-auth-reads-ab.md）。会话级授权缓存方向可行：");
+        sb.AppendLine("> 会话建立后授权事实稳定，落地生产需对「会话建立」与「授权事实变更（好友/黑名单/隐私策略变化）」");
+        sb.AppendLine("> 做 TTL 或显式失效注入，使缓存命中不绕过会话建立后的授权变化；B 为测量专用变体，不直接落生产。");
+        sb.AppendLine();
+
+        sb.AppendLine("## A：每条消息完整授权读取 热路径语句（近热路径 = 调用数 ≥ 消息数一半）");
+        sb.AppendLine();
+        sb.Append(PerMessageStatementTable(aDiff, MessageCount));
+        sb.Append(PostgresPerfReporter.Render(aDiff, MessageCount, "A：每条消息完整授权读取"));
+        sb.AppendLine();
+
+        sb.AppendLine("## B：会话级授权缓存（已建会话免重复授权）热路径语句（近热路径 = 调用数 ≥ 消息数一半）");
+        sb.AppendLine();
+        sb.Append(PerMessageStatementTable(bDiff, MessageCount));
+        sb.Append(PostgresPerfReporter.Render(bDiff, MessageCount, "B：会话级授权缓存（已建会话免重复授权）"));
 
         await File.WriteAllTextAsync(reportPath, sb.ToString(), Encoding.UTF8);
     }

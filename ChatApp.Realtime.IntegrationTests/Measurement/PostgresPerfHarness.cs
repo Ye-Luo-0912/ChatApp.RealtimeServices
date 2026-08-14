@@ -62,6 +62,7 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     private NpgsqlRealtimeMessageStore? _mergedMessageStore;
     private NpgsqlRealtimeOutboxStore? _outboxStore;
     private string? _superBundleCommandText;
+    private string? _noAuthSuperBundleCommandText;
 
     public string SchemaName { get; } = $"perf_{Guid.NewGuid():N}"[..17];
 
@@ -142,11 +143,16 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     /// <summary>
     /// 创建并播种生产合并路径所需的事务内授权表（<c>public."AspNetUsers"</c> /
     /// <c>public."T_BlockRecords"</c> / <c>public."T_UserFriendEntry"</c>），并让语料中的
-    /// 发送/接收用户（10_000_000_001 / 10_000_000_002）成为互加好友且非禁止陌生人策略，
-    /// 使 <see cref="MessageWriteAdmissionReader.AcquireDirectAndAllocateSequenceAsync"/>
+    /// 发送用户（10_000_000_001）与 <paramref name="receiverCount"/> 个接收用户
+    /// （10_000_000_002 起递增）成为互加好友且非禁止陌生人策略，使
+    /// <see cref="MessageWriteAdmissionReader.AcquireDirectAndAllocateSequenceAsync"/>
     /// 的 <c>direct_authorization</c> 判定为 Allowed。
+    /// <para>
+    /// 默认 <paramref name="receiverCount"/>=1 时行为与既有一致（仅播种 10_000_000_001 /
+    /// 10_000_000_002 一对）；多会话压测需为每个会话的接收者播种授权关系。
+    /// </para>
     /// </summary>
-    public async Task SeedAuthTablesAsync(CancellationToken ct = default)
+    public async Task SeedAuthTablesAsync(int receiverCount = 1, CancellationToken ct = default)
     {
         await using var connection = await Client.GetDataSource().OpenConnectionAsync(ct).ConfigureAwait(false);
         await using (var cmd = new NpgsqlCommand(
@@ -179,18 +185,25 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
 
         // FriendRequestPolicy=1（RequireVerification）≠ 2（NoStrangers），配合互加好友，
         // direct_authorization 判定 privacy_policy≠2 且双向好友存在 → decision=0（Allowed）。
+        // 每个会话是「发送者 + 一个接收者」，只需播种这两条好友边（O(n)），无需全互连。
+        var lastId = 10_000_000_001L + receiverCount;
         await using (var cmd = new NpgsqlCommand(
-            """
-            INSERT INTO public."AspNetUsers" ("Id", "FriendRequestPolicy") VALUES
-                (10000000001, 1),
-                (10000000002, 1)
-            ON CONFLICT ("Id") DO NOTHING;
+            $"""
+             INSERT INTO public."AspNetUsers" ("Id", "FriendRequestPolicy")
+             SELECT g.id, 1
+             FROM generate_series(10000000001, {lastId}) AS g(id)
+             ON CONFLICT ("Id") DO NOTHING;
 
-            INSERT INTO public."T_UserFriendEntry" ("UserId", "FriendId", "IsDeleted") VALUES
-                (10000000001, 10000000002, FALSE),
-                (10000000002, 10000000001, FALSE)
-            ON CONFLICT ("UserId", "FriendId") DO NOTHING;
-            """,
+             INSERT INTO public."T_UserFriendEntry" ("UserId", "FriendId", "IsDeleted")
+             SELECT 10000000001, g.id, FALSE
+             FROM generate_series(10000000002, {lastId}) AS g(id)
+             ON CONFLICT ("UserId", "FriendId") DO NOTHING;
+
+             INSERT INTO public."T_UserFriendEntry" ("UserId", "FriendId", "IsDeleted")
+             SELECT g.id, 10000000001, FALSE
+             FROM generate_series(10000000002, {lastId}) AS g(id)
+             ON CONFLICT ("UserId", "FriendId") DO NOTHING;
+             """,
             connection))
         {
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
@@ -491,53 +504,164 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     /// 任何写入；message 幂等冲突时 outbox/ledger 不产生孤立行。语料 id 带种子前缀避免跨窗口幂等冲突。
     /// </para>
     /// </summary>
-    public async Task RunSuperBundleWorkloadAsync(
+    public Task RunSuperBundleWorkloadAsync(
         int count,
         int seed,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        int conversationCount = 1)
+        => RunSuperBundleWorkloadCoreAsync(count, seed, includeAuthorization: true, conversationCount, ct);
+
+    /// <summary>
+    /// 用同一固定语料直接驱动「跳过授权读取」的 no-auth super-bundle 热路径。
+    /// <para>
+    /// 与 <see cref="RunSuperBundleWorkloadAsync"/> 语句数相同（单条 CTE）、写入行集相同；
+    /// 唯一差异是 admission 段不读取 <c>direct_user_state</c>（AspNetUsers）与
+    /// <c>direct_authorization</c>（T_BlockRecords / T_UserFriendEntry），<c>write_gate</c>
+    /// 只按生命周期 + 幂等 canonical 门控。用于 A/B 量化「同会话重复授权读取」的每消息成本
+    /// （热路径 SQL 数不变，仅读取表数 5 → 1）。
+    /// </para>
+    /// </summary>
+    public Task RunNoAuthSuperBundleWorkloadAsync(
+        int count,
+        int seed,
+        CancellationToken ct = default,
+        int conversationCount = 1)
+        => RunSuperBundleWorkloadCoreAsync(count, seed, includeAuthorization: false, conversationCount, ct);
+
+    /// <summary>
+    /// 用同一固定语料驱动「已建会话免重复授权」的会话级授权缓存热路径。
+    /// <para>
+    /// 与 <see cref="RunSuperBundleWorkloadAsync"/> 使用相同的多会话语料分布
+    /// （<paramref name="conversationCount"/> 个会话、每会话 msgsPerConv = count/conversationCount
+    /// 条消息）；唯一差异是授权读取的粒度：每个会话的第一条消息执行带完整授权读取的
+    /// super-bundle（建立会话时校验 direct_user_state + direct_authorization），后续消息执行
+    /// no-auth super-bundle（跳过 4 处授权表读取）。模拟生产「会话级授权缓存」——会话建立后
+    /// 授权事实稳定、已建会话免重复授权。写入行集与 A 完全相同，仅减少已建会话的授权读取。
+    /// </para>
+    /// </summary>
+    public Task RunSessionAuthCacheWorkloadAsync(
+        int count,
+        int seed,
+        CancellationToken ct = default,
+        int conversationCount = 1)
+        => RunSessionAuthCacheWorkloadCoreAsync(count, seed, conversationCount, ct);
+
+    private async Task RunSuperBundleWorkloadCoreAsync(
+        int count,
+        int seed,
+        bool includeAuthorization,
+        int conversationCount,
+        CancellationToken ct)
     {
-        var commandText = _superBundleCommandText ??= BuildSuperBundleCommandText(Schema);
+        var commandText = includeAuthorization
+            ? _superBundleCommandText ??= BuildSuperBundleCommandText(Schema)
+            : _noAuthSuperBundleCommandText ??= BuildNoAuthSuperBundleCommandText(Schema);
         var rng = new Random(seed);
-        long sender = 10_000_000_001;
-        long receiver = 10_000_000_002;
-        var conversationId = ConversationId.CreateDirect(sender, receiver);
+        var msgsPerConv = Math.Max(1, count / Math.Max(1, conversationCount));
 
         for (var i = 0; i < count; i++)
         {
             // 消息 id / 客户端 id / 事件 id 均带种子前缀，避免预热与测量两段窗口
             // 使用相同 id 但内容不同而触发幂等内容冲突。
-            var messageId = $"perf-sb-{seed}-{i:D6}";
-            var message = new RealtimeMessageRecord
-            {
-                MessageId = messageId,
-                ClientMessageId = $"perf-client-{seed}-{i:D6}",
-                SenderUserId = sender,
-                SenderSessionId = "session-perf",
-                ReceiverUserId = receiver,
-                ConversationId = conversationId,
-                Content = "perf-content-" + rng.Next(10_000),
-                ReceivedAtMs = 1_700_000_000_000L + i,
-            };
-
-            var evt = new RealtimeEvent
-            {
-                EventId = $"perf-evt-{seed}-{i:D6}",
-                Type = RealtimeEventType.MessageReceived,
-                TargetUserId = receiver,
-                ActorUserId = sender,
-                MessageId = messageId,
-                SessionId = "session-perf",
-                OccurredAtMs = 1_700_000_000_000L + i,
-                PayloadJson = """{"v":1}""",
-            };
+            var (sender, receiver, conversationId) = ConversationSlot(seed, i, msgsPerConv, conversationCount);
+            var (message, evt) = BuildSuperBundleCorpusItem(seed, i, sender, receiver, conversationId, rng);
 
             var outcome = await ExecuteSuperBundleAsync(commandText, message, evt, ct).ConfigureAwait(false);
             if (!outcome.MessageInserted)
             {
                 throw new InvalidOperationException(
-                    $"super-bundle CTE 未按预期创建消息 {messageId}");
+                    $"super-bundle CTE 未按预期创建消息 {message.MessageId}");
             }
         }
+    }
+
+    private async Task RunSessionAuthCacheWorkloadCoreAsync(
+        int count,
+        int seed,
+        int conversationCount,
+        CancellationToken ct)
+    {
+        var fullText = _superBundleCommandText ??= BuildSuperBundleCommandText(Schema);
+        var noAuthText = _noAuthSuperBundleCommandText ??= BuildNoAuthSuperBundleCommandText(Schema);
+        var rng = new Random(seed);
+        var msgsPerConv = Math.Max(1, count / Math.Max(1, conversationCount));
+
+        for (var i = 0; i < count; i++)
+        {
+            var (sender, receiver, conversationId) = ConversationSlot(seed, i, msgsPerConv, conversationCount);
+            var (message, evt) = BuildSuperBundleCorpusItem(seed, i, sender, receiver, conversationId, rng);
+
+            // 已建会话免重复授权：仅每会话第一条消息执行完整授权读取（建立会话），
+            // 后续消息跳过授权读取（会话级授权缓存命中）。
+            var commandText = i % msgsPerConv == 0 ? fullText : noAuthText;
+            var outcome = await ExecuteSuperBundleAsync(commandText, message, evt, ct).ConfigureAwait(false);
+            if (!outcome.MessageInserted)
+            {
+                throw new InvalidOperationException(
+                    $"会话级授权缓存 CTE 未按预期创建消息 {message.MessageId}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// 计算语料中第 <paramref name="i"/> 条消息所属会话槽位的发送者/接收者/会话 id。
+    /// <para>
+    /// 消息按连续块分布到 <paramref name="conversationCount"/> 个会话：接收者 =
+    /// 10_000_000_002 + convIndex，会话 id = 直接单聊（发送者固定 10_000_000_001）。
+    /// <c>msgsPerConv</c> 由调用方按 count/conversationCount 计算。
+    /// </para>
+    /// </summary>
+    private static (long Sender, long Receiver, string ConversationId) ConversationSlot(
+        int seed,
+        int i,
+        int msgsPerConv,
+        int conversationCount)
+    {
+        _ = seed; // 分布只依赖 i；seed 用于语料 id 前缀隔离。
+        var convIndex = Math.Min(i / msgsPerConv, conversationCount - 1);
+        var sender = 10_000_000_001L;
+        var receiver = 10_000_000_002L + convIndex;
+        return (sender, receiver, ConversationId.CreateDirect(sender, receiver));
+    }
+
+    /// <summary>
+    /// 构造 super-bundle 语料的单条消息 + 事件（发送者/接收者/会话 id 由调用方指定，
+    /// 消息/客户端/事件 id 带种子前缀避免跨窗口幂等冲突）。
+    /// </summary>
+    private static (RealtimeMessageRecord Message, RealtimeEvent Event) BuildSuperBundleCorpusItem(
+        int seed,
+        int i,
+        long sender,
+        long receiver,
+        string conversationId,
+        Random rng)
+    {
+        var messageId = $"perf-sb-{seed}-{i:D6}";
+        var message = new RealtimeMessageRecord
+        {
+            MessageId = messageId,
+            ClientMessageId = $"perf-client-{seed}-{i:D6}",
+            SenderUserId = sender,
+            SenderSessionId = "session-perf",
+            ReceiverUserId = receiver,
+            ConversationId = conversationId,
+            Content = "perf-content-" + rng.Next(10_000),
+            ReceivedAtMs = 1_700_000_000_000L + i,
+        };
+
+        var evt = new RealtimeEvent
+        {
+            EventId = $"perf-evt-{seed}-{i:D6}",
+            Type = RealtimeEventType.MessageReceived,
+            TargetUserId = receiver,
+            ActorUserId = sender,
+            MessageId = messageId,
+            SessionId = "session-perf",
+            OccurredAtMs = 1_700_000_000_000L + i,
+            PayloadJson = """{"v":1}""",
+        };
+
+        return (message, evt);
     }
 
     /// <summary>
@@ -553,6 +677,21 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
     /// </para>
     /// </summary>
     private static string BuildSuperBundleCommandText(RealtimeDatabaseSchema schema)
+        => BuildSuperBundleCommandTextCore(schema, includeAuthorization: true);
+
+    /// <summary>
+    /// 生成「跳过授权读取」的 no-auth super-bundle CTE：与
+    /// <see cref="BuildSuperBundleCommandText"/> 语句数相同、写入行集相同，唯一差异是
+    /// admission 段不读取 <c>direct_user_state</c>（AspNetUsers）与 <c>direct_authorization</c>
+    /// （T_BlockRecords / T_UserFriendEntry），<c>write_gate</c> 只按生命周期 + 幂等 canonical
+    /// 门控，最终 SELECT 的授权判定固定为 NULL。用于 A/B 量化「同会话重复授权读取」成本。
+    /// </summary>
+    private static string BuildNoAuthSuperBundleCommandText(RealtimeDatabaseSchema schema)
+        => BuildSuperBundleCommandTextCore(schema, includeAuthorization: false);
+
+    private static string BuildSuperBundleCommandTextCore(
+        RealtimeDatabaseSchema schema,
+        bool includeAuthorization)
     {
         var conversations = schema.ConversationsTableSql;
         var members = schema.ConversationMembersTableSql;
@@ -560,6 +699,77 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
         var ledger = schema.CommandIdempotencyLedgerTableSql;
         var messages = schema.MessagesTableSql;
         var outbox = schema.OutboxTableSql;
+
+        // 授权读取段（direct_user_state + direct_authorization，4 处表读取）仅
+        // includeAuthorization 时出现；否则 write_gate 只按生命周期 + 幂等 canonical 门控。
+        var userStateCte = includeAuthorization
+            ? $"""
+              direct_user_state AS MATERIALIZED (
+                  SELECT
+                      COUNT(*) FILTER (WHERE "Id" = $2) > 0 AS sender_exists,
+                      COUNT(*) FILTER (WHERE "Id" = $3) > 0 AS receiver_exists,
+                      COALESCE(
+                          MAX("FriendRequestPolicy"::int) FILTER (WHERE "Id" = $3),
+                          -1) AS privacy_policy
+                  FROM public."AspNetUsers"
+                  WHERE "Id" IN ($2, $3)
+              ),
+              """
+            : "";
+        var authorizationCte = includeAuthorization
+            ? $"""
+              direct_authorization AS MATERIALIZED (
+                  SELECT CASE
+                      WHEN NOT direct_user_state.sender_exists THEN 1
+                      WHEN NOT direct_user_state.receiver_exists THEN 2
+                      WHEN EXISTS (
+                          SELECT 1
+                          FROM public."T_BlockRecords"
+                          WHERE "BlockerId" = $3
+                            AND "BlockedUserId" = $2
+                      ) THEN 3
+                      WHEN direct_user_state.privacy_policy = 2 THEN 4
+                      WHEN NOT (
+                          EXISTS (
+                              SELECT 1
+                              FROM public."T_UserFriendEntry"
+                              WHERE "UserId" = $2
+                                AND "FriendId" = $3
+                                AND NOT "IsDeleted"
+                          )
+                          AND EXISTS (
+                              SELECT 1
+                              FROM public."T_UserFriendEntry"
+                              WHERE "UserId" = $3
+                                AND "FriendId" = $2
+                                AND NOT "IsDeleted"
+                          )
+                      ) THEN 5
+                      ELSE 0
+                  END::smallint AS decision
+                  FROM direct_user_state
+              ),
+              """
+            : "";
+        var gateSource = includeAuthorization
+            ? """
+              FROM lifecycle
+              CROSS JOIN direct_authorization
+              WHERE lifecycle.state = 0
+                AND direct_authorization.decision = 0
+                AND NOT EXISTS (SELECT 1 FROM canonical)
+              """
+            : """
+              FROM lifecycle
+              WHERE lifecycle.state = 0
+                AND NOT EXISTS (SELECT 1 FROM canonical)
+              """;
+        var decisionExpr = includeAuthorization
+            ? "direct_authorization.decision"
+            : "NULL::smallint";
+        var fromSuffix = includeAuthorization
+            ? "\n            CROSS JOIN direct_authorization;"
+            : ";";
 
         return $"""
             WITH ordered_users AS MATERIALIZED (
@@ -587,54 +797,11 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
                   AND client_message_id = $4
                 LIMIT 1
             ),
-            direct_user_state AS MATERIALIZED (
-                SELECT
-                    COUNT(*) FILTER (WHERE "Id" = $2) > 0 AS sender_exists,
-                    COUNT(*) FILTER (WHERE "Id" = $3) > 0 AS receiver_exists,
-                    COALESCE(
-                        MAX("FriendRequestPolicy"::int) FILTER (WHERE "Id" = $3),
-                        -1) AS privacy_policy
-                FROM public."AspNetUsers"
-                WHERE "Id" IN ($2, $3)
-            ),
-            direct_authorization AS MATERIALIZED (
-                SELECT CASE
-                    WHEN NOT direct_user_state.sender_exists THEN 1
-                    WHEN NOT direct_user_state.receiver_exists THEN 2
-                    WHEN EXISTS (
-                        SELECT 1
-                        FROM public."T_BlockRecords"
-                        WHERE "BlockerId" = $3
-                          AND "BlockedUserId" = $2
-                    ) THEN 3
-                    WHEN direct_user_state.privacy_policy = 2 THEN 4
-                    WHEN NOT (
-                        EXISTS (
-                            SELECT 1
-                            FROM public."T_UserFriendEntry"
-                            WHERE "UserId" = $2
-                              AND "FriendId" = $3
-                              AND NOT "IsDeleted"
-                        )
-                        AND EXISTS (
-                            SELECT 1
-                            FROM public."T_UserFriendEntry"
-                            WHERE "UserId" = $3
-                              AND "FriendId" = $2
-                              AND NOT "IsDeleted"
-                        )
-                    ) THEN 5
-                    ELSE 0
-                END::smallint AS decision
-                FROM direct_user_state
-            ),
+            {userStateCte}
+            {authorizationCte}
             write_gate AS MATERIALIZED (
                 SELECT 1
-                FROM lifecycle
-                CROSS JOIN direct_authorization
-                WHERE lifecycle.state = 0
-                  AND direct_authorization.decision = 0
-                  AND NOT EXISTS (SELECT 1 FROM canonical)
+                {gateSource}
             ),
             upsert_conversation AS (
                 INSERT INTO {conversations} (
@@ -767,10 +934,9 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
                     AS write_flags,
                 lifecycle.state,
                 canonical.command_id,
-                direct_authorization.decision
+                {decisionExpr}
             FROM lifecycle
-            LEFT JOIN canonical ON TRUE
-            CROSS JOIN direct_authorization;
+            LEFT JOIN canonical ON TRUE{fromSuffix}
             """;
     }
 
