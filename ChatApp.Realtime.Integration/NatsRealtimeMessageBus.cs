@@ -198,6 +198,11 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
         CancellationToken ct = default)
         => _requestClient.QuerySyncBootstrapAsync(query, ct);
 
+    public Task<ChatApp.Realtime.Abstractions.Calls.CallProcessResult> SendCallCommandAsync(
+        ChatApp.Realtime.Abstractions.Calls.CallCommand command,
+        CancellationToken ct = default)
+        => _requestClient.SendCallCommandAsync(command, ct);
+
     public Task<RealtimeHistoryMessage?> TryGetMessageByIdAsync(
         long userId,
         string messageId,

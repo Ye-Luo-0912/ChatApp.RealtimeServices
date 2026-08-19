@@ -1,4 +1,5 @@
 using ChatApp.Realtime.Abstractions.Attachments;
+using ChatApp.Realtime.Abstractions.Calls;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Queueing;
 using ChatApp.Realtime.Abstractions.Relationships;
@@ -6,6 +7,7 @@ using ChatApp.Realtime.Abstractions.Routing;
 using ChatApp.Realtime.Abstractions.Stores;
 using ChatApp.Realtime.Abstractions.Sync;
 using ChatApp.Realtime.Infrastructure.Core.Attachments;
+using ChatApp.Realtime.Infrastructure.Core.Calls;
 using ChatApp.Realtime.Infrastructure.Core.DependencyInjection;
 using ChatApp.Realtime.Infrastructure.Core.Relationships;
 using ChatApp.Realtime.Infrastructure.Nats.Configuration;
@@ -99,6 +101,16 @@ public static class RealtimeServicesRegistration
         services.TryAddSingleton<IDeadLetterArchiveSink, NullDeadLetterArchiveSink>();
 
         services.AddRealtimeInfrastructureCore();
+        // CALL-CTRL-1：生产签名校验。配置 CallGrantSigning:Secret（与 Server JwtSettings.Secret 一致）
+        // 时以 HMAC-SHA256 校验 grant 签名（fail-closed）；未配置时保留默认结构校验（开发/测试）。
+        var callGrantSecret = Normalize(configuration["CallGrantSigning:Secret"]);
+        if (!string.IsNullOrWhiteSpace(callGrantSecret))
+        {
+            services.AddSingleton<ICallGrantVerifier>(provider =>
+                new SignedCallGrantVerifier(
+                    provider.GetRequiredService<CallPolicyOptions>(),
+                    callGrantSecret));
+        }
         services.AddRealtimeInfrastructureRedis(connectionOptions.Garnet);
         services.AddRealtimeInfrastructurePostgres(
             connectionOptions.RealtimeDatabase,

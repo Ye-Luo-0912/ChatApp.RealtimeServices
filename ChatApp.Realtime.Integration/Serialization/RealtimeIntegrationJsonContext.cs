@@ -101,6 +101,9 @@ namespace ChatApp.Realtime.Integration.Serialization;
 [JsonSerializable(typeof(RelationshipListResult))]
 [JsonSerializable(typeof(RelationshipListItem))]
 [JsonSerializable(typeof(List<RelationshipListItem>))]
+[JsonSerializable(typeof(ChatApp.Realtime.Abstractions.Calls.CallCommand))]
+[JsonSerializable(typeof(ChatApp.Realtime.Abstractions.Calls.CallProcessResult))]
+[JsonSerializable(typeof(ChatApp.Realtime.Abstractions.Calls.CallGrant))]
 internal sealed partial class RealtimeIntegrationJsonContext : JsonSerializerContext
 {
 }

@@ -53,24 +53,8 @@ public sealed class DefaultCallControlProcessor : ICallControlProcessor
 
         var nowMs = _clock.GetUtcNow().ToUnixTimeMilliseconds();
 
-        // 授权：fail-closed。grant 不可用/过期即拒绝。
-        var grant = await _grantVerifier.VerifyAsync(command.Grant, nowMs, ct).ConfigureAwait(false);
-        if (!grant.Valid)
-        {
-            var code = grant.Error ?? CallErrorCode.GrantInvalid;
-            _metrics.Failure(code);
-            return CallProcessResult.Failed(code, "通话授权无效或已过期。");
-        }
-
-        var actorIsCaller = command.ActorUserId == command.Grant.CallerUserId;
-        var isParticipant = actorIsCaller || command.ActorUserId == command.Grant.CalleeUserId;
-        if (!isParticipant)
-        {
-            _metrics.Failure(CallErrorCode.GrantInvalid);
-            return CallProcessResult.Failed(CallErrorCode.GrantInvalid, "命令发起者不是通话参与方。");
-        }
-
         // SDP 预算：信号载荷必须在预算内，且存在。
+        // （授权在 CAS 循环内按快照决定：建通话需 grant，既有通话按已存储参与者身份授权。）
         if (CallStateMachine.CarriesSdp(command.Type))
         {
             if (string.IsNullOrWhiteSpace(command.Sdp))
@@ -124,6 +108,49 @@ public sealed class DefaultCallControlProcessor : ICallControlProcessor
                 return CallProcessResult.Failed(CallErrorCode.RevisionStale, "命令 revision 已过期（乱序）。");
             }
 
+            // 授权：fail-closed。
+            // - 建通话（无既有快照）：必须持有 Server 签发的有效 grant。
+            // - 既有通话：以已存储的参与者身份授权。grant 只签发给了主叫，被叫从未持有，
+            //   因此 Accept/Reject/End 等命令不能要求再次出示 grant——否则被叫永远无法应答。
+            CallGrant grant;
+            bool actorIsCaller;
+            if (snapshot is null)
+            {
+                var verified = await _grantVerifier.VerifyAsync(command.Grant, nowMs, ct).ConfigureAwait(false);
+                if (!verified.Valid)
+                {
+                    var code = verified.Error ?? CallErrorCode.GrantInvalid;
+                    _metrics.Failure(code);
+                    return CallProcessResult.Failed(code, "通话授权无效或已过期。");
+                }
+
+                grant = command.Grant!;
+                actorIsCaller = command.ActorUserId == grant.CallerUserId;
+                if (command.ActorUserId != grant.CallerUserId && command.ActorUserId != grant.CalleeUserId)
+                {
+                    _metrics.Failure(CallErrorCode.GrantInvalid);
+                    return CallProcessResult.Failed(CallErrorCode.GrantInvalid, "命令发起者不是通话参与方。");
+                }
+            }
+            else
+            {
+                grant = new CallGrant
+                {
+                    CallId = snapshot.CallId,
+                    CallerUserId = snapshot.CallerUserId,
+                    CalleeUserId = snapshot.CalleeUserId,
+                    ExpiresAtMs = snapshot.ExpiresAtMs,
+                    Nonce = string.Empty,
+                    Signature = string.Empty
+                };
+                actorIsCaller = command.ActorUserId == snapshot.CallerUserId;
+                if (command.ActorUserId != snapshot.CallerUserId && command.ActorUserId != snapshot.CalleeUserId)
+                {
+                    _metrics.Failure(CallErrorCode.GrantInvalid);
+                    return CallProcessResult.Failed(CallErrorCode.GrantInvalid, "命令发起者不是通话参与方。");
+                }
+            }
+
             // 状态机迁移表校验。
             var transition = CallStateMachine.Transition(current, command.Type, actorIsCaller);
             if (transition is null)
@@ -155,8 +182,8 @@ public sealed class DefaultCallControlProcessor : ICallControlProcessor
                 CallId = command.CallId,
                 State = transition.TargetState,
                 EndReason = transition.EndReason,
-                CallerUserId = command.Grant.CallerUserId,
-                CalleeUserId = command.Grant.CalleeUserId,
+                CallerUserId = grant.CallerUserId,
+                CalleeUserId = grant.CalleeUserId,
                 Revision = nextRevision,
                 LastCommandId = command.CommandId,
                 LastCommandType = command.Type,
@@ -182,18 +209,20 @@ public sealed class DefaultCallControlProcessor : ICallControlProcessor
                 continue;
             }
 
-            // 成功：若命令携带 SDP，经临时信令路径转发给对端。
+            // 成功：对端可见状态变更（非 silent 命令）经临时信令路径转发给对端。
+            // silent 仅指 Ringing ack（IsSilent），不转发；Invite/Accept/Reconnect 携带 SDP，
+            // Reject/Cancel/End 为纯控制信号（Sdp 为空），对端靠 Kind 驱动本端收敛终态。
             CallSignalEnvelope? signal = null;
-            if (CallStateMachine.CarriesSdp(command.Type))
+            if (!CallStateMachine.IsSilent(command.Type))
             {
                 signal = new CallSignalEnvelope
                 {
                     SignalId = $"{command.CallId}:{nextRevision}",
                     CallId = command.CallId,
                     FromUserId = command.ActorUserId,
-                    ToUserId = OtherParticipant(command),
+                    ToUserId = OtherParticipant(command.ActorUserId, grant),
                     Kind = command.Type,
-                    Sdp = command.Sdp!,
+                    Sdp = command.Sdp ?? string.Empty,
                     Revision = nextRevision,
                     OccurredAtMs = nowMs
                 };
@@ -212,8 +241,8 @@ public sealed class DefaultCallControlProcessor : ICallControlProcessor
             await _auditStore.RecordAsync(new CallAuditEntry
             {
                 CallId = command.CallId,
-                CallerUserId = command.Grant.CallerUserId,
-                CalleeUserId = command.Grant.CalleeUserId,
+                CallerUserId = grant.CallerUserId,
+                CalleeUserId = grant.CalleeUserId,
                 State = transition.TargetState,
                 EndReason = transition.EndReason,
                 Revision = nextRevision,
@@ -310,10 +339,10 @@ public sealed class DefaultCallControlProcessor : ICallControlProcessor
         _ => snapshot.ExpiresAtMs
     };
 
-    private static long OtherParticipant(CallCommand command)
-        => command.ActorUserId == command.Grant.CallerUserId
-            ? command.Grant.CalleeUserId
-            : command.Grant.CallerUserId;
+    private static long OtherParticipant(long actorUserId, CallGrant grant)
+        => actorUserId == grant.CallerUserId
+            ? grant.CalleeUserId
+            : grant.CallerUserId;
 
     private static (CallErrorCode ErrorCode, string Message)? Validate(CallCommand command)
     {

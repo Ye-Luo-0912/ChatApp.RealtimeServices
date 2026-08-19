@@ -189,4 +189,10 @@ public static class RealtimeWireSerializer
 
     public static RelationshipListResult? DeserializeRelationshipListResult(string json) =>
         JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.RelationshipListResult);
+
+    public static string Serialize(ChatApp.Realtime.Abstractions.Calls.CallCommand command) =>
+        JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.CallCommand);
+
+    public static ChatApp.Realtime.Abstractions.Calls.CallProcessResult? DeserializeCallProcessResult(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.CallProcessResult);
 }

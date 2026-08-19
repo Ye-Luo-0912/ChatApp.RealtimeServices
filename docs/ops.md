@@ -29,7 +29,7 @@ Account cleanup saga / inbox DLQ / `T_AttachmentBlobDeleteJob` live on **ChatApp
 | GET | `/ops/relationship-projection/streams` | Privacy-minimized local stream metadata |
 | GET | `/ops/relationship-projection/reconcile` | Server digest versus local projection; 200/409/503 |
 
-For the release gate, load the Ops key into `CHATAPP_OPS_API_KEY` from the secret store and run:
+For a manual projection reconciliation, load the Ops key into `CHATAPP_OPS_API_KEY` from the secret store and run:
 
 ```powershell
 pwsh scripts/Invoke-RelationshipProjectionReconcile.ps1 -BaseUri https://realtime.example

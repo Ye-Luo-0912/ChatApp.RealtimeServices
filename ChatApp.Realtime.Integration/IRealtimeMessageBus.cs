@@ -68,6 +68,15 @@ public interface IRealtimeMessageBus
         SyncBootstrapQuery query,
         CancellationToken ct = default);
 
+    /// <summary>
+    /// 通话信令命令（invite/ringing/accept/reject/cancel/end/reconnect/timeout）。
+    /// 经 Core NATS `chat.call-commands` request/reply 到达 Realtime，零持久化。
+    /// 返回状态机处理结果（终态/错误码/需转发的对端信号）。
+    /// </summary>
+    Task<ChatApp.Realtime.Abstractions.Calls.CallProcessResult> SendCallCommandAsync(
+        ChatApp.Realtime.Abstractions.Calls.CallCommand command,
+        CancellationToken ct = default);
+
     /// <summary>按消息 Id 查询；UserId 须为参与方（发送或接收）。</summary>
     Task<RealtimeHistoryMessage?> TryGetMessageByIdAsync(
         long userId,

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using ChatApp.Realtime.Abstractions.Attachments;
+using ChatApp.Realtime.Abstractions.Calls;
 using ChatApp.Realtime.Abstractions.Conversations;
 using ChatApp.Realtime.Abstractions.Messaging;
 using ChatApp.Realtime.Abstractions.Messaging.History;
@@ -289,6 +290,26 @@ internal sealed class RealtimeRequestClient
 
         return RealtimeWireSerializer.DeserializeSyncBootstrapPage(data)
                ?? throw new JsonException("同步引导查询响应无法反序列化。");
+    }
+
+    public async Task<CallProcessResult> SendCallCommandAsync(
+        CallCommand command,
+        CancellationToken ct = default)
+    {
+        var data = await RequestRawAsync(
+            "call_command.request",
+            _options.CallCommandsSubject,
+            RealtimeWireSerializer.Serialize(command),
+            command.ActorUserId,
+            command.ActorSessionId,
+            timeoutMs: _options.HistoryRequestTimeoutMs,
+            ct).ConfigureAwait(false);
+
+        if (data is null)
+            throw new JsonException("通话信令命令返回了空响应。");
+
+        return RealtimeWireSerializer.DeserializeCallProcessResult(data)
+               ?? throw new JsonException("通话信令命令响应无法反序列化。");
     }
 
     public async Task<RealtimeHistoryMessage?> TryGetMessageByIdAsync(

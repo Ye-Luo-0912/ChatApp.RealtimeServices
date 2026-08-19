@@ -27,6 +27,12 @@ public sealed class RealtimeIntegrationOptions
     public string RelationshipListQueriesSubject { get; set; } = "chat.relationship-list.query";
     public string DeadLettersSubject { get; set; } = "chat.dead-letters";
 
+    /// <summary>
+    /// 通话信令命令 subject（Core NATS request/reply，零持久化）。
+    /// 与 Realtime RealtimeQueueTopics.CallCommands 对齐，不进入 JetStream/PostgreSQL/Outbox。
+    /// </summary>
+    public string CallCommandsSubject { get; set; } = "chat.call-commands";
+
     /// <summary>推送投递命令 subject（RealtimeServices 发布，Gateway 消费后执行实际推送）。</summary>
     public string PushDeliveriesSubject { get; set; } = "chat.push-deliveries";
 

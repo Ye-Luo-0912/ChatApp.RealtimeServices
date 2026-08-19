@@ -1,5 +1,7 @@
 # Realtime P1 performance notes
 
+> Historical implementation and measurement record. It is not the active roadmap; current feature work is tracked in [NEXT-STAGE.md](NEXT-STAGE.md). Performance changes are now supporting work and require a reproduced hotspot or feature regression.
+
 ## Outbox metrics
 - Hot-path gauges (`pending` / `dead`) update on publish success, dead-letter, and dead replay.
 - `OutboxMetricsCollector` reconciles Pending/Dead aggregates on a long interval (default 5m), not every 5s.
@@ -53,9 +55,9 @@ its connection, transaction, commands, parameters, and result; only immutable sc
 
 These changes target the formal soak's `2,034,057 TaskCanceledException`, 68
 `SemaphoreFullException`, `97,988.93 B/msg`, and `10.1964 DB ops/msg`. Unit/integration tests validate
-behavior; short same-profile Smoke/Change/Capacity runs decide SQL, WAL, DB-op, allocation, CPU, GC,
-and latency regressions. A 30-minute Candidate is reserved for a frozen release candidate, while the
-8-hour Formal run is only for release gating, long-lived memory, and checkpoint/WAL steady state.
+behavior; short same-profile runs decide SQL, WAL, DB-op, allocation, CPU, GC, and latency regressions.
+Long-lived memory and checkpoint/WAL steady-state runs are deferred until the related feature set is
+frozen; they are not part of the current development route.
 
 ## 2026-08-09 commit-hint and database-session layer
 
@@ -82,8 +84,8 @@ and latency regressions. A 30-minute Candidate is reserved for a frozen release 
 
 Validation: Release solution build has zero warnings/errors; unit tests `296/296` and PostgreSQL
 container integration tests `42/42` pass. These tests establish ownership, retry, index, and migration
-semantics. Same-profile short runs decide SQL/WAL/operation/allocation regressions; Candidate and
-Formal runs are reserved for frozen-candidate trends and final long-lived release evidence.
+semantics. Same-profile short runs decide SQL/WAL/operation/allocation regressions; longer trend runs
+are deferred until the related feature set is frozen.
 
 ## 2026-08-09 bounded hint coalescing decision
 
@@ -101,8 +103,8 @@ P99 from `69.6–73.7 ms` to `98.3 ms`, and one of three runs reached about `393
 `0 ms` control had no comparable spike. Therefore `2 ms` remains an explicit resource-priority option;
 it is not a safe low-tail-latency default, and `3 ms` is also rejected as a default.
 
-This repeated short A/B is sufficient for the configuration decision, not for `MemoryStable` or a
-release-soak verdict. The capacity manifest and report now record the effective window so future runs
+This repeated short A/B is sufficient for the configuration decision, not for a long-lived
+`MemoryStable` conclusion. The capacity manifest and report record the effective window so future runs
 cannot silently mix configurations.
 
 ## EfCore gaps (non-production / fallback)
