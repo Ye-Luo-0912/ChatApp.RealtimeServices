@@ -6,14 +6,15 @@ namespace ChatApp.Realtime.Tests;
 public sealed class PerformanceMigrationCatalogTests
 {
     [Fact]
-    public void DefaultCatalog_EndsWithOutboxHotDrainFillfactor50Migration()
+    public void DefaultCatalog_EndsWithVoiceAttachmentWaveformMigration()
     {
         var migrations = RealtimeSchemaMigrationRunner.DefaultMigrations();
 
-        var migration = Assert.IsType<Migration069_OutboxHotDrainFillfactor50>(migrations[^1]);
-        Assert.Equal(69, migration.Version);
-        Assert.IsType<Migration068_RemoveUnusedReplyForwardIndexes>(migrations[^2]);
-        Assert.False(((IRealtimeSchemaMigration)migrations[^2]).RequiresTransaction);
+        var migration = Assert.IsType<Migration070_VoiceAttachmentWaveform>(migrations[^1]);
+        Assert.Equal(70, migration.Version);
+        Assert.IsType<Migration069_OutboxHotDrainFillfactor50>(migrations[^2]);
+        Assert.IsType<Migration068_RemoveUnusedReplyForwardIndexes>(migrations[^3]);
+        Assert.False(((IRealtimeSchemaMigration)migrations[^3]).RequiresTransaction);
         Assert.Equal(
             migrations.Count,
             migrations.Select(item => item.Version).Distinct().Count());

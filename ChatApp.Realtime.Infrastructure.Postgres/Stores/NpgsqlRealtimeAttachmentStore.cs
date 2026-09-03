@@ -219,7 +219,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                        client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
                        content_hash, state_version,
                        is_voice, voice_codec, voice_container,
-                       voice_duration_ms, voice_sample_rate_hz, voice_channels;
+                       voice_duration_ms, voice_sample_rate_hz, voice_channels,
+                       voice_waveform_peaks;
              """,
             connection);
         command.Parameters.AddWithValue("status", (short)AttachmentStatus.Uploaded);
@@ -275,7 +276,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                        client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
                        content_hash, state_version,
                        is_voice, voice_codec, voice_container,
-                       voice_duration_ms, voice_sample_rate_hz, voice_channels;
+                       voice_duration_ms, voice_sample_rate_hz, voice_channels,
+                       voice_waveform_peaks;
              """,
             connection);
         command.Parameters.AddWithValue("scanning", (short)AttachmentStatus.Scanning);
@@ -352,7 +354,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                        client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
                        content_hash, state_version,
                        is_voice, voice_codec, voice_container,
-                       voice_duration_ms, voice_sample_rate_hz, voice_channels;
+                       voice_duration_ms, voice_sample_rate_hz, voice_channels,
+                       voice_waveform_peaks;
              """,
             connection);
         command.Parameters.AddWithValue("status", (short)targetStatus);
@@ -441,7 +444,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                     client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
                     content_hash, state_version,
                     is_voice, voice_codec, voice_container,
-                    voice_duration_ms, voice_sample_rate_hz, voice_channels
+                    voice_duration_ms, voice_sample_rate_hz, voice_channels,
+                    voice_waveform_peaks
              FROM {_databaseSchema.AttachmentsTableSql}
              WHERE message_id IS NULL
                AND status IN (@ticketed, @uploaded, @scanning)
@@ -531,7 +535,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                     client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
                     content_hash, state_version,
                     is_voice, voice_codec, voice_container,
-                    voice_duration_ms, voice_sample_rate_hz, voice_channels
+                    voice_duration_ms, voice_sample_rate_hz, voice_channels,
+                    voice_waveform_peaks
              FROM {_databaseSchema.AttachmentsTableSql}
              WHERE message_id = ANY(@message_ids)
              ORDER BY message_id, created_at_ms, attachment_id;
@@ -564,7 +569,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                       client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
                       content_hash, state_version,
                     is_voice, voice_codec, voice_container,
-                    voice_duration_ms, voice_sample_rate_hz, voice_channels
+                    voice_duration_ms, voice_sample_rate_hz, voice_channels,
+                    voice_waveform_peaks
                FROM {_databaseSchema.AttachmentsTableSql}
                WHERE uploader_user_id = @user_id
                ORDER BY attachment_id
@@ -576,7 +582,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                       client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
                       content_hash, state_version,
                     is_voice, voice_codec, voice_container,
-                    voice_duration_ms, voice_sample_rate_hz, voice_channels
+                    voice_duration_ms, voice_sample_rate_hz, voice_channels,
+                    voice_waveform_peaks
                FROM {_databaseSchema.AttachmentsTableSql}
                WHERE uploader_user_id = @user_id
                  AND attachment_id > @after_id
@@ -752,7 +759,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                     client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
                     content_hash, state_version,
                     is_voice, voice_codec, voice_container,
-                    voice_duration_ms, voice_sample_rate_hz, voice_channels
+                    voice_duration_ms, voice_sample_rate_hz, voice_channels,
+                    voice_waveform_peaks
              FROM {_databaseSchema.AttachmentsTableSql}
              WHERE attachment_id = @attachment_id;
              """,
@@ -777,7 +785,8 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                     client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
                     content_hash, state_version,
                     is_voice, voice_codec, voice_container,
-                    voice_duration_ms, voice_sample_rate_hz, voice_channels
+                    voice_duration_ms, voice_sample_rate_hz, voice_channels,
+                    voice_waveform_peaks
              FROM {_databaseSchema.AttachmentsTableSql}
              WHERE uploader_user_id = @uploader_user_id
                AND client_attachment_id = @client_attachment_id;
@@ -837,6 +846,9 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
             : null,
         VoiceChannels = reader.FieldCount > 21 && !reader.IsDBNull(21)
             ? reader.GetInt16(21)
+            : null,
+        VoiceWaveformPeaks = reader.FieldCount > 22 && !reader.IsDBNull(22)
+            ? reader.GetFieldValue<byte[]>(22)
             : null
     };
 }

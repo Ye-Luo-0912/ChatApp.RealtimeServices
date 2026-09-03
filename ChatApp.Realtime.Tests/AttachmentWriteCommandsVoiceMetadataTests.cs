@@ -47,6 +47,74 @@ public sealed class AttachmentWriteCommandsVoiceMetadataTests
         Assert.Equal(3_200L, arrays.VoiceDurationMs[0]);
         Assert.Equal(48_000, arrays.VoiceSampleRateHz[0]);
         Assert.Equal((short)1, arrays.VoiceChannels[0]);
+        // 无波形声明 → 波形位保持 NULL（可选字段，缺省即无波形）。
+        Assert.Null(arrays.VoiceWaveformPeaks[0]);
+    }
+
+    [Fact]
+    public void Build_CompleteVoiceClaimWithWaveform_CarriesPeaksInSlot()
+    {
+        // 完整语音声明 + 波形：随语音 6 字段同位写入（绑定 UPDATE 同语句写列）。
+        var peaks = new byte[] { 12, 96, 255, 48, 7 };
+        var arrays = AttachmentWriteCommands.BuildVoiceMetadataArrays(
+            ["a1"],
+            [
+                new AttachmentRef
+                {
+                    AttachmentId = "a1",
+                    ContentType = "audio/ogg",
+                    IsVoice = true,
+                    VoiceCodec = "opus",
+                    VoiceContainer = "ogg",
+                    VoiceDurationMs = 3_200,
+                    VoiceSampleRateHz = 48_000,
+                    VoiceChannels = 1,
+                    VoiceWaveformPeaks = peaks
+                }
+            ]);
+
+        Assert.True(arrays.IsVoice[0]);
+        Assert.Equal(peaks, arrays.VoiceWaveformPeaks[0]);
+    }
+
+    [Fact]
+    public void Build_EmptyWaveform_TreatedAsNoWaveform()
+    {
+        var arrays = AttachmentWriteCommands.BuildVoiceMetadataArrays(
+            ["a1"],
+            [
+                VoiceWithWaveform("a1", [])
+            ]);
+
+        Assert.True(arrays.IsVoice[0]);
+        Assert.Null(arrays.VoiceWaveformPeaks[0]);
+    }
+
+    [Fact]
+    public void Build_OverlongWaveform_DroppedButVoiceFieldsKept()
+    {
+        // 越界波形（> 64 KiB）按无波形处理；语音 6 字段仍有效写入。
+        var arrays = AttachmentWriteCommands.BuildVoiceMetadataArrays(
+            ["a1"],
+            [
+                VoiceWithWaveform("a1", new byte[AttachmentWriteCommands.MaxWaveformPeaksBytes + 1])
+            ]);
+
+        Assert.True(arrays.IsVoice[0]);
+        Assert.Equal("opus", arrays.VoiceCodec[0]);
+        Assert.Null(arrays.VoiceWaveformPeaks[0]);
+    }
+
+    [Fact]
+    public void Build_BoundLengthWaveform_Kept()
+    {
+        var peaks = new byte[AttachmentWriteCommands.MaxWaveformPeaksBytes];
+        var arrays = AttachmentWriteCommands.BuildVoiceMetadataArrays(
+            ["a1"],
+            [VoiceWithWaveform("a1", peaks)]);
+
+        Assert.True(arrays.IsVoice[0]);
+        Assert.Equal(peaks, arrays.VoiceWaveformPeaks[0]);
     }
 
     [Fact]
@@ -76,6 +144,8 @@ public sealed class AttachmentWriteCommandsVoiceMetadataTests
         Assert.Null(arrays.VoiceDurationMs[0]);
         Assert.Null(arrays.VoiceSampleRateHz[0]);
         Assert.Null(arrays.VoiceChannels[0]);
+        // 残缺语音声明：波形随声明整体忽略（"残缺即整体忽略"）。
+        Assert.Null(arrays.VoiceWaveformPeaks[0]);
     }
 
     [Fact]
@@ -170,4 +240,32 @@ public sealed class AttachmentWriteCommandsVoiceMetadataTests
 
         Assert.Null(arrays.IsVoice[0]);
     }
+
+    [Fact]
+    public void BindSqlCommandText_WritesAndReturnsWaveformColumn()
+    {
+        // 纯 SQL 层：绑定语句必须写 voice_waveform_peaks（SET + unnest bytea[] + RETURNING），
+        // 保证绑定写波形 → 回查带出闭环在语句形状上成立。
+        var sql = AttachmentWriteCommands.BuildBindSqlCommandText("realtime.\"attachments\"");
+
+        Assert.Contains(
+            "voice_waveform_peaks = COALESCE(m.voice_waveform_peaks, a.voice_waveform_peaks)",
+            sql);
+        Assert.Contains("@m_voice_waveform_peaks::bytea[]", sql);
+        Assert.Contains("voice_waveform_peaks)", sql);
+        Assert.Contains("a.voice_waveform_peaks;", sql);
+    }
+
+    private static AttachmentRef VoiceWithWaveform(string attachmentId, byte[] peaks) => new()
+    {
+        AttachmentId = attachmentId,
+        ContentType = "audio/ogg",
+        IsVoice = true,
+        VoiceCodec = "opus",
+        VoiceContainer = "ogg",
+        VoiceDurationMs = 3_200,
+        VoiceSampleRateHz = 48_000,
+        VoiceChannels = 1,
+        VoiceWaveformPeaks = peaks
+    };
 }

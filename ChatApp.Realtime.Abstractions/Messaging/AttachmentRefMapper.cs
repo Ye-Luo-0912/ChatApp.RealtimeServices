@@ -28,7 +28,8 @@ public static class AttachmentRefMapper
             VoiceContainer = record.VoiceContainer,
             VoiceDurationMs = record.VoiceDurationMs,
             VoiceSampleRateHz = record.VoiceSampleRateHz,
-            VoiceChannels = record.VoiceChannels
+            VoiceChannels = record.VoiceChannels,
+            VoiceWaveformPeaks = record.VoiceWaveformPeaks
         };
     }
 

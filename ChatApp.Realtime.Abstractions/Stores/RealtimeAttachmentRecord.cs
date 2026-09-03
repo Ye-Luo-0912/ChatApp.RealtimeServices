@@ -43,4 +43,10 @@ public sealed class RealtimeAttachmentRecord
 
     /// <summary>声道数。仅语音附件有值。</summary>
     public short? VoiceChannels { get; init; }
+
+    /// <summary>
+    /// 语音波形采样峰值包络（VOICE-MSG-2 可选 waveform，有界 bytea）：每字节 0–255 归一化幅度。
+    /// 可选字段——缺省/空表示无波形；绑定语音消息时随发送方元数据快照写入（BOUND-V2）。
+    /// </summary>
+    public byte[]? VoiceWaveformPeaks { get; init; }
 }

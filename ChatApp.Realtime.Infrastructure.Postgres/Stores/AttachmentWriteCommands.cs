@@ -24,7 +24,8 @@ internal static class AttachmentWriteCommands
     /// <para>
     /// VOICE-MSG-2：<paramref name="attachmentMetadata"/>（发送方元数据快照，仅消息里出现的附件）
     /// 中语音字段成组有效（is_voice=true 且 codec/container/duration/sample_rate/channels 均非空且为正）的
-    /// 附件，在绑定同一 UPDATE 内把语音 6 字段写入附件行（sender 值优先，COALESCE 回退注册表现值）；
+    /// 附件，在绑定同一 UPDATE 内把语音 6 字段与可选波形 <c>voice_waveform_peaks</c> 写入附件行
+    /// （sender 值优先，COALESCE 回退注册表现值；波形仅在语音声明完整时随写）；
     /// 残缺/越界语音声明按无元数据处理（保消息必达、不触碰 ck_attachments_voice_metadata 约束），
     /// 非语音附件的注册表现值不受影响。
     /// </para>
@@ -117,48 +118,17 @@ internal static class AttachmentWriteCommands
             return AttachmentBindResult.Fail(errors);
 
         // VOICE-MSG-2：按可绑定 id 集合构建语音元数据 unnest 数组（与 bindable 顺序对齐）。
-        // 完整语音集 → is_voice=true + 5 元数据；其余（无/残缺语音声明）→ 全 NULL（COALESCE 保留现值）。
+        // 完整语音集 → is_voice=true + 5 元数据 + 可选 waveform；其余（无/残缺语音声明）→
+        // 全 NULL（COALESCE 保留现值）。
         var voiceMetadata = BuildVoiceMetadataArrays(
             bindable,
             attachmentMetadata);
 
-        // Step 2：全部可绑定，一次 UPDATE 并 RETURNING 取回线协议字段（含语音元数据）。
+        // Step 2：全部可绑定，一次 UPDATE 并 RETURNING 取回线协议字段（含语音元数据与波形）。
         // 语音元数据经 FROM unnest 与绑定同语句写入：sender 值优先，NULL 回退注册表现值。
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         await using var command = new NpgsqlCommand(
-            $"""
-             UPDATE {schema.AttachmentsTableSql} AS a
-             SET message_id = @message_id,
-                 conversation_id = @conversation_id,
-                 status = @bound_status,
-                 bound_at_ms = @bound_at_ms,
-                 is_voice = COALESCE(m.is_voice, a.is_voice),
-                 voice_codec = COALESCE(m.voice_codec, a.voice_codec),
-                 voice_container = COALESCE(m.voice_container, a.voice_container),
-                 voice_duration_ms = COALESCE(m.voice_duration_ms, a.voice_duration_ms),
-                 voice_sample_rate_hz = COALESCE(m.voice_sample_rate_hz, a.voice_sample_rate_hz),
-                 voice_channels = COALESCE(m.voice_channels, a.voice_channels)
-             FROM unnest(
-                      @m_attachment_ids::text[],
-                      @m_is_voice::boolean[],
-                      @m_voice_codec::text[],
-                      @m_voice_container::text[],
-                      @m_voice_duration_ms::bigint[],
-                      @m_voice_sample_rate_hz::integer[],
-                      @m_voice_channels::smallint[])
-                  AS m(attachment_id, is_voice, voice_codec, voice_container,
-                       voice_duration_ms, voice_sample_rate_hz, voice_channels)
-             WHERE a.attachment_id = m.attachment_id
-               AND a.attachment_id = ANY(@attachment_ids)
-               AND a.uploader_user_id = @uploader_user_id
-               AND a.status IN (@available_status, @confirmed_status)
-             RETURNING a.attachment_id, a.uploader_user_id, a.object_key, a.public_url,
-                       a.content_type, a.size_bytes, a.original_name, a.status,
-                       a.message_id, a.conversation_id,
-                       a.client_attachment_id, a.created_at_ms, a.confirmed_at_ms, a.bound_at_ms,
-                       a.content_hash, a.is_voice, a.voice_codec, a.voice_container,
-                       a.voice_duration_ms, a.voice_sample_rate_hz, a.voice_channels;
-             """,
+            BuildBindSqlCommandText(schema.AttachmentsTableSql),
             connection,
             transaction);
         command.Parameters.AddWithValue("message_id", messageId);
@@ -218,6 +188,9 @@ internal static class AttachmentWriteCommands
                     : null,
                 VoiceChannels = reader.FieldCount > 20 && !reader.IsDBNull(20)
                     ? reader.GetInt16(20)
+                    : null,
+                VoiceWaveformPeaks = reader.FieldCount > 21 && !reader.IsDBNull(21)
+                    ? reader.GetFieldValue<byte[]>(21)
                     : null
             });
         }
@@ -233,12 +206,21 @@ internal static class AttachmentWriteCommands
         string?[] VoiceContainer,
         long?[] VoiceDurationMs,
         int?[] VoiceSampleRateHz,
-        short?[] VoiceChannels);
+        short?[] VoiceChannels,
+        byte[]?[] VoiceWaveformPeaks);
+
+    /// <summary>voice_waveform_peaks 有界上限（与 wire 二进制 bytea 域预算一致，64 KiB）。</summary>
+    internal const int MaxWaveformPeaksBytes = 64 * 1024;
 
     /// <summary>
     /// 按可绑定 id 顺序构建语音元数据数组。仅"完整语音声明"（is_voice=true 且
     /// codec/container 非空白、duration/sample_rate/channels 为正，codec/container 截断到列宽 32）
     /// 产生非 NULL 位；其余（无元数据、非语音、残缺声明）全 NULL，绑定时不触碰语音列。
+    /// <para>
+    /// 波形（可选）仅在语音声明完整时随写：空数组视为无波形；超过
+    /// <see cref="MaxWaveformPeaksBytes"/> 的越界波形按无波形处理（丢弃波形本身，
+    /// 不影响已有效的语音 6 字段写入）。
+    /// </para>
     /// </summary>
     internal static VoiceMetadataArrays BuildVoiceMetadataArrays(
         IReadOnlyList<string> bindableIds,
@@ -251,11 +233,13 @@ internal static class AttachmentWriteCommands
         var durationMs = new long?[count];
         var sampleRateHz = new int?[count];
         var channels = new short?[count];
+        var waveformPeaks = new byte[]?[count];
 
         if (attachmentMetadata is not { Count: > 0 })
         {
             return new VoiceMetadataArrays(
-                bindableIds.ToArray(), isVoice, codec, container, durationMs, sampleRateHz, channels);
+                bindableIds.ToArray(), isVoice, codec, container, durationMs, sampleRateHz,
+                channels, waveformPeaks);
         }
 
         // 元数据快照可能与请求集合非严格对齐（旧网关/重复 id）：按 id 建索引，仅对可绑定 id 生效。
@@ -288,7 +272,7 @@ internal static class AttachmentWriteCommands
             if (!valid)
             {
                 // 残缺语音声明：ck_attachments_voice_metadata 禁止 is_voice=true 且元数据缺失。
-                // 按无元数据处理，保消息必达。
+                // 按无元数据处理（含波形），保消息必达。
                 continue;
             }
 
@@ -302,14 +286,61 @@ internal static class AttachmentWriteCommands
             durationMs[i] = reference.VoiceDurationMs;
             sampleRateHz[i] = reference.VoiceSampleRateHz;
             channels[i] = reference.VoiceChannels;
+            waveformPeaks[i] = reference.VoiceWaveformPeaks is { Length: > 0 } peaks
+                               && peaks.Length <= MaxWaveformPeaksBytes
+                ? peaks
+                : null;
         }
 
         return new VoiceMetadataArrays(
-            bindableIds.ToArray(), isVoice, codec, container, durationMs, sampleRateHz, channels);
+            bindableIds.ToArray(), isVoice, codec, container, durationMs, sampleRateHz,
+            channels, waveformPeaks);
     }
 
     /// <summary>voice_codec/voice_container 列宽（Migration065）。</summary>
     private const int VoiceCodecColumnLength = 32;
+
+    /// <summary>
+    /// 绑定 UPDATE 语句文本（语音 6 字段 + 可选波形列经 unnest 同语句写入，
+    /// RETURNING 带回全部线协议字段）。独立成方法供纯 SQL 层单测校验语句形状。
+    /// </summary>
+    internal static string BuildBindSqlCommandText(string attachmentsTableSql) => $"""
+         UPDATE {attachmentsTableSql} AS a
+         SET message_id = @message_id,
+             conversation_id = @conversation_id,
+             status = @bound_status,
+             bound_at_ms = @bound_at_ms,
+             is_voice = COALESCE(m.is_voice, a.is_voice),
+             voice_codec = COALESCE(m.voice_codec, a.voice_codec),
+             voice_container = COALESCE(m.voice_container, a.voice_container),
+             voice_duration_ms = COALESCE(m.voice_duration_ms, a.voice_duration_ms),
+             voice_sample_rate_hz = COALESCE(m.voice_sample_rate_hz, a.voice_sample_rate_hz),
+             voice_channels = COALESCE(m.voice_channels, a.voice_channels),
+             voice_waveform_peaks = COALESCE(m.voice_waveform_peaks, a.voice_waveform_peaks)
+         FROM unnest(
+                  @m_attachment_ids::text[],
+                  @m_is_voice::boolean[],
+                  @m_voice_codec::text[],
+                  @m_voice_container::text[],
+                  @m_voice_duration_ms::bigint[],
+                  @m_voice_sample_rate_hz::integer[],
+                  @m_voice_channels::smallint[],
+                  @m_voice_waveform_peaks::bytea[])
+              AS m(attachment_id, is_voice, voice_codec, voice_container,
+                   voice_duration_ms, voice_sample_rate_hz, voice_channels,
+                   voice_waveform_peaks)
+         WHERE a.attachment_id = m.attachment_id
+           AND a.attachment_id = ANY(@attachment_ids)
+           AND a.uploader_user_id = @uploader_user_id
+           AND a.status IN (@available_status, @confirmed_status)
+         RETURNING a.attachment_id, a.uploader_user_id, a.object_key, a.public_url,
+                   a.content_type, a.size_bytes, a.original_name, a.status,
+                   a.message_id, a.conversation_id,
+                   a.client_attachment_id, a.created_at_ms, a.confirmed_at_ms, a.bound_at_ms,
+                   a.content_hash, a.is_voice, a.voice_codec, a.voice_container,
+                   a.voice_duration_ms, a.voice_sample_rate_hz, a.voice_channels,
+                   a.voice_waveform_peaks;
+         """;
 
     private static void AddVoiceMetadataParameters(
         NpgsqlCommand command,
@@ -328,5 +359,6 @@ internal static class AttachmentWriteCommands
         AddArray("m_voice_duration_ms", NpgsqlDbType.Bigint, metadata.VoiceDurationMs);
         AddArray("m_voice_sample_rate_hz", NpgsqlDbType.Integer, metadata.VoiceSampleRateHz);
         AddArray("m_voice_channels", NpgsqlDbType.Smallint, metadata.VoiceChannels);
+        AddArray("m_voice_waveform_peaks", NpgsqlDbType.Bytea, metadata.VoiceWaveformPeaks);
     }
 }

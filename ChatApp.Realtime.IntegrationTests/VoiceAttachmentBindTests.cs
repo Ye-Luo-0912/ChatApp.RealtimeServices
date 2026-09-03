@@ -215,7 +215,8 @@ public sealed class VoiceAttachmentBindTests : IAsyncLifetime
                 VoiceContainer = "wav",
                 VoiceDurationMs = 3_500,
                 VoiceSampleRateHz = 16_000,
-                VoiceChannels = 1
+                VoiceChannels = 1,
+                VoiceWaveformPeaks = [5, 90, 180, 255, 12]
             }
         };
         var bound = await store.BindToMessageAsync(
@@ -231,8 +232,10 @@ public sealed class VoiceAttachmentBindTests : IAsyncLifetime
         Assert.Equal(3_500L, row.VoiceDurationMs);
         Assert.Equal(16_000, row.VoiceSampleRateHz);
         Assert.Equal((short)1, row.VoiceChannels);
+        // VOICE-MSG-2 waveform：完整语音声明的波形随绑定写入 voice_waveform_peaks 列。
+        Assert.Equal(new byte[] { 5, 90, 180, 255, 12 }, row.VoiceWaveformPeaks);
 
-        // 历史回查侧：按 message_id 读回的注册表行携带语音 6 字段
+        // 历史回查侧：按 message_id 读回的注册表行携带语音 6 字段与波形
         var historyRows = await store.ListByMessageIdsAsync(["msg-meta-1"]);
         var historyRow = Assert.Single(historyRows);
         Assert.True(historyRow.IsVoice);
@@ -240,6 +243,7 @@ public sealed class VoiceAttachmentBindTests : IAsyncLifetime
         Assert.Equal(3_500L, historyRow.VoiceDurationMs);
         Assert.Equal(16_000, historyRow.VoiceSampleRateHz);
         Assert.Equal((short)1, historyRow.VoiceChannels);
+        Assert.Equal(new byte[] { 5, 90, 180, 255, 12 }, historyRow.VoiceWaveformPeaks);
     }
 
     [Fact]

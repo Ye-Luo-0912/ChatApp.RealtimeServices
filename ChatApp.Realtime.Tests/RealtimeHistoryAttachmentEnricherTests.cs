@@ -77,11 +77,14 @@ public sealed class RealtimeHistoryAttachmentEnricherTests
         Assert.Equal(3_200L, voice.VoiceDurationMs);
         Assert.Equal(48_000, voice.VoiceSampleRateHz);
         Assert.Equal((short)1, voice.VoiceChannels);
+        // VOICE-MSG-2 waveform：注册表波形列经回查随 AttachmentRef 带出到历史消息。
+        Assert.Equal(new byte[] { 8, 64, 255, 32 }, voice.VoiceWaveformPeaks);
 
         var file = attachments.Single(a => a.AttachmentId == "att-file-1");
         Assert.False(file.IsVoice);
         Assert.Null(file.VoiceCodec);
         Assert.Null(file.VoiceDurationMs);
+        Assert.Null(file.VoiceWaveformPeaks);
     }
 
     private static RealtimeAttachmentRecord VoiceRecord(string id, string messageId) => new()
@@ -102,7 +105,8 @@ public sealed class RealtimeHistoryAttachmentEnricherTests
         VoiceContainer = "ogg",
         VoiceDurationMs = 3_200,
         VoiceSampleRateHz = 48_000,
-        VoiceChannels = 1
+        VoiceChannels = 1,
+        VoiceWaveformPeaks = [8, 64, 255, 32]
     };
 
     private static RealtimeHistoryMessage History(string messageId, string content) => new()
