@@ -151,6 +151,7 @@ public static class RealtimeServicesRegistration
         services.AddHostedService<ConversationListQueryWorker>();
         services.AddHostedService<ConversationMarkReadWorker>();
         services.AddHostedService<ConversationSetPrefsWorker>();
+        services.AddHostedService<ConversationMutesQueryWorker>();
         services.AddHostedService<GroupConversationWorker>();
         services.AddHostedService<AttachmentFinalizeWorker>();
         // P1：附件扫描消费者。消费扫描结果驱动 Uploaded → Scanning → Available | Rejected。
@@ -306,6 +307,8 @@ public static class RealtimeServicesRegistration
             throw new InvalidOperationException("Nats:Subjects:ConversationMarkReads 为必填配置。");
         if (string.IsNullOrWhiteSpace(options.Subjects.ConversationSetPrefs))
             throw new InvalidOperationException("Nats:Subjects:ConversationSetPrefs 为必填配置。");
+        if (string.IsNullOrWhiteSpace(options.Subjects.ConversationMutesQueries))
+            throw new InvalidOperationException("Nats:Subjects:ConversationMutesQueries 为必填配置。");
         if (string.IsNullOrWhiteSpace(options.Subjects.MessageRecalls))
             throw new InvalidOperationException("Nats:Subjects:MessageRecalls 为必填配置。");
         if (string.IsNullOrWhiteSpace(options.Subjects.MessageEdits))
@@ -587,6 +590,7 @@ public static class RealtimeServicesRegistration
                 ConversationListQueries = options.Subjects.ConversationListQueries,
                 ConversationMarkReads = options.Subjects.ConversationMarkReads,
                 ConversationSetPrefs = options.Subjects.ConversationSetPrefs,
+                ConversationMutesQueries = options.Subjects.ConversationMutesQueries,
                 MessageRecalls = options.Subjects.MessageRecalls,
                 MessageEdits = options.Subjects.MessageEdits,
                 MessageReactions = options.Subjects.MessageReactions,

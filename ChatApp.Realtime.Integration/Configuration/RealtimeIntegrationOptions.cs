@@ -16,6 +16,8 @@ public sealed class RealtimeIntegrationOptions
     public string ConversationListQueriesSubject { get; set; } = "chat.conversation-list.query";
     public string ConversationMarkReadsSubject { get; set; } = "chat.conversation-mark-read";
     public string ConversationSetPrefsSubject { get; set; } = "chat.conversation-prefs.set";
+    /// <summary>NATS Core request/reply：会话成员免打扰批量查询（Gateway → Realtime，ACCOUNT-OPS-1）。</summary>
+    public string ConversationMutesQuerySubject { get; set; } = "chat.conversation-mutes.query";
     public string MessageRecallsSubject { get; set; } = "chat.message-recall";
     public string MessageEditsSubject { get; set; } = "chat.message-edit";
     public string MessageReactionsSubject { get; set; } = "chat.message-reaction";

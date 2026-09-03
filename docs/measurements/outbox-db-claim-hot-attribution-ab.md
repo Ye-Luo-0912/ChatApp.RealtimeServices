@@ -1,11 +1,11 @@
 ﻿# OUTBOX-DB-1 排水 HOT 更细归因（claim-only vs claim+delete）
 
-> 生成时间：2026-09-02 16:06:36 UTC；语料固定、随机种子 20260813；两配置均 fillfactor=50、每配置 inbound 2000 条消息；A 只 claim（不 delete）、B claim+delete（delete-on-complete）；两窗口前均 TRUNCATE outbox 从空表起始。
+> 生成时间：2026-09-03 22:50:41 UTC；语料固定、随机种子 20260813；两配置均 fillfactor=50、每配置 inbound 2000 条消息；A 只 claim（不 delete）、B claim+delete（delete-on-complete）；两窗口前均 TRUNCATE outbox 从空表起始。
 
 | 配置 | claim 消息数 | claim WAL/消息 | claim WAL 记录/消息 | outbox updates | outbox hot_updates | HOT 命中率 | outbox dead tuples |
 |---|---|---|---|---|---|---|---|
-| A：claim-only（无 delete） | 2,000 | 1,043 | 2.8 | 2,000 | 1,723 | 86% | 450 |
-| B：claim+delete（生产默认） | 2,000 | 1,033 | 2.7 | 2,000 | 1,723 | 86% | 2,286 |
+| A：claim-only（无 delete） | 2,000 | 1,042 | 2.8 | 2,000 | 1,723 | 86% | 450 |
+| B：claim+delete（生产默认） | 2,000 | 1,032 | 2.7 | 2,000 | 1,723 | 86% | 2,286 |
 
 > 以 pg_stat_statements 语句级 wal_bytes/wal_records 归因 claim，A/B 同容器顺序运行、仅差是否 delete；
 > HOT 命中率 = hot_updates / updates（排水窗口内 outbox 表）；delete-on-complete 排水里唯一的 UPDATE 是 claim（
@@ -19,20 +19,20 @@
 
 | 指标 | 窗口总量 | 每消息 |
 |---|---|---|
-| WAL 字节 | 287,476 | 144 |
-| WAL 记录 | 2,156 | 1.1 |
+| WAL 字节 | 1,166,854 | 583 |
+| WAL 记录 | 8,682 | 4.3 |
 | WAL FPI | 0 | 0.00 |
-| WAL write | 108 | 0.054 |
+| WAL write | 432 | 0.216 |
 | WAL sync | 0 | 0.000 |
 
 ### Top SQL（按执行耗时降序，窗口增量）
 
 | queryid | calls | exec(ms) | rows | blks_read | dirtied | wal_records | wal_fpi | wal_bytes | sql |
 |---|---|---|---|---|---|---|---|---|---|
-| 1F1A5B390EB81DF3 | 1 | 213.0 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
-| 13FE8940C25F27BC | 1 | 51.1 | 3,934 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
-| 23F83703EC45ABDF | 10 | 19.2 | 2,000 | 0 | 358 | 5,677 | 308 | 2,087,192 | `WITH candidates AS MATERIALIZED (     SELECT item.event_id     FROM "perf_fb342889857c"."o…` |
-| 7FD7FA9679F7127A | 1 | 1.3 | 29 | 0 | 20 | 11 | 11 | 86,255 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
+| 1F1A5B390EB81DF3 | 1 | 208.5 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
+| C49C71344BD7CF03 | 1 | 19.6 | 3,386 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
+| F649EE9F9A113532 | 10 | 18.7 | 2,000 | 0 | 357 | 5,680 | 307 | 2,084,957 | `WITH candidates AS MATERIALIZED (     SELECT item.event_id     FROM "perf_35d7af7140f3"."o…` |
+| 7FD7FA9679F7127A | 1 | 1.2 | 29 | 0 | 21 | 6 | 6 | 47,546 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
 | 9DFE0023C220BBE7 | 13 | 0.1 | 0 | 0 | 0 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
 | B9A3FC5813DDA531 | 13 | 0.0 | 0 | 0 | 0 | 0 | 0 | 0 | `RESET ALL` |
 | 20928A0A690DF580 | 13 | 0.0 | 13 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
@@ -46,10 +46,10 @@
 
 | queryid | calls | wal_bytes | wal_records | wal_fpi | sql |
 |---|---|---|---|---|---|
-| 23F83703EC45ABDF | 10 | 2,087,192 | 5,677 | 308 | `WITH candidates AS MATERIALIZED (     SELECT item.event_id     FROM "perf_fb342889857c"."o…` |
-| 7FD7FA9679F7127A | 1 | 86,255 | 11 | 11 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
+| F649EE9F9A113532 | 10 | 2,084,957 | 5,680 | 307 | `WITH candidates AS MATERIALIZED (     SELECT item.event_id     FROM "perf_35d7af7140f3"."o…` |
+| 7FD7FA9679F7127A | 1 | 47,546 | 6 | 6 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
 | 1F1A5B390EB81DF3 | 1 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
-| 13FE8940C25F27BC | 1 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
+| C49C71344BD7CF03 | 1 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
 | 9DFE0023C220BBE7 | 13 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
 | B9A3FC5813DDA531 | 13 | 0 | 0 | 0 | `RESET ALL` |
 | 20928A0A690DF580 | 13 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
@@ -102,27 +102,27 @@
 
 | 指标 | 窗口总量 | 每消息 |
 |---|---|---|
-| WAL 字节 | 359,210 | 180 |
-| WAL 记录 | 2,519 | 1.3 |
-| WAL FPI | 2 | 0.00 |
-| WAL write | 126 | 0.063 |
+| WAL 字节 | 2,378,093 | 1,189 |
+| WAL 记录 | 16,029 | 8.0 |
+| WAL FPI | 25 | 0.01 |
+| WAL write | 796 | 0.398 |
 | WAL sync | 0 | 0.000 |
 
 ### Top SQL（按执行耗时降序，窗口增量）
 
 | queryid | calls | exec(ms) | rows | blks_read | dirtied | wal_records | wal_fpi | wal_bytes | sql |
 |---|---|---|---|---|---|---|---|---|---|
-| 1F1A5B390EB81DF3 | 1 | 210.2 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
-| 13FE8940C25F27BC | 1 | 45.3 | 3,934 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
-| 23F83703EC45ABDF | 10 | 16.0 | 2,000 | 0 | 358 | 5,422 | 308 | 2,066,784 | `WITH candidates AS MATERIALIZED (     SELECT item.event_id     FROM "perf_fb342889857c"."o…` |
-| 3D7EA8433DD4A480 | 10 | 6.0 | 2,000 | 0 | 0 | 2,290 | 0 | 131,628 | `DELETE FROM "perf_fb342889857c"."outbox" AS item USING UNNEST($1, $2) AS arr(event_id, cla…` |
-| 7FD7FA9679F7127A | 1 | 1.3 | 29 | 0 | 2 | 2 | 2 | 15,926 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
+| 1F1A5B390EB81DF3 | 1 | 211.7 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
+| C49C71344BD7CF03 | 1 | 23.9 | 3,386 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
+| F649EE9F9A113532 | 10 | 15.2 | 2,000 | 0 | 357 | 5,422 | 307 | 2,064,163 | `WITH candidates AS MATERIALIZED (     SELECT item.event_id     FROM "perf_35d7af7140f3"."o…` |
+| A0C06CCB7C3788DD | 10 | 5.8 | 2,000 | 0 | 0 | 2,290 | 0 | 131,628 | `DELETE FROM "perf_35d7af7140f3"."outbox" AS item USING UNNEST($1, $2) AS arr(event_id, cla…` |
+| 7FD7FA9679F7127A | 1 | 1.3 | 29 | 0 | 0 | 0 | 0 | 0 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
 | 9DFE0023C220BBE7 | 23 | 0.1 | 0 | 0 | 0 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
 | B9A3FC5813DDA531 | 23 | 0.1 | 0 | 0 | 0 | 0 | 0 | 0 | `RESET ALL` |
 | 20928A0A690DF580 | 23 | 0.1 | 23 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
 | 881865BABB8509BA | 1 | 0.0 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT COALESCE(wal_records, $1), COALESCE(wal_fpi, $2), COALESCE(wal_bytes, $3),        C…` |
-| 763D4E8E0DC293DC | 23 | 0.0 | 0 | 0 | 0 | 0 | 0 | 0 | `CLOSE ALL` |
 | 8464F5314FC1C676 | 23 | 0.0 | 0 | 0 | 0 | 0 | 0 | 0 | `DISCARD SEQUENCES` |
+| 763D4E8E0DC293DC | 23 | 0.0 | 0 | 0 | 0 | 0 | 0 | 0 | `CLOSE ALL` |
 | F9011CF57CBB30AB | 23 | 0.0 | 0 | 0 | 0 | 0 | 0 | 0 | `UNLISTEN *` |
 | 73FA2B7FF171D0F7 | 23 | 0.0 | 0 | 0 | 0 | 0 | 0 | 0 | `DISCARD TEMP` |
 
@@ -130,17 +130,17 @@
 
 | queryid | calls | wal_bytes | wal_records | wal_fpi | sql |
 |---|---|---|---|---|---|
-| 23F83703EC45ABDF | 10 | 2,066,784 | 5,422 | 308 | `WITH candidates AS MATERIALIZED (     SELECT item.event_id     FROM "perf_fb342889857c"."o…` |
-| 3D7EA8433DD4A480 | 10 | 131,628 | 2,290 | 0 | `DELETE FROM "perf_fb342889857c"."outbox" AS item USING UNNEST($1, $2) AS arr(event_id, cla…` |
-| 7FD7FA9679F7127A | 1 | 15,926 | 2 | 2 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
+| F649EE9F9A113532 | 10 | 2,064,163 | 5,422 | 307 | `WITH candidates AS MATERIALIZED (     SELECT item.event_id     FROM "perf_35d7af7140f3"."o…` |
+| A0C06CCB7C3788DD | 10 | 131,628 | 2,290 | 0 | `DELETE FROM "perf_35d7af7140f3"."outbox" AS item USING UNNEST($1, $2) AS arr(event_id, cla…` |
 | 1F1A5B390EB81DF3 | 1 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
-| 13FE8940C25F27BC | 1 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
+| C49C71344BD7CF03 | 1 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
+| 7FD7FA9679F7127A | 1 | 0 | 0 | 0 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
 | 9DFE0023C220BBE7 | 23 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
 | B9A3FC5813DDA531 | 23 | 0 | 0 | 0 | `RESET ALL` |
 | 20928A0A690DF580 | 23 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
 | 881865BABB8509BA | 1 | 0 | 0 | 0 | `SELECT COALESCE(wal_records, $1), COALESCE(wal_fpi, $2), COALESCE(wal_bytes, $3),        C…` |
-| 763D4E8E0DC293DC | 23 | 0 | 0 | 0 | `CLOSE ALL` |
 | 8464F5314FC1C676 | 23 | 0 | 0 | 0 | `DISCARD SEQUENCES` |
+| 763D4E8E0DC293DC | 23 | 0 | 0 | 0 | `CLOSE ALL` |
 | F9011CF57CBB30AB | 23 | 0 | 0 | 0 | `UNLISTEN *` |
 | 73FA2B7FF171D0F7 | 23 | 0 | 0 | 0 | `DISCARD TEMP` |
 

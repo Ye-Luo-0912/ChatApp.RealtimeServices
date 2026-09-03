@@ -1510,6 +1510,12 @@ public sealed class SyncBootstrapQueryProcessorTests
             long? mutedUntilMs,
             CancellationToken ct = default) =>
             throw new NotSupportedException();
+
+        public Task<IReadOnlyList<long>> QueryMutedMemberIdsAsync(
+            string conversationId,
+            IReadOnlyList<long> memberUserIds,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 
     private sealed class CapturingHistoryStore : IRealtimeMessageHistoryStore

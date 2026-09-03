@@ -54,4 +54,13 @@ public sealed class NoopRealtimeConversationStore : IRealtimeConversationStore
         ct.ThrowIfCancellationRequested();
         throw new InvalidOperationException("未配置真实会话存储，无法更新会话偏好。");
     }
+
+    public Task<IReadOnlyList<long>> QueryMutedMemberIdsAsync(
+        string conversationId,
+        IReadOnlyList<long> memberUserIds,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        throw new InvalidOperationException("未配置真实会话存储，无法查询会话免打扰状态。");
+    }
 }

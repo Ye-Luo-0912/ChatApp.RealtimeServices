@@ -31,6 +31,7 @@ public sealed class RealtimeStartupReporter : IHostedService
         "ConversationListQueryWorker",
         "ConversationMarkReadWorker",
         "ConversationSetPrefsWorker",
+        "ConversationMutesQueryWorker",
         "GroupConversationWorker",
         "AttachmentFinalizeWorker",
         "MessageRecallWorker",

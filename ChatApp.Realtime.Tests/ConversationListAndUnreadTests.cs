@@ -1001,5 +1001,11 @@ public sealed class ConversationListAndUnreadTests : IAsyncLifetime
             long? mutedUntilMs,
             CancellationToken ct = default) =>
             throw new NotSupportedException();
+
+        public Task<IReadOnlyList<long>> QueryMutedMemberIdsAsync(
+            string conversationId,
+            IReadOnlyList<long> memberUserIds,
+            CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 }

@@ -95,6 +95,7 @@ public sealed class NatsSubjectOptions
     public string ConversationListQueries { get; init; } = "chat.conversation-list.query";
     public string ConversationMarkReads { get; init; } = "chat.conversation-mark-read";
     public string ConversationSetPrefs { get; init; } = "chat.conversation-prefs.set";
+    public string ConversationMutesQueries { get; init; } = "chat.conversation-mutes.query";
     public string MessageRecalls { get; init; } = "chat.message-recall";
     public string MessageEdits { get; init; } = "chat.message-edit";
     public string MessageReactions { get; init; } = "chat.message-reaction";

@@ -49,6 +49,8 @@ public static class RealtimeNatsRegistration
         services.AddSingleton<IConversationMarkReadConsumer, NatsConversationMarkReadConsumer>();
         services.RemoveAll<IConversationSetPrefsConsumer>();
         services.AddSingleton<IConversationSetPrefsConsumer, NatsConversationSetPrefsConsumer>();
+        services.RemoveAll<IConversationMutesQueryConsumer>();
+        services.AddSingleton<IConversationMutesQueryConsumer, NatsConversationMutesQueryConsumer>();
         services.RemoveAll<IGroupConversationConsumer>();
         services.AddSingleton<IGroupConversationConsumer, NatsGroupConversationConsumer>();
         services.RemoveAll<IAttachmentFinalizeConsumer>();

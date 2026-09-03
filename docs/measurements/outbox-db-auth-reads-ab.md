@@ -1,11 +1,11 @@
 ﻿# OUTBOX-DB-1 减少重复读取 A/B（跳过同会话授权读取的每消息成本）
 
-> 生成时间：2026-09-02 17:25:57 UTC；语料固定、随机种子 20260813；每配置 inbound 2000 条消息、单聊同会话。
+> 生成时间：2026-09-03 22:50:56 UTC；语料固定、随机种子 20260813；每配置 inbound 2000 条消息、单聊同会话。
 
 | 配置 | 热路径 SQL/消息 | SQL 往返/消息 | 总执行时间/消息(ms) | WAL 字节/消息 | WAL 记录/消息 |
 |---|---|---|---|---|---|
-| A：super-bundle（带授权读取） | 1 | 8.0 | 0.31 | 3,996 | 29.3 |
-| B：no-auth super-bundle（跳过授权读取） | 1 | 8.0 | 0.27 | 3,202 | 24.1 |
+| A：super-bundle（带授权读取） | 1 | 8.0 | 0.29 | 3,952 | 29.8 |
+| B：no-auth super-bundle（跳过授权读取） | 1 | 8.0 | 0.26 | 3,332 | 25.1 |
 
 > 以 pg_stat_statements 语句级 calls/wal_bytes 归因，A/B 同容器顺序运行、语句数与写入行集完全相同；
 > 唯一差异是 admission 段的授权读取：A 每条消息读取 direct_user_state（AspNetUsers 2 行）+
@@ -33,23 +33,23 @@
 
 | 指标 | 窗口总量 | 每消息 |
 |---|---|---|
-| WAL 字节 | 7,992,881 | 3,996 |
-| WAL 记录 | 58,662 | 29.3 |
-| WAL FPI | 176 | 0.09 |
-| WAL write | 2,212 | 1.106 |
+| WAL 字节 | 7,904,383 | 3,952 |
+| WAL 记录 | 59,508 | 29.8 |
+| WAL FPI | 149 | 0.07 |
+| WAL write | 2,247 | 1.123 |
 | WAL sync | 0 | 0.000 |
 
 ### Top SQL（按执行耗时降序，窗口增量）
 
 | queryid | calls | exec(ms) | rows | blks_read | dirtied | wal_records | wal_fpi | wal_bytes | sql |
 |---|---|---|---|---|---|---|---|---|---|
-| F041A8037B761C25 | 2,000 | 343.1 | 2,000 | 0 | 592 | 48,368 | 0 | 6,370,444 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
-| 1F1A5B390EB81DF3 | 1 | 212.2 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
-| 13FE8940C25F27BC | 1 | 40.7 | 4,526 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
-| 7FD7FA9679F7127A | 1 | 5.2 | 29 | 0 | 0 | 7 | 0 | 404 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
-| 9DFE0023C220BBE7 | 2,003 | 4.9 | 0 | 0 | 0 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
+| 7B6A5FEADEAD6808 | 2,000 | 336.3 | 2,000 | 0 | 592 | 48,370 | 0 | 6,370,832 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
+| 1F1A5B390EB81DF3 | 1 | 207.9 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
+| C49C71344BD7CF03 | 1 | 19.1 | 3,287 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
+| 9DFE0023C220BBE7 | 2,003 | 4.7 | 0 | 0 | 0 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
 | 20928A0A690DF580 | 2,003 | 3.1 | 2,003 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
-| B9A3FC5813DDA531 | 2,003 | 2.2 | 0 | 0 | 0 | 0 | 0 | 0 | `RESET ALL` |
+| B9A3FC5813DDA531 | 2,003 | 2.1 | 0 | 0 | 0 | 0 | 0 | 0 | `RESET ALL` |
+| 7FD7FA9679F7127A | 1 | 1.3 | 29 | 0 | 0 | 5 | 0 | 280 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
 | 763D4E8E0DC293DC | 2,003 | 0.5 | 0 | 0 | 0 | 0 | 0 | 0 | `CLOSE ALL` |
 | 8464F5314FC1C676 | 2,003 | 0.4 | 0 | 0 | 0 | 0 | 0 | 0 | `DISCARD SEQUENCES` |
 | F9011CF57CBB30AB | 2,003 | 0.3 | 0 | 0 | 0 | 0 | 0 | 0 | `UNLISTEN *` |
@@ -60,10 +60,10 @@
 
 | queryid | calls | wal_bytes | wal_records | wal_fpi | sql |
 |---|---|---|---|---|---|
-| F041A8037B761C25 | 2,000 | 6,370,444 | 48,368 | 0 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
-| 7FD7FA9679F7127A | 1 | 404 | 7 | 0 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
+| 7B6A5FEADEAD6808 | 2,000 | 6,370,832 | 48,370 | 0 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
+| 7FD7FA9679F7127A | 1 | 280 | 5 | 0 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
 | 1F1A5B390EB81DF3 | 1 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
-| 13FE8940C25F27BC | 1 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
+| C49C71344BD7CF03 | 1 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
 | 9DFE0023C220BBE7 | 2,003 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
 | 20928A0A690DF580 | 2,003 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
 | B9A3FC5813DDA531 | 2,003 | 0 | 0 | 0 | `RESET ALL` |
@@ -82,7 +82,7 @@
 | messages | 2,000 | 0 | 0 | 0 | 0 |
 | outbox | 2,000 | 0 | 0 | 0 | 0 |
 | conversations | 0 | 2,000 | 0 | 2,000 | 0 |
-| conversation_members | 0 | 2,000 | 0 | 2,000 | 0 |
+| conversation_members | 0 | 2,000 | 0 | 2,000 | -46 |
 | device_sync_cursors | 0 | 0 | 0 | 0 | 0 |
 | attachments | 0 | 0 | 0 | 0 | 0 |
 | message_mutation_requests | 0 | 0 | 0 | 0 | 0 |
@@ -129,23 +129,23 @@
 
 | 指标 | 窗口总量 | 每消息 |
 |---|---|---|
-| WAL 字节 | 6,405,642 | 3,203 |
-| WAL 记录 | 48,263 | 24.1 |
+| WAL 字节 | 6,665,957 | 3,333 |
+| WAL 记录 | 50,256 | 25.1 |
 | WAL FPI | 0 | 0.00 |
-| WAL write | 1,916 | 0.958 |
+| WAL write | 1,997 | 0.999 |
 | WAL sync | 0 | 0.000 |
 
 ### Top SQL（按执行耗时降序，窗口增量）
 
 | queryid | calls | exec(ms) | rows | blks_read | dirtied | wal_records | wal_fpi | wal_bytes | sql |
 |---|---|---|---|---|---|---|---|---|---|
-| 103FBA12330D7F90 | 2,000 | 280.9 | 2,000 | 0 | 627 | 48,433 | 0 | 6,619,232 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
-| 1F1A5B390EB81DF3 | 1 | 216.1 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
-| 13FE8940C25F27BC | 1 | 31.2 | 4,526 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
-| 7FD7FA9679F7127A | 1 | 5.2 | 29 | 0 | 0 | 0 | 0 | 0 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
-| 9DFE0023C220BBE7 | 2,003 | 4.8 | 0 | 0 | 0 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
-| 20928A0A690DF580 | 2,003 | 3.2 | 2,003 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
-| B9A3FC5813DDA531 | 2,003 | 2.1 | 0 | 0 | 0 | 0 | 0 | 0 | `RESET ALL` |
+| 801B4D3BE6C433B0 | 2,000 | 279.8 | 2,000 | 0 | 627 | 48,432 | 0 | 6,619,222 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
+| 1F1A5B390EB81DF3 | 1 | 206.6 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
+| C49C71344BD7CF03 | 1 | 19.1 | 3,287 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
+| 9DFE0023C220BBE7 | 2,003 | 4.2 | 0 | 0 | 0 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
+| 20928A0A690DF580 | 2,003 | 3.0 | 2,003 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
+| 7FD7FA9679F7127A | 1 | 2.0 | 29 | 0 | 0 | 0 | 0 | 0 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
+| B9A3FC5813DDA531 | 2,003 | 1.7 | 0 | 0 | 0 | 0 | 0 | 0 | `RESET ALL` |
 | 763D4E8E0DC293DC | 2,003 | 0.5 | 0 | 0 | 0 | 0 | 0 | 0 | `CLOSE ALL` |
 | 8464F5314FC1C676 | 2,003 | 0.4 | 0 | 0 | 0 | 0 | 0 | 0 | `DISCARD SEQUENCES` |
 | F9011CF57CBB30AB | 2,003 | 0.3 | 0 | 0 | 0 | 0 | 0 | 0 | `UNLISTEN *` |
@@ -156,12 +156,12 @@
 
 | queryid | calls | wal_bytes | wal_records | wal_fpi | sql |
 |---|---|---|---|---|---|
-| 103FBA12330D7F90 | 2,000 | 6,619,232 | 48,433 | 0 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
+| 801B4D3BE6C433B0 | 2,000 | 6,619,222 | 48,432 | 0 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
 | 1F1A5B390EB81DF3 | 1 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
-| 13FE8940C25F27BC | 1 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
-| 7FD7FA9679F7127A | 1 | 0 | 0 | 0 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
+| C49C71344BD7CF03 | 1 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
 | 9DFE0023C220BBE7 | 2,003 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
 | 20928A0A690DF580 | 2,003 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
+| 7FD7FA9679F7127A | 1 | 0 | 0 | 0 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
 | B9A3FC5813DDA531 | 2,003 | 0 | 0 | 0 | `RESET ALL` |
 | 763D4E8E0DC293DC | 2,003 | 0 | 0 | 0 | `CLOSE ALL` |
 | 8464F5314FC1C676 | 2,003 | 0 | 0 | 0 | `DISCARD SEQUENCES` |

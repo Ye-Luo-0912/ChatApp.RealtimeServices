@@ -421,6 +421,45 @@ public sealed class NpgsqlRealtimeConversationStore : IRealtimeConversationStore
             nextMutedUntilMs);
     }
 
+    public async Task<IReadOnlyList<long>> QueryMutedMemberIdsAsync(
+        string conversationId,
+        IReadOnlyList<long> memberUserIds,
+        CancellationToken ct = default)
+    {
+        // now 与 SetMemberPrefsAsync 的写入时钟一致：UTC Unix 毫秒。
+        // 生效语义：is_muted = true 且（muted_until_ms 为 null 或 > now）。
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        await using var connection = await _databaseClient
+            .GetDataSource()
+            .OpenConnectionAsync(ct)
+            .ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            $"""
+             SELECT m.user_id
+             FROM {_databaseSchema.ConversationMembersTableSql} AS m
+             WHERE m.conversation_id = @conversation_id
+               AND m.user_id = ANY(@user_ids)
+               AND m.left_at_ms IS NULL
+               AND m.is_muted
+               AND (m.muted_until_ms IS NULL OR m.muted_until_ms > @now_ms)
+             ORDER BY m.user_id;
+             """,
+            connection);
+        command.Parameters.AddWithValue("conversation_id", conversationId);
+        var userIdsParameter = command.Parameters.Add("user_ids", NpgsqlDbType.Array | NpgsqlDbType.Bigint);
+        userIdsParameter.Value = memberUserIds.ToArray();
+        command.Parameters.AddWithValue("now_ms", nowMs);
+
+        var muted = new List<long>(memberUserIds.Count);
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            muted.Add(reader.GetInt64(0));
+        }
+
+        return muted;
+    }
+
     public async Task<ConversationReadAdvanceResult> AdvanceReadCursorAsync(
         long userId,
         string conversationId,

@@ -111,6 +111,38 @@ internal sealed class RealtimeRequestClient
                ?? throw new JsonException("会话偏好设置响应无法反序列化。");
     }
 
+    public async Task<ConversationMutesQueryResult> QueryConversationMutesAsync(
+        ConversationMutesQuery query,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        // ACCOUNT-OPS-1：Gateway → Realtime 服务间查询。身份头无单用户语义
+        //（免打扰查询以会话为单位，覆盖多个成员），故传 0 表示无用户身份；
+        // 信任边界由 NATS 账户认证 + subject ACL 保障。
+        var data = await RequestRawAsync(
+            "conversation_mutes.query",
+            _options.ConversationMutesQuerySubject,
+            RealtimeWireSerializer.Serialize(query),
+            userId: 0,
+            sessionId: null,
+            timeoutMs: _options.HistoryRequestTimeoutMs,
+            ct).ConfigureAwait(false);
+
+        // fail-open：空响应/反序列化失败返回空 MutedUserIds（不过滤），
+        // 保证免打扰查询不可用时离线推送仍可达（可用性优先）。
+        if (string.IsNullOrWhiteSpace(data))
+            return ConversationMutesQueryResult.Failed(
+                query.RequestId,
+                "empty_response",
+                "会话免打扰查询返回了空响应。");
+
+        return RealtimeWireSerializer.DeserializeConversationMutesQueryResult(data)
+               ?? ConversationMutesQueryResult.Failed(
+                   query.RequestId,
+                   "invalid_response_json",
+                   "会话免打扰查询响应无法反序列化。");
+    }
+
     public async Task<GroupConversationResult> MutateGroupConversationAsync(
         GroupConversationCommand command,
         CancellationToken ct = default)

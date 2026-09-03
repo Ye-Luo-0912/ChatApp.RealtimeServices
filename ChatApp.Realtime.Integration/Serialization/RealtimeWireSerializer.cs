@@ -30,6 +30,15 @@ public static class RealtimeWireSerializer
     public static string Serialize(ConversationSetPrefsCommand command) =>
         JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.ConversationSetPrefsCommand);
 
+    public static string Serialize(ConversationMutesQuery query) =>
+        JsonSerializer.Serialize(query, RealtimeIntegrationJsonContext.Default.ConversationMutesQuery);
+
+    public static ConversationMutesQuery? DeserializeConversationMutesQuery(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.ConversationMutesQuery);
+
+    public static ConversationMutesQueryResult? DeserializeConversationMutesQueryResult(string json) =>
+        JsonSerializer.Deserialize(json, RealtimeIntegrationJsonContext.Default.ConversationMutesQueryResult);
+
     public static string Serialize(GroupConversationCommand command) =>
         JsonSerializer.Serialize(command, RealtimeIntegrationJsonContext.Default.GroupConversationCommand);
 

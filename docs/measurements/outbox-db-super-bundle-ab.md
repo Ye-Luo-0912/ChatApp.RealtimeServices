@@ -1,11 +1,11 @@
 ﻿# OUTBOX-DB-1 合并同事务写入 A/B（super-bundle 单条 CTE）
 
-> 生成时间：2026-09-02 16:05:58 UTC；语料固定、随机种子 20260813；每配置 inbound 2000 条消息。
+> 生成时间：2026-09-03 22:49:55 UTC；语料固定、随机种子 20260813；每配置 inbound 2000 条消息。
 
 | 配置 | 热路径 SQL/消息 | SQL 往返/消息 | 总执行时间/消息(ms) | WAL 字节/消息 | WAL 记录/消息 |
 |---|---|---|---|---|---|
-| A：合并（admission CTE + bundle，2 条数据语句） | 2 | 13.4 | 1.19 | 3,472 | 27.3 |
-| B：super-bundle（合并为单条 CTE） | 1 | 9.5 | 0.96 | 4,755 | 37.0 |
+| A：合并（admission CTE + bundle，2 条数据语句） | 2 | 12.9 | 0.94 | 3,834 | 29.6 |
+| B：super-bundle（合并为单条 CTE） | 1 | 9.3 | 0.75 | 3,310 | 25.4 |
 
 > 以 pg_stat_statements 语句级 calls/wal_bytes 归因，A/B 同容器顺序运行、仅写入合并程度不同；
 > 确定性收益是每次消息的数据路径 SQL −1（热路径 2 条 → 1 条）：B 把生产合并路径的 admission CTE
@@ -18,17 +18,17 @@
 
 | 调用 | 调用/消息 | exec/消息(ms) | wal_records/消息 | wal_bytes/调用 | sql 片段 |
 |---|---|---|---|---|---|
-| 2,000 | 1.0 | 0.13 | 19.1 | 2,779 | `WITH inserted_message AS MATERIALIZED (     INSERT INTO "perf_4da8d3180c…` |
-| 2,000 | 1.0 | 0.13 | 4.0 | 353 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     F…` |
-| 2,093 | 1.0 | 0.00 | 0.0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
-| 2,512 | 1.3 | 0.00 | 0.0 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
-| 2,093 | 1.0 | 0.00 | 0.0 | 0 | `RESET ALL` |
-| 2,094 | 1.0 | 0.00 | 0.0 | 0 | `SELECT pg_advisory_unlock_all()` |
-| 2,507 | 1.3 | 0.00 | 0.0 | 0 | `COMMIT` |
-| 2,093 | 1.0 | 0.00 | 0.0 | 0 | `DISCARD SEQUENCES` |
-| 2,095 | 1.0 | 0.00 | 0.0 | 0 | `CLOSE ALL` |
-| 2,095 | 1.0 | 0.00 | 0.0 | 0 | `UNLISTEN *` |
-| 2,095 | 1.0 | 0.00 | 0.0 | 0 | `DISCARD TEMP` |
+| 2,000 | 1.0 | 0.11 | 19.1 | 2,779 | `WITH inserted_message AS MATERIALIZED (     INSERT INTO "perf_32c13fb0c6…` |
+| 2,000 | 1.0 | 0.10 | 4.0 | 353 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     F…` |
+| 2,026 | 1.0 | 0.00 | 0.0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
+| 2,426 | 1.2 | 0.00 | 0.0 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 2,026 | 1.0 | 0.00 | 0.0 | 0 | `RESET ALL` |
+| 2,026 | 1.0 | 0.00 | 0.0 | 0 | `SELECT pg_advisory_unlock_all()` |
+| 2,423 | 1.2 | 0.00 | 0.0 | 0 | `COMMIT` |
+| 2,026 | 1.0 | 0.00 | 0.0 | 0 | `DISCARD SEQUENCES` |
+| 2,026 | 1.0 | 0.00 | 0.0 | 0 | `CLOSE ALL` |
+| 2,026 | 1.0 | 0.00 | 0.0 | 0 | `UNLISTEN *` |
+| 2,026 | 1.0 | 0.00 | 0.0 | 0 | `DISCARD TEMP` |
 
 ## A：合并（admission CTE + bundle）（2000 条近热路径消息）
 
@@ -36,100 +36,100 @@
 
 | 指标 | 窗口总量 | 每消息 |
 |---|---|---|
-| WAL 字节 | 6,944,758 | 3,472 |
-| WAL 记录 | 54,616 | 27.3 |
-| WAL FPI | 333 | 0.17 |
-| WAL write | 1,818 | 0.909 |
+| WAL 字节 | 7,668,681 | 3,834 |
+| WAL 记录 | 59,149 | 29.6 |
+| WAL FPI | 100 | 0.05 |
+| WAL write | 2,321 | 1.161 |
 | WAL sync | 0 | 0.000 |
 
 ### Top SQL（按执行耗时降序，窗口增量）
 
 | queryid | calls | exec(ms) | rows | blks_read | dirtied | wal_records | wal_fpi | wal_bytes | sql |
 |---|---|---|---|---|---|---|---|---|---|
-| 6A5B03D0C4125F4D | 2,000 | 263.0 | 2,000 | 0 | 603 | 38,233 | 0 | 5,559,500 | `WITH inserted_message AS MATERIALIZED (     INSERT INTO "perf_4da8d3180cf9"."messages" (  …` |
-| 7F8CBE236CAB3E90 | 2,000 | 256.3 | 2,000 | 0 | 0 | 8,097 | 0 | 707,384 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
-| 1F1A5B390EB81DF3 | 1 | 209.6 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
-| 64AB052FA5FE730A | 1 | 187.3 | 0 | 0 | 0 | 36 | 1 | 4,103 | `CREATE INDEX CONCURRENTLY "ix_conversation_members_user_pinned_list"     ON "rt_outbox_aud…` |
-| 13FE8940C25F27BC | 1 | 36.4 | 3,615 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
-| C651AFCF55162FC2 | 6 | 27.1 | 1,032 | 0 | 0 | 7 | 0 | 418 | `SELECT ns.nspname, t.oid, t.typname, t.typtype, t.typnotnull, t.elemtypoid FROM (     -- A…` |
-| 31EC5DFCEFD4401 | 34 | 26.2 | 34 | 0 | 19 | 646 | 0 | 114,670 | `WITH inserted_message AS MATERIALIZED (     INSERT INTO "realtime"."messages" (         me…` |
-| 86D18C8B24474D63 | 1 | 13.4 | 0 | 0 | 0 | 5 | 0 | 336 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
-| E276F3FC63A3E3E2 | 1 | 12.4 | 0 | 0 | 0 | 6 | 0 | 394 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
-| 3AC8235C2FFE7F1E | 1 | 12.1 | 0 | 0 | 0 | 7 | 0 | 546 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
-| 4B40B1F5983D7496 | 1 | 11.2 | 0 | 0 | 0 | 6 | 0 | 392 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
-| E2FCD983F2E71AC4 | 1 | 10.1 | 0 | 0 | 0 | 5 | 0 | 340 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
-| EC37CE6C65CB7824 | 1 | 9.9 | 0 | 0 | 0 | 6 | 0 | 484 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
-| 261466F1BD346818 | 1 | 9.8 | 0 | 0 | 0 | 6 | 0 | 488 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
-| 168EFDB0902C7F21 | 1 | 9.0 | 0 | 0 | 0 | 4 | 0 | 278 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
-| 9DFE0023C220BBE7 | 2,093 | 8.9 | 0 | 0 | 0 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
-| D6C944F452669EEE | 2,512 | 7.8 | 0 | 0 | 0 | 0 | 0 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
-| CA500FB662CCE79B | 1 | 7.6 | 0 | 0 | 0 | 70 | 1 | 7,098 | `CREATE TABLE IF NOT EXISTS "rt_group_amplification_send_38208ab0"."schema_migrations" (   …` |
-| 10D79BC4EB4AA48 | 1 | 7.3 | 0 | 0 | 0 | 68 | 1 | 6,986 | `CREATE TABLE IF NOT EXISTS "rt_outbox_compact_publish_b6694435"."schema_migrations" (     …` |
-| 7D7ED15418175A3B | 3 | 6.7 | 0 | 0 | 0 | 140 | 2 | 15,245 | `CREATE TABLE IF NOT EXISTS "rt_outbox_compact_publish_b6694435"."schema_migration_checkpoi…` |
-| EC23FA6C96F40416 | 1 | 6.2 | 0 | 0 | 1 | 69 | 1 | 10,594 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_atomic_d8dfbe3b"."schema_migrations" (     "ve…` |
-| C5A6730AE8C2011E | 1 | 6.1 | 0 | 0 | 2 | 70 | 1 | 11,000 | `CREATE TABLE IF NOT EXISTS "rt_outbox_reclaim_token_02e36e4e"."schema_migrations" (     "v…` |
-| 55CD82040F8F95D3 | 1 | 5.8 | 0 | 0 | 0 | 68 | 1 | 6,986 | `CREATE TABLE IF NOT EXISTS "rt_ledger_txn_rollback_974a04a3"."schema_migrations" (     "ve…` |
-| B9A3FC5813DDA531 | 2,093 | 5.7 | 0 | 0 | 0 | 0 | 0 | 0 | `RESET ALL` |
-| D3F4539C46147179 | 34 | 5.3 | 34 | 0 | 0 | 139 | 0 | 21,814 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
-| 20928A0A690DF580 | 2,094 | 5.1 | 2,094 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
-| 642279687B67DC61 | 1 | 4.9 | 0 | 0 | 3 | 186 | 2 | 24,480 | `CREATE TABLE IF NOT EXISTS "rt_ledger_txn_rollback_974a04a3"."attachments" (     "attachme…` |
-| 4E4C0FE91E523DFC | 1 | 4.9 | 0 | 0 | 0 | 68 | 1 | 6,986 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Expired_cbf8a6d5"."schema_migrations" (     "ver…` |
-| D8C5F0CC2C23A63 | 3 | 4.8 | 0 | 0 | 1 | 144 | 2 | 15,645 | `CREATE TABLE IF NOT EXISTS "rt_group_amplification_send_38208ab0"."schema_migration_checkp…` |
-| 4BBD11988980EF14 | 1 | 4.7 | 0 | 0 | 0 | 135 | 2 | 14,475 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Expired_cbf8a6d5"."relationship_change_log" (   …` |
+| E5AFA989139E6561 | 2,000 | 215.7 | 2,000 | 0 | 602 | 38,237 | 0 | 5,559,264 | `WITH inserted_message AS MATERIALIZED (     INSERT INTO "perf_32c13fb0c603"."messages" (  …` |
+| 1F1A5B390EB81DF3 | 1 | 209.0 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
+| 573DCDB8A2FCC27A | 2,000 | 197.1 | 2,000 | 0 | 0 | 8,097 | 0 | 707,424 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
+| 56E20AFCD7439C9D | 1 | 145.3 | 0 | 0 | 0 | 36 | 1 | 4,103 | `CREATE INDEX CONCURRENTLY "ix_conversation_members_user_pinned_list"     ON "rt_voice_bind…` |
+| C49C71344BD7CF03 | 1 | 38.8 | 2,047 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
+| C651AFCF55162FC2 | 6 | 20.3 | 1,032 | 0 | 0 | 5 | 0 | 310 | `SELECT ns.nspname, t.oid, t.typname, t.typtype, t.typnotnull, t.elemtypoid FROM (     -- A…` |
+| 5AE1ADAF6A86BFB0 | 1 | 10.8 | 0 | 0 | 0 | 6 | 0 | 484 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
+| 4791C451E8498C72 | 1 | 10.7 | 0 | 0 | 0 | 6 | 0 | 398 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
+| 6295D2061B54B3EB | 1 | 10.5 | 0 | 0 | 0 | 6 | 0 | 488 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
+| E7A2DE41789F1387 | 1 | 10.0 | 0 | 0 | 0 | 6 | 0 | 400 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
+| 67DFCFC8592AA202 | 1 | 9.4 | 0 | 0 | 0 | 6 | 0 | 490 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
+| E49D0622BE025D32 | 1 | 9.0 | 0 | 0 | 0 | 4 | 0 | 278 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
+| 985402309A5DC9F | 1 | 8.7 | 0 | 0 | 0 | 44 | 0 | 4,023 | `ALTER TABLE "rt_outbox_reclaim_token_47b4ad33"."message_state" ADD CONSTRAINT fk_message_s…` |
+| 6690771C9A2BDCAA | 1 | 8.4 | 0 | 0 | 0 | 4 | 0 | 278 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
+| 9DFE0023C220BBE7 | 2,026 | 6.8 | 0 | 0 | 0 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
+| D6C944F452669EEE | 2,426 | 5.8 | 0 | 0 | 0 | 0 | 0 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 7954E31A88255C7D | 1 | 5.7 | 0 | 0 | 0 | 14 | 0 | 1,458 | `DROP INDEX CONCURRENTLY IF EXISTS "rt_outbox_audit_list_2c86d521"."ix_outbox_pending_attem…` |
+| 4AF876927F98B980 | 1 | 5.4 | 0 | 0 | 0 | 68 | 1 | 6,986 | `CREATE TABLE IF NOT EXISTS "rt_outbox_reclaim_token_47b4ad33"."schema_migrations" (     "v…` |
+| B9A3FC5813DDA531 | 2,026 | 5.2 | 0 | 0 | 0 | 0 | 0 | 0 | `RESET ALL` |
+| 585290785E79A0DA | 1 | 5.0 | 0 | 0 | 0 | 25 | 1 | 2,897 | `CREATE INDEX CONCURRENTLY "ix_outbox_pending_created" ON "rt_ledger_txn_rollback_84080684"…` |
+| A7093EFE9C300A14 | 1 | 4.9 | 0 | 0 | 0 | 68 | 1 | 6,986 | `CREATE TABLE IF NOT EXISTS "rt_ledger_txn_rollback_84080684"."schema_migrations" (     "ve…` |
+| DE8D27C9D8E5DD27 | 1 | 4.9 | 0 | 0 | 0 | 68 | 1 | 6,986 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_list_2c86d521"."schema_migrations" (     "vers…` |
+| 9BA3EBEDB5073110 | 1 | 4.8 | 1 | 5 | 11 | 11 | 0 | 1,026 | `INSERT INTO "rt_voice_bind_Scanning_4a0c9032"."attachments" (     attachment_id, uploader_…` |
+| 26AA63265F16757C | 1 | 4.7 | 0 | 0 | 1 | 69 | 1 | 7,746 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_crash_claim_a6fd832c"."schema_migrations" (   …` |
+| 7302A5964BA4A13B | 1 | 4.7 | 0 | 0 | 1 | 70 | 1 | 7,206 | `CREATE TABLE IF NOT EXISTS "rt_group_amplification_edit_9d29498d"."schema_migrations" (   …` |
+| 5E974A6F7C84F404 | 1 | 4.4 | 0 | 0 | 4 | 186 | 2 | 24,474 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Expired_b9f4bd18"."attachments" (     "attachmen…` |
+| 587FECE708B64BA5 | 3 | 4.4 | 0 | 0 | 1 | 144 | 2 | 15,477 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_crash_claim_a6fd832c"."schema_migration_checkp…` |
+| 875D456D6BC08F61 | 3 | 4.3 | 0 | 0 | 1 | 142 | 2 | 19,497 | `CREATE TABLE IF NOT EXISTS "rt_outbox_reclaim_token_47b4ad33"."schema_migration_checkpoint…` |
+| 587890D2EEB3970D | 1 | 4.1 | 0 | 0 | 2 | 94 | 1 | 14,683 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_list_2c86d521"."conversations" (     "convers…` |
+| ED5C045B04C0D91A | 1 | 4.1 | 1 | 4 | 9 | 11 | 0 | 980 | `INSERT INTO "rt_voice_bind_Expired_b9f4bd18"."attachments" (     attachment_id, uploader_u…` |
 
 ### Top SQL（按 WAL 字节降序，窗口增量）
 
 | queryid | calls | wal_bytes | wal_records | wal_fpi | sql |
 |---|---|---|---|---|---|
-| 6A5B03D0C4125F4D | 2,000 | 5,559,500 | 38,233 | 0 | `WITH inserted_message AS MATERIALIZED (     INSERT INTO "perf_4da8d3180cf9"."messages" (  …` |
-| 7F8CBE236CAB3E90 | 2,000 | 707,384 | 8,097 | 0 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
-| 31EC5DFCEFD4401 | 34 | 114,670 | 646 | 0 | `WITH inserted_message AS MATERIALIZED (     INSERT INTO "realtime"."messages" (         me…` |
-| C48B05E5B509A7DB | 1 | 110,148 | 1,006 | 0 | `INSERT INTO "rt_group_amplification_recall_3247ac18"."conversation_members" (     conversa…` |
-| 96BF4DAEE4DE052F | 1 | 110,148 | 1,006 | 0 | `INSERT INTO "rt_group_amplification_send_38208ab0"."conversation_members" (     conversati…` |
-| BAAC44745E436BA6 | 1 | 30,189 | 209 | 1 | `CREATE TABLE IF NOT EXISTS "rt_group_amplification_send_38208ab0"."relationship_projection…` |
-| 4C410D9AFE93AD55 | 1 | 29,373 | 203 | 1 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_atomic_d8dfbe3b"."relationship_projection_rebu…` |
-| 6B8B776097959158 | 1 | 27,385 | 171 | 2 | `CREATE TABLE IF NOT EXISTS "rt_group_amplification_send_38208ab0"."relationship_projection…` |
-| E1B6DA6093623D4A | 1 | 26,963 | 170 | 2 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_atomic_d8dfbe3b"."relationship_projection_item…` |
-| DDD8E68B7D471605 | 1 | 26,528 | 204 | 1 | `CREATE TABLE IF NOT EXISTS "rt_group_amplification_recall_3247ac18"."relationship_projecti…` |
-| B326E3AE4A7C5566 | 1 | 26,039 | 206 | 1 | `CREATE TABLE IF NOT EXISTS "rt_ledger_txn_rollback_974a04a3"."relationship_projection_rebu…` |
-| 19FC97319D6A28C4 | 1 | 25,737 | 201 | 1 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_crash_claim_0391e3fb"."relationship_projection…` |
-| E6C59AF38678D09F | 1 | 25,497 | 201 | 1 | `CREATE TABLE IF NOT EXISTS "rt_outbox_compact_publish_b6694435"."relationship_projection_r…` |
-| 26A432E0F37ABF72 | 1 | 25,481 | 201 | 1 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Expired_cbf8a6d5"."relationship_projection_rebui…` |
-| 642279687B67DC61 | 1 | 24,480 | 186 | 2 | `CREATE TABLE IF NOT EXISTS "rt_ledger_txn_rollback_974a04a3"."attachments" (     "attachme…` |
+| E5AFA989139E6561 | 2,000 | 5,559,264 | 38,237 | 0 | `WITH inserted_message AS MATERIALIZED (     INSERT INTO "perf_32c13fb0c603"."messages" (  …` |
+| 573DCDB8A2FCC27A | 2,000 | 707,424 | 8,097 | 0 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
+| 247859BDA132156C | 1 | 110,148 | 1,006 | 0 | `INSERT INTO "rt_group_amplification_edit_9d29498d"."conversation_members" (     conversati…` |
+| 3221D9D8394BC808 | 1 | 29,429 | 204 | 1 | `CREATE TABLE IF NOT EXISTS "rt_outbox_reclaim_token_47b4ad33"."relationship_projection_reb…` |
+| D2FF291FD6F27AAC | 1 | 29,337 | 207 | 1 | `CREATE TABLE IF NOT EXISTS "rt_group_amplification_edit_9d29498d"."relationship_projection…` |
+| 3B7252228BAB20C4 | 1 | 29,117 | 202 | 1 | `CREATE TABLE IF NOT EXISTS "rt_ledger_txn_rollback_84080684"."relationship_projection_rebu…` |
+| E9F1A8B4EB6F908 | 1 | 27,577 | 172 | 2 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_list_2c86d521"."relationship_projection_items"…` |
+| 5DD1516F574F9BA | 1 | 26,687 | 213 | 1 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Expired_b9f4bd18"."relationship_projection_rebui…` |
+| C1AFF28E609CDB21 | 1 | 26,083 | 207 | 1 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_list_2c86d521"."relationship_projection_rebuil…` |
+| 53C50C97941B7973 | 1 | 25,497 | 201 | 1 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Scanning_4a0c9032"."relationship_projection_rebu…` |
+| BF0EEB71979B1BCF | 1 | 24,743 | 185 | 2 | `CREATE TABLE IF NOT EXISTS "rt_group_amplification_edit_9d29498d"."relationship_projection…` |
+| 5E974A6F7C84F404 | 1 | 24,474 | 186 | 2 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Expired_b9f4bd18"."attachments" (     "attachmen…` |
+| 6B33BB861E53D106 | 1 | 24,171 | 148 | 2 | `CREATE TABLE IF NOT EXISTS "rt_ledger_txn_rollback_84080684"."relationship_projection_snap…` |
+| 385A0FA77A7298F1 | 1 | 23,537 | 172 | 2 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Expired_b9f4bd18"."relationship_projection_items…` |
+| E94818A73340D6EF | 1 | 23,219 | 169 | 2 | `CREATE TABLE IF NOT EXISTS "rt_outbox_reclaim_token_47b4ad33"."relationship_projection_ite…` |
 
 ### 表级统计（窗口增量）
 
 | table | inserts | updates | deletes | hot_updates | dead_tuples |
 |---|---|---|---|---|---|
-| friendships | 0 | 0 | 0 | 0 | 0 |
-| account_cleanup_jobs | 0 | 0 | 0 | 0 | 0 |
-| conversations | 0 | 2,000 | 0 | 2,000 | 0 |
-| device_sync_cursors | 0 | 0 | 0 | 0 | 0 |
-| messages | 2,000 | 0 | 0 | 0 | 0 |
+| schema_migrations | 0 | 0 | 0 | 0 | 0 |
 | schema_migration_checkpoints | 0 | 0 | 0 | 0 | 0 |
-| friend_requests | 0 | 0 | 0 | 0 | 0 |
-| group_operation_audit | 0 | 0 | 0 | 0 | 0 |
-| group_mutation_requests | 0 | 0 | 0 | 0 | 0 |
-| relationship_mutation_requests | 0 | 0 | 0 | 0 | 0 |
+| messages | 2,000 | 0 | 0 | 0 | 0 |
 | outbox | 2,000 | 0 | 0 | 0 | 0 |
-| outbox_replay_audit | 0 | 0 | 0 | 0 | 0 |
-| command_idempotency_ledger | 2,000 | 0 | 0 | 0 | 0 |
-| message_reactions | 0 | 0 | 0 | 0 | 0 |
-| user_deletion_tombstones | 0 | 0 | 0 | 0 | 0 |
-| relationship_change_log | 0 | 0 | 0 | 0 | 0 |
-| relationship_projection_snapshots | 0 | 0 | 0 | 0 | 0 |
-| relationship_projection_history | 0 | 0 | 0 | 0 | 0 |
-| relationship_projection_inbox | 0 | 0 | 0 | 0 | 0 |
-| relationship_projection_rebuild_state | 0 | 0 | 0 | 0 | 0 |
+| conversations | 0 | 2,000 | 0 | 2,000 | -8 |
+| conversation_members | 0 | 2,000 | 0 | 2,000 | 14 |
+| device_sync_cursors | 0 | 0 | 0 | 0 | 0 |
 | attachments | 0 | 0 | 0 | 0 | 0 |
 | message_mutation_requests | 0 | 0 | 0 | 0 | 0 |
-| conversation_members | 0 | 2,000 | 0 | 2,000 | 13 |
+| message_reactions | 0 | 0 | 0 | 0 | 0 |
+| group_mutation_requests | 0 | 0 | 0 | 0 | 0 |
+| user_deletion_tombstones | 0 | 0 | 0 | 0 | 0 |
+| command_idempotency_ledger | 2,000 | 0 | 0 | 0 | 0 |
+| group_operation_audit | 0 | 0 | 0 | 0 | 0 |
 | conversation_membership_periods | 0 | 0 | 0 | 0 | 0 |
-| relationship_projection_items | 0 | 0 | 0 | 0 | 0 |
-| relationship_projection_versions | 0 | 0 | 0 | 0 | 0 |
+| account_cleanup_jobs | 0 | 0 | 0 | 0 | 0 |
 | message_state | 0 | 0 | 0 | 0 | 0 |
+| friend_requests | 0 | 0 | 0 | 0 | 0 |
+| friendships | 0 | 0 | 0 | 0 | 0 |
+| relationship_mutation_requests | 0 | 0 | 0 | 0 | 0 |
 | relationship_sync_cursors | 0 | 0 | 0 | 0 | 0 |
-| schema_migrations | 0 | 0 | 0 | 0 | 0 |
+| relationship_change_log | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_versions | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_items | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_inbox | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_snapshots | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_rebuild_state | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_history | 0 | 0 | 0 | 0 | 0 |
+| outbox_replay_audit | 0 | 0 | 0 | 0 | 0 |
 
 > HOT 命中率（hot_updates / updates）：conversations 2,000/2,000（100%）；conversation_members 2,000/2,000（100%）。non-HOT 更新会对已修改索引列维护索引并产生额外 WAL。
 
@@ -138,14 +138,14 @@
 
 | 调用 | 调用/消息 | exec/消息(ms) | wal_records/消息 | wal_bytes/调用 | sql 片段 |
 |---|---|---|---|---|---|
-| 2,000 | 1.0 | 0.28 | 24.2 | 3,300 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     F…` |
-| 2,028 | 1.0 | 0.00 | 0.0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
-| 2,028 | 1.0 | 0.00 | 0.0 | 0 | `SELECT pg_advisory_unlock_all()` |
-| 2,028 | 1.0 | 0.00 | 0.0 | 0 | `RESET ALL` |
-| 2,028 | 1.0 | 0.00 | 0.0 | 0 | `DISCARD SEQUENCES` |
-| 2,028 | 1.0 | 0.00 | 0.0 | 0 | `CLOSE ALL` |
-| 2,028 | 1.0 | 0.00 | 0.0 | 0 | `UNLISTEN *` |
-| 2,028 | 1.0 | 0.00 | 0.0 | 0 | `DISCARD TEMP` |
+| 2,000 | 1.0 | 0.20 | 24.2 | 3,301 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     F…` |
+| 2,024 | 1.0 | 0.00 | 0.0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
+| 2,024 | 1.0 | 0.00 | 0.0 | 0 | `RESET ALL` |
+| 2,024 | 1.0 | 0.00 | 0.0 | 0 | `SELECT pg_advisory_unlock_all()` |
+| 2,024 | 1.0 | 0.00 | 0.0 | 0 | `CLOSE ALL` |
+| 2,024 | 1.0 | 0.00 | 0.0 | 0 | `DISCARD SEQUENCES` |
+| 2,024 | 1.0 | 0.00 | 0.0 | 0 | `UNLISTEN *` |
+| 2,024 | 1.0 | 0.00 | 0.0 | 0 | `DISCARD TEMP` |
 
 ## B：super-bundle（合并同事务写入为单条 CTE）（2000 条近热路径消息）
 
@@ -153,66 +153,66 @@
 
 | 指标 | 窗口总量 | 每消息 |
 |---|---|---|
-| WAL 字节 | 9,511,708 | 4,756 |
-| WAL 记录 | 73,931 | 37.0 |
-| WAL FPI | 381 | 0.19 |
-| WAL write | 2,403 | 1.202 |
+| WAL 字节 | 6,621,387 | 3,311 |
+| WAL 记录 | 50,885 | 25.4 |
+| WAL FPI | 250 | 0.12 |
+| WAL write | 1,681 | 0.841 |
 | WAL sync | 0 | 0.000 |
 
 ### Top SQL（按执行耗时降序，窗口增量）
 
 | queryid | calls | exec(ms) | rows | blks_read | dirtied | wal_records | wal_fpi | wal_bytes | sql |
 |---|---|---|---|---|---|---|---|---|---|
-| F34F8BE5D519327F | 2,000 | 550.2 | 2,000 | 0 | 632 | 48,427 | 0 | 6,601,417 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
-| 1F1A5B390EB81DF3 | 1 | 209.3 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
-| 3D477F44F9E6752B | 1 | 56.7 | 0 | 0 | 0 | 36 | 1 | 4,103 | `CREATE INDEX CONCURRENTLY "ix_conversation_members_user_pinned_list"     ON "rt_lifecycle_…` |
-| C651AFCF55162FC2 | 6 | 40.5 | 1,032 | 0 | 0 | 27 | 0 | 1,530 | `SELECT ns.nspname, t.oid, t.typname, t.typtype, t.typnotnull, t.elemtypoid FROM (     -- A…` |
-| 13FE8940C25F27BC | 1 | 29.6 | 3,694 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
-| 8D745B6662C17598 | 1 | 13.9 | 0 | 0 | 0 | 10 | 0 | 814 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
-| 4AD2DE504CCD2597 | 1 | 13.1 | 0 | 0 | 0 | 5 | 0 | 426 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
-| 53F8AC5100B11537 | 1 | 12.9 | 0 | 0 | 0 | 5 | 0 | 336 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
-| 183A58B7E580281B | 1 | 12.4 | 0 | 0 | 0 | 20 | 1 | 2,148 | `CREATE INDEX IF NOT EXISTS "ix_messages_forwarded_from" ON "rt_outbox_pending_index_clean…` |
-| A0C75BF13E3F2974 | 1 | 11.4 | 0 | 0 | 0 | 6 | 0 | 492 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
-| F9531E415772CEFA | 3 | 11.2 | 0 | 0 | 0 | 152 | 2 | 16,387 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Ticketed_3f8223df"."schema_migration_checkpoints…` |
-| 31B355BFE1AD9187 | 1 | 10.9 | 0 | 0 | 0 | 5 | 0 | 426 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
-| A21E5D1FCD87441A | 3 | 9.1 | 0 | 0 | 1 | 145 | 2 | 19,609 | `CREATE TABLE IF NOT EXISTS "rt_outbox_pending_index_cleanup_fbaf1b7c"."schema_migration_ch…` |
-| 9DFE0023C220BBE7 | 2,028 | 8.3 | 0 | 0 | 0 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
-| 46D1DC8BA3B33123 | 1 | 7.9 | 0 | 0 | 0 | 68 | 1 | 6,986 | `CREATE TABLE IF NOT EXISTS "rt_outbox_pending_index_cleanup_fbaf1b7c"."schema_migrations" …` |
-| 1C97027C18F8E3AE | 1 | 7.7 | 0 | 0 | 0 | 69 | 1 | 7,040 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_missing_f9bf7984"."schema_migrations" (     "v…` |
-| FCDB34D84707E19C | 1 | 7.1 | 0 | 0 | 0 | 68 | 1 | 6,986 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Ticketed_3f8223df"."schema_migrations" (     "ve…` |
-| 3C73A4C804597180 | 6 | 6.5 | 0 | 0 | 0 | 2 | 0 | 112 | `-- Load field definitions for (free-standing) composite types SELECT typ.oid, att.attname,…` |
-| 2C6C296E1832DDD5 | 1 | 6.4 | 0 | 0 | 1 | 145 | 2 | 15,699 | `CREATE TABLE IF NOT EXISTS "rt_lifecycle_deleted_rejects_writes_a6a051f8"."message_mutatio…` |
-| 4E4A1368A2ADEC69 | 1 | 6.3 | 1 | 5 | 11 | 12 | 0 | 1,090 | `INSERT INTO "rt_voice_bind_Uploaded_c37fda5a"."attachments" (     attachment_id, uploader_…` |
-| 1E5A15324DD82797 | 1 | 6.3 | 0 | 0 | 0 | 68 | 1 | 6,986 | `CREATE TABLE IF NOT EXISTS "rt_lifecycle_shared_concurrent_dd49e375"."schema_migrations" (…` |
-| A45E185DB4D1A6B8 | 1 | 5.7 | 0 | 0 | 4 | 141 | 2 | 20,068 | `CREATE TABLE IF NOT EXISTS "rt_lifecycle_shared_concurrent_dd49e375"."messages" (     "me…` |
-| 4F98BFD6E61A82E4 | 1 | 5.7 | 0 | 0 | 1 | 68 | 1 | 6,984 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Uploaded_c37fda5a"."schema_migrations" (     "ve…` |
-| AA316D208DE9A1EB | 3 | 5.6 | 0 | 0 | 2 | 143 | 2 | 19,087 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Uploaded_c37fda5a"."schema_migration_checkpoints…` |
-| 36C71B8AA31A14A2 | 1 | 5.1 | 0 | 0 | 2 | 169 | 2 | 18,933 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Uploaded_c37fda5a"."relationship_projection_item…` |
-| E8BF85A8E03F125D | 1 | 5.1 | 0 | 0 | 1 | 146 | 2 | 16,070 | `CREATE TABLE IF NOT EXISTS "rt_outbox_pending_index_cleanup_fbaf1b7c"."outbox" (     "eve…` |
-| 20928A0A690DF580 | 2,028 | 5.0 | 2,028 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
-| A0A76E17B6D0F16B | 1 | 5.0 | 1 | 6 | 13 | 14 | 0 | 1,226 | `INSERT INTO "rt_voice_bind_Ticketed_3f8223df"."attachments" (     attachment_id, uploader_…` |
-| 25612453ACEED702 | 1 | 4.8 | 0 | 0 | 3 | 183 | 2 | 24,450 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Uploaded_c37fda5a"."attachments" (     "attachme…` |
-| E046DF963A6C2210 | 1 | 4.8 | 0 | 0 | 2 | 153 | 2 | 19,156 | `CREATE TABLE IF NOT EXISTS "rt_outbox_pending_index_cleanup_fbaf1b7c"."friend_requests" ( …` |
+| 287418D9446B3AF5 | 2,000 | 402.1 | 2,000 | 0 | 621 | 48,429 | 0 | 6,602,306 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
+| 1F1A5B390EB81DF3 | 1 | 207.7 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
+| 2AD6BD6EC9665A0D | 1 | 102.4 | 0 | 0 | 0 | 37 | 1 | 4,153 | `CREATE INDEX CONCURRENTLY "ix_conversation_members_user_pinned_list"     ON "rt_lifecycle_…` |
+| C651AFCF55162FC2 | 5 | 22.2 | 860 | 0 | 0 | 3 | 0 | 196 | `SELECT ns.nspname, t.oid, t.typname, t.typtype, t.typnotnull, t.elemtypoid FROM (     -- A…` |
+| C49C71344BD7CF03 | 1 | 20.8 | 2,723 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
+| 648961FB01E444E0 | 1 | 13.1 | 0 | 0 | 0 | 8 | 0 | 626 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
+| 63D823AC0B9DF08A | 1 | 11.5 | 0 | 0 | 0 | 6 | 0 | 488 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
+| 98AC1853651047FF | 1 | 10.8 | 0 | 0 | 0 | 6 | 0 | 494 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
+| 319921C387CD9D2E | 1 | 10.7 | 0 | 0 | 0 | 7 | 0 | 542 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
+| 1FF541EAC640F5A | 1 | 10.3 | 0 | 0 | 0 | 6 | 0 | 390 | `DO $$ BEGIN     IF EXISTS (         SELECT 1 FROM information_schema.columns         WHERE…` |
+| 1D41E8AD84E0B9D1 | 1 | 8.4 | 1 | 1 | 23 | 26 | 0 | 3,798 | `WITH inserted_message AS MATERIALIZED (     INSERT INTO "rt_lifecycle_active_after_rollbac…` |
+| 9DFE0023C220BBE7 | 2,024 | 6.4 | 0 | 0 | 0 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
+| C431907809E26F56 | 1 | 6.2 | 0 | 0 | 0 | 70 | 1 | 7,215 | `CREATE TABLE IF NOT EXISTS "realtime"."schema_migrations" (     "version" integer NOT NULL…` |
+| 6FB3118884DDDBD2 | 1 | 5.7 | 0 | 0 | 4 | 139 | 2 | 14,815 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_atomic_3e5ee10e"."relationship_change_log" (  …` |
+| B8D3DC37523ED3E1 | 1 | 5.7 | 0 | 0 | 1 | 69 | 1 | 7,026 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Uploaded_f4166fbf"."schema_migrations" (     "ve…` |
+| F353A2690F9249F | 1 | 5.5 | 0 | 0 | 1 | 69 | 1 | 7,866 | `CREATE TABLE IF NOT EXISTS "rt_outbox_pending_index_cleanup_d1e6c813"."schema_migrations" …` |
+| 10D00B0DC19F1074 | 1 | 4.9 | 0 | 0 | 1 | 69 | 1 | 7,038 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_atomic_3e5ee10e"."schema_migrations" (     "ve…` |
+| 238584DBF4534C5F | 1 | 4.7 | 0 | 0 | 0 | 37 | 1 | 4,165 | `CREATE INDEX CONCURRENTLY "ix_conversation_members_user_pinned_list"     ON "rt_outbox_aud…` |
+| 46D6128C6FE46D8B | 1 | 4.5 | 0 | 0 | 1 | 139 | 2 | 18,329 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_atomic_3e5ee10e"."friend_requests" (     "requ…` |
+| D9507526C04D2C69 | 1 | 4.5 | 0 | 0 | 3 | 103 | 2 | 11,078 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_atomic_3e5ee10e"."friendships" (     "friendsh…` |
+| C049A50FA16E1BEE | 3 | 4.5 | 0 | 0 | 1 | 143 | 2 | 15,419 | `CREATE TABLE IF NOT EXISTS "rt_outbox_pending_index_cleanup_d1e6c813"."schema_migration_ch…` |
+| B9A3FC5813DDA531 | 2,024 | 4.3 | 0 | 0 | 0 | 0 | 0 | 0 | `RESET ALL` |
+| 7EB68A6188984E4A | 1 | 4.3 | 0 | 0 | 3 | 185 | 2 | 24,408 | `CREATE TABLE IF NOT EXISTS "rt_outbox_pending_index_cleanup_d1e6c813"."attachments" (     …` |
+| 75D57A4834A0BB83 | 3 | 4.2 | 0 | 0 | 3 | 143 | 2 | 15,411 | `CREATE TABLE IF NOT EXISTS "realtime"."schema_migration_checkpoints" (     "migration_vers…` |
+| 6AA35CE9C8E92ACB | 3 | 4.1 | 0 | 0 | 1 | 143 | 2 | 15,577 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_atomic_3e5ee10e"."schema_migration_checkpoints…` |
+| 66CBF308DA60102 | 1 | 4.1 | 1 | 5 | 11 | 11 | 0 | 1,026 | `INSERT INTO "rt_voice_bind_Uploaded_f4166fbf"."attachments" (     attachment_id, uploader_…` |
+| 20928A0A690DF580 | 2,024 | 4.0 | 2,024 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
+| C7D9F8D0FE6C011D | 1 | 3.9 | 0 | 0 | 1 | 184 | 2 | 20,626 | `CREATE TABLE IF NOT EXISTS "rt_lifecycle_active_after_rollback_d3c8f0e4"."attachments" (  …` |
+| 756E532241F1D2BA | 1 | 3.8 | 0 | 0 | 2 | 138 | 1 | 14,589 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_atomic_3e5ee10e"."group_operation_audit" (    …` |
+| 7A2975F9E4D89B70 | 1 | 3.8 | 0 | 0 | 3 | 135 | 1 | 17,970 | `CREATE TABLE IF NOT EXISTS "rt_outbox_pending_index_cleanup_d1e6c813"."group_operation_aud…` |
 
 ### Top SQL（按 WAL 字节降序，窗口增量）
 
 | queryid | calls | wal_bytes | wal_records | wal_fpi | sql |
 |---|---|---|---|---|---|
-| F34F8BE5D519327F | 2,000 | 6,601,417 | 48,427 | 0 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
-| 1580C8F0ACADCF40 | 1 | 30,125 | 204 | 1 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_missing_f9bf7984"."relationship_projection_reb…` |
-| 2EA67751069560F6 | 1 | 27,147 | 219 | 1 | `CREATE TABLE IF NOT EXISTS "rt_outbox_pending_index_cleanup_fbaf1b7c"."relationship_projec…` |
-| A5907600E9458089 | 1 | 26,243 | 218 | 1 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Uploaded_c37fda5a"."relationship_projection_rebu…` |
-| A7B84C3177EECF28 | 1 | 25,637 | 201 | 1 | `CREATE TABLE IF NOT EXISTS "rt_lifecycle_deleted_rejects_writes_a6a051f8"."relationship_pr…` |
-| 9D665F6388A4D53A | 1 | 24,764 | 201 | 1 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Ticketed_3f8223df"."relationship_projection_rebu…` |
-| E7CD50B02E1A6415 | 1 | 24,747 | 188 | 2 | `CREATE TABLE IF NOT EXISTS "rt_lifecycle_shared_concurrent_dd49e375"."attachments" (     "…` |
-| 25612453ACEED702 | 1 | 24,450 | 183 | 2 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Uploaded_c37fda5a"."attachments" (     "attachme…` |
-| 2F3B97419516F5FC | 1 | 24,142 | 180 | 2 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_missing_f9bf7984"."attachments" (     "attachm…` |
-| FE760D8365EF6933 | 1 | 23,183 | 169 | 2 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_missing_f9bf7984"."relationship_projection_ite…` |
-| 88B112170A78B1ED | 1 | 22,664 | 146 | 2 | `CREATE TABLE IF NOT EXISTS "rt_lifecycle_shared_concurrent_dd49e375"."outbox" (     "even…` |
-| 3DEB9E703BFB256A | 1 | 22,497 | 169 | 2 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Ticketed_3f8223df"."relationship_projection_item…` |
-| 95365CA51C5334DC | 1 | 22,413 | 171 | 2 | `CREATE TABLE IF NOT EXISTS "rt_outbox_pending_index_cleanup_fbaf1b7c"."relationship_projec…` |
-| 5916446FF8EB54E2 | 1 | 21,478 | 190 | 2 | `CREATE TABLE IF NOT EXISTS "rt_outbox_pending_index_cleanup_fbaf1b7c"."relationship_projec…` |
-| 58E0B34B71F43C26 | 1 | 21,455 | 193 | 2 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Uploaded_c37fda5a"."relationship_projection_hist…` |
+| 287418D9446B3AF5 | 2,000 | 6,602,306 | 48,429 | 0 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
+| 9DEBFDCA885F1BDA | 1 | 29,708 | 211 | 1 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_atomic_3e5ee10e"."relationship_projection_rebu…` |
+| F8F10996AD1DB2FD | 1 | 24,913 | 200 | 1 | `CREATE TABLE IF NOT EXISTS "rt_lifecycle_active_after_rollback_d3c8f0e4"."relationship_pro…` |
+| D1D45B53123618E8 | 1 | 24,784 | 201 | 1 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Uploaded_f4166fbf"."relationship_projection_rebu…` |
+| 8F34AE3A93A81112 | 1 | 24,737 | 200 | 1 | `CREATE TABLE IF NOT EXISTS "realtime"."relationship_projection_rebuild_state" (     "id" s…` |
+| 7EB68A6188984E4A | 1 | 24,408 | 185 | 2 | `CREATE TABLE IF NOT EXISTS "rt_outbox_pending_index_cleanup_d1e6c813"."attachments" (     …` |
+| 8D635AAC52B4DAE9 | 1 | 23,248 | 170 | 2 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_atomic_3e5ee10e"."relationship_projection_item…` |
+| F7470B0497D29F65 | 1 | 22,397 | 167 | 2 | `CREATE TABLE IF NOT EXISTS "rt_lifecycle_active_after_rollback_d3c8f0e4"."relationship_pro…` |
+| C12C67489523BAF7 | 1 | 21,619 | 182 | 2 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_atomic_3e5ee10e"."relationship_projection_hist…` |
+| E4B10393007D3119 | 1 | 21,351 | 187 | 2 | `CREATE TABLE IF NOT EXISTS "rt_voice_bind_Uploaded_f4166fbf"."relationship_projection_hist…` |
+| 9DB17B83421AECE0 | 1 | 20,919 | 183 | 2 | `CREATE TABLE IF NOT EXISTS "realtime"."relationship_projection_history" (     "owner_user_…` |
+| 62A69CB444BB4206 | 1 | 20,859 | 182 | 2 | `CREATE TABLE IF NOT EXISTS "rt_lifecycle_active_after_rollback_d3c8f0e4"."relationship_pro…` |
+| C7D9F8D0FE6C011D | 1 | 20,626 | 184 | 2 | `CREATE TABLE IF NOT EXISTS "rt_lifecycle_active_after_rollback_d3c8f0e4"."attachments" (  …` |
+| A4A6D31079C94B29 | 1 | 20,598 | 122 | 1 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_atomic_3e5ee10e"."conversation_members" (    …` |
+| 1A30E06F1F48B8B7 | 1 | 20,520 | 182 | 2 | `CREATE TABLE IF NOT EXISTS "rt_outbox_audit_atomic_3e5ee10e"."attachments" (     "attachme…` |
 
 ### 表级统计（窗口增量）
 
@@ -222,8 +222,8 @@
 | schema_migration_checkpoints | 0 | 0 | 0 | 0 | 0 |
 | messages | 2,000 | 0 | 0 | 0 | 0 |
 | outbox | 2,000 | 0 | 0 | 0 | 0 |
-| conversations | 0 | 2,000 | 0 | 1,998 | -8 |
-| conversation_members | 0 | 2,000 | 0 | 1,999 | -24 |
+| conversations | 0 | 2,000 | 0 | 2,000 | -11 |
+| conversation_members | 0 | 2,000 | 0 | 2,000 | -6 |
 | device_sync_cursors | 0 | 0 | 0 | 0 | 0 |
 | attachments | 0 | 0 | 0 | 0 | 0 |
 | message_mutation_requests | 0 | 0 | 0 | 0 | 0 |
@@ -248,5 +248,5 @@
 | relationship_projection_history | 0 | 0 | 0 | 0 | 0 |
 | outbox_replay_audit | 0 | 0 | 0 | 0 | 0 |
 
-> HOT 命中率（hot_updates / updates）：conversations 1,998/2,000（100%）；conversation_members 1,999/2,000（100%）。non-HOT 更新会对已修改索引列维护索引并产生额外 WAL。
+> HOT 命中率（hot_updates / updates）：conversations 2,000/2,000（100%）；conversation_members 2,000/2,000（100%）。non-HOT 更新会对已修改索引列维护索引并产生额外 WAL。
 

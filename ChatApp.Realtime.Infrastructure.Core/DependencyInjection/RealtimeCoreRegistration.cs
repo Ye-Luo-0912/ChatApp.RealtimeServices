@@ -48,6 +48,7 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IConversationListQueryProcessor, DefaultConversationListQueryProcessor>();
         services.TryAddSingleton<IConversationMarkReadProcessor, DefaultConversationMarkReadProcessor>();
         services.TryAddSingleton<IConversationSetPrefsProcessor, DefaultConversationSetPrefsProcessor>();
+        services.TryAddSingleton<IConversationMutesQueryProcessor, DefaultConversationMutesQueryProcessor>();
         services.TryAddSingleton<IGroupConversationProcessor, DefaultGroupConversationProcessor>();
         services.TryAddSingleton<IAttachmentFinalizeProcessor, DefaultAttachmentFinalizeProcessor>();
         services.TryAddSingleton<IMessageRecallProcessor, DefaultMessageRecallProcessor>();
@@ -79,6 +80,7 @@ public static class RealtimeCoreRegistration
         services.TryAddSingleton<IConversationListQueryConsumer, NoopConversationListQueryConsumer>();
         services.TryAddSingleton<IConversationMarkReadConsumer, NoopConversationMarkReadConsumer>();
         services.TryAddSingleton<IConversationSetPrefsConsumer, NoopConversationSetPrefsConsumer>();
+        services.TryAddSingleton<IConversationMutesQueryConsumer, NoopConversationMutesQueryConsumer>();
         services.TryAddSingleton<IGroupConversationConsumer, NoopGroupConversationConsumer>();
         services.TryAddSingleton<IAttachmentFinalizeConsumer, NoopAttachmentFinalizeConsumer>();
         services.TryAddSingleton<IMessageRecallConsumer, NoopMessageRecallConsumer>();

@@ -50,6 +50,19 @@ public interface IRealtimeConversationStore
         bool? muted,
         long? mutedUntilMs,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// 批量查询会话成员中"当前生效免打扰"的用户 Id（ACCOUNT-OPS-1 离线推送过滤）。
+    /// <para>
+    /// 生效语义与 <see cref="SetMemberPrefsAsync"/> 写入一致：
+    /// <c>is_muted = true</c> 且（<c>muted_until_ms</c> 为 null 或 &gt; UTC now 毫秒）。
+    /// 只统计未离群（left_at_ms IS NULL）成员；返回结果按用户 Id 升序、已去重。
+    /// </para>
+    /// </summary>
+    Task<IReadOnlyList<long>> QueryMutedMemberIdsAsync(
+        string conversationId,
+        IReadOnlyList<long> memberUserIds,
+        CancellationToken ct = default);
 }
 
 public readonly record struct ConversationReadAdvanceResult(

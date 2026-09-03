@@ -27,6 +27,20 @@ public interface IRealtimeMessageBus
     Task<ConversationSetPrefsResult> SetConversationPrefsAsync(
         ConversationSetPrefsCommand command,
         CancellationToken ct = default);
+
+    /// <summary>
+    /// 批量查询会话成员"当前生效免打扰"状态（Gateway 离线推送过滤，ACCOUNT-OPS-1）。
+    /// Core NATS request/reply 到 RealtimeServices，零持久化。
+    /// 默认实现返回查询失败（MutedUserIds 为空），调用方按 fail-open 处理（不过滤）；
+    /// 生产路径由 <see cref="NatsRealtimeMessageBus"/> 覆盖。
+    /// </summary>
+    Task<ConversationMutesQueryResult> QueryConversationMutesAsync(
+        ConversationMutesQuery query,
+        CancellationToken ct = default)
+        => Task.FromResult(ConversationMutesQueryResult.Failed(
+            query?.RequestId,
+            "mutes_query_unavailable",
+            "免打扰批量查询能力未接入（fail-open：不过滤）。"));
     Task<GroupConversationResult> MutateGroupConversationAsync(
         GroupConversationCommand command,
         CancellationToken ct = default);

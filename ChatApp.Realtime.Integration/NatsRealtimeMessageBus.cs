@@ -148,6 +148,11 @@ public sealed class NatsRealtimeMessageBus : IRealtimeMessageBus, IAsyncDisposab
         CancellationToken ct = default)
         => _requestClient.SetConversationPrefsAsync(command, ct);
 
+    public Task<ConversationMutesQueryResult> QueryConversationMutesAsync(
+        ConversationMutesQuery query,
+        CancellationToken ct = default)
+        => _requestClient.QueryConversationMutesAsync(query, ct);
+
     public Task<GroupConversationResult> MutateGroupConversationAsync(
         GroupConversationCommand command,
         CancellationToken ct = default)

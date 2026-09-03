@@ -18,6 +18,7 @@ public static class RealtimeIntegrationRegistration
         ArgumentException.ThrowIfNullOrWhiteSpace(options.ConversationListQueriesSubject);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.ConversationMarkReadsSubject);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.ConversationSetPrefsSubject);
+        ArgumentException.ThrowIfNullOrWhiteSpace(options.ConversationMutesQuerySubject);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.MessageRecallsSubject);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.MessageEditsSubject);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.SyncBootstrapQueriesSubject);

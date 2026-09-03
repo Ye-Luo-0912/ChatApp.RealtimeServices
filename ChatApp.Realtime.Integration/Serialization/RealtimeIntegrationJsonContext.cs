@@ -46,6 +46,8 @@ namespace ChatApp.Realtime.Integration.Serialization;
 [JsonSerializable(typeof(ConversationMarkReadResult))]
 [JsonSerializable(typeof(ConversationSetPrefsCommand))]
 [JsonSerializable(typeof(ConversationSetPrefsResult))]
+[JsonSerializable(typeof(ConversationMutesQuery))]
+[JsonSerializable(typeof(ConversationMutesQueryResult))]
 [JsonSerializable(typeof(GroupConversationCommand))]
 [JsonSerializable(typeof(GroupConversationResult))]
 [JsonSerializable(typeof(MessageReader))]
