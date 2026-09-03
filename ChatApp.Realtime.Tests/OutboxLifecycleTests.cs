@@ -12,20 +12,26 @@ namespace ChatApp.Realtime.Tests;
 
 public sealed class OutboxLifecycleTests : IAsyncLifetime
 {
-    private readonly PostgreSqlContainer _postgres = new PostgreSqlBuilder()
+    private readonly PostgreSqlContainer? _postgres = string.IsNullOrEmpty(ExternalPostgresConnectionString()) ? new PostgreSqlBuilder()
         .WithImage("postgres:16-alpine")
-        .Build();
+        .Build() : null;
+    private readonly string _externalPostgres = ExternalPostgresConnectionString() ?? string.Empty;
+    private readonly string _schemaSuffix = Guid.NewGuid().ToString("N")[..8];
 
-    public Task InitializeAsync() => _postgres.StartAsync();
+    private static string? ExternalPostgresConnectionString() => Environment.GetEnvironmentVariable("CHATAPP_TEST_POSTGRES");
 
-    public Task DisposeAsync() => _postgres.DisposeAsync().AsTask();
+    private string PostgresConnectionString => _postgres?.GetConnectionString() ?? _externalPostgres;
+
+    public Task InitializeAsync() => _postgres?.StartAsync() ?? Task.CompletedTask;
+
+    public Task DisposeAsync() => _postgres?.DisposeAsync().AsTask() ?? Task.CompletedTask;
 
     [Fact]
     public async Task MarkDead_ExcludesFromClaim_AndReplayRestoresPending()
     {
         const string schemaName = "realtime_p1_outbox_lifecycle";
-        var connectionString = _postgres.GetConnectionString();
-        var schema = new RealtimeDatabaseSchema(schemaName);
+        var connectionString = PostgresConnectionString;
+        var schema = new RealtimeDatabaseSchema($"{schemaName}_{_schemaSuffix}");
         var client = new RealtimeDatabaseClient(
             connectionString,
             NullLogger<RealtimeDatabaseClient>.Instance);
@@ -64,8 +70,8 @@ public sealed class OutboxLifecycleTests : IAsyncLifetime
     public async Task CleanupPublished_DeletesOnlyOldPublishedRows()
     {
         const string schemaName = "realtime_p1_outbox_cleanup";
-        var connectionString = _postgres.GetConnectionString();
-        var schema = new RealtimeDatabaseSchema(schemaName);
+        var connectionString = PostgresConnectionString;
+        var schema = new RealtimeDatabaseSchema($"{schemaName}_{_schemaSuffix}");
         var client = new RealtimeDatabaseClient(
             connectionString,
             NullLogger<RealtimeDatabaseClient>.Instance);
@@ -100,8 +106,8 @@ public sealed class OutboxLifecycleTests : IAsyncLifetime
     public async Task GetStats_ReportsOldestPendingAndInFlightAgeSources()
     {
         const string schemaName = "realtime_p1_outbox_stats";
-        var connectionString = _postgres.GetConnectionString();
-        var schema = new RealtimeDatabaseSchema(schemaName);
+        var connectionString = PostgresConnectionString;
+        var schema = new RealtimeDatabaseSchema($"{schemaName}_{_schemaSuffix}");
         var client = new RealtimeDatabaseClient(
             connectionString,
             NullLogger<RealtimeDatabaseClient>.Instance);
@@ -124,8 +130,8 @@ public sealed class OutboxLifecycleTests : IAsyncLifetime
     public async Task ListDead_ListsOnlyDeadRowsBeforeCutoff_AscByCreatedAt()
     {
         const string schemaName = "realtime_p1_outbox_list_dead";
-        var connectionString = _postgres.GetConnectionString();
-        var schema = new RealtimeDatabaseSchema(schemaName);
+        var connectionString = PostgresConnectionString;
+        var schema = new RealtimeDatabaseSchema($"{schemaName}_{_schemaSuffix}");
         var client = new RealtimeDatabaseClient(
             connectionString,
             NullLogger<RealtimeDatabaseClient>.Instance);
@@ -158,8 +164,8 @@ public sealed class OutboxLifecycleTests : IAsyncLifetime
     public async Task DeleteDeadBatch_DeletesOnlyMatchingEventIds()
     {
         const string schemaName = "realtime_p1_outbox_delete_dead";
-        var connectionString = _postgres.GetConnectionString();
-        var schema = new RealtimeDatabaseSchema(schemaName);
+        var connectionString = PostgresConnectionString;
+        var schema = new RealtimeDatabaseSchema($"{schemaName}_{_schemaSuffix}");
         var client = new RealtimeDatabaseClient(
             connectionString,
             NullLogger<RealtimeDatabaseClient>.Instance);
@@ -182,8 +188,8 @@ public sealed class OutboxLifecycleTests : IAsyncLifetime
     public async Task DeleteDeadBatch_DoesNotDeletePublishedOrPending()
     {
         const string schemaName = "realtime_p1_outbox_delete_dead_status";
-        var connectionString = _postgres.GetConnectionString();
-        var schema = new RealtimeDatabaseSchema(schemaName);
+        var connectionString = PostgresConnectionString;
+        var schema = new RealtimeDatabaseSchema($"{schemaName}_{_schemaSuffix}");
         var client = new RealtimeDatabaseClient(
             connectionString,
             NullLogger<RealtimeDatabaseClient>.Instance);

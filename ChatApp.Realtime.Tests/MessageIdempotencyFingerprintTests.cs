@@ -13,13 +13,19 @@ namespace ChatApp.Realtime.Tests;
 
 public sealed class MessageIdempotencyFingerprintTests : IAsyncLifetime
 {
-    private readonly PostgreSqlContainer _postgres = new PostgreSqlBuilder()
+    private readonly PostgreSqlContainer? _postgres = string.IsNullOrEmpty(ExternalPostgresConnectionString()) ? new PostgreSqlBuilder()
         .WithImage("postgres:16-alpine")
-        .Build();
+        .Build() : null;
+    private readonly string _externalPostgres = ExternalPostgresConnectionString() ?? string.Empty;
+    private readonly string _schemaSuffix = Guid.NewGuid().ToString("N")[..8];
 
-    public Task InitializeAsync() => _postgres.StartAsync();
+    private static string? ExternalPostgresConnectionString() => Environment.GetEnvironmentVariable("CHATAPP_TEST_POSTGRES");
 
-    public Task DisposeAsync() => _postgres.DisposeAsync().AsTask();
+    private string PostgresConnectionString => _postgres?.GetConnectionString() ?? _externalPostgres;
+
+    public Task InitializeAsync() => _postgres?.StartAsync() ?? Task.CompletedTask;
+
+    public Task DisposeAsync() => _postgres?.DisposeAsync().AsTask() ?? Task.CompletedTask;
 
     [Fact]
     public async Task Npgsql_SameKeySameFingerprint_IsDuplicate()
@@ -118,8 +124,10 @@ public sealed class MessageIdempotencyFingerprintTests : IAsyncLifetime
     [Fact]
     public async Task EfCore_SameKeyDifferentReceiver_IsConflict()
     {
-        const string schemaName = "realtime_p1_fp_ef_conflict";
-        var connectionString = _postgres.GetConnectionString();
+        // schema 名与迁移目标保持同一后缀；ConfigureSchema 是进程级静态，
+        // 测试结束必须复位为默认值，否则污染之后运行的其他测试类。
+        var schemaName = $"realtime_p1_fp_ef_conflict_{_schemaSuffix}";
+        var connectionString = PostgresConnectionString;
         var schema = new RealtimeDatabaseSchema(schemaName);
         var client = new RealtimeDatabaseClient(
             connectionString,
@@ -131,6 +139,8 @@ public sealed class MessageIdempotencyFingerprintTests : IAsyncLifetime
         }
 
         RealtimeDbContext.ConfigureSchema(schemaName);
+        try
+        {
         var options = new DbContextOptionsBuilder<RealtimeDbContext>()
             .UseNpgsql(connectionString)
             .Options;
@@ -145,13 +155,18 @@ public sealed class MessageIdempotencyFingerprintTests : IAsyncLifetime
 
         Assert.Equal(RealtimeMessagePersistKind.Created, first.Kind);
         Assert.Equal(RealtimeMessagePersistKind.ContentConflict, conflict.Kind);
+        }
+        finally
+        {
+            RealtimeDbContext.ConfigureSchema("realtime");
+        }
     }
 
     private async Task<(RealtimeDatabaseClient Client, RealtimeDatabaseSchema Schema)> CreateStoreAsync(
         string schemaName)
     {
-        var connectionString = _postgres.GetConnectionString();
-        var schema = new RealtimeDatabaseSchema(schemaName);
+        var connectionString = PostgresConnectionString;
+        var schema = new RealtimeDatabaseSchema($"{schemaName}_{_schemaSuffix}");
         var client = new RealtimeDatabaseClient(
             connectionString,
             NullLogger<RealtimeDatabaseClient>.Instance);

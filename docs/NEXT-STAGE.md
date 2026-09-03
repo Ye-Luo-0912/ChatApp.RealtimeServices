@@ -35,6 +35,14 @@ Realtime 负责消息、会话、回执、同步投影、Outbox/JetStream 和跨
 
 完成标准：Gateway/Client 能从同一消息事件重建完整语音附件状态，失败可安全重试且不绕过附件安全门禁。
 
+> 状态（2026-09-02）：**已交付并真机验收**。附件绑定链路（`AttachmentWriteCommands` 绑定 UPDATE）
+> 写入语音 6 字段（is_voice/codec/container/duration_ms/sample_rate_hz/channels，Migration065 建列），
+> `IRealtimeAttachmentStore.EnrichAsync` 历史回查带出——Gateway/Client 从同一消息事件与历史重建
+> 均能还原完整语音附件状态（真机 e2e VoiceE2E 41/0，relgate 全栈）。上行元数据经
+> `IncomingMessageCommand.Attachments` 快照传递（Realtime.Abstractions 2.5.3 / Integration 3.1.4，
+> additive wire 兼容）；残缺语音声明按无元数据处理，保消息必达、不触碰 `ck_attachments_voice_metadata`。
+> 本地测试已恢复无 Docker 运行（夹具双模式：`CHATAPP_TEST_POSTGRES/NATS/GARNET`），391 + 135 全绿。
+
 ### P1：`CALL-E2E-2` 通话信令交付
 
 1. 接入 Server 正式签发的短期 call grant，校验 issuer/audience、参与者、设备/会话、nonce、过期和撤销边界；测试 verifier 不能成为默认运行路径。

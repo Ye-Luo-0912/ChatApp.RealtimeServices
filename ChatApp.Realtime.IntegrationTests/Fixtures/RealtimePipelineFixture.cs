@@ -27,13 +27,24 @@ namespace ChatApp.Realtime.IntegrationTests.Fixtures;
 /// </summary>
 public sealed class RealtimePipelineFixture : IAsyncLifetime
 {
-    private readonly PostgreSqlContainer _postgres = new PostgreSqlBuilder()
-        .WithImage("postgres:16-alpine")
-        .Build();
+    // 外部基础设施直连（无 Docker 本地运行）：CHATAPP_TEST_POSTGRES / CHATAPP_TEST_NATS，
+    // 未设置时保持 Testcontainers 容器路径不变。
+    private static string? External(string name) => Environment.GetEnvironmentVariable(name);
 
-    private readonly NatsContainer _nats = new NatsBuilder()
-        .WithImage("nats:2.10-alpine")
-        .Build();
+    private static readonly string? ExternalPostgres = External("CHATAPP_TEST_POSTGRES");
+    private static readonly string? ExternalNats = External("CHATAPP_TEST_NATS");
+
+    private readonly PostgreSqlContainer? _postgres = ExternalPostgres is null
+        ? new PostgreSqlBuilder()
+            .WithImage("postgres:16-alpine")
+            .Build()
+        : null;
+
+    private readonly NatsContainer? _nats = ExternalNats is null
+        ? new NatsBuilder()
+            .WithImage("nats:2.10-alpine")
+            .Build()
+        : null;
 
     private WebApplication? _host;
     private HttpClient? _http;
@@ -46,11 +57,11 @@ public sealed class RealtimePipelineFixture : IAsyncLifetime
     public async Task InitializeAsync()
     {
         await Task.WhenAll(
-            _postgres.StartAsync(),
-            _nats.StartAsync()).ConfigureAwait(false);
+            _postgres?.StartAsync() ?? Task.CompletedTask,
+            _nats?.StartAsync() ?? Task.CompletedTask).ConfigureAwait(false);
 
-        PostgresConnectionString = _postgres.GetConnectionString();
-        NatsUrl = SanitizeNatsUrl(_nats.GetConnectionString());
+        PostgresConnectionString = _postgres?.GetConnectionString() ?? ExternalPostgres!;
+        NatsUrl = _nats is not null ? SanitizeNatsUrl(_nats.GetConnectionString()) : ExternalNats!;
         await InitializeIdentitySchemaAsync().ConfigureAwait(false);
 
         var httpPort = GetFreeTcpPort();
@@ -188,9 +199,14 @@ public sealed class RealtimePipelineFixture : IAsyncLifetime
             await _host.DisposeAsync().ConfigureAwait(false);
         }
 
-        await Task.WhenAll(
-            _postgres.DisposeAsync().AsTask(),
-            _nats.DisposeAsync().AsTask()).ConfigureAwait(false);
+        if (_postgres is not null)
+        {
+            await _postgres.DisposeAsync().AsTask().ConfigureAwait(false);
+        }
+        if (_nats is not null)
+        {
+            await _nats.DisposeAsync().AsTask().ConfigureAwait(false);
+        }
     }
 
     private async Task WaitUntilReadyAsync()

@@ -22,13 +22,19 @@ namespace ChatApp.Realtime.IntegrationTests;
 [Trait("Category", "Integration")]
 public sealed class LedgerConcurrentConflictTests : IAsyncLifetime
 {
-    private readonly PostgreSqlContainer _postgres = new PostgreSqlBuilder()
+    private readonly PostgreSqlContainer? _postgres = string.IsNullOrEmpty(ExternalPostgresConnectionString()) ? new PostgreSqlBuilder()
         .WithImage("postgres:16-alpine")
-        .Build();
+        .Build() : null;
+    private readonly string _externalPostgres = ExternalPostgresConnectionString() ?? string.Empty;
+    private readonly string _schemaSuffix = Guid.NewGuid().ToString("N")[..8];
 
-    public Task InitializeAsync() => _postgres.StartAsync();
+    private static string? ExternalPostgresConnectionString() => Environment.GetEnvironmentVariable("CHATAPP_TEST_POSTGRES");
 
-    public Task DisposeAsync() => _postgres.DisposeAsync().AsTask();
+    private string PostgresConnectionString => _postgres?.GetConnectionString() ?? _externalPostgres;
+
+    public Task InitializeAsync() => _postgres?.StartAsync() ?? Task.CompletedTask;
+
+    public Task DisposeAsync() => _postgres?.DisposeAsync().AsTask() ?? Task.CompletedTask;
 
     [Fact]
     public async Task RecordAsync_ConcurrentSameKey_OnlyOneInsertSucceeds()
@@ -263,8 +269,8 @@ public sealed class LedgerConcurrentConflictTests : IAsyncLifetime
     private async Task<(RealtimeDatabaseClient Client, RealtimeDatabaseSchema Schema)> CreateStoreAsync(
         string schemaName)
     {
-        var connectionString = _postgres.GetConnectionString();
-        var schema = new RealtimeDatabaseSchema(schemaName);
+        var connectionString = PostgresConnectionString;
+        var schema = new RealtimeDatabaseSchema($"{schemaName}_{_schemaSuffix}");
         var client = new RealtimeDatabaseClient(
             connectionString,
             NullLogger<RealtimeDatabaseClient>.Instance);

@@ -33,18 +33,25 @@ namespace ChatApp.Realtime.IntegrationTests.Measurement;
 /// </summary>
 public sealed class PostgresPerfHarness : IAsyncDisposable
 {
-    private readonly PostgreSqlContainer _container = new PostgreSqlBuilder()
-        .WithImage("postgres:16")
-        // 注意：PostgreSqlContainer 的镜像 entrypoint 会自动附加 "postgres"
-        // 作为命令，因此这里只传 -c 参数；若带上前导 "postgres" 会得到
-        // "postgres postgres ..." 而启动失败。
-        .WithCommand(
-            "-c", "shared_preload_libraries=pg_stat_statements",
-            "-c", "pg_stat_statements.track=top")
-        // TCP 端口就绪后 PG 可能仍需初始化才能接受连接（首连 SSL 协商会被重置）。
-        // 端口等待 + 连接重试（见 InitializeAsync）共同消除该就绪竞态。
-        .WithWaitStrategy(Wait.ForUnixContainer().UntilExternalTcpPortIsAvailable(5432))
-        .Build();
+    // 外部基础设施直连（无 Docker 本地运行）：CHATAPP_TEST_POSTGRES。
+    // 要求该实例已配置 shared_preload_libraries='pg_stat_statements' 并 CREATE EXTENSION。
+    private static string? ExternalConnectionString() =>
+        Environment.GetEnvironmentVariable("CHATAPP_TEST_POSTGRES");
+
+    private readonly PostgreSqlContainer? _container = string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CHATAPP_TEST_POSTGRES"))
+        ? new PostgreSqlBuilder()
+            .WithImage("postgres:16")
+            // 注意：PostgreSqlContainer 的镜像 entrypoint 会自动附加 "postgres"
+            // 作为命令，因此这里只传 -c 参数；若带上前导 "postgres" 会得到
+            // "postgres postgres ..." 而启动失败。
+            .WithCommand(
+                "-c", "shared_preload_libraries=pg_stat_statements",
+                "-c", "pg_stat_statements.track=top")
+            // TCP 端口就绪后 PG 可能仍需初始化才能接受连接（首连 SSL 协商会被重置）。
+            // 端口等待 + 连接重试（见 InitializeAsync）共同消除该就绪竞态。
+            .WithWaitStrategy(Wait.ForUnixContainer().UntilExternalTcpPortIsAvailable(5432))
+            .Build()
+        : null;
 
     /// <summary>初始化完成后到重试放弃的时长。</summary>
     private static readonly TimeSpan ConnectRetryWindow = TimeSpan.FromSeconds(30);
@@ -72,9 +79,12 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
 
     public async Task InitializeAsync()
     {
-        await _container.StartAsync().ConfigureAwait(false);
+        if (_container is not null)
+        {
+            await _container.StartAsync().ConfigureAwait(false);
+        }
 
-        var connectionString = _container.GetConnectionString();
+        var connectionString = _container?.GetConnectionString() ?? ExternalConnectionString()!;
         _client = new RealtimeDatabaseClient(connectionString, NullLogger<RealtimeDatabaseClient>.Instance);
         var schema = new RealtimeDatabaseSchema(SchemaName);
         _schema = schema;
@@ -243,7 +253,8 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
                    shared_blks_read, shared_blks_dirtied,
                    wal_records, wal_fpi, wal_bytes
             FROM pg_stat_statements
-            WHERE queryid IS NOT NULL AND calls > 0;
+            WHERE queryid IS NOT NULL AND calls > 0
+              AND dbid = (SELECT oid FROM pg_database WHERE datname = current_database());
             """,
             connection);
         var results = new List<PgStatementStat>();
@@ -1406,7 +1417,10 @@ public sealed class PostgresPerfHarness : IAsyncDisposable
             await _client.DisposeAsync().ConfigureAwait(false);
         }
 
-        await _container.DisposeAsync().ConfigureAwait(false);
+        if (_container is not null)
+        {
+            await _container.DisposeAsync().ConfigureAwait(false);
+        }
     }
 }
 

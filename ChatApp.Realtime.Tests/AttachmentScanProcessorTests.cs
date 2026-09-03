@@ -223,7 +223,7 @@ public sealed class AttachmentScanProcessorTests
         public Task<RealtimeAttachmentRecord> InsertConfirmedAsync(RealtimeAttachmentRecord attachment, CancellationToken ct = default) =>
             throw new NotSupportedException();
 
-        public Task<int> BindToMessageAsync(string messageId, string? conversationId, long uploaderUserId, IReadOnlyList<string> attachmentIds, CancellationToken ct = default) =>
+        public Task<int> BindToMessageAsync(string messageId, string? conversationId, long uploaderUserId, IReadOnlyList<string> attachmentIds, IReadOnlyList<ChatApp.Realtime.Abstractions.Messaging.AttachmentRef>? attachmentMetadata = null, CancellationToken ct = default) =>
             throw new NotSupportedException();
 
         public Task<AttachmentFinalizePersistResult> FinalizeUploadAsync(long actorUserId, string attachmentId, long sizeBytes, string? contentHash, CancellationToken ct = default) =>

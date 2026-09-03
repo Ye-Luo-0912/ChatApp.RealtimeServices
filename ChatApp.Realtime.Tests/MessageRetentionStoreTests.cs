@@ -15,20 +15,26 @@ namespace ChatApp.Realtime.Tests;
 
 public sealed class MessageRetentionStoreTests : IAsyncLifetime
 {
-    private readonly PostgreSqlContainer _postgres = new PostgreSqlBuilder()
+    private readonly PostgreSqlContainer? _postgres = string.IsNullOrEmpty(ExternalPostgresConnectionString()) ? new PostgreSqlBuilder()
         .WithImage("postgres:16-alpine")
-        .Build();
+        .Build() : null;
+    private readonly string _externalPostgres = ExternalPostgresConnectionString() ?? string.Empty;
+    private readonly string _schemaSuffix = Guid.NewGuid().ToString("N")[..8];
 
-    public Task InitializeAsync() => _postgres.StartAsync();
+    private static string? ExternalPostgresConnectionString() => Environment.GetEnvironmentVariable("CHATAPP_TEST_POSTGRES");
 
-    public Task DisposeAsync() => _postgres.DisposeAsync().AsTask();
+    private string PostgresConnectionString => _postgres?.GetConnectionString() ?? _externalPostgres;
+
+    public Task InitializeAsync() => _postgres?.StartAsync() ?? Task.CompletedTask;
+
+    public Task DisposeAsync() => _postgres?.DisposeAsync().AsTask() ?? Task.CompletedTask;
 
     [Fact]
     public async Task PurgeBatch_DeletesOnlyOldRows_RetainsRecent()
     {
         const string schemaName = "realtime_retention_basic";
         var (client, schema, store) = await CreateStoreAsync(schemaName);
-        var cs = _postgres.GetConnectionString();
+        var cs = PostgresConnectionString;
 
         await InsertMessageAsync(cs, schema, "old-1", receivedAtMs: 1_000, conversationId: "c1");
         await InsertMessageAsync(cs, schema, "old-2", receivedAtMs: 2_000, conversationId: "c1");
@@ -51,7 +57,7 @@ public sealed class MessageRetentionStoreTests : IAsyncLifetime
     {
         const string schemaName = "realtime_retention_batches";
         var (client, schema, store) = await CreateStoreAsync(schemaName);
-        var cs = _postgres.GetConnectionString();
+        var cs = PostgresConnectionString;
 
         for (var i = 0; i < 5; i++)
         {
@@ -101,7 +107,7 @@ public sealed class MessageRetentionStoreTests : IAsyncLifetime
     {
         const string schemaName = "realtime_retention_disabled";
         var (_, schema, store) = await CreateStoreAsync(schemaName);
-        var cs = _postgres.GetConnectionString();
+        var cs = PostgresConnectionString;
         await InsertMessageAsync(cs, schema, "old", receivedAtMs: 1, conversationId: "c");
 
         var options = new MessageRetentionOptions
@@ -126,7 +132,7 @@ public sealed class MessageRetentionStoreTests : IAsyncLifetime
     {
         const string schemaName = "realtime_retention_tip";
         var (_, schema, store) = await CreateStoreAsync(schemaName);
-        var cs = _postgres.GetConnectionString();
+        var cs = PostgresConnectionString;
 
         await EnsureConversationAsync(cs, schema, "c-empty", lastMessageId: "only", lastAtMs: 5_000);
         await InsertMessageAsync(cs, schema, "only", receivedAtMs: 5_000, conversationId: "c-empty");
@@ -154,7 +160,7 @@ public sealed class MessageRetentionStoreTests : IAsyncLifetime
     {
         const string schemaName = "realtime_retention_attach";
         var (_, schema, store) = await CreateStoreAsync(schemaName);
-        var cs = _postgres.GetConnectionString();
+        var cs = PostgresConnectionString;
 
         await InsertMessageAsync(cs, schema, "old-att", receivedAtMs: 1_000, conversationId: "c-att", senderUserId: 10);
         await InsertMessageAsync(cs, schema, "new-att", receivedAtMs: 50_000, conversationId: "c-att", senderUserId: 10);
@@ -200,7 +206,7 @@ public sealed class MessageRetentionStoreTests : IAsyncLifetime
     {
         const string schemaName = "realtime_retention_unread";
         var (_, schema, store) = await CreateStoreAsync(schemaName);
-        var cs = _postgres.GetConnectionString();
+        var cs = PostgresConnectionString;
 
         await EnsureConversationAsync(cs, schema, "c-unread", lastMessageId: "new-1", lastAtMs: 50_000);
         // Receiver never read: last_read null, unread inflated by old + new messages from peer.
@@ -241,8 +247,8 @@ public sealed class MessageRetentionStoreTests : IAsyncLifetime
     private async Task<(RealtimeDatabaseClient Client, RealtimeDatabaseSchema Schema, NpgsqlRealtimeMessageRetentionStore Store)>
         CreateStoreAsync(string schemaName)
     {
-        var connectionString = _postgres.GetConnectionString();
-        var schema = new RealtimeDatabaseSchema(schemaName);
+        var connectionString = PostgresConnectionString;
+        var schema = new RealtimeDatabaseSchema($"{schemaName}_{_schemaSuffix}");
         var client = new RealtimeDatabaseClient(
             connectionString,
             NullLogger<RealtimeDatabaseClient>.Instance);

@@ -1,11 +1,11 @@
 ﻿# OUTBOX-DB-1 避免无变化 UPDATE A/B（会话头列守卫：乱序下 HOT 命中与索引维护成本）
 
-> 生成时间：2026-08-19 06:39:10 UTC；语料固定、随机种子 20260813；每配置 inbound 2000 条消息、单会话（发送者固定 10_000_000_001、接收者固定 10_000_000_002）、会话头高水位乱序语料（第 0 条极高 received_at_ms 建立高水位，后续消息均低于高水位）。
+> 生成时间：2026-09-02 17:25:29 UTC；语料固定、随机种子 20260813；每配置 inbound 2000 条消息、单会话（发送者固定 10_000_000_001、接收者固定 10_000_000_002）、会话头高水位乱序语料（第 0 条极高 received_at_ms 建立高水位，后续消息均低于高水位）。
 
 | 配置 | 热路径 SQL/消息 | SQL 往返/消息 | 总执行时间/消息(ms) | WAL 字节/消息 | WAL 记录/消息 | conversations HOT 命中率 |
 |---|---|---|---|---|---|---|
-| A：无条件覆盖会话头列（无 CASE 守卫） | 1 | 8.0 | 0.34 | 4,130 | 32.4 | 100.0% |
-| B：生产 CASE 守卫（保留未推进会话头列） | 1 | 8.0 | 0.32 | 1,680 | 12.7 | 100.0% |
+| A：无条件覆盖会话头列（无 CASE 守卫） | 1 | 8.0 | 0.38 | 2,996 | 23.4 | 100.0% |
+| B：生产 CASE 守卫（保留未推进会话头列） | 1 | 8.0 | 0.41 | 2,765 | 20.9 | 100.0% |
 
 > 以 pg_stat_statements + pg_stat_user_tables 归属，A/B 同容器顺序运行、语句数与写入行集完全相同；
 > 唯一差异是会话 upsert 的 SET 片段：A 无条件覆盖 last_message_id/preview/at_ms/sender_user_id，
@@ -26,13 +26,13 @@
 
 | 调用 | 调用/消息 | exec/消息(ms) | wal_records/消息 | wal_bytes/调用 | sql 片段 |
 |---|---|---|---|---|---|
-| 2,000 | 1.0 | 0.23 | 24.2 | 3,183 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     F…` |
+| 2,000 | 1.0 | 0.25 | 24.2 | 3,183 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     F…` |
 | 2,003 | 1.0 | 0.01 | 0.0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
 | 2,003 | 1.0 | 0.00 | 0.0 | 0 | `RESET ALL` |
 | 2,003 | 1.0 | 0.00 | 0.0 | 0 | `SELECT pg_advisory_unlock_all()` |
 | 2,003 | 1.0 | 0.00 | 0.0 | 0 | `DISCARD SEQUENCES` |
-| 2,003 | 1.0 | 0.00 | 0.0 | 0 | `UNLISTEN *` |
 | 2,003 | 1.0 | 0.00 | 0.0 | 0 | `CLOSE ALL` |
+| 2,003 | 1.0 | 0.00 | 0.0 | 0 | `UNLISTEN *` |
 | 2,003 | 1.0 | 0.00 | 0.0 | 0 | `DISCARD TEMP` |
 
 ## A：无条件覆盖会话头列（无 CASE 守卫）（2000 条近热路径消息）
@@ -41,94 +41,94 @@
 
 | 指标 | 窗口总量 | 每消息 |
 |---|---|---|
-| WAL 字节 | 8,260,532 | 4,130 |
-| WAL 记录 | 64,862 | 32.4 |
-| WAL FPI | 103 | 0.05 |
-| WAL write | 803 | 0.402 |
+| WAL 字节 | 5,992,264 | 2,996 |
+| WAL 记录 | 46,726 | 23.4 |
+| WAL FPI | 0 | 0.00 |
+| WAL write | 1,857 | 0.928 |
 | WAL sync | 0 | 0.000 |
 
 ### Top SQL（按执行耗时降序，窗口增量）
 
 | queryid | calls | exec(ms) | rows | blks_read | dirtied | wal_records | wal_fpi | wal_bytes | sql |
 |---|---|---|---|---|---|---|---|---|---|
-| B0B27170B9705F99 | 2,000 | 452.0 | 2,000 | 0 | 592 | 48,356 | 0 | 6,367,568 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
-| E11B52EF572B8535 | 1 | 201.3 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
-| 403F8B358778114D | 2,003 | 11.4 | 0 | 0 | 0 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
-| 4040643821AD66AF | 2,003 | 6.7 | 0 | 0 | 0 | 0 | 0 | 0 | `RESET ALL` |
-| 878A9E463E585A2C | 2,003 | 5.9 | 2,003 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
-| D28E47E4803A0167 | 2,003 | 1.3 | 0 | 0 | 0 | 0 | 0 | 0 | `DISCARD SEQUENCES` |
-| C0D0E27048376284 | 2,003 | 0.8 | 0 | 0 | 0 | 0 | 0 | 0 | `UNLISTEN *` |
-| 92049CC8AB443DC6 | 2,003 | 0.8 | 0 | 0 | 0 | 0 | 0 | 0 | `CLOSE ALL` |
-| B71A600DFCB91748 | 1 | 0.4 | 235 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
-| 516E8F1759460B47 | 2,003 | 0.2 | 0 | 0 | 0 | 0 | 0 | 0 | `DISCARD TEMP` |
-| 265A210A7402B089 | 1 | 0.2 | 29 | 0 | 0 | 3 | 0 | 181 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
-| DA559F39F26D405A | 1 | 0.0 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT COALESCE(wal_records, $1), COALESCE(wal_fpi, $2), COALESCE(wal_bytes, $3),        C…` |
+| 2181869AE728FDD4 | 2,000 | 499.2 | 2,000 | 0 | 593 | 48,354 | 0 | 6,367,546 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
+| 1F1A5B390EB81DF3 | 1 | 202.1 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
+| 13FE8940C25F27BC | 1 | 25.0 | 4,489 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
+| 9DFE0023C220BBE7 | 2,003 | 10.3 | 0 | 0 | 0 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
+| B9A3FC5813DDA531 | 2,003 | 5.7 | 0 | 0 | 0 | 0 | 0 | 0 | `RESET ALL` |
+| 7FD7FA9679F7127A | 1 | 5.5 | 29 | 0 | 0 | 1 | 0 | 68 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
+| 20928A0A690DF580 | 2,003 | 5.3 | 2,003 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
+| 8464F5314FC1C676 | 2,003 | 0.9 | 0 | 0 | 0 | 0 | 0 | 0 | `DISCARD SEQUENCES` |
+| 763D4E8E0DC293DC | 2,003 | 0.9 | 0 | 0 | 0 | 0 | 0 | 0 | `CLOSE ALL` |
+| F9011CF57CBB30AB | 2,003 | 0.5 | 0 | 0 | 0 | 0 | 0 | 0 | `UNLISTEN *` |
+| 73FA2B7FF171D0F7 | 2,003 | 0.3 | 0 | 0 | 0 | 0 | 0 | 0 | `DISCARD TEMP` |
+| 881865BABB8509BA | 1 | 0.0 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT COALESCE(wal_records, $1), COALESCE(wal_fpi, $2), COALESCE(wal_bytes, $3),        C…` |
 
 ### Top SQL（按 WAL 字节降序，窗口增量）
 
 | queryid | calls | wal_bytes | wal_records | wal_fpi | sql |
 |---|---|---|---|---|---|
-| B0B27170B9705F99 | 2,000 | 6,367,568 | 48,356 | 0 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
-| 265A210A7402B089 | 1 | 181 | 3 | 0 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
-| E11B52EF572B8535 | 1 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
-| 403F8B358778114D | 2,003 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
-| 4040643821AD66AF | 2,003 | 0 | 0 | 0 | `RESET ALL` |
-| 878A9E463E585A2C | 2,003 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
-| D28E47E4803A0167 | 2,003 | 0 | 0 | 0 | `DISCARD SEQUENCES` |
-| C0D0E27048376284 | 2,003 | 0 | 0 | 0 | `UNLISTEN *` |
-| 92049CC8AB443DC6 | 2,003 | 0 | 0 | 0 | `CLOSE ALL` |
-| B71A600DFCB91748 | 1 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
-| 516E8F1759460B47 | 2,003 | 0 | 0 | 0 | `DISCARD TEMP` |
-| DA559F39F26D405A | 1 | 0 | 0 | 0 | `SELECT COALESCE(wal_records, $1), COALESCE(wal_fpi, $2), COALESCE(wal_bytes, $3),        C…` |
+| 2181869AE728FDD4 | 2,000 | 6,367,546 | 48,354 | 0 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
+| 7FD7FA9679F7127A | 1 | 68 | 1 | 0 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
+| 1F1A5B390EB81DF3 | 1 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
+| 13FE8940C25F27BC | 1 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
+| 9DFE0023C220BBE7 | 2,003 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
+| B9A3FC5813DDA531 | 2,003 | 0 | 0 | 0 | `RESET ALL` |
+| 20928A0A690DF580 | 2,003 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
+| 8464F5314FC1C676 | 2,003 | 0 | 0 | 0 | `DISCARD SEQUENCES` |
+| 763D4E8E0DC293DC | 2,003 | 0 | 0 | 0 | `CLOSE ALL` |
+| F9011CF57CBB30AB | 2,003 | 0 | 0 | 0 | `UNLISTEN *` |
+| 73FA2B7FF171D0F7 | 2,003 | 0 | 0 | 0 | `DISCARD TEMP` |
+| 881865BABB8509BA | 1 | 0 | 0 | 0 | `SELECT COALESCE(wal_records, $1), COALESCE(wal_fpi, $2), COALESCE(wal_bytes, $3),        C…` |
 
 ### 表级统计（窗口增量）
 
 | table | inserts | updates | deletes | hot_updates | dead_tuples |
 |---|---|---|---|---|---|
-| relationship_projection_rebuild_state | 0 | 0 | 0 | 0 | 0 |
-| device_sync_cursors | 0 | 0 | 0 | 0 | 0 |
+| schema_migrations | 0 | 0 | 0 | 0 | 0 |
+| schema_migration_checkpoints | 0 | 0 | 0 | 0 | 0 |
 | messages | 2,000 | 0 | 0 | 0 | 0 |
-| command_idempotency_ledger | 2,000 | 0 | 0 | 0 | 0 |
-| conversation_members | 0 | 2,000 | 0 | 2,000 | 0 |
-| account_cleanup_jobs | 0 | 0 | 0 | 0 | 0 |
-| user_deletion_tombstones | 0 | 0 | 0 | 0 | 0 |
-| relationship_projection_items | 0 | 0 | 0 | 0 | 0 |
-| friendships | 0 | 0 | 0 | 0 | 0 |
+| outbox | 2,000 | 0 | 0 | 0 | 0 |
 | conversations | 0 | 2,000 | 0 | 2,000 | 1 |
+| conversation_members | 0 | 2,000 | 0 | 2,000 | 0 |
+| device_sync_cursors | 0 | 0 | 0 | 0 | 0 |
+| attachments | 0 | 0 | 0 | 0 | 0 |
+| message_mutation_requests | 0 | 0 | 0 | 0 | 0 |
+| message_reactions | 0 | 0 | 0 | 0 | 0 |
+| group_mutation_requests | 0 | 0 | 0 | 0 | 0 |
+| user_deletion_tombstones | 0 | 0 | 0 | 0 | 0 |
+| command_idempotency_ledger | 2,000 | 0 | 0 | 0 | 0 |
+| group_operation_audit | 0 | 0 | 0 | 0 | 0 |
+| conversation_membership_periods | 0 | 0 | 0 | 0 | 0 |
+| account_cleanup_jobs | 0 | 0 | 0 | 0 | 0 |
+| message_state | 0 | 0 | 0 | 0 | 0 |
+| friend_requests | 0 | 0 | 0 | 0 | 0 |
+| friendships | 0 | 0 | 0 | 0 | 0 |
+| relationship_mutation_requests | 0 | 0 | 0 | 0 | 0 |
+| relationship_sync_cursors | 0 | 0 | 0 | 0 | 0 |
+| relationship_change_log | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_versions | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_items | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_inbox | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_snapshots | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_rebuild_state | 0 | 0 | 0 | 0 | 0 |
 | relationship_projection_history | 0 | 0 | 0 | 0 | 0 |
 | outbox_replay_audit | 0 | 0 | 0 | 0 | 0 |
-| conversation_membership_periods | 0 | 0 | 0 | 0 | 0 |
-| relationship_sync_cursors | 0 | 0 | 0 | 0 | 0 |
-| message_state | 0 | 0 | 0 | 0 | 0 |
-| message_reactions | 0 | 0 | 0 | 0 | 0 |
-| relationship_projection_inbox | 0 | 0 | 0 | 0 | 0 |
-| relationship_mutation_requests | 0 | 0 | 0 | 0 | 0 |
-| message_mutation_requests | 0 | 0 | 0 | 0 | 0 |
-| schema_migration_checkpoints | 0 | 0 | 0 | 0 | 0 |
-| schema_migrations | 0 | 0 | 0 | 0 | 0 |
-| relationship_projection_snapshots | 0 | 0 | 0 | 0 | 0 |
-| outbox | 2,000 | 0 | 0 | 0 | 0 |
-| group_mutation_requests | 0 | 0 | 0 | 0 | 0 |
-| group_operation_audit | 0 | 0 | 0 | 0 | 0 |
-| relationship_projection_versions | 0 | 0 | 0 | 0 | 0 |
-| friend_requests | 0 | 0 | 0 | 0 | 0 |
-| relationship_change_log | 0 | 0 | 0 | 0 | 0 |
-| attachments | 0 | 0 | 0 | 0 | 0 |
 
-> HOT 命中率（hot_updates / updates）：conversation_members 2,000/2,000（100%）；conversations 2,000/2,000（100%）。non-HOT 更新会对已修改索引列维护索引并产生额外 WAL。
+> HOT 命中率（hot_updates / updates）：conversations 2,000/2,000（100%）；conversation_members 2,000/2,000（100%）。non-HOT 更新会对已修改索引列维护索引并产生额外 WAL。
 
 
 ## B：生产 CASE 守卫（保留未推进会话头列）热路径语句（近热路径 = 调用数 ≥ 消息数一半）
 
 | 调用 | 调用/消息 | exec/消息(ms) | wal_records/消息 | wal_bytes/调用 | sql 片段 |
 |---|---|---|---|---|---|
-| 2,000 | 1.0 | 0.21 | 24.2 | 3,308 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     F…` |
+| 2,000 | 1.0 | 0.27 | 24.2 | 3,308 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     F…` |
 | 2,003 | 1.0 | 0.01 | 0.0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
 | 2,003 | 1.0 | 0.00 | 0.0 | 0 | `RESET ALL` |
 | 2,003 | 1.0 | 0.00 | 0.0 | 0 | `SELECT pg_advisory_unlock_all()` |
+| 2,003 | 1.0 | 0.00 | 0.0 | 0 | `CLOSE ALL` |
 | 2,003 | 1.0 | 0.00 | 0.0 | 0 | `DISCARD SEQUENCES` |
 | 2,003 | 1.0 | 0.00 | 0.0 | 0 | `UNLISTEN *` |
-| 2,003 | 1.0 | 0.00 | 0.0 | 0 | `CLOSE ALL` |
 | 2,003 | 1.0 | 0.00 | 0.0 | 0 | `DISCARD TEMP` |
 
 ## B：生产 CASE 守卫（2000 条近热路径消息）
@@ -137,81 +137,81 @@
 
 | 指标 | 窗口总量 | 每消息 |
 |---|---|---|
-| WAL 字节 | 3,361,343 | 1,681 |
-| WAL 记录 | 25,340 | 12.7 |
+| WAL 字节 | 5,531,691 | 2,766 |
+| WAL 记录 | 41,701 | 20.9 |
 | WAL FPI | 0 | 0.00 |
-| WAL write | 813 | 0.406 |
+| WAL write | 1,656 | 0.828 |
 | WAL sync | 0 | 0.000 |
 
 ### Top SQL（按执行耗时降序，窗口增量）
 
 | queryid | calls | exec(ms) | rows | blks_read | dirtied | wal_records | wal_fpi | wal_bytes | sql |
 |---|---|---|---|---|---|---|---|---|---|
-| F441132799D72C49 | 2,000 | 411.2 | 2,000 | 0 | 629 | 48,421 | 0 | 6,617,600 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
-| E11B52EF572B8535 | 1 | 201.3 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
-| 403F8B358778114D | 2,003 | 10.5 | 0 | 0 | 0 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
-| 4040643821AD66AF | 2,003 | 6.2 | 0 | 0 | 0 | 0 | 0 | 0 | `RESET ALL` |
-| 878A9E463E585A2C | 2,003 | 5.3 | 2,003 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
-| D28E47E4803A0167 | 2,003 | 1.2 | 0 | 0 | 0 | 0 | 0 | 0 | `DISCARD SEQUENCES` |
-| C0D0E27048376284 | 2,003 | 0.7 | 0 | 0 | 0 | 0 | 0 | 0 | `UNLISTEN *` |
-| 92049CC8AB443DC6 | 2,003 | 0.7 | 0 | 0 | 0 | 0 | 0 | 0 | `CLOSE ALL` |
-| B71A600DFCB91748 | 1 | 0.7 | 239 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
-| 516E8F1759460B47 | 2,003 | 0.2 | 0 | 0 | 0 | 0 | 0 | 0 | `DISCARD TEMP` |
-| 265A210A7402B089 | 1 | 0.2 | 29 | 0 | 0 | 0 | 0 | 0 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
-| DA559F39F26D405A | 1 | 0.0 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT COALESCE(wal_records, $1), COALESCE(wal_fpi, $2), COALESCE(wal_bytes, $3),        C…` |
+| 1006556CC50A1D0D | 2,000 | 537.9 | 2,000 | 0 | 631 | 48,417 | 0 | 6,616,887 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
+| 1F1A5B390EB81DF3 | 1 | 215.0 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
+| 13FE8940C25F27BC | 1 | 36.9 | 4,489 | 0 | 0 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
+| 9DFE0023C220BBE7 | 2,003 | 11.1 | 0 | 0 | 0 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
+| 7FD7FA9679F7127A | 1 | 6.2 | 29 | 0 | 0 | 0 | 0 | 0 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
+| B9A3FC5813DDA531 | 2,003 | 5.9 | 0 | 0 | 0 | 0 | 0 | 0 | `RESET ALL` |
+| 20928A0A690DF580 | 2,003 | 5.7 | 2,003 | 0 | 0 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
+| 763D4E8E0DC293DC | 2,003 | 1.1 | 0 | 0 | 0 | 0 | 0 | 0 | `CLOSE ALL` |
+| 8464F5314FC1C676 | 2,003 | 1.0 | 0 | 0 | 0 | 0 | 0 | 0 | `DISCARD SEQUENCES` |
+| F9011CF57CBB30AB | 2,003 | 0.5 | 0 | 0 | 0 | 0 | 0 | 0 | `UNLISTEN *` |
+| 73FA2B7FF171D0F7 | 2,003 | 0.3 | 0 | 0 | 0 | 0 | 0 | 0 | `DISCARD TEMP` |
+| 881865BABB8509BA | 1 | 0.0 | 1 | 0 | 0 | 0 | 0 | 0 | `SELECT COALESCE(wal_records, $1), COALESCE(wal_fpi, $2), COALESCE(wal_bytes, $3),        C…` |
 
 ### Top SQL（按 WAL 字节降序，窗口增量）
 
 | queryid | calls | wal_bytes | wal_records | wal_fpi | sql |
 |---|---|---|---|---|---|
-| F441132799D72C49 | 2,000 | 6,617,600 | 48,421 | 0 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
-| E11B52EF572B8535 | 1 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
-| 403F8B358778114D | 2,003 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
-| 4040643821AD66AF | 2,003 | 0 | 0 | 0 | `RESET ALL` |
-| 878A9E463E585A2C | 2,003 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
-| D28E47E4803A0167 | 2,003 | 0 | 0 | 0 | `DISCARD SEQUENCES` |
-| C0D0E27048376284 | 2,003 | 0 | 0 | 0 | `UNLISTEN *` |
-| 92049CC8AB443DC6 | 2,003 | 0 | 0 | 0 | `CLOSE ALL` |
-| B71A600DFCB91748 | 1 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
-| 516E8F1759460B47 | 2,003 | 0 | 0 | 0 | `DISCARD TEMP` |
-| 265A210A7402B089 | 1 | 0 | 0 | 0 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
-| DA559F39F26D405A | 1 | 0 | 0 | 0 | `SELECT COALESCE(wal_records, $1), COALESCE(wal_fpi, $2), COALESCE(wal_bytes, $3),        C…` |
+| 1006556CC50A1D0D | 2,000 | 6,616,887 | 48,417 | 0 | `WITH ordered_users AS MATERIALIZED (     SELECT DISTINCT t.user_id     FROM (VALUES ($2), …` |
+| 1F1A5B390EB81DF3 | 1 | 0 | 0 | 0 | `SELECT pg_stat_force_next_flush(), pg_sleep($1)` |
+| 13FE8940C25F27BC | 1 | 0 | 0 | 0 | `SELECT queryid, query, calls, total_exec_time, rows,        shared_blks_read, shared_blks_…` |
+| 9DFE0023C220BBE7 | 2,003 | 0 | 0 | 0 | `SET SESSION AUTHORIZATION DEFAULT` |
+| 7FD7FA9679F7127A | 1 | 0 | 0 | 0 | `SELECT relname, COALESCE(n_tup_ins, $2), COALESCE(n_tup_upd, $3), COALESCE(n_tup_del, $4),…` |
+| B9A3FC5813DDA531 | 2,003 | 0 | 0 | 0 | `RESET ALL` |
+| 20928A0A690DF580 | 2,003 | 0 | 0 | 0 | `SELECT pg_advisory_unlock_all()` |
+| 763D4E8E0DC293DC | 2,003 | 0 | 0 | 0 | `CLOSE ALL` |
+| 8464F5314FC1C676 | 2,003 | 0 | 0 | 0 | `DISCARD SEQUENCES` |
+| F9011CF57CBB30AB | 2,003 | 0 | 0 | 0 | `UNLISTEN *` |
+| 73FA2B7FF171D0F7 | 2,003 | 0 | 0 | 0 | `DISCARD TEMP` |
+| 881865BABB8509BA | 1 | 0 | 0 | 0 | `SELECT COALESCE(wal_records, $1), COALESCE(wal_fpi, $2), COALESCE(wal_bytes, $3),        C…` |
 
 ### 表级统计（窗口增量）
 
 | table | inserts | updates | deletes | hot_updates | dead_tuples |
 |---|---|---|---|---|---|
-| relationship_projection_rebuild_state | 0 | 0 | 0 | 0 | 0 |
-| device_sync_cursors | 0 | 0 | 0 | 0 | 0 |
+| schema_migrations | 0 | 0 | 0 | 0 | 0 |
+| schema_migration_checkpoints | 0 | 0 | 0 | 0 | 0 |
 | messages | 2,000 | 0 | 0 | 0 | 0 |
-| command_idempotency_ledger | 2,000 | 0 | 0 | 0 | 0 |
-| conversation_members | 0 | 2,000 | 0 | 2,000 | 0 |
-| account_cleanup_jobs | 0 | 0 | 0 | 0 | 0 |
+| outbox | 2,000 | 0 | 0 | 0 | 0 |
+| conversations | 0 | 2,000 | 0 | 1,999 | -11 |
+| conversation_members | 0 | 2,000 | 0 | 2,000 | -10 |
+| device_sync_cursors | 0 | 0 | 0 | 0 | 0 |
+| attachments | 0 | 0 | 0 | 0 | 0 |
+| message_mutation_requests | 0 | 0 | 0 | 0 | 0 |
+| message_reactions | 0 | 0 | 0 | 0 | 0 |
+| group_mutation_requests | 0 | 0 | 0 | 0 | 0 |
 | user_deletion_tombstones | 0 | 0 | 0 | 0 | 0 |
-| relationship_projection_items | 0 | 0 | 0 | 0 | 0 |
+| command_idempotency_ledger | 2,000 | 0 | 0 | 0 | 0 |
+| group_operation_audit | 0 | 0 | 0 | 0 | 0 |
+| conversation_membership_periods | 0 | 0 | 0 | 0 | 0 |
+| account_cleanup_jobs | 0 | 0 | 0 | 0 | 0 |
+| message_state | 0 | 0 | 0 | 0 | 0 |
+| friend_requests | 0 | 0 | 0 | 0 | 0 |
 | friendships | 0 | 0 | 0 | 0 | 0 |
-| conversations | 0 | 2,000 | 0 | 2,000 | 2 |
+| relationship_mutation_requests | 0 | 0 | 0 | 0 | 0 |
+| relationship_sync_cursors | 0 | 0 | 0 | 0 | 0 |
+| relationship_change_log | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_versions | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_items | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_inbox | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_snapshots | 0 | 0 | 0 | 0 | 0 |
+| relationship_projection_rebuild_state | 0 | 0 | 0 | 0 | 0 |
 | relationship_projection_history | 0 | 0 | 0 | 0 | 0 |
 | outbox_replay_audit | 0 | 0 | 0 | 0 | 0 |
-| conversation_membership_periods | 0 | 0 | 0 | 0 | 0 |
-| relationship_sync_cursors | 0 | 0 | 0 | 0 | 0 |
-| message_state | 0 | 0 | 0 | 0 | 0 |
-| message_reactions | 0 | 0 | 0 | 0 | 0 |
-| relationship_projection_inbox | 0 | 0 | 0 | 0 | 0 |
-| relationship_mutation_requests | 0 | 0 | 0 | 0 | 0 |
-| message_mutation_requests | 0 | 0 | 0 | 0 | 0 |
-| schema_migration_checkpoints | 0 | 0 | 0 | 0 | 0 |
-| schema_migrations | 0 | 0 | 0 | 0 | 0 |
-| relationship_projection_snapshots | 0 | 0 | 0 | 0 | 0 |
-| outbox | 2,000 | 0 | 0 | 0 | 0 |
-| group_mutation_requests | 0 | 0 | 0 | 0 | 0 |
-| group_operation_audit | 0 | 0 | 0 | 0 | 0 |
-| relationship_projection_versions | 0 | 0 | 0 | 0 | 0 |
-| friend_requests | 0 | 0 | 0 | 0 | 0 |
-| relationship_change_log | 0 | 0 | 0 | 0 | 0 |
-| attachments | 0 | 0 | 0 | 0 | 0 |
 
-> HOT 命中率（hot_updates / updates）：conversation_members 2,000/2,000（100%）；conversations 2,000/2,000（100%）。non-HOT 更新会对已修改索引列维护索引并产生额外 WAL。
+> HOT 命中率（hot_updates / updates）：conversations 1,999/2,000（100%）；conversation_members 2,000/2,000（100%）。non-HOT 更新会对已修改索引列维护索引并产生额外 WAL。
 
 
 ## conversations 表级更新（两配置均 HOT，印证索引已移除）
@@ -219,4 +219,4 @@
 | 配置 | 更新 | HOT 更新 | HOT 命中率 | 死元组 |
 |---|---|---|---|---|
 | A：无条件覆盖 | 2,000 | 2,000 | 100.0% | 1 |
-| B：生产 CASE 守卫 | 2,000 | 2,000 | 100.0% | 2 |
+| B：生产 CASE 守卫 | 2,000 | 1,999 | 100.0% | -11 |

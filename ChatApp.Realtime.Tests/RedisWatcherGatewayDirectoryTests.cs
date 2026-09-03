@@ -15,9 +15,17 @@ namespace ChatApp.Realtime.Tests;
 /// </summary>
 public sealed class RedisWatcherGatewayDirectoryTests : IAsyncLifetime
 {
-    private readonly RedisContainer _redis = new RedisBuilder()
-        .WithImage("redis:7-alpine")
-        .Build();
+    private static string? ExternalGarnetConnectionString() =>
+        Environment.GetEnvironmentVariable("CHATAPP_TEST_GARNET");
+
+    private readonly RedisContainer? _redis =
+        string.IsNullOrEmpty(ExternalGarnetConnectionString())
+            ? new RedisBuilder().WithImage("redis:7-alpine").Build()
+            : null;
+
+    private readonly string _externalRedis = ExternalGarnetConnectionString() ?? string.Empty;
+
+    private string RedisConnectionString => _redis?.GetConnectionString() ?? _externalRedis;
 
     private RoutingMetrics _metrics = null!;
     private RealtimeGarnetClient _client = null!;
@@ -25,11 +33,14 @@ public sealed class RedisWatcherGatewayDirectoryTests : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
-        await _redis.StartAsync();
+        if (_redis is not null)
+        {
+            await _redis.StartAsync();
+        }
 
         _metrics = new RoutingMetrics();
         _client = new RealtimeGarnetClient(
-            _redis.GetConnectionString(),
+            RedisConnectionString,
             NullLogger<RealtimeGarnetClient>.Instance);
         _directory = new RedisWatcherGatewayDirectory(
             _client,
@@ -41,7 +52,10 @@ public sealed class RedisWatcherGatewayDirectoryTests : IAsyncLifetime
     {
         _metrics.Dispose();
         _client.Dispose();
-        await _redis.DisposeAsync().AsTask();
+        if (_redis is not null)
+        {
+            await _redis.DisposeAsync().AsTask();
+        }
     }
 
     /// <summary>
