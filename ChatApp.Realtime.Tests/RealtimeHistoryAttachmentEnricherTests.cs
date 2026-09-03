@@ -53,6 +53,58 @@ public sealed class RealtimeHistoryAttachmentEnricherTests
         Assert.Equal(0, store.ListCallCount);
     }
 
+    [Fact]
+    public async Task EnrichAsync_VoiceRegistryRows_CarryVoiceFieldsIntoHistory()
+    {
+        // VOICE-MSG-2：注册表语音行经回查后，历史消息附件必须携带语音 6 字段
+        // （注册表由绑定链路以发送方元数据快照持久化语音列）。
+        var store = new CapturingAttachmentStore(
+        [
+            VoiceRecord("att-voice-1", "m1"),
+            Record("att-file-1", "m1", "photo.png")
+        ]);
+
+        var messages = new RealtimeHistoryMessage[] { History("m1", "voice") };
+        var enriched = await RealtimeHistoryAttachmentEnricher.EnrichAsync(store, messages);
+
+        var attachments = enriched[0].Attachments!;
+        Assert.Equal(2, attachments.Count);
+
+        var voice = attachments.Single(a => a.AttachmentId == "att-voice-1");
+        Assert.True(voice.IsVoice);
+        Assert.Equal("opus", voice.VoiceCodec);
+        Assert.Equal("ogg", voice.VoiceContainer);
+        Assert.Equal(3_200L, voice.VoiceDurationMs);
+        Assert.Equal(48_000, voice.VoiceSampleRateHz);
+        Assert.Equal((short)1, voice.VoiceChannels);
+
+        var file = attachments.Single(a => a.AttachmentId == "att-file-1");
+        Assert.False(file.IsVoice);
+        Assert.Null(file.VoiceCodec);
+        Assert.Null(file.VoiceDurationMs);
+    }
+
+    private static RealtimeAttachmentRecord VoiceRecord(string id, string messageId) => new()
+    {
+        AttachmentId = id,
+        UploaderUserId = 1,
+        ObjectKey = $"k/{id}",
+        ContentType = "audio/ogg",
+        SizeBytes = 12_345,
+        OriginalName = "voice.ogg",
+        Status = AttachmentStatus.Bound,
+        MessageId = messageId,
+        ConversationId = "dm:1:2",
+        CreatedAtMs = 1,
+        BoundAtMs = 2,
+        IsVoice = true,
+        VoiceCodec = "opus",
+        VoiceContainer = "ogg",
+        VoiceDurationMs = 3_200,
+        VoiceSampleRateHz = 48_000,
+        VoiceChannels = 1
+    };
+
     private static RealtimeHistoryMessage History(string messageId, string content) => new()
     {
         MessageId = messageId,
@@ -103,6 +155,7 @@ public sealed class RealtimeHistoryAttachmentEnricherTests
             string? conversationId,
             long uploaderUserId,
             IReadOnlyList<string> attachmentIds,
+            IReadOnlyList<ChatApp.Realtime.Abstractions.Messaging.AttachmentRef>? attachmentMetadata = null,
             CancellationToken ct = default) =>
             throw new NotSupportedException();
 

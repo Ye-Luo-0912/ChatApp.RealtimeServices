@@ -22,7 +22,8 @@ internal sealed class AttachmentBindingWriter
         string messageId,
         string? conversationId,
         long uploaderUserId,
-        IReadOnlyList<string> attachmentIds)
+        IReadOnlyList<string> attachmentIds,
+        IReadOnlyList<ChatApp.Realtime.Abstractions.Messaging.AttachmentRef>? attachmentMetadata = null)
     {
         return AttachmentWriteCommands.BindConfirmedToMessageAsync(
             _session.Connection,
@@ -32,6 +33,7 @@ internal sealed class AttachmentBindingWriter
             conversationId,
             uploaderUserId,
             attachmentIds,
+            attachmentMetadata,
             _session.CancellationToken);
     }
 }

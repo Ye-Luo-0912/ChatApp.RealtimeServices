@@ -21,6 +21,7 @@ public sealed class NoopRealtimeAttachmentStore(ILogger<NoopRealtimeAttachmentSt
         string? conversationId,
         long uploaderUserId,
         IReadOnlyList<string> attachmentIds,
+        IReadOnlyList<ChatApp.Realtime.Abstractions.Messaging.AttachmentRef>? attachmentMetadata = null,
         CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();

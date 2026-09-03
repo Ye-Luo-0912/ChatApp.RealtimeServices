@@ -201,6 +201,9 @@ public sealed class DefaultIncomingMessageProcessor : IIncomingMessageProcessor
             ConversationId = conversationId,
             Content = command.Content,
             AttachmentIds = command.AttachmentIds,
+            // VOICE-MSG-2：携带发送方附件元数据快照（仅消息里出现的附件），
+            // SaveAsync 绑定链路据此把语音 6 字段持久化到附件注册表。
+            Attachments = command.Attachments,
             ReplyToMessageId = command.ReplyToMessageId,
             ReplyToSenderUserId = command.ReplyToSenderUserId,
             ReplyToPreview = command.ReplyToPreview,

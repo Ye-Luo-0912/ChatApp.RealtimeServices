@@ -19,6 +19,12 @@ public sealed class RealtimeMessageRecord
     /// </summary>
     public IReadOnlyList<string>? AttachmentIds { get; init; }
 
+    /// <summary>
+    /// 与 <see cref="AttachmentIds"/> 对齐的附件元数据快照（VOICE-MSG-2，可空）。
+    /// 绑定链路据此把语音 6 字段写入附件注册表行；历史回查经注册表带出。
+    /// </summary>
+    public IReadOnlyList<Messaging.AttachmentRef>? Attachments { get; init; }
+
     public string? ReplyToMessageId { get; init; }
     public long? ReplyToSenderUserId { get; init; }
     public string? ReplyToPreview { get; init; }

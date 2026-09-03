@@ -14,6 +14,56 @@ namespace ChatApp.Realtime.Tests;
 public sealed class DefaultIncomingMessageProcessorTests
 {
     [Fact]
+    public async Task ProcessAsync_CarriesAttachmentMetadataSnapshotIntoRecord()
+    {
+        // VOICE-MSG-2：命令里的附件元数据快照必须原样进入 RealtimeMessageRecord，
+        // 由 SaveAsync 绑定链路把语音 6 字段持久化到附件注册表（历史回查的数据来源）。
+        var store = new CapturingStore();
+        using var metrics = new RealtimeMetrics();
+        var processor = new DefaultIncomingMessageProcessor(
+            store,
+            new RecordingRealtimeOutboxSignal(),
+            metrics,
+            NoopTombstoneAndLedger.Tombstone,
+            new AlwaysMemberGroupStore(),
+            NoopUserExistenceChecker.Instance,
+            NoopBlockListStore.Instance,
+            NoopPrivacySettingStore.Instance,
+            NoopDirectMessagePolicy.Instance,
+            NoopMessageRateLimiter.Instance,
+            NullLogger<DefaultIncomingMessageProcessor>.Instance);
+
+        var metadata = new[]
+        {
+            new AttachmentRef
+            {
+                AttachmentId = "att-voice-1",
+                ContentType = "audio/wav",
+                IsVoice = true,
+                VoiceCodec = "pcm",
+                VoiceContainer = "wav",
+                VoiceDurationMs = 3_500,
+                VoiceSampleRateHz = 16_000,
+                VoiceChannels = 1
+            }
+        };
+        var command = ValidCommand() with
+        {
+            AttachmentIds = ["att-voice-1"],
+            Attachments = metadata
+        };
+
+        var result = await processor.ProcessAsync(command);
+
+        Assert.True(result.Succeeded);
+        Assert.NotNull(store.Message);
+        Assert.Equal(command.AttachmentIds, store.Message.AttachmentIds);
+        Assert.Equal(metadata, store.Message.Attachments);
+        Assert.True(store.Message.Attachments![0].IsVoice);
+        Assert.Equal(16_000, store.Message.Attachments[0].VoiceSampleRateHz);
+    }
+
+    [Fact]
     public async Task ProcessAsync_PersistsMessageAndOutboxEventTogether()
     {
         var store = new CapturingStore();

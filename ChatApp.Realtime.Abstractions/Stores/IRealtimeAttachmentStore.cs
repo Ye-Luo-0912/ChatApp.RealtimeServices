@@ -20,12 +20,15 @@ public interface IRealtimeAttachmentStore
     /// <summary>
     /// 将 Confirmed 附件绑定到消息；返回成功绑定的行数。
     /// 调用方应在与消息写入同一事务中执行（见消息存储 SaveAsync）。
+    /// <paramref name="attachmentMetadata"/> 为发送方元数据快照（VOICE-MSG-2，仅消息里
+    /// 出现的附件）：绑定 SQL 据此把语音 6 字段写入附件行（其余字段以注册表为准，不覆盖）。
     /// </summary>
     Task<int> BindToMessageAsync(
         string messageId,
         string? conversationId,
         long uploaderUserId,
         IReadOnlyList<string> attachmentIds,
+        IReadOnlyList<ChatApp.Realtime.Abstractions.Messaging.AttachmentRef>? attachmentMetadata = null,
         CancellationToken ct = default);
     /// <summary>
     /// 确认附件上传完成：Ticketed(0) → Uploaded(4)。

@@ -355,7 +355,8 @@ public sealed class NpgsqlRealtimeMessageStore :
                         message.MessageId,
                         message.ConversationId,
                         message.SenderUserId,
-                        message.AttachmentIds)
+                        message.AttachmentIds,
+                        message.Attachments)
                     .ConfigureAwait(false);
                 if (!bindResult.Success)
                 {

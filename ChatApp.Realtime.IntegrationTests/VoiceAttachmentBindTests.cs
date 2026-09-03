@@ -24,13 +24,19 @@ namespace ChatApp.Realtime.IntegrationTests;
 [Trait("Category", "Integration")]
 public sealed class VoiceAttachmentBindTests : IAsyncLifetime
 {
-    private readonly PostgreSqlContainer _postgres = new PostgreSqlBuilder()
+    private readonly PostgreSqlContainer? _postgres = string.IsNullOrEmpty(ExternalPostgresConnectionString()) ? new PostgreSqlBuilder()
         .WithImage("postgres:16-alpine")
-        .Build();
+        .Build() : null;
+    private readonly string _externalPostgres = ExternalPostgresConnectionString() ?? string.Empty;
+    private readonly string _schemaSuffix = Guid.NewGuid().ToString("N")[..8];
 
-    public Task InitializeAsync() => _postgres.StartAsync();
+    private static string? ExternalPostgresConnectionString() => Environment.GetEnvironmentVariable("CHATAPP_TEST_POSTGRES");
 
-    public Task DisposeAsync() => _postgres.DisposeAsync().AsTask();
+    private string PostgresConnectionString => _postgres?.GetConnectionString() ?? _externalPostgres;
+
+    public Task InitializeAsync() => _postgres?.StartAsync() ?? Task.CompletedTask;
+
+    public Task DisposeAsync() => _postgres?.DisposeAsync().AsTask() ?? Task.CompletedTask;
 
     [Fact]
     public async Task Bind_AvailableVoiceAttachment_Succeeds_AndCarriesVoiceMetadata()
@@ -184,11 +190,130 @@ public sealed class VoiceAttachmentBindTests : IAsyncLifetime
             (await GetAsync(client, schema, "att-scanning-1")).Status);
     }
 
+    [Fact]
+    public async Task Bind_WithSenderVoiceMetadata_PersistsVoiceColumns_AndRoundTripsViaListByMessageIds()
+    {
+        // VOICE-MSG-2：发送方元数据快照经绑定链路持久化语音 6 字段到附件注册表，
+        // 历史路径（DefaultMessageHistoryQueryProcessor.EnrichAsync → ListByMessageIdsAsync）
+        // 按注册表回查后即可带出语音元数据。
+        var (client, schema) = await CreateStoreAsync("rt_voice_bind_meta");
+        var store = new NpgsqlRealtimeAttachmentStore(
+            client, schema, NullLogger<NpgsqlRealtimeAttachmentStore>.Instance);
+        await InsertAsync(
+            client, schema,
+            AttachmentRow("att-meta-voice-1", "k/meta-1", uploader: 1001,
+                status: AttachmentStatus.Available));
+
+        var metadata = new[]
+        {
+            new ChatApp.Realtime.Abstractions.Messaging.AttachmentRef
+            {
+                AttachmentId = "att-meta-voice-1",
+                ContentType = "audio/wav",
+                IsVoice = true,
+                VoiceCodec = "pcm",
+                VoiceContainer = "wav",
+                VoiceDurationMs = 3_500,
+                VoiceSampleRateHz = 16_000,
+                VoiceChannels = 1
+            }
+        };
+        var bound = await store.BindToMessageAsync(
+            "msg-meta-1", "dm:1001:1002", uploaderUserId: 1001,
+            ["att-meta-voice-1"], metadata);
+
+        Assert.Equal(1, bound);
+        var row = await GetAsync(client, schema, "att-meta-voice-1");
+        Assert.Equal(AttachmentStatus.Bound, row.Status);
+        Assert.True(row.IsVoice);
+        Assert.Equal("pcm", row.VoiceCodec);
+        Assert.Equal("wav", row.VoiceContainer);
+        Assert.Equal(3_500L, row.VoiceDurationMs);
+        Assert.Equal(16_000, row.VoiceSampleRateHz);
+        Assert.Equal((short)1, row.VoiceChannels);
+
+        // 历史回查侧：按 message_id 读回的注册表行携带语音 6 字段
+        var historyRows = await store.ListByMessageIdsAsync(["msg-meta-1"]);
+        var historyRow = Assert.Single(historyRows);
+        Assert.True(historyRow.IsVoice);
+        Assert.Equal("pcm", historyRow.VoiceCodec);
+        Assert.Equal(3_500L, historyRow.VoiceDurationMs);
+        Assert.Equal(16_000, historyRow.VoiceSampleRateHz);
+        Assert.Equal((short)1, historyRow.VoiceChannels);
+    }
+
+    [Fact]
+    public async Task Bind_WithPartialVoiceMetadata_BindsSuccessfully_WithoutVoiceColumns()
+    {
+        // 残缺语音声明（is_voice=true 但缺 sample_rate）：ck_attachments_voice_metadata 禁止，
+        // 按无元数据处理——消息照常绑定，注册表现值不变（消息必达）。
+        var (client, schema) = await CreateStoreAsync("rt_voice_bind_partial");
+        var store = new NpgsqlRealtimeAttachmentStore(
+            client, schema, NullLogger<NpgsqlRealtimeAttachmentStore>.Instance);
+        await InsertAsync(
+            client, schema,
+            AttachmentRow("att-partial-voice-1", "k/partial-1", uploader: 1001,
+                status: AttachmentStatus.Available));
+
+        var metadata = new[]
+        {
+            new ChatApp.Realtime.Abstractions.Messaging.AttachmentRef
+            {
+                AttachmentId = "att-partial-voice-1",
+                ContentType = "audio/wav",
+                IsVoice = true,
+                VoiceCodec = "pcm",
+                VoiceContainer = "wav",
+                VoiceDurationMs = 3_500,
+                VoiceSampleRateHz = null,
+                VoiceChannels = 1
+            }
+        };
+        var bound = await store.BindToMessageAsync(
+            "msg-partial-1", "dm:1001:1002", uploaderUserId: 1001,
+            ["att-partial-voice-1"], metadata);
+
+        Assert.Equal(1, bound);
+        var row = await GetAsync(client, schema, "att-partial-voice-1");
+        Assert.Equal(AttachmentStatus.Bound, row.Status);
+        Assert.False(row.IsVoice);
+        Assert.Null(row.VoiceCodec);
+        Assert.Null(row.VoiceDurationMs);
+    }
+
+    [Fact]
+    public async Task Bind_WithoutMetadata_PreservesExistingVoiceColumns()
+    {
+        // 仅 id 上行（旧客户端路径）：绑定不得触碰已有语音列（如扫描侧写入的元数据）。
+        var (client, schema) = await CreateStoreAsync("rt_voice_bind_preserve");
+        var store = new NpgsqlRealtimeAttachmentStore(
+            client, schema, NullLogger<NpgsqlRealtimeAttachmentStore>.Instance);
+        await InsertAsync(
+            client, schema,
+            AttachmentRow("att-preserve-voice-1", "k/preserve-1", uploader: 1001,
+                status: AttachmentStatus.Available,
+                isVoice: true, codec: "opus", container: "ogg",
+                durationMs: 3_200, sampleRateHz: 48_000, channels: 1));
+
+        var bound = await store.BindToMessageAsync(
+            "msg-preserve-1", "dm:1001:1002", uploaderUserId: 1001,
+            ["att-preserve-voice-1"]);
+
+        Assert.Equal(1, bound);
+        var row = await GetAsync(client, schema, "att-preserve-voice-1");
+        Assert.Equal(AttachmentStatus.Bound, row.Status);
+        Assert.True(row.IsVoice);
+        Assert.Equal("opus", row.VoiceCodec);
+        Assert.Equal(3_200L, row.VoiceDurationMs);
+        Assert.Equal(48_000, row.VoiceSampleRateHz);
+        Assert.Equal((short)1, row.VoiceChannels);
+    }
+
     private async Task<(RealtimeDatabaseClient Client, RealtimeDatabaseSchema Schema)> CreateStoreAsync(
         string schemaName)
     {
-        var connectionString = _postgres.GetConnectionString();
-        var schema = new RealtimeDatabaseSchema(schemaName);
+        var connectionString = PostgresConnectionString;
+        var schema = new RealtimeDatabaseSchema($"{schemaName}_{_schemaSuffix}");
         var client = new RealtimeDatabaseClient(
             connectionString,
             NullLogger<RealtimeDatabaseClient>.Instance);

@@ -464,6 +464,7 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
         string? conversationId,
         long uploaderUserId,
         IReadOnlyList<string> attachmentIds,
+        IReadOnlyList<ChatApp.Realtime.Abstractions.Messaging.AttachmentRef>? attachmentMetadata = null,
         CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(messageId);
@@ -484,6 +485,7 @@ public sealed class NpgsqlRealtimeAttachmentStore : IRealtimeAttachmentStore
                 conversationId,
                 uploaderUserId,
                 attachmentIds,
+                attachmentMetadata,
                 ct)
             .ConfigureAwait(false);
 

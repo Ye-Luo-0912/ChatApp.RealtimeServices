@@ -21,6 +21,13 @@ internal static class AttachmentWriteCommands
     /// 已绑定冲突、非本人或不存在返回各自稳定错误码。任一附件不可绑定即整体失败返回
     /// <see cref="AttachmentBindResult.Fail"/>，绝不绑定子集或静默跳过。
     /// </para>
+    /// <para>
+    /// VOICE-MSG-2：<paramref name="attachmentMetadata"/>（发送方元数据快照，仅消息里出现的附件）
+    /// 中语音字段成组有效（is_voice=true 且 codec/container/duration/sample_rate/channels 均非空且为正）的
+    /// 附件，在绑定同一 UPDATE 内把语音 6 字段写入附件行（sender 值优先，COALESCE 回退注册表现值）；
+    /// 残缺/越界语音声明按无元数据处理（保消息必达、不触碰 ck_attachments_voice_metadata 约束），
+    /// 非语音附件的注册表现值不受影响。
+    /// </para>
     /// </summary>
     public static async Task<AttachmentBindResult> BindConfirmedToMessageAsync(
         NpgsqlConnection connection,
@@ -30,7 +37,8 @@ internal static class AttachmentWriteCommands
         string? conversationId,
         long uploaderUserId,
         IReadOnlyList<string> attachmentIds,
-        CancellationToken ct)
+        IReadOnlyList<AttachmentRef>? attachmentMetadata = null,
+        CancellationToken ct = default)
     {
         if (attachmentIds.Count == 0)
             return AttachmentBindResult.Ok([]);
@@ -108,23 +116,48 @@ internal static class AttachmentWriteCommands
         if (errors.Count > 0)
             return AttachmentBindResult.Fail(errors);
 
+        // VOICE-MSG-2：按可绑定 id 集合构建语音元数据 unnest 数组（与 bindable 顺序对齐）。
+        // 完整语音集 → is_voice=true + 5 元数据；其余（无/残缺语音声明）→ 全 NULL（COALESCE 保留现值）。
+        var voiceMetadata = BuildVoiceMetadataArrays(
+            bindable,
+            attachmentMetadata);
+
         // Step 2：全部可绑定，一次 UPDATE 并 RETURNING 取回线协议字段（含语音元数据）。
+        // 语音元数据经 FROM unnest 与绑定同语句写入：sender 值优先，NULL 回退注册表现值。
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         await using var command = new NpgsqlCommand(
             $"""
-             UPDATE {schema.AttachmentsTableSql}
+             UPDATE {schema.AttachmentsTableSql} AS a
              SET message_id = @message_id,
                  conversation_id = @conversation_id,
                  status = @bound_status,
-                 bound_at_ms = @bound_at_ms
-             WHERE attachment_id = ANY(@attachment_ids)
-               AND uploader_user_id = @uploader_user_id
-               AND status IN (@available_status, @confirmed_status)
-             RETURNING attachment_id, uploader_user_id, object_key, public_url, content_type,
-                       size_bytes, original_name, status, message_id, conversation_id,
-                       client_attachment_id, created_at_ms, confirmed_at_ms, bound_at_ms,
-                       content_hash, is_voice, voice_codec, voice_container,
-                       voice_duration_ms, voice_sample_rate_hz, voice_channels;
+                 bound_at_ms = @bound_at_ms,
+                 is_voice = COALESCE(m.is_voice, a.is_voice),
+                 voice_codec = COALESCE(m.voice_codec, a.voice_codec),
+                 voice_container = COALESCE(m.voice_container, a.voice_container),
+                 voice_duration_ms = COALESCE(m.voice_duration_ms, a.voice_duration_ms),
+                 voice_sample_rate_hz = COALESCE(m.voice_sample_rate_hz, a.voice_sample_rate_hz),
+                 voice_channels = COALESCE(m.voice_channels, a.voice_channels)
+             FROM unnest(
+                      @m_attachment_ids::text[],
+                      @m_is_voice::boolean[],
+                      @m_voice_codec::text[],
+                      @m_voice_container::text[],
+                      @m_voice_duration_ms::bigint[],
+                      @m_voice_sample_rate_hz::integer[],
+                      @m_voice_channels::smallint[])
+                  AS m(attachment_id, is_voice, voice_codec, voice_container,
+                       voice_duration_ms, voice_sample_rate_hz, voice_channels)
+             WHERE a.attachment_id = m.attachment_id
+               AND a.attachment_id = ANY(@attachment_ids)
+               AND a.uploader_user_id = @uploader_user_id
+               AND a.status IN (@available_status, @confirmed_status)
+             RETURNING a.attachment_id, a.uploader_user_id, a.object_key, a.public_url,
+                       a.content_type, a.size_bytes, a.original_name, a.status,
+                       a.message_id, a.conversation_id,
+                       a.client_attachment_id, a.created_at_ms, a.confirmed_at_ms, a.bound_at_ms,
+                       a.content_hash, a.is_voice, a.voice_codec, a.voice_container,
+                       a.voice_duration_ms, a.voice_sample_rate_hz, a.voice_channels;
              """,
             connection,
             transaction);
@@ -145,6 +178,7 @@ internal static class AttachmentWriteCommands
             "attachment_ids",
             NpgsqlDbType.Array | NpgsqlDbType.Text);
         idsParam.Value = bindable;
+        AddVoiceMetadataParameters(command, voiceMetadata);
 
         var records = new List<RealtimeAttachmentRecord>(bindable.Count);
         await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
@@ -189,5 +223,110 @@ internal static class AttachmentWriteCommands
         }
 
         return AttachmentBindResult.Ok(records);
+    }
+
+    /// <summary>语音元数据 unnest 行：与可绑定 id 集合逐位对齐；无语音声明的位全 NULL。</summary>
+    internal sealed record VoiceMetadataArrays(
+        string[] AttachmentIds,
+        bool?[] IsVoice,
+        string?[] VoiceCodec,
+        string?[] VoiceContainer,
+        long?[] VoiceDurationMs,
+        int?[] VoiceSampleRateHz,
+        short?[] VoiceChannels);
+
+    /// <summary>
+    /// 按可绑定 id 顺序构建语音元数据数组。仅"完整语音声明"（is_voice=true 且
+    /// codec/container 非空白、duration/sample_rate/channels 为正，codec/container 截断到列宽 32）
+    /// 产生非 NULL 位；其余（无元数据、非语音、残缺声明）全 NULL，绑定时不触碰语音列。
+    /// </summary>
+    internal static VoiceMetadataArrays BuildVoiceMetadataArrays(
+        IReadOnlyList<string> bindableIds,
+        IReadOnlyList<AttachmentRef>? attachmentMetadata)
+    {
+        var count = bindableIds.Count;
+        var isVoice = new bool?[count];
+        var codec = new string?[count];
+        var container = new string?[count];
+        var durationMs = new long?[count];
+        var sampleRateHz = new int?[count];
+        var channels = new short?[count];
+
+        if (attachmentMetadata is not { Count: > 0 })
+        {
+            return new VoiceMetadataArrays(
+                bindableIds.ToArray(), isVoice, codec, container, durationMs, sampleRateHz, channels);
+        }
+
+        // 元数据快照可能与请求集合非严格对齐（旧网关/重复 id）：按 id 建索引，仅对可绑定 id 生效。
+        var byId = new Dictionary<string, AttachmentRef>(StringComparer.Ordinal);
+        foreach (var reference in attachmentMetadata)
+        {
+            if (reference?.AttachmentId is { Length: > 0 } id)
+                byId[id] = reference;
+        }
+
+        for (var i = 0; i < count; i++)
+        {
+            if (!byId.TryGetValue(bindableIds[i], out var reference)
+                || !reference.IsVoice)
+            {
+                continue;
+            }
+
+            var trimmedCodec = string.IsNullOrWhiteSpace(reference.VoiceCodec)
+                ? null
+                : reference.VoiceCodec.Trim();
+            var trimmedContainer = string.IsNullOrWhiteSpace(reference.VoiceContainer)
+                ? null
+                : reference.VoiceContainer.Trim();
+            var valid = trimmedCodec is not null
+                        && trimmedContainer is not null
+                        && reference.VoiceDurationMs is > 0
+                        && reference.VoiceSampleRateHz is > 0
+                        && reference.VoiceChannels is > 0;
+            if (!valid)
+            {
+                // 残缺语音声明：ck_attachments_voice_metadata 禁止 is_voice=true 且元数据缺失。
+                // 按无元数据处理，保消息必达。
+                continue;
+            }
+
+            isVoice[i] = true;
+            codec[i] = trimmedCodec!.Length > VoiceCodecColumnLength
+                ? trimmedCodec[..VoiceCodecColumnLength]
+                : trimmedCodec;
+            container[i] = trimmedContainer!.Length > VoiceCodecColumnLength
+                ? trimmedContainer[..VoiceCodecColumnLength]
+                : trimmedContainer;
+            durationMs[i] = reference.VoiceDurationMs;
+            sampleRateHz[i] = reference.VoiceSampleRateHz;
+            channels[i] = reference.VoiceChannels;
+        }
+
+        return new VoiceMetadataArrays(
+            bindableIds.ToArray(), isVoice, codec, container, durationMs, sampleRateHz, channels);
+    }
+
+    /// <summary>voice_codec/voice_container 列宽（Migration065）。</summary>
+    private const int VoiceCodecColumnLength = 32;
+
+    private static void AddVoiceMetadataParameters(
+        NpgsqlCommand command,
+        VoiceMetadataArrays metadata)
+    {
+        void AddArray(string name, NpgsqlDbType type, object value)
+        {
+            var parameter = command.Parameters.Add(name, NpgsqlDbType.Array | type);
+            parameter.Value = value;
+        }
+
+        AddArray("m_attachment_ids", NpgsqlDbType.Text, metadata.AttachmentIds);
+        AddArray("m_is_voice", NpgsqlDbType.Boolean, metadata.IsVoice);
+        AddArray("m_voice_codec", NpgsqlDbType.Text, metadata.VoiceCodec);
+        AddArray("m_voice_container", NpgsqlDbType.Text, metadata.VoiceContainer);
+        AddArray("m_voice_duration_ms", NpgsqlDbType.Bigint, metadata.VoiceDurationMs);
+        AddArray("m_voice_sample_rate_hz", NpgsqlDbType.Integer, metadata.VoiceSampleRateHz);
+        AddArray("m_voice_channels", NpgsqlDbType.Smallint, metadata.VoiceChannels);
     }
 }

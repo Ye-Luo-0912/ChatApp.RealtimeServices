@@ -25,6 +25,13 @@ public sealed record IncomingMessageCommand
     /// </summary>
     public IReadOnlyList<string>? AttachmentIds { get; init; }
 
+    /// <summary>
+    /// 与 <see cref="AttachmentIds"/> 对齐的附件元数据快照（VOICE-MSG-2）。
+    /// 仅包含本条消息引用的附件；绑定链路据此把语音 6 字段持久化到附件注册表，
+    /// 历史消息经注册表回查后即可携带语音元数据。可为 null（旧发送方/仅 id 上行）。
+    /// </summary>
+    public IReadOnlyList<AttachmentRef>? Attachments { get; init; }
+
     /// <summary>被回复消息的服务端 MessageId。</summary>
     public string? ReplyToMessageId { get; init; }
 
