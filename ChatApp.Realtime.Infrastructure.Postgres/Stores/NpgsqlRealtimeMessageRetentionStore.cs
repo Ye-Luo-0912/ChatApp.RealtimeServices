@@ -175,9 +175,10 @@ public sealed class NpgsqlRealtimeMessageRetentionStore(
 
             await transaction.CommitAsync(ct).ConfigureAwait(false);
 
-            logger.LogDebug(
-                "Message retention purged batch. Deleted={Deleted}; TipsRepaired={Repaired}; " +
-                "AttachmentsAbandoned={Abandoned}; PurgeEvents={PurgeEvents}; Cutoff={Cutoff}",
+            // 4201：回收审计由 Debug 提升为 Information——该批次是附件解绑与
+            // blob 回收入队的唯一留痕点，审计要求它在生产默认级别可见。
+            RealtimeMessageRetentionLog.PurgeBatchCompleted(
+                logger,
                 deletedIds.Count,
                 repaired,
                 attachmentsAbandoned,
