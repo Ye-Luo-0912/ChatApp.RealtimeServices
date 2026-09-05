@@ -52,6 +52,26 @@ public sealed class NpgsqlRealtimeOutboxStore :
         }
     }
 
+    public async ValueTask<IRealtimeOutboxClaimSession> OpenClaimSessionAsync(
+        string instanceId,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(instanceId);
+        var connection = await _databaseClient.GetDataSource()
+            .OpenConnectionAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var session = new ClaimSession(this, connection, instanceId);
+            await session.PrepareAsync(ct).ConfigureAwait(false);
+            return session;
+        }
+        catch
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
     public async Task<IReadOnlyList<RealtimeOutboxRecord>> ClaimBatchAsync(
         string instanceId,
         int batchSize,
